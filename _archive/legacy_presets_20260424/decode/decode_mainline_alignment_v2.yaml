@@ -1,0 +1,26 @@
+# Step5 / 默认 eval：canonical 主线路径（alignment-first，低温不确定触发采样；非 nucleus 高熵、非 rerank）
+decode_strategy: uncertainty_low_temp_top_k
+decode_seed: 3407
+max_explanation_length: 36
+label_smoothing: 0.02
+repetition_penalty: 1.12
+generate_temperature: 0.20
+generate_top_p: 1.0
+top_k: 5
+gap_threshold: 0.35
+prefix_greedy_steps: 4
+no_repeat_ngram_size: 3
+min_len: 4
+soft_max_len: 28
+hard_max_len: 36
+eos_boost_start: 9999
+eos_boost_value: 0.0
+tail_temperature: -1.0
+tail_top_p: -1.0
+forbid_eos_after_open_quote: true
+forbid_eos_after_open_bracket: true
+forbid_bad_terminal_tokens: true
+decode_token_repeat_window: 4
+decode_token_repeat_max: 2
+candidate_family: balanced
+candidate_mixed_include_diverse: false

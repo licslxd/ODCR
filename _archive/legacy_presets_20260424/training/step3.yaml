@@ -1,0 +1,4 @@
+# Step3 shared/specific 结构化解耦（A100 2×GPU 主线）：任务表 + pure_train_common 共享纯训练语义
+defaults:
+  - step3_core
+  - pure_train_common

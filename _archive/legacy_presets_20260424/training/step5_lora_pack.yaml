@@ -1,0 +1,10 @@
+# Step5B：LoRA + 微批 + 梯度累加（在 step5.yaml 的 defaults 中置于 pure_train_common **之后** 以覆盖布局字段）。
+# train_batch_size 由父进程按 world_size×per_device×accum 自动重写（见 odcr_core.config_loader）。
+train_mode: lora
+train_precision: bf16
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+per_device_eval_batch_size: 2
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05

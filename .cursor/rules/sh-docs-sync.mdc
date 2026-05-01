@@ -1,0 +1,16 @@
+---
+globs: scripts/entrypoints/**/*.sh,scripts/orchestration/**/*.sh,scripts/lib/**/*.sh,code/paths_config.py
+alwaysApply: false
+---
+
+# `scripts/` Shell、`paths_config` 与文档同步
+
+凡修改 **`scripts/entrypoints/`、`scripts/orchestration/`、`scripts/lib/`** 下任意 `*.sh` 或 **`code/paths_config.py`**（参数、默认、日志/checkpoint 规则、`ODCR_ROOT` 相关行为等），**在同一提交内**须同步更新 **`docs/ODCR_Scripts_and_Runtime_Guide.md`**，使叙述与源码一致。
+
+该文件为**唯一维护的**脚本速查、参数表、路径规范与运行期（preset / `DDP_NPROC` 等）综合指南；勿再新增并行的「copy」类重复文档。
+
+**原则**：以脚本与 `paths_config.py` 为准；文档若与源码不一致，以源码为准并修正文档。
+
+**自检**：对照脚本的 `usage`/注释、`case` 分支、`export`；对照 `paths_config.get_stage_run_dir` 等与文档第 2 节表格。
+
+**Git**：仓库已提供 `.githooks/pre-commit`；在仓库根执行 `bash scripts/install/install_git_hooks.sh`（或 `git config core.hooksPath .githooks`）后，提交时若暂存了上述 shell 或 `code/paths_config.py`，会强制要求同批暂存 **`docs/ODCR_Scripts_and_Runtime_Guide.md`**。

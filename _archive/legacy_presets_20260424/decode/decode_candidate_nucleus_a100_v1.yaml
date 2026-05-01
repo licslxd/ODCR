@@ -1,0 +1,13 @@
+# 候选/多样性实验专用：nucleus 多候选族，不作为论文主表默认 decode（主表见 decode_mainline_alignment_v2）
+decode_strategy: nucleus
+decode_seed: null
+max_explanation_length: 25
+label_smoothing: 0.05
+repetition_penalty: 1.1
+generate_temperature: 0.62
+generate_top_p: 0.83
+no_repeat_ngram_size: 3
+min_len: 2
+soft_max_len: 11
+hard_max_len: 25
+domain_fusion_mode: gate_cross_attn

@@ -1,0 +1,4 @@
+# 显式候选/nucleus 多样性路径（非默认主表；对照实验用）
+hardware_preset: default
+decode_preset: decode_candidate_nucleus_a100_v1
+eval_batch_size: 2048

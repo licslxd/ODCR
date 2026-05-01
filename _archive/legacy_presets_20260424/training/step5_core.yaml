@@ -1,0 +1,77 @@
+# Step5B 任务表：与 pure_train_common、step5_lora_pack 组合（见 presets/training/step5.yaml）。
+# 每行只写与「文件末尾全局片段」不同的字段；正交 / LCI / FCA / 解释支路正则权重在全局片段统一维护。
+1:
+  train_batch_size: 1024
+  lr: 5.0e-4
+  coef: 1
+2:
+  train_batch_size: 512
+  lr: 1.0e-3
+  coef: 0.1
+3:
+  train_batch_size: 1024
+  lr: 5.0e-4
+  coef: 0.5
+4:
+  train_batch_size: 1024
+  epochs: 50
+  checkpoint_selection_mode: guarded_composite
+  checkpoint_guard_valid_loss_rel_tol: 0.01
+  loss_weight_batch_diversity: 0.01
+  batch_diversity_ramp_target_scale: 0.5
+  generate_temperature: 0.18
+  decode_top_k: 3
+  gap_threshold: 0.50
+  prefix_greedy_steps: 6
+  max_explanation_length: 30
+  repetition_penalty: 1.09
+  label_smoothing: 0.01
+  lr: 1.0e-3
+  coef: 0.5
+5:
+  lr: 1.0e-3
+  coef: 0.5
+6:
+  lr: 1.0e-3
+  coef: 0.5
+7:
+  lr: 1.0e-4
+  coef: 0.5
+8:
+  lr: 5.0e-4
+  coef: 1
+
+# --- 全局片段（deep_merge 到每任务；不放入 pure_train_common，避免 Step3 训练 payload 混入 Step5B 专有项）---
+train_label_max_length: 36
+train_dynamic_padding: true
+ema_enabled: true
+ema_decay: 0.999
+generate_during_train: false
+epochs: 30
+full_bleu_eval:
+  mode: off
+checkpoint_metric: valid_loss
+checkpoint_selection_mode: valid_loss_only
+min_lr_ratio: 0.1
+adv: 0.005
+lambda_ortho: 0.2
+lambda_ortho_xcov: 1.0
+lambda_ortho_cos: 0.25
+lambda_ortho_step5: 0.15
+lambda_lci: 0.12
+lambda_fca: 0.08
+loss_weight_batch_diversity: 0.02
+batch_diversity_warmup_epochs: 2
+batch_diversity_mode: mean_prob_neg_entropy
+batch_diversity_eps: 1.0e-8
+batch_diversity_use_ema: true
+batch_diversity_ema_decay: 0.9
+batch_diversity_min_valid_tokens: 64
+batch_diversity_loss_clamp_abs: 0.2
+batch_diversity_ramp_epochs: 0
+batch_diversity_ramp_target_scale: 1.0
+batch_diversity_ema_init_mode: uniform
+full_bleu_decode_strategy: inherit
+loss_weight_repeat_ul: 0.045
+loss_weight_terminal_clean: 0.03
+terminal_clean_span: 3

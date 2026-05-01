@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+source_conda() {
+  if command -v conda >/dev/null 2>&1; then
+    local base
+    base="$(conda info --base 2>/dev/null || true)"
+    if [[ -n "$base" && -f "$base/etc/profile.d/conda.sh" ]]; then
+      # shellcheck disable=SC1090
+      source "$base/etc/profile.d/conda.sh"
+    fi
+  elif [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+  elif [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+  fi
+}
+
+source_conda
+if command -v conda >/dev/null 2>&1; then
+  conda activate D4C >/dev/null 2>&1 || true
+fi
+
+export ODCR_ROOT="$SCRIPT_DIR"
+export PYTHONPATH="$SCRIPT_DIR/code${PYTHONPATH:+:$PYTHONPATH}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+DAEMON=0
+ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--daemon" ]]; then
+    DAEMON=1
+  else
+    ARGS+=("$arg")
+  fi
+done
+
+if [[ "$DAEMON" == "1" ]]; then
+  printf 'ODCR --daemon is retired: run foreground through ./odcr so logs stay under runs/<stage>/<unit>/<run_id>/meta.\n' >&2
+  exit 2
+fi
+
+exec python "$SCRIPT_DIR/code/odcr.py" "${ARGS[@]}"

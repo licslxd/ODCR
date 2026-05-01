@@ -1,0 +1,28 @@
+# 排除大型模型权重
+artifacts/models/
+
+# 排除海量运行日志
+AI_analysis/01_raw_logs/
+runs/
+test/*.log
+*.log
+slurm-*.out
+
+# 排除 Python 缓存
+__pycache__/
+*.pyc
+
+# 排除根目录下的系统误生成的临时文件
+--gres=*
+--wrap=*
+-J
+
+# 忽略文件夹下的所有内容
+AI_analysis/*
+data/*
+merged/*
+
+# 但不要忽略 .gitkeep 文件本身，这样文件夹结构就能传上去
+!AI_analysis/.gitkeep
+!data/.gitkeep
+!merged/.gitkeep

@@ -1,0 +1,14 @@
+# A100 单卡快速探路 / 小规模 eval（低并行）
+ddp_world_size: 1
+num_proc: 2
+dataloader_num_workers_train: 2
+dataloader_num_workers_valid: 2
+dataloader_num_workers_test: 2
+dataloader_prefetch_factor_train: 2
+dataloader_prefetch_factor_valid: 2
+dataloader_prefetch_factor_test: 2
+max_parallel_cpu: 8
+omp_num_threads: 1
+mkl_num_threads: 1
+tokenizers_parallelism: false
+cuda_visible_devices: "0"

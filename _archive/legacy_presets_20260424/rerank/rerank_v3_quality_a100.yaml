@@ -1,0 +1,13 @@
+# Rerank 为辅助路径：非主表 mainline 默认；用于候选池重排与实验对比。
+# generic_template 软罚分默认关闭（w=0），避免误伤正常句式；需要时可显式调大。
+schema_version: odcr_rerank_v3/1.0
+w_lp_norm: 1.0
+w_completion: 0.62
+w_well_formed: 0.55
+w_source_coverage: 0.6
+w_repeat_v2: 0.45
+w_malformed_tail: 0.5
+w_malformed_token: 0.5
+w_generic_template: 0.0
+w_entity_drift: 0.45
+w_length_v2: 0.15

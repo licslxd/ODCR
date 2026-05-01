@@ -1,0 +1,7 @@
+# code/tools/async_eval_daemon.py 默认行为来源；CLI 显式参数最后覆盖本文件。
+eval_device_policy: opportunistic
+poll_interval_sec: 20
+eval_profile: eval_balanced_2gpu
+decode_preset: decode_mainline_alignment_v2
+rerank_preset: null
+max_pending_jobs: 1

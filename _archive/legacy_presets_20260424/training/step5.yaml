@@ -1,0 +1,5 @@
+# Step5 解释支路（A100 2×GPU 主线）：任务表 + pure_train_common 共享纯训练语义；step5_lora_pack 覆盖微批/LoRA 默认
+defaults:
+  - step5_core
+  - pure_train_common
+  - step5_lora_pack

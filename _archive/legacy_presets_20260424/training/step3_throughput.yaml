@@ -1,0 +1,7 @@
+# Step3 吞吐向 DDP：与 step3 相同任务表与 pure_train_common，但关闭 DDP find_unused_parameters。
+# 主线默认仍为 true（config + 多数 preset 未写时）；若出现 unused parameter / reducer 报错，改回 --preset step3。
+# 适用：shared/specific 主图在各 rank 上稳定、确认无「本步未参与 loss 的可训练参数」分支时尝试。
+defaults:
+  - step3_core
+  - pure_train_common
+ddp_find_unused_parameters: false

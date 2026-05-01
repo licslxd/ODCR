@@ -1,0 +1,82 @@
+# Step3 structured disentanglement 任务表（不含 A100 纯训练共享项；由 step3.yaml 组合 pure_train_common）
+1:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 5.0e-4
+  coef: 1
+2:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 1.0e-3
+  coef: 0.1
+3:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 5.0e-4
+  coef: 0.5
+4:
+  train_batch_size: 256
+  per_device_train_batch_size: 64
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 5.0e-4
+  coef: 0.2
+5:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 1.0e-3
+  coef: 0.5
+6:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 1.0e-3
+  coef: 0.5
+7:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 1.0e-4
+  coef: 0.5
+8:
+  train_batch_size: 1024
+  train_label_max_length: 64
+  epochs: 30
+  full_bleu_eval:
+    mode: off
+  checkpoint_metric: valid_loss
+  min_lr_ratio: 0.1
+  lr: 5.0e-4
+  coef: 1

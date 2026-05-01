@@ -1,0 +1,4 @@
+# 默认主评（大 batch）：mainline decode，无 rerank
+hardware_preset: default
+decode_preset: decode_mainline_alignment_v2
+eval_batch_size: 4096

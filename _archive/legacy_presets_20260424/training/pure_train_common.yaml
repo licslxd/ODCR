@@ -1,0 +1,17 @@
+# 跨 Step3 / Step5 共享的纯训练语义（ODCR 主线；单一事实来源）；由 step3.yaml / step5.yaml 经 defaults 引用。
+# 不含 train_label_max_length；不含 Step5B 专有项（解释支路权重、batch_diversity 等，见 presets/training/step5_core.yaml 全局片段）。
+# 含 epochs/min_lr_ratio 以便单独被选为 --preset 时仍能解析（lr/coef 仍来自 task + training 解析链）。
+epochs: 50
+min_lr_ratio: 0.1
+train_batch_size: 256
+per_device_train_batch_size: 32
+gradient_accumulation_steps: 4
+ema_enabled: true
+ema_decay: 0.999
+generate_during_train: false
+train_dynamic_padding: true
+full_bleu_eval:
+  mode: off
+checkpoint_metric: valid_loss
+# Step5：首 train/valid batch collate 后再做 CPU 索引 min/max 审计（排障时置 true）
+step5_strict_index_batches: false

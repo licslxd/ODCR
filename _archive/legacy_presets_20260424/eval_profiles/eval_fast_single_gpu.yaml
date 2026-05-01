@@ -1,0 +1,4 @@
+# 默认主评：mainline decode，无 rerank
+hardware_preset: a100_1gpu_fast
+decode_preset: decode_mainline_alignment_v2
+eval_batch_size: 1024

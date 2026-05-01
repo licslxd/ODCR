@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env bash /public/home/zhangliml/lc/ODCR/ODCR-main/.codex/hooks/odcr_post_edit_stop.sh",
+            "timeout": 180,
+            "statusMessage": "Running ODCR post-edit validation"
+          }
+        ]
+      }
+    ]
+  }
+}

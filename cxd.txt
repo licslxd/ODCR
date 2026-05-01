@@ -1,0 +1,565 @@
+一、先给总图：每个阶段只负责一类创新
+preprocess
+
+主负责：EASD 的证据锚点层
+辅负责：HSS 的风格分层先验
+
+step3
+
+主负责：EASD 的表征实现层
+辅负责：HSS 的层级风格结构
+
+step4
+
+主负责：RCR
+辅负责：UCI 的置信度元数据
+并为 Step5A / Step5B 做数据分流
+
+step5A
+
+主负责：LCI
+辅负责：UCI 的不变性调度
+
+step5B
+
+主负责：CCV
+辅负责：FCA
+并消费 HSS / RCR / EASD 的上游资产
+
+这就是总原则：
+
+预处理打锚点，Step3 洗表征，Step4 算可靠性并分流，Step5A 打评分，Step5B 打解释。
+
+二、4 主 3 辅的最终定义
+4 个主创新
+EASD
+Evidence-Anchored Shared/Specific Disentanglement
+RCR
+Reliability-aware Counterfactual Routing
+LCI
+Latent Counterfactual Invariance
+CCV
+Causally Controlled Verbalizer
+3 个辅创新
+HSS
+Hierarchical Specific Style
+FCA
+Faithfulness Consistency Alignment
+UCI
+Uncertainty-aware Counterfactual Invariance
+三、模块级创新点分配图
+1) preprocess：证据锚点层
+这一层主创新
+
+EASD
+
+这一层辅创新
+
+HSS
+
+这一层必须产出的东西
+
+预处理阶段不再只输出：
+
+user
+item
+rating
+review
+explanation
+domain
+
+而要额外输出 6 类锚点资产。
+
+A. content_evidence
+
+这是 shared 的监督来源。
+包括：
+
+名词短语
+item 属性词
+高频 aspect span
+review / explanation 中的核心理由片段
+B. style_evidence
+
+这是 specific 的监督来源。
+包括：
+
+形容词 / 副词
+句式风格信号
+域常见表达
+评价口吻词
+C. polarity_anchor
+
+这是 shared 的偏好强度辅助锚点。
+包括：
+
+rating bucket
+sentiment polarity
+intensity
+D. domain_style_anchor
+
+这是 HSS 的第一层。
+它不是简单 domain id，而是：
+
+该域最代表性的 style token / phrase 分布
+域风格中心
+E. local_style_residual_hint
+
+这是 HSS 的第二层。
+表示样本相对域中心的风格偏差。
+
+F. evidence_quality_prior
+
+这是后面 RCR 的先验输入。
+包括：
+
+text length
+truncation risk
+template risk
+bad tail risk
+html/noise risk
+这一层创新点的真正作用
+给 S_sh 一个内容来源
+给 S_sp 一个风格来源
+不再让 shared/specific 纯靠模型自己猜
+这一层在你现有代码里的映射
+
+审计已经指出，当前预处理最大缺口正是：
+
+没有 content evidence anchor
+没有 style evidence anchor
+没有 evidence-to-representation 桥。
+所以这层是你新创新点里最不能省的一层。
+这一层不该做什么
+不做模型语义判断
+不做评分预测
+不做 counterfactual 干预
+它只做一件事：把证据标签打出来。
+2) step3：表征纯化层
+这一层主创新
+
+EASD
+
+这一层辅创新
+
+HSS
+
+这一层的职责
+
+Step3 不再是“域对抗训练”。
+它应该变成：
+
+shared/specific 的显式构造 + 证据约束 + prototype 几何纯化
+
+这一层应承接的模块
+
+根据审计，最值得保留的是：
+
+domain_fusion
+prefix/gate/cross-attn
+user/item/domain profiles
+DDP/cache/artefact 工程链路。
+这一层要新增的结构
+A. shared projector
+user-shared
+item-shared
+B. specific projector
+user-specific
+item-specific
+C. prototype updater
+global shared prototype
+domain-global style prototype
+optional cluster/local style prototype
+D. evidence supervision heads
+content evidence → shared
+style evidence → specific
+EASD 在 Step3 的落点
+
+EASD 在这里不只是“有两个 projector”，而是三层同时成立：
+
+结构分离
+P_sh / P_sp
+证据分离
+content_evidence -> S_sh
+style_evidence -> S_sp
+几何分离
+shared 近共享中心
+domain-specific 远离/分簇
+HSS 在 Step3 的落点
+
+HSS 在这里负责 specific 的两层化：
+
+层 1：domain-global style
+表示某域总体风格
+层 2：instance-local style residual
+表示样本自身风格偏差
+
+这样 specific 不会太粗。
+
+这一层服务哪些指标
+直接服务
+RMSE
+MAE
+间接服务
+ROUGE-L
+BLEU-3/4
+METEOR
+DIST-1/2
+
+因为它决定了后面内容/风格是否真的分得开。
+
+这一层不该再做什么
+
+审计已经拍板了，不该再保留：
+
+discriminator 域混淆
+explanation 主损失主导
+仅靠 domain_idx 的粗对齐。
+
+也就是说，Step3 的创新点不是“更会混淆域”，而是更会分离 shared/specific。
+
+3) step4：反事实可靠性与数据分流层
+这一层主创新
+
+RCR
+
+这一层辅创新
+
+UCI（只产元数据，不在这里训练）
+
+这一层的职责
+
+Step4 不再以“生成一堆文本级 CF 并熵过滤”为主角。
+它应该变成：
+
+反事实可靠性建模 + scorer/explainer 双路径路由中枢
+
+审计对这层的支持
+
+审计已经明确指出，当前 Step4 已经具备数据治理中枢的雏形，最有价值的字段包括：
+
+sample_origin
+is_counterfactual
+train_keep
+sample_weight_hint
+clean_text
+template_hit
+bad_tail_hit。
+
+所以这层不是推翻重来，而是把现有 Step4 提升成真正的创新中枢。
+
+这一层要新增的核心字段
+A. rating_stability_score
+
+shared 不变、specific 替换后，scorer 预测的稳定程度
+
+B. content_retention_score
+
+反事实样本保留核心内容证据的程度
+
+C. style_shift_score
+
+specific 替换后，风格是否真的发生方向性变化
+
+D. cf_reliability_score
+
+综合可靠性分数
+
+E. uncertainty_score
+
+供 UCI 使用的置信度元数据
+
+RCR 在 Step4 的落点
+
+RCR 由两部分组成：
+
+1. Reliability modeling
+
+不是“这个 CF 生成出来了，所以能用”，而是：
+
+评分稳不稳
+内容留没留
+风格变没变
+文本质量行不行
+2. Routing
+
+按可靠性分流成两条路径：
+
+scorer-clean path
+
+特点：
+
+factual 优先
+高可靠 CF 才能进
+内容保持优先
+风格噪声低
+explainer-rich path
+
+特点：
+
+factual 也进
+高可靠 CF 全进
+中等可靠但风格变化明显的也可进
+为解释多样性保留空间
+UCI 在 Step4 的落点
+
+UCI 不在 Step4 训练，但 Step4 必须产出：
+
+uncertainty_score
+reliability bucket
+confidence group
+
+这是 Step5A 后续做 uncertainty-aware LCI 的前提。
+
+这一层服务哪些指标
+直接服务
+RMSE
+MAE
+ROUGE
+BLEU
+METEOR
+DIST
+
+因为它决定谁能喂 scorer，谁能喂 explainer。
+
+这一层不该做什么
+不再把熵过滤当主判据
+不再让文本级 generate 成为唯一 CF 机制
+不做最终训练
+它只负责：判定可靠性 + 路由样本。
+4) step5A：评分稳定性层
+这一层主创新
+
+LCI
+
+这一层辅创新
+
+UCI
+
+这一层的职责
+
+只管评分，不管解释。
+
+这一层应该是：
+
+scorer-only optimization under latent counterfactual invariance
+
+LCI 在 Step5A 的落点
+
+LCI 的核心动作只有一个：
+
+保持 S_sh
+替换/扰动 S_sp
+强制 scorer 输出基本稳定
+Step5A 的输入
+
+只吃：
+
+Step4 的 scorer-clean path
+shared / specific 表征
+reliability / uncertainty metadata
+Step5A 的核心创新动作
+A. shared-dominant scoring
+
+评分头主要依赖 shared
+
+B. weak/stop-grad specific coupling
+
+specific 最多旁路进入，不得主导评分
+
+C. latent CF scoring consistency
+
+真实表征与反事实 specific 替换表征下，评分一致
+
+UCI 在 Step5A 的落点
+
+UCI 是 LCI 的增强版：
+
+高可靠、高置信样本 → 强 enforce LCI
+低可靠、低置信样本 → 弱 enforce LCI
+为什么 UCI 要放在 Step5A
+
+因为不变性不是越强越好。
+有些样本本来就跨域不稳，硬压只会让 scorer 过度保守。
+
+这一层服务哪些指标
+核心直接服务
+RMSE
+MAE
+
+这是你推荐性能的主战场。
+
+这一层不该做什么
+
+审计已经很明确，以下都不该留在 scorer 主线上：
+
+loss_e
+loss_c
+repeat_ul
+terminal_clean
+batch_diversity
+decode/rerank 干预
+
+也就是说，Step5A 的创新点非常纯：
+
+shared 更干净 + scorer 更稳 + CF 扰动更不影响评分
+
+5) step5B：解释语言化层
+这一层主创新
+
+CCV
+
+这一层辅创新
+
+FCA
+
+这一层的职责
+
+Step5B 只负责把：
+
+shared 内容
+specific 风格
+item evidence
+rating polarity
+
+翻译成解释文本。
+
+CCV 在 Step5B 的落点
+
+CCV 的定义是：
+
+LLM 或 future explainer 不是做推荐，而是做因果控制变量的语言化器。
+
+也就是：
+
+S_sh 决定“说什么”
+S_sp 决定“怎么说”
+evidence 决定“提到什么”
+polarity 决定“说得多强烈”
+FCA 在 Step5B 的落点
+
+FCA 是解释一致性桥。
+
+它负责的不是“解释去预测 rating”，而是：
+
+解释用到的内容证据，必须和 scorer 真正依赖的证据尽量一致。
+
+Step5B 的输入
+
+最好不是直接强耦 fused hidden，
+而是审计里建议的：
+Step4/5 导出的 prompt table / 结构化资产。
+
+这点我完全支持，因为它最利于你后续接 LLM verbalizer。
+
+这一层服务哪些指标
+直接服务
+ROUGE-1
+ROUGE-L
+BLEU-1~4
+METEOR
+DIST-1
+DIST-2
+这一层不该做什么
+不再反向污染 scorer
+不再把复杂 decode controller 当成主创新
+不承担推荐精度责任
+四、把 7 个创新点重新压成阶段-模块图
+preprocess
+主：EASD
+辅：HSS
+
+输出：
+
+content_evidence
+style_evidence
+polarity_anchor
+domain_style_anchor
+local_style_residual_hint
+evidence_quality_prior
+step3
+主：EASD
+辅：HSS
+
+输出：
+
+S_sh
+S_sp
+shared prototype
+style prototype
+evidence-aligned hidden states
+step4
+主：RCR
+辅：UCI metadata
+
+输出：
+
+scorer-clean set
+explainer-rich set
+rating_stability_score
+content_retention_score
+style_shift_score
+cf_reliability_score
+uncertainty_score
+step5A
+主：LCI
+辅：UCI
+
+输出：
+
+stable scorer
+RMSE/MAE 优化后的 rating head
+latent CF invariance statistics
+step5B
+主：CCV
+辅：FCA
+
+输出：
+
+controlled explanations
+content/style verbalization
+faithfulness-aligned explanation behavior
+五、你这套创新点还有没有能继续优化的地方
+
+有，但我建议只继续打磨下面 3 个，不再发散。
+
+1. EASD 还能更强
+
+最值得继续强化的是：
+
+evidence 粒度从词级升级到 phrase/span 级
+content/style anchor 更细
+让 shared/specific 的监督不只是“有或没有”，而是“强弱与类型”
+2. RCR 还能更强
+
+最值得继续强化的是：
+
+cf_reliability 从规则分数升级成混合分数
+加入 latent reaction 与 scorer response
+让 Step4 成为真正的“反事实路由器”
+3. LCI 还能更强
+
+最值得继续强化的是：
+
+从单一 global prototype 干预
+升级到 cluster/global/instance 多粒度干预
+再用 UCI 做样本级权重调度
+六、我替你拍板的最终模块级创新点分配
+
+如果你现在就要一个最稳、最强、最不散的版本，我会认这个：
+
+核心 4 主
+preprocess + step3：EASD
+step4：RCR
+step5A：LCI
+step5B：CCV
+必带 3 辅
+preprocess + step3：HSS
+step5B：FCA
+step4 + step5A：UCI
+
+一句话收口：
+
+preprocess/step3 负责让内容和风格分得开，step4 负责让反事实样本知道该去哪里，step5A 负责让评分对风格扰动免疫，step5B 负责把这套控制逻辑自然地说出来。
+
+这就是我认为你新版 code 最好的模块级创新点分配图。二、 核心创新点 (CXD) 的终极提纯（直接可用作论文卖点）在你的 cxd.txt 基础上，我们把这几个模块的“学术包装”再往上拔高一层，让它们听起来不可反驳：🔴 主核 1：LCI (隐空间反事实不变性) —— 推荐精度的“护城河”目前的理解： 让 Scorer 在换了 $S_{sp}$ 后评分不跳。进一步优化/提纯： 在论文中，你要把 LCI 包装成对 D4C 的**“降维打击”。D4C 在明文空间（Text Space）做反事实，在弱相关场景（TripAdvisor ↔ Yelp）一定会引入“语义破裂噪声（Semantic Collapse Noise）”，从而导致负迁移。而你的 LCI 是在流形空间（Latent Manifold Space）**进行 $do()$ 演算，这叫 "Noise-Free Counterfactual Intervention"。这解释了为什么你的 RMSE/MAE 在极端跨域下远超 Baseline。🔴 辅核转主核：EASD (证据对齐的共享/特异解耦) —— 解释因果图的“定海神针”目前的理解： 利用预处理的内容证据和风格证据去约束 $S_{sh}$ 和 $S_{sp}$。进一步优化/提纯： 单纯的数学正交（Orthogonal Loss）在深度学习里往往是“伪解耦”。结合你的预处理（内容词 vs 风格词），你要在论文里提出 "Semantically-Grounded Causal Sufficiency"（语义锚定的因果充分性）。这意味着你的解耦不是瞎学的，$S_{sh}$ 被锚定在了真实的 Item Aspect（如“画质”、“味道”）上，$S_{sp}$ 被锚定在了域特异的表达习惯上。这就让你的解耦从“玄学数学”变成了“可解释的因果变量”。🔴 展示核：CCV (因果受控生成器) —— LLM 在推荐中的“正确打开方式”目前的理解： LLM 不参与推荐，只负责把 $S_{sh}$ 和 $S_{sp}$ 翻译成人话。进一步优化/提纯： 审稿人经常批评“直接用大模型做推荐是杀鸡用牛刀且不可控”。你要把 CCV 包装成 "Latent-to-Text Causal Decoder"（隐变量到文本的因果解码器）。在这个视角下，LLM 只是一个极其强大的 Verbalizer（词汇化工具）。这证明了你真正做到了“可控生成”（Controlled Generation）—— 我调 $S_{sp}$，LLM 就只换语气；我调 $S_{sh}$，LLM 就换核心理由。这是目前很多单纯微调 LLaMA 做推荐的文章根本做不到的 Faithfulness（忠实度）。三、 关于执行层面的强烈建议（避坑指南）你现在的蓝图极其漂亮，但在利用 2x40G A100 执行时，我必须给你三个“护栏”：预处理 (Preprocess) 必须“宁缺毋滥”：Step 3 的 EASD 极度依赖预处理打出的 content_evidence 和 style_evidence。如果这里用复杂的 NLP Parser 搞错了，后面全盘皆输。建议： 第一版跑通时，用最粗暴、最准确的词表匹配（TF-IDF 选出的域特异词作为 Style，高频名词作为 Content）。先把 Pipeline 跑通，以后再用大模型离线打更细的标签。Step 4 的 RCR 可靠性打分必须“极其严格”：cf_reliability_score 是决定反事实样本去哪里的关键。建议： 如果一个反事实样本干预后，导致 Rating 波动超过 0.5 分，直接把它从 scorer-clean set 里永久剔除。Scorer 宁可少吃一点数据，也绝不能吃那些会干扰核心偏好 $S_{sh}$ 的毒数据。Step 5A 和 5B 必须“彻底断开”：不要为了图省事，在同一个 PyTorch 脚本里同时 Forward Scorer 和 LLM。建议： Step 5A 训完后，直接把 Backbone 的权重 .pth 存下来并完全冻结 (Frozen)。Step 5B (LLM 微调) 启动时，只加载冻结的 Backbone 提取 $S_{sh}, S_{sp}$，仅训练 Bridge 网络和 LLM 的 LoRA 权重。这样你调优 LLM 文本指标时，永远不用担心弄坏好不容易刷出来的 RMSE。

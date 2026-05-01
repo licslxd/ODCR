@@ -1,0 +1,4 @@
+# 2×GPU 吞吐向 eval：主表口径 = mainline decode only（不叠 rerank）
+hardware_preset: default
+decode_preset: decode_mainline_alignment_v2
+eval_batch_size: 2048

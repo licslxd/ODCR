@@ -1,0 +1,49 @@
+# 与 code/config.py 内置 task_configs 一致；可由 presets/tasks/*.yaml 覆盖合并（须含 1..8）
+1:
+  auxiliary: AM_Electronics
+  target: AM_CDs
+  lr: 5.0e-4
+  coef: 1
+  adv: 0.01
+2:
+  auxiliary: AM_Movies
+  target: AM_CDs
+  lr: 1.0e-3
+  coef: 0.1
+  adv: 0.01
+3:
+  auxiliary: AM_CDs
+  target: AM_Electronics
+  lr: 5.0e-4
+  coef: 0.5
+  adv: 0.1
+4:
+  auxiliary: AM_Movies
+  target: AM_Electronics
+  lr: 1.0e-3
+  coef: 0.5
+  adv: 0.01
+5:
+  auxiliary: AM_CDs
+  target: AM_Movies
+  lr: 1.0e-3
+  coef: 0.5
+  adv: 0.01
+6:
+  auxiliary: AM_Electronics
+  target: AM_Movies
+  lr: 1.0e-3
+  coef: 0.5
+  adv: 0.01
+7:
+  auxiliary: Yelp
+  target: TripAdvisor
+  lr: 1.0e-4
+  coef: 0.5
+  adv: 0.01
+8:
+  auxiliary: TripAdvisor
+  target: Yelp
+  lr: 5.0e-4
+  coef: 1
+  adv: 0.01

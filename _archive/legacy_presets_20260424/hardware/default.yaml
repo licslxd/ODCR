@@ -1,0 +1,13 @@
+# A100 2×GPU 训练/评测默认硬件（主线）；未指定 --hardware-preset 时解析为 default
+ddp_world_size: 2
+num_proc: 8
+dataloader_num_workers_train: 8
+dataloader_num_workers_valid: 8
+dataloader_num_workers_test: 8
+dataloader_prefetch_factor_train: 2
+dataloader_prefetch_factor_valid: 2
+dataloader_prefetch_factor_test: 2
+omp_num_threads: 8
+mkl_num_threads: 8
+tokenizers_parallelism: false
+cuda_visible_devices: "0,1"

@@ -1,0 +1,6 @@
+# 辅助分析 / 产品可选：rerank 质量路径（非默认主表）
+hardware_preset: default
+decode_preset: decode_candidate_nucleus_a100_v1
+rerank_preset: rerank_v3_quality_a100
+eval_batch_size: 2048
+num_return_sequences: 3

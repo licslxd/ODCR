@@ -1,0 +1,477 @@
+project:
+  name: ODCR
+  default_task: 4
+  seed: 3407
+  run_root: runs
+  cache_dir: cache
+  data_dir: data
+  merged_dir: merged
+
+env:
+  python_bin: python
+  conda_env: D4C
+  offline: true
+  local_files_only: true
+  models_dir: artifacts/models
+  step5_text_model: artifacts/models/google__flan-t5-xl
+  sentence_embed_model: artifacts/models/BAAI__bge-large-en-v1.5
+  embed_dim: 1024
+
+hardware:
+  active: default
+  preprocess:
+    gpu_ids: [0, 1]
+  profiles:
+    default:
+      ddp_world_size: 2
+      num_proc: 8
+      dataloader_num_workers_train: 8
+      dataloader_num_workers_valid: 8
+      dataloader_num_workers_test: 8
+      dataloader_prefetch_factor_train: 2
+      dataloader_prefetch_factor_valid: 2
+      dataloader_prefetch_factor_test: 2
+      omp_num_threads: 8
+      mkl_num_threads: 8
+      tokenizers_parallelism: false
+      cuda_visible_devices: "0,1"
+    a100_1gpu_fast:
+      ddp_world_size: 1
+      num_proc: 2
+      dataloader_num_workers_train: 2
+      dataloader_num_workers_valid: 2
+      dataloader_num_workers_test: 2
+      dataloader_prefetch_factor_train: 2
+      dataloader_prefetch_factor_valid: 2
+      dataloader_prefetch_factor_test: 2
+      max_parallel_cpu: 8
+      omp_num_threads: 1
+      mkl_num_threads: 1
+      tokenizers_parallelism: false
+      cuda_visible_devices: "0"
+
+tasks:
+  1: {source: AM_Electronics, target: AM_CDs, lr: 5.0e-4, coef: 1.0}
+  2: {source: AM_Movies, target: AM_CDs, lr: 1.0e-3, coef: 0.1}
+  3: {source: AM_CDs, target: AM_Electronics, lr: 5.0e-4, coef: 0.5}
+  4: {source: AM_Movies, target: AM_Electronics, lr: 1.0e-3, coef: 0.5}
+  5: {source: AM_CDs, target: AM_Movies, lr: 1.0e-3, coef: 0.5}
+  6: {source: AM_Electronics, target: AM_Movies, lr: 1.0e-3, coef: 0.5}
+  7: {source: Yelp, target: TripAdvisor, lr: 1.0e-4, coef: 0.5}
+  8: {source: TripAdvisor, target: Yelp, lr: 5.0e-4, coef: 1.0}
+
+preprocess:
+  datasets: [AM_Electronics, AM_CDs, AM_Movies, Yelp, TripAdvisor]
+  a:
+    datasets: [AM_Electronics, AM_CDs, AM_Movies, Yelp, TripAdvisor]
+    resume: true
+    skip_completed: true
+    workers: 1
+  b:
+    datasets: [AM_Electronics, AM_CDs, AM_Movies, Yelp, TripAdvisor]
+    gpu_ids: [0, 1]
+    batch_size: 512
+    read_chunk_rows: 100000
+    group_shard_size: 4096
+    grouped_text_cache_enabled: true
+    grouped_text_cache_dir: cache/preprocess_b
+    grouped_text_cache_version: preprocess_b_grouped_text_cache_v1
+    bf16_enabled: true
+    tf32_enabled: true
+    verify_sample_size: 8
+    verify_seed: 7
+    resume: true
+    skip_completed: true
+  c:
+    datasets: [AM_Electronics, AM_CDs, AM_Movies, Yelp, TripAdvisor]
+    gpu_ids: [0, 1]
+    chunk_batch_size: 512
+    bf16_enabled: true
+    tf32_enabled: true
+    tokenizer_hotpath_enabled: true
+    token_window_cache_enabled: true
+    token_window_cache_dir: cache/preprocess_c
+    token_window_cache_version: preprocess_c_token_windows_v3
+    token_window_cache_shard_size: 2048
+    resume: true
+    skip_completed: true
+
+step3:
+  structured_losses:
+    orthogonal:
+      weight: 0.20
+      xcov_weight: 1.00
+      cosine_weight: 0.25
+    variance_weight: 0.10
+    shared_invariance_weight: 0.18
+    specific_separation_weight: 0.16
+    anchor_alignment_weight: 0.08
+    content_alignment_weight: 0.12
+    style_alignment_weight: 0.12
+    shared_prototype_weight: 0.08
+    domain_style_alignment_weight: 0.06
+    local_style_alignment_weight: 0.06
+    polarity_alignment_weight: 0.05
+    residual_specific_weight: 0.025
+    prototype_separation_weight: 0.04
+    light_explainer_weight: 0.03
+  train:
+    batch_size: 1024
+    micro_batch_size: 128
+    grad_accum: 4
+    epochs: 50
+    train_label_max_length: 64
+    min_lr_ratio: 0.1
+    checkpoint_metric: valid_loss
+    full_bleu_eval: {mode: off}
+    lr: 5.0e-4
+    coef: 0.5
+    backend:
+      train_dynamic_padding: true
+      ema_enabled: true
+      ema_decay: 0.999
+      generate_during_train: false
+      full_bleu_decode_strategy: inherit
+  tasks:
+    1: {lr: 5.0e-4, coef: 1.0}
+    2: {lr: 1.0e-3, coef: 0.1}
+    3: {lr: 5.0e-4, coef: 0.5}
+    4: {batch_size: 512, micro_batch_size: 64, grad_accum: 4, lr: 5.0e-4, coef: 0.2}
+    5: {lr: 1.0e-3, coef: 0.5}
+    6: {lr: 1.0e-3, coef: 0.5}
+    7: {lr: 1.0e-4, coef: 0.5}
+    8: {lr: 5.0e-4, coef: 1.0}
+
+step4:
+  train:
+    batch_size: 2048
+    micro_batch_size: 1024
+    grad_accum: 1
+    epochs: 1
+    train_label_max_length: 64
+  rcr:
+    cf_reliability_weights:
+      content_retention: 0.36
+      rating_stability: 0.30
+      style_shift: 0.22
+      text_quality: 0.12
+    uncertainty_weights:
+      rating_instability: 0.45
+      content_weakness: 0.28
+      text_quality_weakness: 0.17
+      entropy: 0.10
+    rating_delta_soft_cap: 1.00
+    route_scorer:
+      min_reliability: 0.68
+      min_content_retention: 0.62
+      min_rating_stability: 0.62
+      max_uncertainty: 0.38
+      max_rating_delta: 0.50
+      min_text_quality: 0.40
+    route_explainer:
+      min_reliability: 0.55
+      relaxed_min_reliability: 0.48
+      min_content_retention: 0.42
+      min_style_shift: 0.50
+      max_uncertainty: 0.62
+      min_text_quality: 0.40
+    confidence_bucket:
+      high:
+        bucket: 2
+        min_reliability: 0.75
+        max_uncertainty: 0.28
+        min_rating_stability: 0.70
+        min_content_retention: 0.65
+      medium:
+        bucket: 1
+        min_reliability: 0.50
+        max_uncertainty: 0.58
+        min_content_retention: 0.40
+      low_bucket: 0
+    train_keep:
+      reject_when_both_routes_zero: true
+      reject_reason: rcr_route_reject
+    sample_weight_hint:
+      scorer_route_multiplier: 1.00
+      explainer_only_route_multiplier: 0.72
+      reliability_floor: 0.35
+      reliability_scale: 0.65
+      uncertainty_base: 0.75
+      uncertainty_scale: 0.25
+    export:
+      required_fields:
+        - train_keep
+        - sample_weight_hint
+        - route_scorer
+        - route_explainer
+        - route_reason_scorer
+        - route_reason_explainer
+        - content_retention_score
+        - style_shift_score
+        - rating_stability_score
+        - cf_reliability_score
+        - uncertainty_score
+        - entropy_score
+        - text_quality_score
+        - confidence_bucket
+        - preprocess_route_scorer_prior
+        - preprocess_route_explainer_prior
+  keep_fields:
+    - odcr_routing_train.csv
+    - index_contract.json
+    - train_keep
+    - sample_weight_hint
+    - route_scorer
+    - route_explainer
+    - content_retention_score
+    - style_shift_score
+    - rating_stability_score
+    - uncertainty_score
+    - cf_reliability_score
+    - preprocess_route_scorer_prior
+    - preprocess_route_explainer_prior
+
+step5:
+  model:
+    emsize: 1024
+    nlayers: 4
+    nhead: 4
+    nhid: 2048
+    dropout: 0.15
+  ddp:
+    find_unused_parameters: true
+    find_unused_false_preflight: synthetic_one_batch
+  lci:
+    enabled: true
+    weight: 0.12
+    confidence_schedule:
+      high: 1.25
+      medium: 0.75
+      low: 0.0
+    min_reliability: 0.55
+    max_uncertainty: 0.58
+    perturb_std: 0.12
+    counterfactual_label_weight: 0.25
+    robustness_weight: 0.35
+  uci:
+    enabled: true
+    bucket_weights:
+      high: 1.25
+      medium: 0.75
+      low: 0.0
+    uncertainty_temperature: 1.35
+    low_confidence_floor: 0.0
+  explainer_gate:
+    bucket_weights:
+      high: 1.10
+      medium: 1.00
+      low: 0.55
+    uncertainty_exponent: 0.85
+    style_shift_diversity_boost: 0.15
+    min_weight: 0.0
+    max_weight: 2.0
+    explainer_only_multiplier: 0.70
+  ccv:
+    enabled: true
+    control_fields:
+      - content_evidence
+      - style_evidence
+      - domain_style_anchor
+      - local_style_residual_hint
+      - cf_reliability_score
+      - uncertainty_score
+      - confidence_bucket
+      - route_explainer
+      - route_scorer
+      - sample_weight_hint
+    uncertainty_tone_control: true
+    route_conditioning: true
+    numeric_control_weight: 1.0
+    control_packet_field_policy: strict_required
+    verbalizer_adapter_policy: ccv_control_adapter
+    soft_prompt_len: 16
+    numeric_control_dim: 13
+    control_adapter_input_blocks: 6
+    native_lora:
+      enabled: true
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      target_modules: []
+  fca:
+    enabled: true
+    weight: 0.08
+    min_reliability: 0.50
+    max_uncertainty: 0.62
+    evidence_alignment_mode: evidence_basis
+  train:
+    batch_size: 32
+    micro_batch_size: 1
+    grad_accum: 16
+    epochs: 30
+    train_label_max_length: 36
+    lr: 1.0e-3
+    coef: 0.5
+    explainer_loss_weight: 0.005
+    backend:
+      train_precision: bf16
+      per_device_eval_batch_size: 2
+      train_dynamic_padding: true
+      ema_enabled: true
+      ema_decay: 0.999
+      generate_during_train: false
+      full_bleu_eval: {mode: off}
+      full_bleu_decode_strategy: inherit
+      checkpoint_metric: valid_loss
+      checkpoint_selection_mode: valid_loss_only
+      min_lr_ratio: 0.1
+      lambda_ortho: 0.2
+      lambda_ortho_xcov: 1.0
+      lambda_ortho_cos: 0.25
+      lambda_ortho_step5: 0.15
+      loss_weight_batch_diversity: 0.02
+      batch_diversity_warmup_epochs: 2
+      batch_diversity_mode: mean_prob_neg_entropy
+      batch_diversity_eps: 1.0e-8
+      batch_diversity_use_ema: true
+      batch_diversity_ema_decay: 0.9
+      batch_diversity_min_valid_tokens: 64
+      batch_diversity_loss_clamp_abs: 0.2
+      batch_diversity_ramp_epochs: 0
+      batch_diversity_ramp_target_scale: 1.0
+      batch_diversity_ema_init_mode: uniform
+      loss_weight_repeat_ul: 0.045
+      loss_weight_terminal_clean: 0.03
+      terminal_clean_span: 3
+  tasks:
+    1: {lr: 5.0e-4, coef: 1.0}
+    2: {lr: 1.0e-3, coef: 0.1}
+    3: {lr: 5.0e-4, coef: 0.5}
+    4:
+      epochs: 50
+      lr: 1.0e-3
+      coef: 0.5
+      backend:
+        checkpoint_selection_mode: guarded_composite
+        checkpoint_guard_valid_loss_rel_tol: 0.01
+        loss_weight_batch_diversity: 0.01
+        batch_diversity_ramp_target_scale: 0.5
+    5: {lr: 1.0e-3, coef: 0.5}
+    6: {lr: 1.0e-3, coef: 0.5}
+    7: {lr: 1.0e-4, coef: 0.5}
+    8: {lr: 5.0e-4, coef: 1.0}
+
+eval:
+  profile: balanced_2gpu
+  profiles:
+    fast_single_gpu:
+      hardware: a100_1gpu_fast
+      decode: mainline
+      eval_batch_size: 1024
+    balanced_2gpu:
+      hardware: default
+      decode: mainline
+      eval_batch_size: 2048
+    loss_max_2gpu:
+      hardware: default
+      decode: mainline
+      eval_batch_size: 4096
+    candidate_nucleus_2gpu:
+      hardware: default
+      decode: candidate_nucleus
+      eval_batch_size: 2048
+    rerank_quality_2gpu:
+      hardware: default
+      decode: candidate_nucleus
+      rerank: quality
+      eval_batch_size: 2048
+      num_return_sequences: 3
+  decode:
+    default:
+      decode_strategy: nucleus
+      decode_seed: null
+      max_explanation_length: 25
+      label_smoothing: 0.05
+      repetition_penalty: 1.08
+      generate_temperature: 0.62
+      generate_top_p: 0.83
+      no_repeat_ngram_size: null
+      min_len: 2
+      soft_max_len: 11
+      hard_max_len: 25
+      eos_boost_start: 12
+      eos_boost_value: 1.2
+      tail_temperature: -1.0
+      tail_top_p: -1.0
+      forbid_eos_after_open_quote: false
+      forbid_eos_after_open_bracket: false
+      forbid_bad_terminal_tokens: true
+      decode_token_repeat_window: 4
+      decode_token_repeat_max: 2
+      candidate_family: conservative
+      candidate_mixed_include_diverse: false
+      domain_fusion_mode: gate_cross_attn
+    mainline:
+      decode_strategy: uncertainty_low_temp_top_k
+      decode_seed: 3407
+      max_explanation_length: 36
+      label_smoothing: 0.02
+      repetition_penalty: 1.12
+      generate_temperature: 0.20
+      generate_top_p: 1.0
+      top_k: 5
+      gap_threshold: 0.35
+      prefix_greedy_steps: 4
+      no_repeat_ngram_size: 3
+      min_len: 4
+      soft_max_len: 28
+      hard_max_len: 36
+      eos_boost_start: 9999
+      eos_boost_value: 0.0
+      forbid_eos_after_open_quote: true
+      forbid_eos_after_open_bracket: true
+      forbid_bad_terminal_tokens: true
+      candidate_family: balanced
+    candidate_nucleus:
+      decode_strategy: nucleus
+      decode_seed: null
+      max_explanation_length: 25
+      label_smoothing: 0.05
+      repetition_penalty: 1.10
+      generate_temperature: 0.62
+      generate_top_p: 0.83
+      no_repeat_ngram_size: 3
+      min_len: 2
+      soft_max_len: 11
+      hard_max_len: 25
+      domain_fusion_mode: gate_cross_attn
+  rerank:
+    default:
+      schema_version: odcr_rerank_v3/1.0
+      hard_min_pred_words: 2
+      hard_max_malformed_token_reasons: 4
+      hard_min_source_coverage: 0.0
+      length_target_words: 18.0
+      length_sigma_words: 10.0
+      w_lp_norm: 1.0
+      w_completion: 0.55
+      w_well_formed: 0.45
+      w_source_coverage: 0.5
+      w_repeat_v2: 0.35
+      w_malformed_tail: 0.4
+      w_malformed_token: 0.45
+      w_generic_template: 0.35
+      w_entity_drift: 0.4
+      w_length_v2: 0.12
+    quality:
+      schema_version: odcr_rerank_v3/1.0
+      w_lp_norm: 1.0
+      w_completion: 0.62
+      w_well_formed: 0.55
+      w_source_coverage: 0.6
+      w_repeat_v2: 0.45
+      w_malformed_tail: 0.5
+      w_malformed_token: 0.5
+      w_generic_template: 0.0
+      w_entity_drift: 0.45
+      w_length_v2: 0.15

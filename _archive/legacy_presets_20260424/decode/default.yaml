@@ -1,0 +1,24 @@
+# Step5 主线 decode（轻控制版）：优先稳主指标，不以 DIST 激进增益为目标。
+decode_strategy: nucleus
+decode_seed: null
+max_explanation_length: 25
+label_smoothing: 0.05
+repetition_penalty: 1.08
+generate_temperature: 0.62
+generate_top_p: 0.83
+no_repeat_ngram_size: null
+min_len: 2
+soft_max_len: 11
+hard_max_len: 25
+eos_boost_start: 12
+eos_boost_value: 1.2
+tail_temperature: -1.0
+tail_top_p: -1.0
+forbid_eos_after_open_quote: false
+forbid_eos_after_open_bracket: false
+forbid_bad_terminal_tokens: true
+decode_token_repeat_window: 4
+decode_token_repeat_max: 2
+candidate_family: conservative
+candidate_mixed_include_diverse: false
+domain_fusion_mode: gate_cross_attn
