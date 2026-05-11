@@ -30,6 +30,9 @@ runs require explicit user authorization.
 The active governance set is:
 
 - `AGENTS.md`: non-negotiable agent and developer rules.
+- `docs/CURRENT_PROJECT_STATE.md`: the only active human-readable project
+  state entry, generated from stage status/latest truth rather than historical
+  notes.
 - `docs/ODCR_ACTIVE_ARCHITECTURE.md`: current active mainline only.
 - `docs/ODCR_ARCHITECTURE_CONTRACT.md`: binding One-Control architecture
   contract.
@@ -75,6 +78,9 @@ keeps `latest.json` with `latest_summary_path`. New code must not write
 missing or damaged `latest.json -> meta/run_summary.json` fails fast; code must
 not scan run directories, probe old `runs/task<T>/...` layouts, or synthesize
 dry-run latest values.
+Stage truth is finalized per run at `meta/stage_status.json`, and formal
+downstream handoff must pass through `odcr_core.upstream_resolver`. Historical
+docs and `AI_analysis/` reports are not live state sources.
 
 Default run console output is intentionally compact and mirrored to
 `meta/console.log`. Detailed launcher and training diagnostics live in
@@ -141,11 +147,16 @@ New parameters must update:
 Batch terms are fixed:
 
 ```text
-batch_size = effective global train batch
-micro_batch_size = per-GPU train batch
-grad_accum = gradient accumulation steps
-batch_size == micro_batch_size * ddp_world_size * grad_accum
+global_batch_size / batch_size = effective optimizer-step train batch
+per_gpu_batch_size = per-GPU forward/backward train batch
+micro_batch_size = display alias only for per_gpu_batch_size
+All active ODCR train stages: global_batch_size = per_gpu_batch_size * ddp_world_size
+batch_semantics_version = odcr_no_accum/1
 ```
+
+`grad_accum`, `gradient_accumulation_steps`, and
+`accumulate_grad_batches` are retired historical concepts and are rejected on
+the active config/CLI/env path.
 
 ## Path Rules
 
@@ -215,6 +226,18 @@ route decisions. Step4 RCR weights, thresholds, confidence buckets, train-keep
 policy, sample-weight policy, and export required fields are owned by
 `configs/odcr.yaml` under `step4.rcr`.
 
+Step4 evidence levels are mandatory. CPU preview is `E1_schema_preview`: it
+uses proxy diagnostics for schema/contract preview and is not tuning evidence.
+CPU preview cannot rank RCR candidates, write `best_candidate.yaml`, produce a
+patch suggestion, support machine verdict A, or support a formal Step4 prompt.
+CUDA/tmux probe availability is only `E3_gpu_transport`; it is not Step4
+posterior runtime evidence. Only `E4_gpu_shard_forward_bounded` or
+`E5_formal_full_run` evidence may support Step4 RCR candidate ranking,
+best-candidate selection, patch suggestions, or verdict-A eligibility. The old
+`C9_balanced_quantile` and `C9_bucket_balanced` CPU-preview candidates are
+superseded, and formal Step4 remains blocked until real GPU E4 validation
+completes.
+
 Current canonical status after the preprocess P0/P1 closure work is code and
 metadata readiness only. It does not mean formal preprocess_a/b/c has already
 been rerun. Fresh preprocess artifacts are still required before Step3/Step4/
@@ -226,18 +249,23 @@ allocation. The shared session is created or entered on admin with
 `odcr-enter-gpu <JOBID>` inside that same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions; and must not manage GPU allocation. Codex trusts
-only the current tmux session's real-time CUDA environment. The controlled tmux
-GPU bridge at `python code/tools/odcr_tmux_gpu_bridge.py` is the only allowed
-send-keys exception: it may target only a user-created, already-entered,
-uniquely validated GPU pane and may send only bridge-generated whitelist short
-validation scripts. It is not arbitrary send-keys. Bridge output is
-AI_analysis-only, uses mode-specific adaptive timeout, and defaults to
-`stop_after_first_valid_result`. A normal admin shell without `nvidia-smi`, a
+only the current tmux session's real-time CUDA environment. GPU use is allowed
+by default for repo-local validation, probe, and bounded runtime after fast
+sanity and current-pane validation. The controlled tmux GPU bridge at
+`python code/tools/odcr_tmux_gpu_bridge.py` may target only a user-created,
+already-entered, uniquely validated GPU pane and may send one bridge-generated
+command file. It is not arbitrary send-keys and is no longer limited by a GPU
+whitelist hard blocker. Bridge output stays under
+`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default, with a
+mandatory formal namespace guard. post-edit full is not a GPU prerequisite, and
+runtime evidence takes priority over static full-suite instability. A normal
+admin shell without `nvidia-smi`, a
 tmux still on admin, or old `AI_analysis` probe output must not be treated as
 proof that the cluster has no GPU. If current tmux CUDA is unavailable, Codex
 fails fast and asks the user to manually enter the GPU node in the same tmux,
-then rerun the probe. Codex GPU validation is limited to <= 3 minutes of short
-probe, short benchmark, command smoke, or quick parameter comparison; full
+then rerun the probe. Formal full train, complete preprocess_b/c,
+Step4/Step5/eval/rerank, and downstream paper metrics still require explicit
+user authorization; full
 preprocess_b/c, complete stage experiments, Step3/Step4/Step5, eval/rerank, and
 long benchmarks are outside Codex's GPU work boundary unless explicitly
 authorized.

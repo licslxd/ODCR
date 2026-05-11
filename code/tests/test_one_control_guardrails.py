@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -15,8 +16,16 @@ REPO_ROOT = CODE_DIR.parent
 sys.path.insert(0, str(CODE_DIR))
 
 from odcr_core.config_resolver import OneControlConfigError, build_preprocess_config, load_yaml_config, resolve_config  # noqa: E402
+from odcr_core.index_contract import (  # noqa: E402
+    INDEX_CONTRACT_FILENAME,
+    INDEX_CONTRACT_SCHEMA_VERSION,
+    ODCR_ROUTING_TRAIN_CSV,
+    STEP4_RCR_REQUIRED_COLUMNS,
+    build_step4_export_lineage,
+)
 from odcr_core.manifests import build_run_manifest  # noqa: E402
 from odcr_core.preprocess_runtime import PreprocessRuntime  # noqa: E402
+from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST  # noqa: E402
 from tools.check_one_control_guardrails import (  # noqa: E402
     D4C_PYTHON_ABS,
     GUARDRAIL_GROUPS,
@@ -36,6 +45,191 @@ from tools.check_one_control_guardrails import (  # noqa: E402
     scan_run_artifact_snippet,
 )
 from tools.odcr_post_edit_check import SCOPES, build_plan, plan_safety_violations  # noqa: E402
+import odcr_core.config_resolver as config_resolver  # noqa: E402
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _write_step5_upstream_fixture(repo: Path, *, task_id: int = 2, run_id: str = "1_1_1") -> None:
+    run = repo / "runs" / "step5" / f"task{task_id}" / run_id
+    meta = run / "meta"
+    state = run / "state"
+    meta.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True)
+    _write_json(meta / "run_summary.json", {"run_id": run_id, "stage": "step5", "task_id": task_id, "status": "ok"})
+    _write_json(state / "checkpoint_lineage.json", {"schema_version": "test", "stage": "step5", "run_id": run_id})
+    _write_json(
+        meta / "stage_status.json",
+        {
+            "schema_version": "odcr_stage_status/1",
+            "stage": "step5",
+            "task": task_id,
+            "task_id": task_id,
+            "run_id": run_id,
+            "run_dir": f"runs/step5/task{task_id}/{run_id}",
+            "final_status": "completed",
+            "downstream_ready": True,
+            "ready_for": ["eval", "rerank"],
+            "status_source": "test_fixture",
+            "rejection_reasons": [],
+            "selected_checkpoint": f"runs/step5/task{task_id}/{run_id}/model/best.pth",
+            "checkpoint_lineage": f"runs/step5/task{task_id}/{run_id}/state/checkpoint_lineage.json",
+            "artifacts": {
+                "run_summary": {
+                    "path": f"runs/step5/task{task_id}/{run_id}/meta/run_summary.json",
+                    "exists": True,
+                    "is_file": True,
+                },
+                "checkpoint_lineage": {
+                    "path": f"runs/step5/task{task_id}/{run_id}/state/checkpoint_lineage.json",
+                    "exists": True,
+                    "is_file": True,
+                },
+            },
+        },
+    )
+    _write_json(
+        repo / "runs" / "step5" / f"task{task_id}" / "latest.json",
+        {
+            "latest_run_id": run_id,
+            "latest_run_dir": f"runs/step5/task{task_id}/{run_id}",
+            "latest_summary_path": f"runs/step5/task{task_id}/{run_id}/meta/run_summary.json",
+            "latest_status": "ok",
+        },
+    )
+
+
+def _write_step4_upstream_fixture(repo: Path, *, task_id: int, run_id: str = "1_1") -> None:
+    run = repo / "runs" / "step4" / f"task{task_id}" / run_id
+    meta = run / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    export_name = ODCR_ROUTING_TRAIN_CSV
+    export = run / export_name
+    row = {col: 1 for col in STEP4_RCR_REQUIRED_COLUMNS}
+    row.update(
+        {
+            "route_reason_scorer": "rcr_scorer_clean",
+            "route_reason_explainer": "rcr_explainer_rich",
+            "confidence_bucket": 2,
+            "preprocess_route_scorer_prior": 0,
+            "preprocess_route_explainer_prior": 0,
+        }
+    )
+    headers = list(STEP4_RCR_REQUIRED_COLUMNS)
+    export.write_text(
+        ",".join(headers) + "\n" + ",".join(str(row[col]) for col in headers) + "\n",
+        encoding="utf-8",
+    )
+    lineage = build_step4_export_lineage(
+        task_id=task_id,
+        auxiliary_domain="A",
+        target_domain="T",
+        step3_checkpoint_lineage_hash="lineage",
+        step4_rcr_config={"fixture": True},
+        step4_run=run_id,
+        frozen_step3_lineage={
+            "upstream_step3_run_id": "2",
+            "step3_checkpoint_path": f"runs/step3/task{task_id}/2/model/best_observed.pth",
+            "step3_checkpoint_hash": "fixture_checkpoint_hash",
+            "step3_stage_status_hash": "fixture_stage_status_hash",
+            "step3_eval_handoff_hash": "fixture_eval_handoff_hash",
+        },
+    )
+    _write_json(
+        run / INDEX_CONTRACT_FILENAME,
+        {
+            "schema_version": INDEX_CONTRACT_SCHEMA_VERSION,
+            "embed_dim": 1024,
+            "backbones": {
+                "sentence_embed": {
+                    "model_id": "fixture",
+                    "local_dir": "/tmp/fixture",
+                    "family": "bge_large_en",
+                    "hidden_size": 1024,
+                    "dual_channel": True,
+                }
+            },
+            "step4_export_lineage": lineage,
+        },
+    )
+    _write_json(run / STEP4_EXPORT_MANIFEST, {"schema_version": "odcr_step4_train_table/1.2", "step4_export_lineage": lineage})
+    _write_json(meta / "source_table.json", {"records": []})
+    _write_json(meta / "resolved_config.json", {"task": {"id": task_id}})
+    _write_json(meta / "run_summary.json", {"run_id": run_id, "stage": "step4", "task_id": task_id, "status": "ok"})
+    _write_json(
+        meta / "stage_status.json",
+        {
+            "schema_version": "odcr_stage_status/1",
+            "stage": "step4",
+            "task": task_id,
+            "task_id": task_id,
+            "run_id": run_id,
+            "run_dir": f"runs/step4/task{task_id}/{run_id}",
+            "final_status": "completed",
+            "downstream_ready": True,
+            "ready_for": ["step5"],
+            "status_source": "test_fixture",
+            "rejection_reasons": [],
+            "selected_export": f"runs/step4/task{task_id}/{run_id}/{export_name}",
+            "export_manifest": f"runs/step4/task{task_id}/{run_id}/{STEP4_EXPORT_MANIFEST}",
+            "index_contract": f"runs/step4/task{task_id}/{run_id}/{INDEX_CONTRACT_FILENAME}",
+            "artifacts": {
+                "run_summary": {
+                    "path": f"runs/step4/task{task_id}/{run_id}/meta/run_summary.json",
+                    "exists": True,
+                    "is_file": True,
+                },
+                "selected_export": {
+                    "path": f"runs/step4/task{task_id}/{run_id}/{export_name}",
+                    "exists": True,
+                    "is_file": True,
+                },
+                "export_manifest": {
+                    "path": f"runs/step4/task{task_id}/{run_id}/{STEP4_EXPORT_MANIFEST}",
+                    "exists": True,
+                    "is_file": True,
+                },
+                "index_contract": {
+                    "path": f"runs/step4/task{task_id}/{run_id}/{INDEX_CONTRACT_FILENAME}",
+                    "exists": True,
+                    "is_file": True,
+                },
+            },
+        },
+    )
+    _write_json(
+        repo / "runs" / "step4" / f"task{task_id}" / "latest.json",
+        {
+            "latest_run_id": run_id,
+            "latest_run_dir": f"runs/step4/task{task_id}/{run_id}",
+            "latest_summary_path": f"runs/step4/task{task_id}/{run_id}/meta/run_summary.json",
+            "latest_status": "ok",
+        },
+    )
+
+
+def _resolve_step5_with_fixture(*, task_id: int, from_step4: str = "1_1", set_overrides: list[str] | None = None):
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        _write_step4_upstream_fixture(repo, task_id=task_id, run_id=from_step4)
+        old_root = config_resolver._REPO_ROOT
+        try:
+            config_resolver._REPO_ROOT = repo
+            return resolve_config(
+                config_path=REPO_ROOT / "configs" / "odcr.yaml",
+                command="step5",
+                task_id=task_id,
+                set_overrides=set_overrides or [],
+                dry_run=True,
+                from_step4=from_step4,
+                eval_profile="balanced_2gpu",
+                mode="full",
+            )
+        finally:
+            config_resolver._REPO_ROOT = old_root
 
 
 class TestOneControlGuardrails(unittest.TestCase):
@@ -138,16 +332,24 @@ class TestOneControlGuardrails(unittest.TestCase):
         default_decode = raw["eval"]["decode"]["default"]
         mainline_decode = raw["eval"]["decode"]["mainline"]
         expected_top_p = float({**default_decode, **mainline_decode}["generate_top_p"])
-        cfg, _, snapshot = resolve_config(
-            config_path=REPO_ROOT / "configs" / "odcr.yaml",
-            command="eval",
-            task_id=4,
-            set_overrides=[],
-            dry_run=True,
-            from_step5="1_1_1",
-            eval_profile="balanced_2gpu",
-            mode="full",
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_step5_upstream_fixture(repo, task_id=2, run_id="1_1_1")
+            old_root = config_resolver._REPO_ROOT
+            try:
+                config_resolver._REPO_ROOT = repo
+                cfg, _, snapshot = resolve_config(
+                    config_path=REPO_ROOT / "configs" / "odcr.yaml",
+                    command="eval",
+                    task_id=2,
+                    set_overrides=[],
+                    dry_run=True,
+                    from_step5="1_1_1",
+                    eval_profile="balanced_2gpu",
+                    mode="full",
+                )
+            finally:
+                config_resolver._REPO_ROOT = old_root
         self.assertEqual(snapshot["field_sources"]["decode"], "eval.decode.mainline")
         self.assertEqual(float(cfg.generate_top_p), expected_top_p)
         self.assertNotEqual(float(cfg.generate_top_p), 0.9)
@@ -158,10 +360,10 @@ class TestOneControlGuardrails(unittest.TestCase):
         cfg, _, snapshot = resolve_config(
             config_path=REPO_ROOT / "configs" / "odcr.yaml",
             command="step4",
-            task_id=4,
+            task_id=2,
             set_overrides=[],
             dry_run=True,
-            from_step3="1",
+            from_step3="2",
             eval_profile="balanced_2gpu",
             mode="full",
         )
@@ -177,8 +379,14 @@ class TestOneControlGuardrails(unittest.TestCase):
     def test_step4_guardrail_rules_are_present(self) -> None:
         report = run_checks(repo_root=REPO_ROOT, strict=True)
         statuses = {item.rule_id: item.status for item in report.results}
-        for rid in ("R012", "R013", "R014", "R015"):
+        for rid in ("R012", "R013", "R014", "R015", "R116"):
             self.assertEqual(statuses.get(rid), "PASS", rid)
+
+    def test_no_accum_guardrail_rule_is_present(self) -> None:
+        report = run_checks(repo_root=REPO_ROOT, strict=True)
+        statuses = {item.rule_id: item.status for item in report.results}
+        self.assertEqual(statuses.get("R117"), "PASS")
+        self.assertEqual(RULE_GROUP_BY_ID.get("R117"), "no-accum-architecture")
 
     def test_step5_guardrail_rules_are_present(self) -> None:
         report = run_checks(repo_root=REPO_ROOT, strict=True)
@@ -190,6 +398,18 @@ class TestOneControlGuardrails(unittest.TestCase):
         report = run_checks(repo_root=REPO_ROOT, strict=True)
         statuses = {item.rule_id: item.status for item in report.results}
         self.assertEqual(statuses.get("R029"), "PASS")
+
+    def test_step3_upstream_gate_guardrail_rule_is_present(self) -> None:
+        report = run_checks(repo_root=REPO_ROOT, strict=True)
+        statuses = {item.rule_id: item.status for item in report.results}
+        self.assertEqual(statuses.get("R097"), "PASS")
+        self.assertEqual(RULE_GROUP_BY_ID.get("R097"), "step3-mainline")
+
+    def test_step3_v0_parameter_guardrail_rule_is_present(self) -> None:
+        report = run_checks(repo_root=REPO_ROOT, strict=True)
+        statuses = {item.rule_id: item.status for item in report.results}
+        self.assertEqual(statuses.get("R099"), "PASS")
+        self.assertEqual(RULE_GROUP_BY_ID.get("R099"), "step3-mainline")
 
     def test_preprocess_contract_guardrail_rule_is_present(self) -> None:
         report = run_checks(repo_root=REPO_ROOT, strict=True)
@@ -240,7 +460,7 @@ class TestOneControlGuardrails(unittest.TestCase):
     def test_p0_cache_hard_gate_guardrail_rules_are_present(self) -> None:
         report = run_checks(repo_root=REPO_ROOT, strict=True)
         statuses = {item.rule_id: item.status for item in report.results}
-        for rid in ("R092", "R093", "R094"):
+        for rid in ("R092", "R093", "R094", "R098"):
             self.assertEqual(statuses.get(rid), "PASS", rid)
             self.assertEqual(RULE_GROUP_BY_ID.get(rid), "p0-cache-hard-gates")
 
@@ -460,7 +680,7 @@ class TestOneControlGuardrails(unittest.TestCase):
         self.assertIn("not fixed defaults for every user-facing change", agents_normalized)
         required_checks = agents.split("## Required Checks Before Finishing", 1)[1]
         self.assertNotIn("For user-facing changes, also run", required_checks)
-        self.assertIn("./odcr step3 --task 4 --dry-run", required_checks)
+        self.assertIn("./odcr step3 --task 2 --dry-run", required_checks)
         self.assertIn("Step3", required_checks)
 
     def test_codex_template_documents_scope_selection(self) -> None:
@@ -497,15 +717,14 @@ class TestOneControlGuardrails(unittest.TestCase):
             "tmux -L odcr_gpu new-session -A -s odcr",
             "odcr-enter-gpu <JOBID>",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "old `AI_analysis` probe output",
-            "<= 3 minutes",
         )
         docs = (
             "AGENTS.md",
@@ -596,14 +815,16 @@ class TestOneControlGuardrails(unittest.TestCase):
         self.assertIn("post_edit_returncode", script)
         self.assertIn("failure_stage", script)
         self.assertIn('RUNTIME_SCHEMA_VERSION = "odcr_codex_hook_runtime/2.2"', script)
-        self.assertIn("DEFAULT_HOOK_MAX_SECONDS = 180", script)
+        self.assertIn("DEFAULT_WRAPPER_TIMEOUT_SECONDS = 180", script)
+        self.assertIn("DEFAULT_HOOK_MAX_SECONDS = DEFAULT_HOOK_CHILD_MAX_SECONDS", script)
         self.assertIn("ODCR_HOOK_MAX_SECONDS", script)
         self.assertIn("MAX_TOUCHED_FILES_SAMPLE = 50", script)
         self.assertIn("governance-fast", script)
         self.assertIn("IGNORED_EXACT_PATHS", script)
         self.assertIn("IGNORED_DIR_PREFIXES", script)
         self.assertIn("IGNORED_FILE_PATTERNS", script)
-        self.assertIn("only_ignored_files_changed", script)
+        self.assertIn("_ignored_only_reason", script)
+        self.assertIn("ignored_only", script)
         self.assertIn("transcript_path", script)
         self.assertIn("infer_scope_for_payload", script)
         self.assertIn("no_session_touched_files", script)
@@ -826,16 +1047,7 @@ class TestOneControlGuardrails(unittest.TestCase):
 
     def test_roots_models_embed_dim_resolve_from_one_control_config(self) -> None:
         raw = load_yaml_config(REPO_ROOT / "configs" / "odcr.yaml")
-        cfg, _, snapshot = resolve_config(
-            config_path=REPO_ROOT / "configs" / "odcr.yaml",
-            command="step5",
-            task_id=4,
-            set_overrides=[],
-            dry_run=True,
-            from_step4="1_1",
-            eval_profile="balanced_2gpu",
-            mode="full",
-        )
+        cfg, _, snapshot = _resolve_step5_with_fixture(task_id=2, from_step4="1_1")
         self.assertEqual(snapshot["field_sources"]["data_dir"], "project.data_dir")
         self.assertEqual(snapshot["field_sources"]["models_dir"], "env.models_dir")
         self.assertEqual(snapshot["field_sources"]["embed_dim"], "env.embed_dim")
@@ -869,16 +1081,7 @@ class TestOneControlGuardrails(unittest.TestCase):
     def test_manifest_backbone_hidden_size_uses_resolved_config_not_user_env(self) -> None:
         old_embed_env = os.environ.pop("ODCR_EMBED_DIM", None)
         try:
-            cfg, _, _ = resolve_config(
-                config_path=REPO_ROOT / "configs" / "odcr.yaml",
-                command="step5",
-                task_id=4,
-                set_overrides=[],
-                dry_run=True,
-                from_step4="1_1",
-                eval_profile="balanced_2gpu",
-                mode="full",
-            )
+            cfg, _, _ = _resolve_step5_with_fixture(task_id=4, from_step4="1_1")
             cfg = replace(cfg, step5_run=None)
             os.environ["ODCR_EMBED_DIM"] = str(int(cfg.embed_dim) + 17)
             manifest = build_run_manifest(cfg)
@@ -897,16 +1100,7 @@ class TestOneControlGuardrails(unittest.TestCase):
                 os.environ["ODCR_EMBED_DIM"] = old_embed_env
 
     def test_manifest_backbone_hidden_size_requires_resolved_embed_dim(self) -> None:
-        cfg, _, _ = resolve_config(
-            config_path=REPO_ROOT / "configs" / "odcr.yaml",
-            command="step5",
-            task_id=4,
-            set_overrides=[],
-            dry_run=True,
-            from_step4="1_1",
-            eval_profile="balanced_2gpu",
-            mode="full",
-        )
+        cfg, _, _ = _resolve_step5_with_fixture(task_id=2, from_step4="1_1")
         cfg = replace(cfg, step5_run=None)
         bad_cfg = replace(cfg, embed_dim=0)
         with self.assertRaisesRegex(RuntimeError, "cfg.embed_dim"):
@@ -915,16 +1109,7 @@ class TestOneControlGuardrails(unittest.TestCase):
     def test_step5_innovation_params_resolve_from_one_control_config(self) -> None:
         raw = load_yaml_config(REPO_ROOT / "configs" / "odcr.yaml")
         expected = raw["step5"]
-        cfg, _, snapshot = resolve_config(
-            config_path=REPO_ROOT / "configs" / "odcr.yaml",
-            command="step5",
-            task_id=4,
-            set_overrides=[],
-            dry_run=True,
-            from_step4="1_1",
-            eval_profile="balanced_2gpu",
-            mode="full",
-        )
+        cfg, _, snapshot = _resolve_step5_with_fixture(task_id=4, from_step4="1_1")
         self.assertEqual(snapshot["field_sources"]["step5_lci"], "step5.lci")
         self.assertEqual(snapshot["field_sources"]["step5_explainer_gate"], "step5.explainer_gate")
         self.assertEqual(snapshot["field_sources"]["step5_native_lora"], "step5.ccv.native_lora")
@@ -971,23 +1156,37 @@ class TestOneControlGuardrails(unittest.TestCase):
         cfg, _, snapshot = resolve_config(
             config_path=REPO_ROOT / "configs" / "odcr.yaml",
             command="step3",
-            task_id=4,
+            task_id=2,
             set_overrides=[],
             dry_run=True,
             mode="full",
         )
         expected = raw["step3"]["structured_losses"]
         self.assertEqual(snapshot["field_sources"]["step3_structured_losses"], "step3.structured_losses")
+        self.assertEqual(snapshot["field_sources"]["step3_loss_semantics"], "step3.loss_semantics")
+        self.assertEqual(
+            snapshot["field_sources"]["step3_ddp_find_unused_parameters"],
+            "step3.ddp.find_unused_parameters",
+        )
         self.assertEqual(
             float(snapshot["step3_structured_losses"]["content_alignment_weight"]),
             float(expected["content_alignment_weight"]),
         )
+        self.assertFalse(snapshot["step3_ddp"]["ddp_find_unused_parameters"])
+        self.assertFalse(snapshot["step3_ddp"]["ddp_static_graph"])
+        self.assertTrue(snapshot["step3_ddp"]["ddp_graph_safety_preflight"])
+        self.assertEqual(float(snapshot["step3_loss_semantics"]["specific_separation_margin"]), 0.6)
         self.assertIn("step3_structured_losses", cfg.effective_training_payload_json)
+        self.assertIn("step3_loss_semantics", cfg.effective_training_payload_json)
+        self.assertIn("step3_ddp", cfg.effective_training_payload_json)
         cfg_changed, _, snapshot_changed = resolve_config(
             config_path=REPO_ROOT / "configs" / "odcr.yaml",
             command="step3",
-            task_id=4,
-            set_overrides=["step3.structured_losses.content_alignment_weight=0.42"],
+            task_id=2,
+            set_overrides=[
+                "step3.structured_losses.content_alignment_weight=0.42",
+                "step3.loss_semantics.specific_separation_margin=0.7",
+            ],
             dry_run=True,
             mode="full",
         )
@@ -995,7 +1194,9 @@ class TestOneControlGuardrails(unittest.TestCase):
             float(snapshot_changed["step3_structured_losses"]["content_alignment_weight"]),
             0.42,
         )
+        self.assertEqual(float(snapshot_changed["step3_loss_semantics"]["specific_separation_margin"]), 0.7)
         self.assertIn('"content_alignment_weight": 0.42', cfg_changed.effective_training_payload_json)
+        self.assertIn('"specific_separation_margin": 0.7', cfg_changed.effective_training_payload_json)
 
     def test_step5_retired_adv_eta_fail_fast(self) -> None:
         for key in ("step5.train.eta=0.1", "step5.train.adv=0.1", "tasks.4.adv=0.1"):
@@ -1028,10 +1229,29 @@ class TestOneControlGuardrails(unittest.TestCase):
         self.assertIn("ODCR One-Control Guardrails: PASS (0 fail, 0 warn)", proc.stdout)
         self.assertNotIn("[WARN]", proc.stdout)
         self.assertIn("one-control guardrail passed", proc.stdout)
-        self.assertIn("step3/step4/step5/eval resolve checks passed", proc.stdout)
+        self.assertIn("step3/step4 resolve checks passed through unified upstream resolver", proc.stdout)
+        self.assertIn("step5/eval resolver fail-fast pending upstream", proc.stdout)
         self.assertIn("no legacy preset mainline", proc.stdout)
         self.assertIn("no scattered config", proc.stdout)
         self.assertIn("no parameter drift", proc.stdout)
+
+    def test_guardrail_covers_cpu12_and_step3_bridge_smoke(self) -> None:
+        report = run_checks(repo_root=REPO_ROOT, strict=True)
+        self.assertTrue(report.ok)
+        child_rule = next(item for item in report.results if item.rule_id == "R026")
+        tmux_rule = next(item for item in report.results if item.rule_id == "R096")
+        self.assertEqual(child_rule.status, "PASS")
+        self.assertEqual(tmux_rule.status, "PASS")
+        yaml_text = (REPO_ROOT / "configs" / "odcr.yaml").read_text(encoding="utf-8")
+        self.assertIn("max_parallel_cpu: 12", yaml_text)
+        self.assertNotIn("max_parallel_cpu: 16", yaml_text)
+        bridge_text = (REPO_ROOT / "code" / "tools" / "odcr_tmux_gpu_bridge.py").read_text(encoding="utf-8")
+        self.assertIn('"repo-command"', bridge_text)
+        self.assertIn('"repo-script"', bridge_text)
+        self.assertIn('"repo-module"', bridge_text)
+        self.assertIn('"command-file"', bridge_text)
+        self.assertIn("build_repo_runtime_executor_script", bridge_text)
+        self.assertIn("formal_namespace_blocked", bridge_text)
 
 
 if __name__ == "__main__":

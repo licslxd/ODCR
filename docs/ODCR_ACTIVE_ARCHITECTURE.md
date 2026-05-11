@@ -72,6 +72,39 @@ required-field hash, and producer code version; dataset existence markers or
 path/mtime-only keys are insufficient. `data/` and `merged/` receive only
 data-contract artifacts, never logs.
 
+The active human-readable project state is `docs/CURRENT_PROJECT_STATE.md`.
+Machine truth for a completed stage is `meta/stage_status.json`, selected via
+the task-level `latest.json` pointer. Step4, Step5, show, doctor, dry-run, and
+runtime admission must use `odcr_core.upstream_resolver`; they must not infer
+live state from `quality_audit.json`, historical docs, or historical
+`AI_analysis` material.
+
+Step3 formal runs use logging policy `odcr_step3_logging/2`.
+`console.log` is a compact human status stream only: stage/task/profile,
+domain pair, run id, compact train config, key artifact paths, epoch/final
+status, and warnings/errors. Full `RUN_META`, `RUN_CONFIG`, source tables,
+launcher command, raw child stdout/stderr, detail loss/timing/cache/checkpoint
+records, and tracebacks belong in `full.log`; `full.log` is the authoritative
+full-log entry and `debug.log` is only an auxiliary transport mirror. Warning
+and error lines in `errors.log` carry rank, local rank, pid, hostname, and
+run id whenever the producer knows them.
+
+Parent resolver output and child runtime output are separate artifacts:
+`meta/resolved_config.json` is the canonical parent resolver snapshot, while
+Step3 child `FinalTrainingConfig`/runtime diagnostics are written to
+`meta/training_runtime_config.json`. `run_summary.json` indexes both paths and
+marks `full.log` as the authoritative full log. Step3 structured analysis uses
+`meta/metrics.jsonl`, `meta/loss_breakdown.jsonl`,
+`meta/timing_profile.jsonl`, `meta/gpu_profile.jsonl`, and
+`meta/epoch_summary.csv`; it must not require parsing `full.log`.
+
+Default Step3 `show`, `dry-run`, and `source_table.json` are formal-only.
+Task2 shows the G1 formal launch surface by default. G0 backup, G2 exploration,
+performance-probe, short-pilot, and historical candidates are visible only via
+verbose/history surfaces. G2 remains `probe_only=true` and
+`formal_allowed=false`; task5/task8/task7 display their own profile role and
+must not inherit task2 ladder roles.
+
 ## Active Preprocess
 
 Preprocess produces canonical evidence fields for downstream stages:
@@ -114,13 +147,28 @@ is not itself a GPU allocation: it is created or entered on the admin node with
 `odcr-enter-gpu <JOBID>` inside that same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions. Codex does not manage GPU allocation.
-The narrow admin-to-GPU-pane exception is the controlled tmux GPU bridge,
-`python code/tools/odcr_tmux_gpu_bridge.py`. It may target only a
-user-created, already-entered, uniquely validated GPU pane and may send only
-bridge-generated whitelist short validation scripts. It is not arbitrary
-send-keys. Bridge output is AI_analysis-only, every mode has a mode-specific
-adaptive timeout, and `stop_after_first_valid_result` is the default completion
-rule.
+GPU use is allowed by default for repo-local validation, probe, and bounded
+runtime once the current pane is a user-created, already-entered, uniquely
+validated GPU pane. The controlled tmux GPU bridge,
+`python code/tools/odcr_tmux_gpu_bridge.py`, may send one bridge-generated
+command file to that pane. It is not arbitrary send-keys, and it is no longer
+limited by a GPU whitelist hard blocker. Bridge output stays under
+`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default. The
+formal namespace guard remains mandatory: validation must not write formal
+latest pointers, formal checkpoints, Step4/Step5/eval/rerank outputs, or paper
+metrics unless a future request explicitly confirms a formal run. post-edit
+full is not a GPU prerequisite; fast sanity and current-pane validation are the
+GPU preflight, and runtime evidence takes priority over static full-suite
+instability.
+
+Bridge runtime has two active execution classes. Short probes such as
+`cuda-probe`, `marker-probe`, smoke tests, and bounded sanity windows keep
+short transport timeouts. Long paper eval or other long artifact verification
+must use the `long-run` detached managed launcher: it writes `command.sh`,
+`pid`, `status.json`, `heartbeat.json`, `stdout.log`, and `stderr.log`, then a
+collector reads the managed status and output artifacts. The default long-run
+mode has no foreground 900-second hard wrapper; an explicit timeout is only an
+emergency cap recorded in launcher status.
 
 Runtime admission and child scripts must fail fast before BGE-large model load
 if CUDA is not visible in the current tmux session's real-time CUDA
@@ -129,10 +177,8 @@ not an admitted formal path. A normal admin shell without `nvidia-smi`, a tmux
 session still sitting on admin, or old `AI_analysis` probe output must not be
 treated as proof that the cluster has no GPU; after the user manually enters the
 GPU node in the same tmux, Codex must rerun the current-environment probe.
-Codex GPU validation is limited to <= 3 minutes of short probe, short
-benchmark, command smoke, or quick parameter comparison and must not start full
-preprocess_b/c, complete stage experiments, Step3/Step4/Step5, eval/rerank, or
-long benchmarks.
+Formal full train, complete preprocess_b/c, Step4/Step5/eval/rerank, and
+downstream paper metrics still require explicit user authorization.
 
 ## Active Step3
 
@@ -154,9 +200,35 @@ Inactive Step3 semantics:
 - No active retired adversarial-training mainline
 - No retired typed bridge reconnected to execution
 
+Step3 downstream handoff requires the active `latest.json` pointer to select a
+run whose `meta/stage_status.json` is downstream-ready and ready for Step4.
+`quality_audit.json` is a training diagnostic only. A completed training run
+whose post-train eval failed may become eligible only through an accepted
+`meta/eval_handoff.json` sidecar produced by `./odcr step3 --accept-eval-only`
+after full `paper_target_only_eval` valid/test evidence passes protocol,
+sample-integrity, registry, and checkpoint-hash checks. The accepted final
+status is `completed_with_eval_handoff`; the old failed state remains in
+`failure_history`, and `downstream_ready=true` means ready for Step4
+preparation, not a completed Step4/Step5 pipeline.
+
 ## Active Step4
 
 Step4 is the RCR posterior routing stage.
+
+Evidence levels are part of the active Step4 contract. CPU preview is
+`E1_schema_preview`: it may check schema, contract, required fields, and
+manifest shape, but it uses proxy diagnostics and is not tuning evidence. CPU
+preview cannot feed RCR candidate ranking, cannot write `best_candidate.yaml`,
+cannot write a formal patch suggestion, cannot justify machine verdict A, and
+cannot support a formal Step4 prompt. CUDA/tmux availability alone is
+`E3_gpu_transport`, not Step4 posterior evidence.
+
+Only `E4_gpu_shard_forward_bounded` or `E5_formal_full_run` may support Step4
+RCR candidate ranking, best candidate, patch suggestion, and verdict-A
+eligibility. The old `C9_balanced_quantile` and `C9_bucket_balanced`
+CPU-preview candidates are superseded. formal Step4 remains blocked until a
+real GPU `E4_gpu_shard_forward_bounded` candidate completes required
+validation.
 
 Active Step4 controls live under:
 
@@ -312,3 +384,51 @@ The following are retired and must not become active control surfaces:
 Retired surfaces may be deleted, migrated, or kept as fail-fast/history-only
 references. They must not provide silent fallback behavior or long-term dual
 mainlines.
+
+## Step3 S2-R Performance And Compatibility
+
+Step3 tokenizer cache reuse is schema `odcr_step3_tokenizer_cache/2`.
+The hard reuse gate is `tokenizer_cache_compat_hash`, derived only from
+task/domain/split, current CSV and preprocess artifact fingerprints, tokenizer
+identity, processor/tokenization schema, `max_length`, `evidence_length`, and
+tokenized field contracts. Full resolved config, source table, optimizer,
+batch, grad accumulation, scheduler, logging, checkpoint cadence, and probe
+candidate metadata are record-only lineage fields and must not invalidate a
+tokenizer cache.
+
+Step3 checkpoint sidecars are schema `odcr_step3_checkpoint_compat/2`.
+Downstream stages gate on semantic hashes such as
+`semantic_model_compat_hash`, `data_contract_hash`,
+`artifact_lineage_hash`, `tokenizer_cache_compat_hash`, checkpoint file hash,
+model architecture, representation/loss contracts, task/domain, profile/domain
+artifacts, and preprocess/source/merged fingerprints. Training/runtime fields
+such as batch size, per-GPU batch size, optimizer, learning rate, scheduler,
+logging cadence, and performance profile remain in the sidecar for
+reproducibility but are not semantic rejection keys. `grad_accum`,
+`gradient_accumulation_steps`, and `accumulate_grad_batches` are retired
+historical names with no active compatibility path.
+
+The Step3 ODCR v0 default uses no-accum cross-rank structured gather: task2
+uses `global_batch_size=1536`, `per_gpu_batch_size=768`, and
+`ddp_world_size=2`, so
+`global_batch_size = per_gpu_batch_size * ddp_world_size`. Four paper tasks
+live under isolated `step3.task_profiles`; the first paper task remains
+engineering task2, not a remapped task1. `step3.backup_profiles` keeps manual
+backup candidates, `step3.performance_candidates.batch_ladder` records
+probe-only tuning candidates, and
+`step3.exploration_profiles.task2_g2_effective_pool_2048` is probe-only and
+formal-disallowed until manually promoted by future evidence.
+Retired S1/S2/M*/N*/C* candidates are history-only or fail-fast. `step3.worker_profiles`
+owns CPU worker candidates W0-W4 under the 12-core budget.
+
+Formal Step3 training and governed performance modes use
+`Step3CUDAPrefetcher` for CUDA double buffering when enabled. The prefetcher
+uses a dedicated CUDA stream for H2D transfer, records CUDA tensor stream
+lifetime, leaves non-tensor metadata on CPU, and records startup/steady-state
+timing fields. CPU/no-CUDA behavior is diagnostic-only and must be explicit.
+
+`step3-ddp-smoke` remains a correctness smoke and must not be used as a
+performance recommendation. Governed bridge modes
+`step3-performance-probe` and `step3-short-pilot` write evidence under
+`AI_analysis` only, forbid formal latest/checkpoint/cache writes, and do not
+produce downstream-consumable checkpoints.

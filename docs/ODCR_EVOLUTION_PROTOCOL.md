@@ -120,19 +120,22 @@ tmux with `tmux -L odcr_gpu new-session -A -s odcr`, then manually runs
 `odcr-enter-gpu <JOBID>` inside that same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions; and must not manage GPU allocation. Codex may
-trust only the current tmux session's real-time CUDA environment. The only
-allowed admin-to-GPU-pane automation is the controlled tmux GPU bridge
-`python code/tools/odcr_tmux_gpu_bridge.py`, targeting a user-created,
-already-entered, uniquely validated GPU pane with bridge-generated whitelist
-short validation scripts only. This is not arbitrary send-keys. Bridge outputs
-are AI_analysis-only, use mode-specific adaptive timeout, and default to
-`stop_after_first_valid_result`. If current tmux CUDA is not visible, fail fast
-and ask the user to enter the GPU node in the same tmux, then rerun the probe.
-Do not infer cluster GPU absence from a normal admin shell, a tmux still on
-admin, or old `AI_analysis` probe output. Codex GPU verification is limited to
-<= 3 minutes of short probe, short benchmark, command smoke, or quick parameter
-comparison; full stage experiments and long benchmarks require explicit future
-authorization and are normally started by the user.
+trust only the current tmux session's real-time CUDA environment. GPU use is
+allowed by default for repo-local validation, probe, and bounded runtime after
+fast sanity and current-pane validation. The controlled tmux GPU bridge
+`python code/tools/odcr_tmux_gpu_bridge.py` targets a user-created,
+already-entered, uniquely validated GPU pane with one bridge-generated command
+file; this is not arbitrary send-keys and is no longer limited by a GPU
+whitelist hard blocker. Bridge outputs stay under
+`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default. The
+formal namespace guard remains mandatory. post-edit full is not a GPU
+prerequisite, and runtime evidence takes priority over static full-suite
+instability. If current tmux CUDA is not visible, fail fast and ask the user to
+enter the GPU node in the same tmux, then rerun the probe. Do not infer cluster
+GPU absence from a normal admin shell, a tmux still on admin, or old
+`AI_analysis` probe output. Formal full train, complete preprocess_b/c,
+Step4/Step5/eval/rerank, and downstream paper metrics still require explicit
+user authorization.
 
 ## 3. New Scripts Or Entrypoints
 
@@ -258,6 +261,30 @@ Allowed evolution:
 - New metrics and caches are allowed when they keep canonical metric/cache
   boundaries and carry lineage/fingerprint metadata when reusable.
 
+Step3 formal logging is governed by `odcr_step3_logging/2`. Future changes
+must preserve the split: default `console.log` is compact human status,
+`full.log` is the authoritative full log and contains launcher/raw child/detail
+streams, `debug.log` is an auxiliary transport mirror, and `errors.log` carries
+warning/error context with rank, local rank, pid, hostname, and run id where
+available. Child runtime snapshots must write
+`meta/training_runtime_config.json`; they must not overwrite parent
+`meta/resolved_config.json`. `run_summary.json` must index both config files
+and the authoritative full log.
+
+Step3 structured metrics are first-class run-meta artifacts:
+`metrics.jsonl`, `loss_breakdown.jsonl`, `timing_profile.jsonl`,
+`gpu_profile.jsonl`, and `epoch_summary.csv`. Adding, renaming, or changing
+these files requires a metrics artifact declaration, run_summary decision,
+guardrail coverage, and targeted tests. AI_analysis may keep an audit digest,
+but it must not become the metrics store or full-log mirror.
+
+Default Step3 `show`, `dry-run`, and `source_table.json` are formal-only.
+Backup, exploration, performance-probe, short-pilot, and historical rows must
+stay hidden unless the user requests verbose/history detail. G2 must remain
+`probe_only=true` and `formal_allowed=false` until a future One-Control change
+explicitly promotes it; non-task2 task profiles must not inherit task2 ladder
+roles.
+
 Forbidden behavior:
 
 - Real run logs must not be written into `data/` or `merged/`.
@@ -360,19 +387,22 @@ weaken or bypass these checks:
   `__pycache__/`, `.pytest_cache/`, `*.log`, and `*.pyc` must be filtered
   before scope inference. Missing/parse-failed/empty session evidence,
   dirty-workspace-only state, ignored-only files, and unknown session files
-  must select `skip`; `all` is allowed only when multiple business stages are
-  explicitly touched in the current session or explicitly overridden.
+  must select `skip`; automatic `all` inference is degraded to
+  `governance-fast` with a manual all follow-up instead of being executed by the
+  Stop hook.
   Neither file may
   contain real preprocess, training, Step4, Step5, eval, or rerank commands.
 - `R056`: docs must state that Codex Hooks or the manual post-edit check are
   the primary single-user workflow, while git hook / CI are optional.
 - `R096`: GPU/tmux governance docs must state the admin tmux -> user manual
   `odcr-enter-gpu <JOBID>` -> current tmux real-time CUDA flow, forbid Codex
-  GPU allocation management, allow only the controlled tmux GPU bridge rather
-  than arbitrary send-keys, require AI_analysis-only outputs with
-  mode-specific adaptive timeout and `stop_after_first_valid_result`, reject old
-  admin probes as blockers, and limit Codex GPU validation to <= 3 minutes of
-  short probe/benchmark work.
+  GPU allocation management, allow runtime-first repo-local GPU validation,
+  probe, and bounded runtime through the controlled tmux GPU bridge rather than
+  arbitrary send-keys, remove GPU whitelist hard blockers and post-edit full
+  GPU prerequisites, require AI_analysis/step3_validation validation outputs
+  with a formal namespace guard, reject old admin probes as blockers, and keep
+  formal full train / complete preprocess_b/c / Step4/Step5/eval/rerank behind
+  explicit user confirmation.
 - `R089`: `AGENTS.md` must require the narrowest applicable post-edit
   validation scope and must not prescribe fixed Step3 show/dry-run commands
   for all user-facing changes.
@@ -444,12 +474,16 @@ hook filters
 `audit.log`, `AI_analysis/`, `AI_analysis/01_raw_logs/codex_hooks/`, `runs/`,
 `cache/`, `artifacts/`, `data/`, `merged/`, Python cache directories, and
 temporary/log/bytecode files before inference. Ignored-only changes select
-`skip` and do not call the checker. Missing/parse-failed/empty transcripts, no
-payload touched files, dirty-workspace-only state, and unknown session files
-also select `skip`. Docs/governance hook changes select `governance-fast`;
-`all` is reserved for explicit current-session multi-stage business changes or
-`ODCR_HOOK_SCOPE=all`. Users can set `ODCR_HOOK_SCOPE=<scope>` to force a
-check. Automatic hook checks default to `--max-seconds 180`; manual deep checks
+`skip` with `post_edit_command=null` and do not call the checker.
+Missing/parse-failed/empty transcripts, no payload touched files,
+dirty-workspace-only state, and unknown session files also select `skip`.
+Docs/governance hook changes select `governance-fast`; automatic Stop hook
+inference must not execute `scope: all` inside the 180-second wrapper path.
+If automatic inference or hook override resolves to `all`, the hook degrades to
+`governance-fast` and records `manual_followup_required=true` with
+`python code/tools/odcr_post_edit_check.py --scope all --max-seconds 900`.
+Manual users may still run that explicit `all` deep validation command.
+Automatic hook child checks default to `--max-seconds 120`; manual deep checks
 may use `--max-seconds 900`.
 Successful Stop hook stdout is JSON-only, and human-readable logs plus
 `runtime_last.json` are written under
@@ -492,9 +526,11 @@ runner changes use `config`; stage changes use their owning stage scope; and
 cross-stage contracts, manifests, lineage, cache/checkpoint hard gates, and
 eval-rerank gates use the related stage scopes or `all` when one scope cannot
 represent the impact. `--scope all` is a valid high-cost full-chain lightweight
-check for explicit multi-business-stage changes, final reclosure/release gates,
-or manual deep validation; it is not permanently banned. It is inappropriate
-only when a narrow single-stage or docs-only change is misclassified into `all`.
+check for final reclosure/release gates or manual deep validation; it is not
+permanently banned. Automatic Stop hook all-scope inference is degraded to
+`governance-fast` and records the manual all follow-up command instead of
+executing all inside the 180-second wrapper path. It is inappropriate when a
+narrow single-stage or docs-only change is misclassified into `all`.
 Ignored-only, dirty-workspace-only, no-session, and unknown current-session
 cases may select `skip` by hook. Step3 show/dry-run commands are required only
 when the selected scope touches Step3, config changes that affect Step3, or
@@ -509,3 +545,40 @@ python code/tools/odcr_post_edit_check.py --scope governance-fast
 Run stage dry-runs only when the current task allows them. Do not run
 preprocess, training, Step4, Step5, eval, or rerank during documentation-only
 governance work unless the task explicitly asks for it.
+
+## Step3 S2-R Evolution Rules
+
+Step3 cache, checkpoint, downstream compatibility, and performance-probe
+changes must preserve the S2-R split:
+
+- Tokenizer cache compatibility must use
+  `odcr_step3_tokenizer_cache/2` and `tokenizer_cache_compat_hash`.
+  Full resolved config, full source table, optimizer, batch, per-GPU batch,
+  scheduler, logging, checkpoint cadence, no-accum batch semantics, and
+  probe/pilot candidate names are record-only lineage and forbidden as cache
+  reuse hard gates. Active `grad_accum`, `gradient_accumulation_steps`, and
+  `accumulate_grad_batches` are retired fail-fast.
+- Step3 checkpoint compatibility must use
+  `odcr_step3_checkpoint_compat/2` with separate
+  `semantic_model_compat_hash`, `data_contract_hash`,
+  `artifact_lineage_hash`, `tokenizer_cache_compat_hash`,
+  `train_runtime_config_hash`, `optimizer_config_hash`,
+  `performance_profile_hash`, and `full_run_config_hash`.
+  Step4/Step5/eval/rerank may reject semantic mismatches but must not reject a
+  checkpoint solely because optimizer, learning rate, batch, per-GPU batch,
+  scheduler, no-accum runtime metadata, or performance profile changed.
+- Active Step3 defaults must remain no-accum, cross-rank structured-gather
+  semantics. Task2 default is `1536/768` with
+  `global_batch_size = per_gpu_batch_size * ddp_world_size`; future changes must update
+  YAML, schema, resolver, show/doctor, tests, guardrail, docs, and the
+  AI_analysis ledger together.
+- Step3 paper tasks must use isolated `step3.task_profiles`; task2 remains the
+  first paper task and must not be remapped to task1. Active performance
+  candidates are G0/G1 only. G2 2048-pool lives under
+  `step3.exploration_profiles` with `probe_only=true` and
+  `formal_allowed=false`. Historical S1/S2/M*/N*/C* candidates must not return
+  as active Step3 probe or formal candidates. Worker profiles W0-W4 remain CPU
+  worker candidate surfaces.
+- Governed `step3-performance-probe` and `step3-short-pilot` modes must keep a
+  fixed command shape, AI_analysis-only outputs, no formal latest/checkpoint or
+  formal cache writes, and no downstream-consumable pilot checkpoints.

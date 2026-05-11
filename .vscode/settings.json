@@ -1,4 +1,31 @@
 {
+  "explorer.excludeGitIgnore": false,
+  "files.exclude": {
+    "**/audit.log": false
+  },
+  "files.watcherExclude": {
+    "**/*.log": false,
+    "**/audit.log": false,
+    "**/.git/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/venv/**": true
+  },
+  "search.exclude": {
+    "**/.codex": true,
+    "**/.cursor": true,
+    "**/AI_analysis": true,
+    "**/_archive": true,
+    "**/artifacts": true,
+    "**/cache": true,
+    "**/code1": true,
+    "**/data": true,
+    "**/merged": true,
+    "**/runs": true
+  },
   "workbench.editorAssociations": {
     "*.md": "vscode.markdown.preview.editor"
   }

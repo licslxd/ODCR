@@ -7,11 +7,12 @@ import json
 import os
 import platform
 import re
+import signal
 import shlex
 import subprocess
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Iterable
@@ -22,8 +23,11 @@ POST_EDIT_REL = Path("code") / "tools" / "odcr_post_edit_check.py"
 HOOK_REL = Path(".codex") / "hooks" / "odcr_post_edit_stop.py"
 LOG_DIR_REL = Path("AI_analysis") / "01_raw_logs" / "codex_hooks"
 RUNTIME_SCHEMA_VERSION = "odcr_codex_hook_runtime/2.2"
-DEFAULT_HOOK_MAX_SECONDS = 180
+DEFAULT_WRAPPER_TIMEOUT_SECONDS = 180
+DEFAULT_HOOK_CHILD_MAX_SECONDS = 120
+DEFAULT_HOOK_MAX_SECONDS = DEFAULT_HOOK_CHILD_MAX_SECONDS
 MANUAL_DEEP_CHECK_MAX_SECONDS = 900
+MANUAL_ALL_FOLLOWUP_COMMAND = "python code/tools/odcr_post_edit_check.py --scope all --max-seconds 900"
 MAX_TOUCHED_FILES_SAMPLE = 50
 BUSINESS_STAGE_SCOPES = ("preprocess", "step3", "step4", "step5", "eval")
 VALID_HOOK_SCOPES = ("governance-fast", "governance", "config", "logging", *BUSINESS_STAGE_SCOPES, "all")
@@ -86,6 +90,15 @@ class ScopeInference:
     skipped: bool = False
     skip_reason: str | None = None
     override_source: str | None = None
+    original_inferred_scope: str | None = None
+    manual_followup_required: bool = False
+    manual_followup_command: str | None = None
+
+
+@dataclass(frozen=True)
+class ChildProcessResult:
+    returncode: int | None
+    timed_out: bool = False
 
 
 def _read_payload() -> dict[str, object]:
@@ -270,6 +283,28 @@ def _is_ignored_path(rel_path: str) -> bool:
         return True
     name = Path(rel).name
     return any(fnmatch(name, pattern) for pattern in IGNORED_FILE_PATTERNS)
+
+
+def _audit_runtime_rel_path(rel_path: str) -> str:
+    rel = _clean_path_token(str(rel_path)).replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    root_prefix = EXPECTED_REPO_ROOT.as_posix() + "/"
+    if rel.startswith(root_prefix):
+        rel = rel[len(root_prefix) :]
+    return rel
+
+
+def _is_audit_runtime_path(rel_path: str) -> bool:
+    rel = _audit_runtime_rel_path(rel_path)
+    return rel == "audit.log" or rel.startswith("AI_analysis/")
+
+
+def _ignored_only_reason(raw_files: Iterable[str]) -> str:
+    raw = tuple(raw_files)
+    if raw and all(_is_audit_runtime_path(path) for path in raw):
+        return "audit_runtime_only"
+    return "ignored_only"
 
 
 def _split_ignored_paths(paths: Iterable[str]) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -506,6 +541,9 @@ def _inference_summary(inference: ScopeInference) -> dict[str, object]:
         "skipped": inference.skipped,
         "skip_reason": inference.skip_reason,
         "override_source": inference.override_source,
+        "original_inferred_scope": inference.original_inferred_scope,
+        "manual_followup_required": inference.manual_followup_required,
+        "manual_followup_command": inference.manual_followup_command,
     }
 
 
@@ -675,9 +713,10 @@ def _scope_from_session_touched_files(
 ) -> ScopeInference:
     raw_files, ignored_files, files = _split_ignored_paths(touched_files)
     if raw_files and not files:
+        reason = _ignored_only_reason(raw_files)
         return _skip_inference(
             source=source,
-            reason="only_ignored_files_changed",
+            reason=reason,
             session_touched_files=raw_files,
             ignored_files=ignored_files,
             workspace_dirty_detected=workspace_dirty_detected,
@@ -857,6 +896,23 @@ def infer_scope_for_payload(
     )
 
 
+def apply_automatic_stop_scope_policy(inference: ScopeInference) -> ScopeInference:
+    """Keep the automatic Stop hook on a short path even when inference says all."""
+
+    if inference.selected_scope != "all":
+        return inference
+    return replace(
+        inference,
+        selected_scope="governance-fast",
+        inference_reason="auto_all_scope_degraded_to_governance_fast",
+        original_inferred_scope=inference.original_inferred_scope or "all",
+        manual_followup_required=True,
+        manual_followup_command=MANUAL_ALL_FOLLOWUP_COMMAND,
+        skipped=False,
+        skip_reason=None,
+    )
+
+
 def _fallback_inference(reason: str = "initializing") -> ScopeInference:
     return ScopeInference(
         selected_scope="skip",
@@ -915,15 +971,51 @@ def _selected_python_version() -> str:
     return os.environ.get("ODCR_HOOK_SELECTED_PYTHON_VERSION") or platform.python_version()
 
 
-def _hook_max_seconds() -> int:
-    value = os.environ.get("ODCR_HOOK_MAX_SECONDS", "").strip()
+def _wrapper_timeout_seconds() -> int:
+    return DEFAULT_WRAPPER_TIMEOUT_SECONDS
+
+
+def _child_timeout_seconds(wrapper_timeout_seconds: int | None = None) -> int:
+    wrapper_timeout = wrapper_timeout_seconds or DEFAULT_WRAPPER_TIMEOUT_SECONDS
+    value = (
+        os.environ.get("ODCR_HOOK_CHILD_MAX_SECONDS", "").strip()
+        or os.environ.get("ODCR_HOOK_MAX_SECONDS", "").strip()
+    )
     if not value:
-        return DEFAULT_HOOK_MAX_SECONDS
+        parsed = DEFAULT_HOOK_CHILD_MAX_SECONDS
+    else:
+        try:
+            parsed = int(value)
+        except ValueError:
+            parsed = DEFAULT_HOOK_CHILD_MAX_SECONDS
+    if parsed <= 0:
+        parsed = DEFAULT_HOOK_CHILD_MAX_SECONDS
+    if parsed >= wrapper_timeout:
+        parsed = DEFAULT_HOOK_CHILD_MAX_SECONDS
+    if parsed >= wrapper_timeout:
+        parsed = max(1, wrapper_timeout - 1)
+    return parsed
+
+
+def _hook_max_seconds() -> int:
+    return _child_timeout_seconds(_wrapper_timeout_seconds())
+
+
+def _iso_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        parsed = int(value)
-    except ValueError:
-        return DEFAULT_HOOK_MAX_SECONDS
-    return parsed if parsed > 0 else DEFAULT_HOOK_MAX_SECONDS
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _build_post_edit_command(
@@ -968,8 +1060,16 @@ def _runtime_payload(
     stderr_path: Path,
     inference: ScopeInference,
     max_seconds: int,
+    child_timeout_seconds: int | None = None,
+    wrapper_timeout_seconds: int | None = None,
+    started_at: str | None = None,
+    post_edit_started_at: str | None = None,
+    finished_at: str | None = None,
+    timed_out: bool = False,
 ) -> dict[str, object]:
     inference_summary = _inference_summary(inference)
+    child_timeout = child_timeout_seconds if child_timeout_seconds is not None else max_seconds
+    wrapper_timeout = wrapper_timeout_seconds if wrapper_timeout_seconds is not None else DEFAULT_WRAPPER_TIMEOUT_SECONDS
     return {
         "schema_version": RUNTIME_SCHEMA_VERSION,
         "cwd": str(cwd),
@@ -986,10 +1086,16 @@ def _runtime_payload(
         "post_edit_command": command,
         "post_edit_returncode": returncode,
         "max_seconds": max_seconds,
+        "child_timeout_seconds": child_timeout,
+        "wrapper_timeout_seconds": wrapper_timeout,
         "failure_stage": failure_stage,
+        "timed_out": timed_out,
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
-        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "started_at": started_at,
+        "post_edit_started_at": post_edit_started_at,
+        "finished_at": finished_at,
+        "timestamp": _iso_now(),
         **inference_summary,
     }
 
@@ -1007,6 +1113,12 @@ def _write_runtime(
     stderr_path: Path,
     inference: ScopeInference,
     max_seconds: int,
+    child_timeout_seconds: int | None = None,
+    wrapper_timeout_seconds: int | None = None,
+    started_at: str | None = None,
+    post_edit_started_at: str | None = None,
+    finished_at: str | None = None,
+    timed_out: bool = False,
 ) -> Path:
     runtime_path, runtime_last = _runtime_paths(repo_root, stamp)
     payload = _runtime_payload(
@@ -1020,10 +1132,16 @@ def _write_runtime(
         stderr_path=stderr_path,
         inference=inference,
         max_seconds=max_seconds,
+        child_timeout_seconds=child_timeout_seconds,
+        wrapper_timeout_seconds=wrapper_timeout_seconds,
+        started_at=started_at,
+        post_edit_started_at=post_edit_started_at,
+        finished_at=finished_at,
+        timed_out=timed_out,
     )
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    runtime_path.write_text(text, encoding="utf-8")
-    runtime_last.write_text(text, encoding="utf-8")
+    _atomic_write_text(runtime_path, text)
+    _atomic_write_text(runtime_last, text)
     return runtime_path
 
 
@@ -1071,6 +1189,9 @@ def _write_log(
         f"scope_candidates: {json.dumps(list(inference.scope_candidates), ensure_ascii=False)}",
         f"multi_stage_detected: {inference.multi_stage_detected}",
         f"inferred_scope: {inference.selected_scope}",
+        f"original_inferred_scope: {inference.original_inferred_scope}",
+        f"manual_followup_required: {inference.manual_followup_required}",
+        f"manual_followup_command: {inference.manual_followup_command}",
         f"skipped: {inference.skipped}",
         f"skip_reason: {inference.skip_reason}",
         f"override_source: {inference.override_source}",
@@ -1100,8 +1221,70 @@ def _append_text(path: Path, text: str) -> None:
         handle.write(text.rstrip() + "\n")
 
 
+def _terminate_child_group(proc: subprocess.Popen[object], stderr_path: Path, *, reason: str) -> None:
+    if proc.poll() is not None:
+        return
+    _append_text(stderr_path, f"ODCR Stop hook terminating post-edit child process group: {reason}.")
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        _append_text(stderr_path, f"ODCR Stop hook could not SIGTERM child process group: {exc!r}.")
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        _append_text(stderr_path, f"ODCR Stop hook could not SIGKILL child process group: {exc!r}.")
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _append_text(stderr_path, "ODCR Stop hook child process group did not exit after SIGKILL.")
+
+
+def _run_post_edit_child(
+    *,
+    command: list[str],
+    repo_root: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    child_timeout_seconds: int,
+) -> ChildProcessResult:
+    with stdout_path.open("w", encoding="utf-8") as out_handle, stderr_path.open("a", encoding="utf-8") as err_handle:
+        proc = subprocess.Popen(
+            command,
+            cwd=repo_root,
+            text=True,
+            stdout=out_handle,
+            stderr=err_handle,
+            start_new_session=True,
+        )
+        try:
+            return ChildProcessResult(returncode=proc.wait(timeout=child_timeout_seconds), timed_out=False)
+        except subprocess.TimeoutExpired:
+            err_handle.write(
+                f"ODCR Stop hook child timeout after {child_timeout_seconds}s; terminating process group.\n"
+            )
+            err_handle.flush()
+            _terminate_child_group(proc, stderr_path, reason=f"timeout after {child_timeout_seconds}s")
+            return ChildProcessResult(
+                returncode=proc.returncode if proc.returncode is not None else -signal.SIGKILL,
+                timed_out=True,
+            )
+        except BaseException:
+            _terminate_child_group(proc, stderr_path, reason="hook exit")
+            raise
+
+
 def main() -> int:
     stamp = _timestamp()
+    started_at = _iso_now()
     payload: dict[str, object] = {}
     cwd = Path(os.environ.get("ODCR_HOOK_LAUNCH_CWD") or os.getcwd()).resolve()
     repo_root = _fallback_repo_root()
@@ -1109,7 +1292,9 @@ def main() -> int:
     hook_event_name = os.environ.get("ODCR_HOOK_EVENT_NAME") or "Stop"
     inference = _fallback_inference("initializing")
     command: list[str] | None = None
-    max_seconds = _hook_max_seconds()
+    wrapper_timeout = _wrapper_timeout_seconds()
+    child_timeout = _child_timeout_seconds(wrapper_timeout)
+    max_seconds = child_timeout
 
     try:
         payload = _read_payload()
@@ -1131,23 +1316,16 @@ def main() -> int:
             stderr_path=stderr_path,
             inference=inference,
             max_seconds=max_seconds,
+            child_timeout_seconds=child_timeout,
+            wrapper_timeout_seconds=wrapper_timeout,
+            started_at=started_at,
         )
 
-        inference = infer_scope_for_payload(payload, repo_root=repo_root, cwd=cwd)
+        inference = apply_automatic_stop_scope_policy(infer_scope_for_payload(payload, repo_root=repo_root, cwd=cwd))
 
         if inference.selected_scope == "skip":
             message = f"ODCR post-edit validation skipped: {inference.skip_reason or inference.inference_reason}."
             _append_text(stderr_path, message)
-            log_path = _write_log(
-                repo_root=repo_root,
-                payload=payload,
-                inference=inference,
-                command=None,
-                returncode=0,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                output=message,
-            )
             _write_runtime(
                 repo_root=repo_root,
                 stamp=stamp,
@@ -1160,6 +1338,20 @@ def main() -> int:
                 stderr_path=stderr_path,
                 inference=inference,
                 max_seconds=max_seconds,
+                child_timeout_seconds=child_timeout,
+                wrapper_timeout_seconds=wrapper_timeout,
+                started_at=started_at,
+                finished_at=_iso_now(),
+            )
+            log_path = _write_log(
+                repo_root=repo_root,
+                payload=payload,
+                inference=inference,
+                command=None,
+                returncode=0,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                output=message,
             )
             _stderr(message)
             _stderr(f"log={log_path.relative_to(repo_root)}")
@@ -1192,6 +1384,10 @@ def main() -> int:
                 stderr_path=stderr_path,
                 inference=inference,
                 max_seconds=max_seconds,
+                child_timeout_seconds=child_timeout,
+                wrapper_timeout_seconds=wrapper_timeout,
+                started_at=started_at,
+                finished_at=_iso_now(),
             )
             _stderr(f"{message} log={log_path.relative_to(repo_root)}")
             _emit_stop_json()
@@ -1203,15 +1399,32 @@ def main() -> int:
             max_seconds=max_seconds,
             dry_run=_truthy_env("ODCR_HOOK_DRY_RUN"),
         )
+        post_edit_started_at = _iso_now()
+        _write_runtime(
+            repo_root=repo_root,
+            stamp=stamp,
+            cwd=cwd,
+            hook_event_name=hook_event_name,
+            command=command,
+            returncode=None,
+            failure_stage="post_edit_running",
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            inference=inference,
+            max_seconds=max_seconds,
+            child_timeout_seconds=child_timeout,
+            wrapper_timeout_seconds=wrapper_timeout,
+            started_at=started_at,
+            post_edit_started_at=post_edit_started_at,
+        )
 
-        with stdout_path.open("w", encoding="utf-8") as out_handle, stderr_path.open("a", encoding="utf-8") as err_handle:
-            proc = subprocess.run(
-                command,
-                cwd=repo_root,
-                text=True,
-                stdout=out_handle,
-                stderr=err_handle,
-            )
+        child_result = _run_post_edit_child(
+            command=command,
+            repo_root=repo_root,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            child_timeout_seconds=child_timeout,
+        )
 
         combined_output = (
             "SCOPE INFERENCE:\n"
@@ -1225,36 +1438,45 @@ def main() -> int:
             payload=payload,
             inference=inference,
             command=command,
-            returncode=proc.returncode,
+            returncode=child_result.returncode if child_result.returncode is not None else 1,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             output=combined_output,
         )
-        failure_stage = "post_edit_check" if proc.returncode != 0 else None
+        if child_result.timed_out:
+            failure_stage = "post_edit_timeout"
+        else:
+            failure_stage = "post_edit_check" if child_result.returncode != 0 else None
         _write_runtime(
             repo_root=repo_root,
             stamp=stamp,
             cwd=cwd,
             hook_event_name=hook_event_name,
             command=command,
-            returncode=proc.returncode,
+            returncode=child_result.returncode,
             failure_stage=failure_stage,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             inference=inference,
             max_seconds=max_seconds,
+            child_timeout_seconds=child_timeout,
+            wrapper_timeout_seconds=wrapper_timeout,
+            started_at=started_at,
+            post_edit_started_at=post_edit_started_at,
+            finished_at=_iso_now(),
+            timed_out=child_result.timed_out,
         )
-        status = "PASS" if proc.returncode == 0 else "FAIL"
+        status = "PASS" if child_result.returncode == 0 else "FAIL"
         _stderr(
             "ODCR post-edit validation "
             f"{status} scope={inference.selected_scope} reason={inference.inference_reason} "
             f"log={log_path.relative_to(repo_root)}"
         )
         _stderr(f"stdout={stdout_path.relative_to(repo_root)} stderr={stderr_path.relative_to(repo_root)}")
-        if proc.returncode != 0:
+        if child_result.returncode != 0:
             _stderr(_read_for_log(stderr_path).rstrip())
         _emit_stop_json()
-        return proc.returncode
+        return child_result.returncode if child_result.returncode is not None else 1
     except Exception:
         trace = traceback.format_exc()
         try:
@@ -1282,6 +1504,10 @@ def main() -> int:
                 stderr_path=stderr_path,
                 inference=inference,
                 max_seconds=max_seconds,
+                child_timeout_seconds=child_timeout,
+                wrapper_timeout_seconds=wrapper_timeout,
+                started_at=started_at,
+                finished_at=_iso_now(),
             )
             _stderr(f"ODCR Stop hook failed before validation; log={log_path.relative_to(repo_root)}")
             _stderr(f"stdout={stdout_path.relative_to(repo_root)} stderr={stderr_path.relative_to(repo_root)}")

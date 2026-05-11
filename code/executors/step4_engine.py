@@ -12,6 +12,7 @@ import shutil
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -58,13 +59,20 @@ from odcr_core.odcr_cf_routing import ODCFRoutingConfig, attach_odcr_cf_routing
 from odcr_core.file_atomic import atomic_write_json
 from odcr_core.training_checkpoint import (
     CheckpointLineageError,
+    STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
     current_effective_payload,
+    current_resolved_config_lineage,
     current_one_control_resolved_config_hash,
+    current_source_table_lineage,
     file_fingerprint,
     model_artifact_fingerprint,
     read_checkpoint_lineage,
+    step3_resolved_config_compatibility_payload,
+    step3_source_table_compatibility_payload,
     stable_hash,
+    validate_step3_checkpoint_lineage,
 )
+from odcr_core.step3_upstream_gate import validate_step3_preprocess_upstream_gate
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -82,6 +90,8 @@ _STEP4_REQUIRES_TORCHRUN_MSG = (
 _STEP4_ENCODE_CACHE_VERSION = "v5_lineage_manifest"
 _STEP4_ENCODE_CACHE_SCHEMA_VERSION = "odcr_step4_encoded_cache/1"
 _STEP4_ENCODE_CACHE_MANIFEST = "cache_manifest.json"
+_STEP4_ENCODE_CACHE_COMPLETED_MARKER = "completed.marker"
+_STEP4_ENCODE_CACHE_FAILED_MARKER = "failed.marker"
 _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION = "executors.step4_engine.encoded_cache/2"
 _STEP4_ENCODE_CACHE_REQUIRED_FIELDS = (
     "user_idx",
@@ -101,6 +111,39 @@ _STEP4_ENCODE_CACHE_REQUIRED_FIELDS = (
 )
 
 
+def _step3_preprocess_lineage_expected_for_step4(upstream_evidence: Mapping[str, Any]) -> dict[str, Any]:
+    preprocess = upstream_evidence.get("preprocess")
+    if not isinstance(preprocess, Mapping):
+        raise CheckpointLineageError("Step4 refused Step3 checkpoint: current preprocess gate evidence missing.")
+    latest_run_ids: dict[str, str] = {}
+    run_summary_fps: dict[str, Any] = {}
+    stage_status_fps: dict[str, Any] = {}
+    stage_manifest_fps: dict[str, Any] = {}
+    source_table_fps: dict[str, Any] = {}
+    metrics_fps: dict[str, Any] = {}
+    verify_fps: dict[str, Any] = {}
+    for unit in ("a", "b", "c"):
+        item = preprocess.get(unit)
+        if not isinstance(item, Mapping):
+            raise CheckpointLineageError(f"Step4 refused Step3 checkpoint: preprocess_{unit} evidence missing.")
+        latest_run_ids[unit] = str(item.get("run_id") or "")
+        run_summary_fps[unit] = item.get("run_summary_fingerprint")
+        stage_status_fps[unit] = item.get("stage_status_fingerprint")
+        stage_manifest_fps[unit] = item.get("stage_manifest_fingerprint")
+        source_table_fps[unit] = item.get("source_table_fingerprint")
+        metrics_fps[unit] = item.get("metrics_fingerprint")
+        verify_fps[unit] = item.get("verify_report_fingerprint")
+    return {
+        "preprocess_latest_run_ids": latest_run_ids,
+        "preprocess_run_summary_fingerprints_hash": stable_hash(run_summary_fps),
+        "preprocess_stage_status_fingerprints_hash": stable_hash(stage_status_fps),
+        "preprocess_stage_manifest_fingerprints_hash": stable_hash(stage_manifest_fps),
+        "preprocess_source_table_fingerprints_hash": stable_hash(source_table_fps),
+        "preprocess_metrics_fingerprints_hash": stable_hash(metrics_fps),
+        "preprocess_verify_report_fingerprints_hash": stable_hash(verify_fps),
+    }
+
+
 def _validate_step3_checkpoint_lineage_for_step4(
     *,
     checkpoint_path: str,
@@ -109,7 +152,6 @@ def _validate_step3_checkpoint_lineage_for_step4(
     target: str,
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    lineage = read_checkpoint_lineage(checkpoint_path, expected_stage="step3")
     payload = current_effective_payload(required=True)
     train_path = os.path.join(get_merged_data_dir(), str(task_idx), "aug_train.csv")
     valid_path = os.path.join(get_merged_data_dir(), str(task_idx), "aug_valid.csv")
@@ -127,30 +169,100 @@ def _validate_step3_checkpoint_lineage_for_step4(
         "nhid": int(config["nhid"]),
         "dropout": float(config["dropout"]),
     }
-    expected = {
+    upstream_evidence = validate_step3_preprocess_upstream_gate(
+        repo_root=get_odcr_root(),
+        task_id=int(task_idx),
+        auxiliary_domain=str(auxiliary),
+        target_domain=str(target),
+        data_dir=get_data_dir(),
+        merged_dir=get_merged_data_dir(),
+        runs_dir=os.environ.get("ODCR_RESOLVED_RUNS_DIR") or os.path.join(get_odcr_root(), "runs"),
+        embed_dim=int(get_odcr_embed_dim()),
+    )
+    resolved_compatibility = step3_resolved_config_compatibility_payload(
+        payload=payload,
+        task_id=int(task_idx),
+        source_domain=str(auxiliary),
+        target_domain=str(target),
+        embed_dim=int(get_odcr_embed_dim()),
+        structured_losses=payload.get("step3_structured_losses") or {},
+        loss_semantics=payload.get("step3_loss_semantics") or {},
+        architecture_hash=stable_hash(current_arch),
+    )
+    source_table = current_source_table_lineage(required_file=bool((os.environ.get("ODCR_MANIFEST_DIR") or "").strip()))
+    source_table_compatibility = step3_source_table_compatibility_payload(source_table)
+    data_contract_payload = {
         "preprocess_contract_version": PREPROCESS_CONTRACT_VERSION,
-        "data_merged_artifact_fingerprint": stable_hash(data_fps),
-        "embed_dim": int(get_odcr_embed_dim()),
-        "step3_structured_losses_config_hash": stable_hash(payload.get("step3_structured_losses") or {}),
-        "model_architecture_config_hash": stable_hash(current_arch),
         "source_task": {
             "task_id": int(task_idx),
             "auxiliary": str(auxiliary),
             "target": str(target),
         },
+        "source_csv_fingerprints": upstream_evidence.get("source_csv_artifacts"),
+        "merged_csv_fingerprints": upstream_evidence.get("merged_artifacts") or data_fps,
     }
-    missing = [k for k in ("one_control_resolved_config_hash", "checkpoint_compatibility_hash") if not lineage.get(k)]
-    if missing:
-        raise CheckpointLineageError(
-            "Step4 refused Step3 checkpoint: missing lineage fields " + ", ".join(missing)
-        )
-    for key, expected_value in expected.items():
-        if lineage.get(key) != expected_value:
-            raise CheckpointLineageError(
-                f"Step4 refused Step3 checkpoint due to lineage mismatch for {key}: "
-                f"checkpoint={lineage.get(key)!r} current={expected_value!r}"
-            )
-    return lineage
+    artifact_lineage_payload = {
+        "data_merged_artifact_fingerprint": stable_hash(data_fps),
+        "preprocess": _step3_preprocess_lineage_expected_for_step4(upstream_evidence),
+        "profile_artifact_fingerprints": upstream_evidence.get("profile_artifact_fingerprints"),
+        "domain_artifact_fingerprints": upstream_evidence.get("domain_artifact_fingerprints"),
+        "sentence_embed_model_identity": {
+            "identity": os.path.abspath(os.environ.get("ODCR_RESOLVED_SENTENCE_EMBED_MODEL") or get_sentence_embed_model_dir()),
+            "resolved_env_key": "ODCR_RESOLVED_SENTENCE_EMBED_MODEL",
+            "model_artifact_fingerprint": model_artifact_fingerprint(
+                os.environ.get("ODCR_RESOLVED_SENTENCE_EMBED_MODEL") or get_sentence_embed_model_dir()
+            ),
+        },
+    }
+    semantic_model_payload = {
+        "resolved_config_compatibility": resolved_compatibility,
+        "source_table_compatibility": source_table_compatibility,
+        "embed_dim": int(get_odcr_embed_dim()),
+        "model_architecture_config_hash": stable_hash(current_arch),
+        "representation_output_contract_hash": stable_hash(
+            {
+                "Step3ForwardOutput": "odcr_step3_forward_output/structured_shared_specific_v1",
+                "Step3LossBundle": "odcr_step3_loss_bundle/structured_shared_specific_v1",
+            }
+        ),
+        "structured_losses_hash": stable_hash(payload.get("step3_structured_losses") or {}),
+        "loss_semantics_hash": stable_hash(payload.get("step3_loss_semantics") or {}),
+        "profile_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("profile_artifact_fingerprints") or {}),
+        "domain_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("domain_artifact_fingerprints") or {}),
+    }
+    expected = {
+        "sidecar_schema_version": STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
+        "task_id": int(task_idx),
+        "source_domain": str(auxiliary),
+        "target_domain": str(target),
+        "preprocess_contract_version": PREPROCESS_CONTRACT_VERSION,
+        "data_merged_artifact_fingerprint": stable_hash(data_fps),
+        "embed_dim": int(get_odcr_embed_dim()),
+        "step3_structured_losses_config_hash": stable_hash(payload.get("step3_structured_losses") or {}),
+        "model_architecture_config_hash": stable_hash(current_arch),
+        "resolved_config_compatibility_hash": stable_hash(resolved_compatibility),
+        "source_table_compatibility_hash": stable_hash(source_table_compatibility),
+        "semantic_model_compat_hash": stable_hash(semantic_model_payload),
+        "data_contract_hash": stable_hash(data_contract_payload),
+        "artifact_lineage_hash": stable_hash(artifact_lineage_payload),
+        **_step3_preprocess_lineage_expected_for_step4(upstream_evidence),
+        "profile_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("profile_artifact_fingerprints") or {}),
+        "domain_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("domain_artifact_fingerprints") or {}),
+        "source_csv_fingerprints_hash": stable_hash(upstream_evidence.get("source_csv_artifacts") or {}),
+        "merged_csv_fingerprints_hash": stable_hash(upstream_evidence.get("merged_artifacts") or data_fps),
+        "source_task": {
+            "task_id": int(task_idx),
+            "auxiliary": str(auxiliary),
+            "target": str(target),
+            "scenario": str(payload.get("scenario") or ""),
+            "direction": str(payload.get("direction") or ""),
+        },
+    }
+    try:
+        # Includes the checkpoint_file_hash hard gate before torch.load.
+        return validate_step3_checkpoint_lineage(checkpoint_path, expected=expected)
+    except CheckpointLineageError as exc:
+        raise CheckpointLineageError(f"Step4 refused Step3 checkpoint: {exc}") from exc
 
 
 def _require_torchrun_env_vars() -> None:
@@ -200,6 +312,7 @@ def _step4_encoded_cache_fingerprint(
         "auxiliary": str(auxiliary),
         "target": str(target),
         "source_aug_csv": source_fp,
+        "data_source_hash": str(source_fp.get("sha256") or ""),
         "source_data_path": str(source_fp.get("path") or os.path.abspath(aug_csv_path)),
         "source_data_sha256": str(source_fp.get("sha256") or ""),
         "source_data_size": int(source_fp.get("size", -1)),
@@ -210,6 +323,7 @@ def _step4_encoded_cache_fingerprint(
         },
         "tokenizer_path_or_id": os.path.abspath(t5_resolved),
         "tokenizer_fingerprint": tokenizer_fp,
+        "tokenizer_config_hash": stable_hash(tokenizer_fp),
         "processor": {
             "name": "executors.step4_engine.Processor",
             "max_length": int(processor_max_length),
@@ -219,6 +333,16 @@ def _step4_encoded_cache_fingerprint(
         "max_length": int(processor_max_length),
         "resolved_config_hash": resolved_config_hash,
         "one_control_resolved_config_hash": resolved_config_hash,
+        "rcr_step4_config_hash": stable_hash(
+            json.loads(os.environ.get("ODCR_STEP4_RCR_CONFIG_JSON") or "{}")
+        ),
+        "upstream_step3_run_id": str(os.path.basename(os.path.abspath(os.environ.get("ODCR_STEP3_RUN_DIR") or ""))),
+        "step3_checkpoint_hash": _step4_file_sha256(
+            os.path.join(os.environ.get("ODCR_STEP3_RUN_DIR") or "", "model", "best.pth")
+        )
+        if os.environ.get("ODCR_STEP3_RUN_DIR")
+        and os.path.isfile(os.path.join(os.environ.get("ODCR_STEP3_RUN_DIR") or "", "model", "best.pth"))
+        else "",
         "step3_checkpoint_lineage_hash": str(step3_checkpoint_lineage_hash),
         "index_contract_or_required_fields_hash": required_fields_hash,
         "producer_code_version": _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION,
@@ -236,6 +360,14 @@ def _step4_encoded_cache_dir(task_idx: int, fingerprint: Mapping[str, Any]) -> s
 
 def _step4_encoded_cache_manifest_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, _STEP4_ENCODE_CACHE_MANIFEST)
+
+
+def _step4_encoded_cache_completed_marker_path(cache_dir: str) -> str:
+    return os.path.join(cache_dir, _STEP4_ENCODE_CACHE_COMPLETED_MARKER)
+
+
+def _step4_encoded_cache_failed_marker_path(cache_dir: str) -> str:
+    return os.path.join(cache_dir, _STEP4_ENCODE_CACHE_FAILED_MARKER)
 
 
 def _load_step4_encoded_cache_manifest(cache_dir: str) -> dict[str, Any] | None:
@@ -263,8 +395,12 @@ def _step4_encoded_cache_manifest_gate_fields(fingerprint: Mapping[str, Any]) ->
         "source_data_mtime_ns": int(fingerprint.get("source_data_mtime_ns", -1)),
         "tokenizer_path_or_id": str(fingerprint.get("tokenizer_path_or_id") or ""),
         "tokenizer_fingerprint": fingerprint.get("tokenizer_fingerprint"),
+        "tokenizer_config_hash": str(fingerprint.get("tokenizer_config_hash") or ""),
         "max_length": int(fingerprint.get("max_length", -1)),
         "resolved_config_hash": str(fingerprint.get("resolved_config_hash") or ""),
+        "rcr_step4_config_hash": str(fingerprint.get("rcr_step4_config_hash") or ""),
+        "upstream_step3_run_id": str(fingerprint.get("upstream_step3_run_id") or ""),
+        "step3_checkpoint_hash": str(fingerprint.get("step3_checkpoint_hash") or ""),
         "step3_checkpoint_lineage_hash": str(fingerprint.get("step3_checkpoint_lineage_hash") or ""),
         "index_contract_or_required_fields_hash": str(fingerprint.get("index_contract_or_required_fields_hash") or ""),
         "producer_code_version": _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION,
@@ -277,11 +413,15 @@ def _step4_encoded_cache_manifest_matches(
     expected_fingerprint: Mapping[str, Any],
     expected_rows: int,
 ) -> tuple[bool, str]:
+    if os.path.exists(_step4_encoded_cache_failed_marker_path(cache_dir)):
+        return False, "failed_marker_present"
     if not _dataset_saved_to_disk(cache_dir):
         return False, "missing_dataset"
     manifest = _load_step4_encoded_cache_manifest(cache_dir)
     if manifest is None:
         return False, "missing_manifest"
+    if not os.path.exists(_step4_encoded_cache_completed_marker_path(cache_dir)):
+        return False, "missing_completed_marker"
     if str(manifest.get("schema_version")) != _STEP4_ENCODE_CACHE_SCHEMA_VERSION:
         return False, "schema_mismatch"
     if str(manifest.get("cache_version")) != _STEP4_ENCODE_CACHE_VERSION:
@@ -304,6 +444,7 @@ def _write_step4_encoded_cache_manifest(
     fingerprint: Mapping[str, Any],
     row_count: int,
 ) -> None:
+    row_count = int(row_count)
     atomic_write_json(
         _step4_encoded_cache_manifest_path(cache_dir),
         {
@@ -311,11 +452,16 @@ def _write_step4_encoded_cache_manifest(
             "cache_version": _STEP4_ENCODE_CACHE_VERSION,
             "fingerprint_hash": str(fingerprint.get("fingerprint_hash") or ""),
             "fingerprint": dict(fingerprint),
-            "row_count": int(row_count),
+            "row_count": row_count,
+            "sample_count": row_count,
+            "cache_compatibility_hash": str(fingerprint.get("fingerprint_hash") or ""),
             "dataset_format": "huggingface_dataset_save_to_disk",
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
     )
+    completed = _step4_encoded_cache_completed_marker_path(cache_dir)
+    with open(completed, "w", encoding="utf-8") as handle:
+        handle.write("ok\n")
 
 
 def _dataset_saved_to_disk(path: str) -> bool:
@@ -333,10 +479,51 @@ def _step4_pyarrow_available() -> bool:
 
 def _step4_partial_format_choice() -> str:
     """parquet（需 pyarrow）/ csv / auto（有 pyarrow 则 parquet）。"""
-    v = os.environ.get("ODCR_STEP4_PARTIAL_FORMAT", "auto").strip().lower()
+    v = str(_step4_runtime_config().get("partial_format", "auto")).strip().lower()
     if v in ("parquet", "csv", "auto"):
         return v
     return "auto"
+
+
+def _step4_runtime_config() -> dict[str, Any]:
+    raw = (os.environ.get("ODCR_STEP4_RUNTIME_CONFIG_JSON") or "").strip()
+    if not raw:
+        return {
+            "decode_threads": 0,
+            "decode_chunk": 4096,
+            "partial_format": "auto",
+            "perf_log_interval": 10,
+            "partial_wait_timeout_seconds": 600,
+        }
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ODCR_STEP4_RUNTIME_CONFIG_JSON invalid JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise RuntimeError("ODCR_STEP4_RUNTIME_CONFIG_JSON must be an object")
+    return obj
+
+
+def _reject_step4_formal_bare_runtime_env() -> None:
+    mode = (os.environ.get("ODCR_STEP4_MODE") or "formal").strip()
+    if mode != "formal":
+        return
+    bad = [
+        key
+        for key in (
+            "ODCR_STEP4_DECODE_THREADS",
+            "ODCR_STEP4_DECODE_CHUNK",
+            "ODCR_STEP4_PARTIAL_FORMAT",
+            "ODCR_STEP4_PERF_LOG_INTERVAL",
+        )
+        if (os.environ.get(key) or "").strip()
+    ]
+    if bad:
+        raise RuntimeError(
+            "Step4 formal runtime refuses bare perf/env overrides: "
+            + ", ".join(bad)
+            + ". Configure configs/odcr.yaml: step4.runtime."
+        )
 
 
 def _step4_partial_suffix_and_kind(fmt_choice: str) -> tuple[str, str]:
@@ -362,6 +549,89 @@ def _step4_read_partial_df(path: str) -> pd.DataFrame:
     if path.endswith(".parquet"):
         return pd.read_parquet(path, engine="pyarrow")
     return pd.read_csv(path, encoding="utf-8")
+
+
+def _step4_file_sha256(path: str) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _step4_partial_manifest_path(partial_path: str) -> str:
+    return partial_path + ".manifest.json"
+
+
+def _step4_partial_failed_marker(partial_path: str) -> str:
+    return partial_path + ".failed"
+
+
+def _step4_write_partial_manifest(
+    *,
+    partial_path: str,
+    rank: int,
+    world_size: int,
+    row_count: int,
+    kind: str,
+) -> str:
+    manifest = {
+        "schema_version": "odcr_step4_partial_artifact/1",
+        "status": "ok",
+        "rank": int(rank),
+        "world_size": int(world_size),
+        "shard_id": int(rank),
+        "path": os.path.abspath(partial_path),
+        "row_count": int(row_count),
+        "format": str(kind),
+        "sha256": _step4_file_sha256(partial_path),
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    out = _step4_partial_manifest_path(partial_path)
+    atomic_write_json(out, manifest)
+    return out
+
+
+def _step4_wait_for_partial_manifests(partial_dir: str, *, world_size: int, timeout_s: int) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + max(1, int(timeout_s))
+    while True:
+        failed = sorted(Path(partial_dir).glob("*.failed"))
+        if failed:
+            raise RuntimeError("Step4 partial failed marker present: " + ", ".join(str(p) for p in failed[:5]))
+        manifests = sorted(Path(partial_dir).glob("*.manifest.json"))
+        if len(manifests) >= int(world_size):
+            out = []
+            for path in manifests:
+                with open(path, "r", encoding="utf-8") as handle:
+                    out.append(json.load(handle))
+            ranks = {int(item.get("rank", -1)) for item in out}
+            if ranks == set(range(int(world_size))):
+                return out
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Step4 partial manifest wait timed out after {timeout_s}s in {partial_dir}; "
+                "no endless polling is allowed."
+            )
+        time.sleep(0.1)
+
+
+def _step4_upstream_artifact_hash(key: str) -> str:
+    try:
+        payload = json.loads(os.environ.get("ODCR_UPSTREAM_RESOLUTION_JSON") or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    validation = payload.get("stage_status_validation") if isinstance(payload, Mapping) else None
+    raw = validation.get(key) if isinstance(validation, Mapping) else None
+    if not raw:
+        return ""
+    path = Path(str(raw))
+    if not path.is_absolute():
+        path = Path(get_odcr_root()) / path
+    if not path.is_file():
+        return ""
+    return _step4_file_sha256(str(path))
 
 
 def _step4_append_primary_log(primary_log_file: str, text: str) -> None:
@@ -515,7 +785,7 @@ def _decode_pred_token_rows(token_rows, chunk_size: int = 4096, progress_plog: S
     """各 rank 本地 batch_decode：先一次性打成 (n, max_len) int64 再用 torch.from_numpy 按 chunk 解码。"""
     if not token_rows:
         return []
-    cs = int(os.environ.get("ODCR_STEP4_DECODE_CHUNK", str(chunk_size)))
+    cs = int(_step4_runtime_config().get("decode_chunk", chunk_size))
     if cs < 1:
         cs = chunk_size
     n = len(token_rows)
@@ -543,7 +813,7 @@ def _decode_pred_token_rows(token_rows, chunk_size: int = 4096, progress_plog: S
         )
 
     num_chunks = (n + cs - 1) // cs if n else 0
-    log_every = int(os.environ.get("ODCR_STEP4_DECODE_CHUNK_LOG_EVERY", "0"))
+    log_every = 0
     out = [""] * n
     t_prog0 = time.perf_counter()
     for chunk_i, s in enumerate(range(0, n, cs)):
@@ -630,6 +900,7 @@ def _run_one_task(
     local_rank: int,
     log_file: str,
 ):
+    _reject_step4_formal_bare_runtime_env()
     step4_e2e_start = time.perf_counter()
     task_config = TASK_DEFAULTS[task_idx]
     auxiliary = task_config["auxiliary"]
@@ -637,13 +908,6 @@ def _run_one_task(
     _task_ckpt_dir = get_stage_run_dir(task_idx)
     _step3_stage = (os.environ.get("ODCR_STEP3_RUN_DIR") or "").strip()
     _model_root = _step3_stage if _step3_stage else _task_ckpt_dir
-    # gather 之后不再用 dist.barrier 等 rank0 decode/CSV；用文件握手让 rank!=0 在下一轮任务/销毁进程组前等待 rank0 写完 CSV（纯 CPU，避免 NCCL 长时间 barrier 超时）。
-    sync_ready_path = os.path.join(_task_ckpt_dir, f".step4_ddp_task_{task_idx}_ready")
-    if rank == 0 and world_size > 1:
-        try:
-            os.remove(sync_ready_path)
-        except OSError:
-            pass
 
     save_file = os.path.join(_model_root, "model", "best.pth")
 
@@ -784,7 +1048,12 @@ def _run_one_task(
     target_df["domain"] = "auxiliary"
     target_df["sample_id"] = np.arange(len(target_df), dtype=np.int64)
     target_dataset = Dataset.from_pandas(target_df)
-    processor = Processor(auxiliary, target)
+    processor = Processor(
+        auxiliary,
+        target,
+        max_length=int(os.environ.get("ODCR_STEP3_TOKENIZER_MAX_LENGTH") or 0),
+        evidence_length=int(os.environ.get("ODCR_STEP3_EVIDENCE_MAX_LENGTH") or 0),
+    )
     proc_max_len = int(processor.max_length)
 
     cache_fingerprint = _step4_encoded_cache_fingerprint(
@@ -812,75 +1081,32 @@ def _run_one_task(
         )
         perf.start()
 
-    # ---------- 阶段 preprocess：仅 rank0 tokenize + save；其余 rank barrier 后 load ----------
+    # ---------- 阶段 preprocess：只验证/加载父进程 pre-DDP cache；DDP 内禁止 cold build ----------
     t_pre0 = time.perf_counter()
-    plog.line("tokenize_phase_start")
-    encoded_data = None
-    cache_hit = False  # 仅 rank0 语义；rank!=0 见 preprocess 日志 replica
-    tokenize_wall = 0.0
-
-    if rank == 0:
-        t_tok0 = time.perf_counter()
-        cache_valid, cache_reason = _step4_encoded_cache_manifest_matches(
-            cache_dir,
-            expected_fingerprint=cache_fingerprint,
-            expected_rows=len(target_df),
-        )
-        if cache_valid:
-            try:
-                encoded_data = load_from_disk(cache_dir)
-                if len(encoded_data) == len(target_df):
-                    cache_hit = True
-                else:
-                    encoded_data = None
-                    cache_reason = "loaded_row_count_mismatch"
-            except Exception:
-                encoded_data = None
-                cache_reason = "load_failed"
-        if encoded_data is None:
-            cache_hit = False
-            if os.path.exists(cache_dir):
-                plog.line(f"tokenize_cache_rebuild reason={cache_reason} dir={cache_dir}")
-                if os.path.isdir(cache_dir):
-                    shutil.rmtree(cache_dir, ignore_errors=True)
-                else:
-                    os.unlink(cache_dir)
-            encoded_data = target_dataset.map(
-                lambda sample: processor(sample), num_proc=nproc, desc="Tokenize"
-            )
-            encoded_data.save_to_disk(cache_dir)
-            _write_step4_encoded_cache_manifest(
-                cache_dir,
-                fingerprint=cache_fingerprint,
-                row_count=len(encoded_data),
-            )
-        tokenize_wall = time.perf_counter() - t_tok0
-        plog.line(
-            f"tokenize_end cache_hit={cache_hit} tokenize_wall_s={tokenize_wall:.4f} n_rows={len(encoded_data)}"
-        )
-    else:
-        plog.line("tokenize_skip_waiting_barrier (rank!=0)")
-
-    t_barrier0 = time.perf_counter()
-    dist.barrier()
-    barrier_preprocess = time.perf_counter() - t_barrier0
-    plog.line(f"barrier_after_tokenize wall_s={barrier_preprocess:.4f}")
-
-    if rank != 0:
-        t_ld = time.perf_counter()
-        cache_valid, cache_reason = _step4_encoded_cache_manifest_matches(
-            cache_dir,
-            expected_fingerprint=cache_fingerprint,
-            expected_rows=len(target_df),
-        )
-        if not cache_valid:
-            raise RuntimeError(
-                f"Step4 encoded cache lineage gate failed on rank {rank}: "
-                f"reason={cache_reason} dir={cache_dir}"
-            )
+    plog.line("pre_ddp_cache_load_start cold_build_allowed=False")
+    t_ld = time.perf_counter()
+    cache_valid, cache_reason = _step4_encoded_cache_manifest_matches(
+        cache_dir,
+        expected_fingerprint=cache_fingerprint,
+        expected_rows=len(target_df),
+    )
+    if cache_valid:
         encoded_data = load_from_disk(cache_dir)
-        tokenize_wall = time.perf_counter() - t_ld
-        plog.line(f"load_from_disk wall_s={tokenize_wall:.4f} n_rows={len(encoded_data)}")
+    else:
+        raise RuntimeError(
+            "Step4 encoded cache is not ready before DDP inference. "
+            f"reason={cache_reason} dir={cache_dir}. "
+            "Run ./odcr step4 --task N --prepare-cache before formal Step4, "
+            "or use ./odcr step4 --task N so the parent launcher prepares cache before torchrun."
+        )
+    if len(encoded_data) != len(target_df):
+        raise RuntimeError(
+            f"Step4 encoded cache row mismatch on rank {rank}: loaded={len(encoded_data)} expected={len(target_df)}"
+        )
+    cache_hit = True
+    tokenize_wall = time.perf_counter() - t_ld
+    barrier_preprocess = 0.0
+    plog.line(f"pre_ddp_cache_load_done cache_hit=True load_wall_s={tokenize_wall:.4f} n_rows={len(encoded_data)}")
 
     encoded_data.set_format("torch")
 
@@ -946,7 +1172,7 @@ def _run_one_task(
         perf.test_num_workers = test_nw
         perf.epoch_start()
 
-    log_interval = max(1, int(os.environ.get("ODCR_STEP4_PERF_LOG_INTERVAL", "10")))
+    log_interval = max(1, int(_step4_runtime_config().get("perf_log_interval", 10)))
     t_prev_end = time.perf_counter()
     first_batch_wait = None
     step_idx = 0
@@ -1123,10 +1349,10 @@ def _run_one_task(
         print(_epoch_scope_note, flush=True)
         append_log_dual(log_file, _epoch_scope_note + "\n")
 
-    partial_dir = os.path.join(_task_ckpt_dir, ".step4_partials")
+    partial_dir = os.path.join(_task_ckpt_dir, "step4_partials")
     os.makedirs(partial_dir, exist_ok=True)
     partial_base = os.path.join(
-        partial_dir, f"step4_partial_task{task_idx}_rank{rank}_pid{os.getpid()}"
+        partial_dir, f"step4_partial_task{task_idx}_rank{rank}"
     )
     fmt_choice = _step4_partial_format_choice()
     partial_suffix, partial_kind = _step4_partial_suffix_and_kind(fmt_choice)
@@ -1136,12 +1362,10 @@ def _run_one_task(
 
     _prev_torch_threads = torch.get_num_threads()
     try:
-        _dt = os.environ.get("ODCR_STEP4_DECODE_THREADS", "0").strip()
-        if _dt:
-            _nti = int(_dt)
-            if _nti > 0:
-                torch.set_num_threads(_nti)
-                plog.line(f"decode_torch_num_threads={_nti}")
+        _nti = int(_step4_runtime_config().get("decode_threads", 0))
+        if _nti > 0:
+            torch.set_num_threads(_nti)
+            plog.line(f"decode_torch_num_threads={_nti}")
         t_dec_local0 = time.perf_counter()
         local_explanations = _decode_pred_token_rows(local_pred_token_rows, progress_plog=plog)
         decode_local_wall_s = time.perf_counter() - t_dec_local0
@@ -1149,7 +1373,7 @@ def _run_one_task(
         torch.set_num_threads(_prev_torch_threads)
 
     n_loc = len(local_explanations)
-    _dchunk = int(os.environ.get("ODCR_STEP4_DECODE_CHUNK", "4096"))
+    _dchunk = int(_step4_runtime_config().get("decode_chunk", 4096))
     _nchunks = (n_loc + _dchunk - 1) // _dchunk if n_loc else 0
     plog.line(
         f"decode_local_wall_s={decode_local_wall_s:.4f} decode_input_rows={n_loc} "
@@ -1175,27 +1399,45 @@ def _run_one_task(
     plog.line(f"partial_df_prep_wall_s={partial_prep_wall_s:.4f}")
 
     t_pw0 = time.perf_counter()
-    _step4_write_partial_df(part_df, partial_path, partial_kind)
+    try:
+        _step4_write_partial_df(part_df, partial_path, partial_kind)
+        partial_manifest_path = _step4_write_partial_manifest(
+            partial_path=partial_path,
+            rank=rank,
+            world_size=world_size,
+            row_count=len(part_df),
+            kind=partial_kind,
+        )
+    except Exception as exc:
+        with open(_step4_partial_failed_marker(partial_path), "w", encoding="utf-8") as handle:
+            handle.write(f"rank={rank}\nfailed_at={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n{exc}\n")
+        raise
     partial_write_wall_s = time.perf_counter() - t_pw0
     plog.line(
-        f"partial_write_wall_s={partial_write_wall_s:.4f} partial_kind={partial_kind} path={partial_path}"
+        f"partial_write_wall_s={partial_write_wall_s:.4f} partial_kind={partial_kind} "
+        f"path={partial_path} manifest={partial_manifest_path}"
     )
 
     t_gather_paths0 = time.perf_counter()
     pre_gather_wait_wall_s = t_gather_paths0 - t_before_partial_phase
-    if world_size == 1:
-        path_gather = [(partial_path,)]
-    else:
-        path_payload = (partial_path,)
-        if rank == 0:
-            path_gather = [None] * world_size
-            dist.gather_object(path_payload, object_gather_list=path_gather, dst=0)
-        else:
-            dist.gather_object(path_payload, dst=0)
+    dist.barrier()
     collective_gather_paths_wall_s = time.perf_counter() - t_gather_paths0
     plog.line(f"pre_gather_wait_wall_s={pre_gather_wait_wall_s:.4f}")
-    plog.line(f"collective_gather_paths_wall_s={collective_gather_paths_wall_s:.4f}")
+    plog.line(f"partial_manifest_barrier_wall_s={collective_gather_paths_wall_s:.4f}")
     plog.line("barrier_before_csv_removed=True")
+    plog.line("destroy_process_group_before_cpu_export=True")
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    try:
+        del model
+        del _model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if rank != 0:
+        plog.line("non_rank0_gpu_released_before_cpu_tail=True")
+        return
 
     decode_merge_rank0_wall_s = 0.0
     rank0_read_partials_wall_s = 0.0
@@ -1204,10 +1446,16 @@ def _run_one_task(
     csv_write_wall_s = 0.0
 
     if rank == 0:
+        wait_timeout = int(_step4_runtime_config().get("partial_wait_timeout_seconds", 600))
+        partial_manifests = _step4_wait_for_partial_manifests(
+            partial_dir,
+            world_size=world_size,
+            timeout_s=wait_timeout,
+        )
         t_read0 = time.perf_counter()
         dfs = []
-        for item in path_gather:
-            pth = item[0] if isinstance(item, (list, tuple)) else item
+        for item in partial_manifests:
+            pth = str(item["path"])
             dfs.append(_step4_read_partial_df(pth))
         rank0_read_partials_wall_s = time.perf_counter() - t_read0
         plog.line(f"rank0_read_partials_wall_s={rank0_read_partials_wall_s:.4f} n_files={len(dfs)}")
@@ -1279,6 +1527,15 @@ def _run_one_task(
             target_domain=target,
             step3_checkpoint_lineage_hash=str(step3_lineage["lineage_hash"]),
             step4_rcr_config=rcr_config.to_dict(),
+            step4_run=_slug,
+            frozen_step3_lineage={
+                "upstream_step3_run_id": str(os.path.basename(os.path.abspath(_model_root))),
+                "step3_checkpoint_path": os.path.abspath(str(config.get("save_file"))),
+                "step3_checkpoint_hash": _step4_file_sha256(str(config.get("save_file"))),
+                "step3_checkpoint_lineage_hash": str(step3_lineage["lineage_hash"]),
+                "step3_stage_status_hash": _step4_upstream_artifact_hash("status_path") or _step4_upstream_artifact_hash("stage_status"),
+                "step3_eval_handoff_hash": _step4_upstream_artifact_hash("eval_handoff"),
+            },
         )
         _ic["step4_export_lineage"] = _step4_export_lineage
         _ic_path = os.path.join(_task_ckpt_dir, INDEX_CONTRACT_FILENAME)
@@ -1299,6 +1556,7 @@ def _run_one_task(
             index_contract_summary=_ic_summary,
             lineage=_step4_export_lineage,
         )
+        manifest["partial_artifacts"] = partial_manifests
         csv_out, man_out, ic_out = write_step4_training_artifacts(
             final_df, manifest, _task_ckpt_dir, index_contract=_ic
         )
@@ -1312,28 +1570,7 @@ def _run_one_task(
         )
         plog.line(f"csv_write_wall_s={csv_write_wall_s:.4f}")
 
-        for item in path_gather:
-            pth = item[0] if isinstance(item, (list, tuple)) else item
-            try:
-                os.remove(pth)
-            except OSError:
-                pass
-
-        if world_size > 1:
-            with open(sync_ready_path, "w", encoding="utf-8") as sf:
-                sf.write("1\n")
-                sf.flush()
-                os.fsync(sf.fileno())
-    else:
-        if world_size > 1:
-            plog.line(
-                "post_gather_no_more_collectives_exit_path=True "
-                "post_csv_ready_wait_reason=rank0_merge_filter_csv_before_next_collective"
-            )
-            t_wait0 = time.perf_counter()
-            while not os.path.exists(sync_ready_path):
-                time.sleep(0.05)
-            plog.line(f"post_csv_ready_wait_wall_s={time.perf_counter() - t_wait0:.4f}")
+        plog.line("partial_artifacts_retained_for_readiness_validator=True")
 
     decode_tail_wall_s = decode_local_wall_s + (
         (decode_merge_rank0_wall_s + rank0_filter_wall_s) if rank == 0 else 0.0

@@ -26,3 +26,6 @@ merged/*
 !AI_analysis/.gitkeep
 !data/.gitkeep
 !merged/.gitkeep
+cache/
+test/
+__pycache__/

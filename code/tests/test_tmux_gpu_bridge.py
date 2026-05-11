@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Mocked tests for the controlled tmux GPU bridge."""
+"""Mocked tests for the runtime-first tmux GPU bridge.
+
+this test proves: bridge command generation supports repo-local runtime execution and stays namespace-safe.
+this test does not prove: CUDA runtime speed, H2D overlap, or formal Step3 quality.
+whether formal hot path is covered: no, only bridge routing and safety are covered.
+whether runtime evidence is required: yes before any performance optimization can claim Level 3/4.
+regression bug it prevents: arbitrary send-keys, formal namespace writes, or whitelist-only GPU gates reappearing.
+"""
 
 from __future__ import annotations
 
@@ -104,13 +111,13 @@ def patched_bridge_paths() -> Iterator[Path]:
             "SUMMARY_DIR": bridge.SUMMARY_DIR,
             "REPORT_DIR": bridge.REPORT_DIR,
             "RUNTIME_DIR": bridge.RUNTIME_DIR,
-            "STATE_FILE": bridge.STATE_FILE,
+            "AI_ANALYSIS": bridge.AI_ANALYSIS,
         }
+        bridge.AI_ANALYSIS = root / "AI_analysis"
         bridge.RAW_LOG_DIR = root / "AI_analysis" / "01_raw_logs"
         bridge.SUMMARY_DIR = root / "AI_analysis" / "04_phase_summaries"
         bridge.REPORT_DIR = root / "AI_analysis" / "05_final_reports"
         bridge.RUNTIME_DIR = root / "AI_analysis" / "runtime"
-        bridge.STATE_FILE = bridge.RUNTIME_DIR / "gpu_pane.json"
         try:
             yield root
         finally:
@@ -215,18 +222,16 @@ class TmuxGpuBridgeTests(unittest.TestCase):
                 tool.resolve_target(bridge.BridgeOptions(mode="discover", socket="/sock/gpu", target="odcr:9.9"))
         self.assertEqual(ctx.exception.stop_reason, "target_not_unique")
 
-    def test_state_file_stale_job_fail_fast(self) -> None:
+    def test_stale_state_file_is_never_trusted(self) -> None:
         runner = valid_runner()
         tool = bridge.TmuxGpuBridge(runner=runner, socket_exists=lambda path: str(path) == "/sock/gpu")
         with patched_bridge_paths():
-            bridge.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            bridge.STATE_FILE.write_text(
-                json.dumps({"socket": "/sock/gpu", "target": "odcr:0.0", "job_id": "999"}),
-                encoding="utf-8",
-            )
-            with self.assertRaises(bridge.BridgeError) as ctx:
-                tool.resolve_target(bridge.BridgeOptions(mode="discover"))
-        self.assertEqual(ctx.exception.stop_reason, "target_invalid")
+            stale = bridge.RUNTIME_DIR / "gpu_pane.json"
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_text(json.dumps({"socket": "/sock/gpu", "target": "odcr:0.0", "job_id": "999"}), encoding="utf-8")
+            target, _discovery, source = tool.resolve_target(bridge.BridgeOptions(mode="discover", socket="/sock/gpu"))
+        self.assertEqual(source, "explicit")
+        self.assertEqual(target.job_id, "10")
 
     def test_discovery_output_contains_target_fields(self) -> None:
         runner = valid_runner()
@@ -266,7 +271,7 @@ class TmuxGpuBridgeTests(unittest.TestCase):
         bridge.validate_script_safety("./odcr preprocess b --dry-run")
         bridge.validate_script_safety("./odcr preprocess c --dry-run")
 
-    def test_step_eval_rerank_modes_blocked(self) -> None:
+    def test_formal_step4_step5_eval_rerank_modes_blocked(self) -> None:
         for text in (
             "./odcr step3 --task 4",
             "./odcr step4 --task 4",
@@ -279,22 +284,29 @@ class TmuxGpuBridgeTests(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(bridge.BridgeError):
                     bridge.validate_script_safety(text)
+        bridge.validate_script_safety(
+            "./odcr step4 --task 2 --preflight --max-samples 128 --validation-namespace step4_preflight_smoke"
+        )
 
     def test_timeout_auto_for_each_mode(self) -> None:
         expected = {
             "discover": 20,
-            "validate-only": 20,
+            "validate-only": 60,
             "unlock-pane": 20,
             "marker-probe": 20,
             "cuda-probe": 45,
             "preprocess-dryrun": 90,
             "bge-smoke": 240,
             "micro-benchmark": 300,
+            "real-data-probe": 180,
+            "step3-startup-validation": 180,
+            "long-run": None,
             "collect": 20,
         }
         for mode, hard in expected.items():
             with self.subTest(mode=mode):
                 self.assertEqual(bridge.resolve_timeouts(mode).hard_timeout_s, hard)
+        self.assertTrue(bridge.resolve_timeouts("long-run").detached)
 
     def test_timeout_above_mode_limit_fails(self) -> None:
         with self.assertRaises(bridge.BridgeError):
@@ -339,7 +351,7 @@ class TmuxGpuBridgeTests(unittest.TestCase):
             paths.status.write_text(json.dumps({"success": True}), encoding="utf-8")
             result = bridge.collect_run("bridge_collect_missing")
         self.assertFalse(result["success"])
-        self.assertEqual(result["stop_reason"], "incomplete")
+        self.assertEqual(result["stop_reason"], "TIMEOUT_INCOMPLETE")
 
     def test_collect_reads_log_status_summary_report(self) -> None:
         with patched_bridge_paths():
@@ -357,6 +369,82 @@ class TmuxGpuBridgeTests(unittest.TestCase):
         self.assertTrue(result["metrics"]["summary_exists"])
         self.assertTrue(result["metrics"]["report_exists"])
 
+    def test_long_run_send_line_has_no_foreground_timeout(self) -> None:
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_long_run_send")
+            command = bridge.send_line(paths, bridge.resolve_timeouts("long-run"))
+        self.assertTrue(command.startswith("bash "))
+        self.assertNotIn("timeout 900s", command)
+        self.assertNotIn("timeout ", command)
+
+    def test_long_run_script_writes_managed_launcher_artifacts(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_long_run_script")
+            script = bridge.build_long_run_managed_launcher_script(
+                "bridge_long_run_script",
+                paths,
+                bridge.resolve_timeouts("long-run"),
+                target,
+                bridge.BridgeOptions(mode="long-run", command_argv=("python", "-c", "print('ok')")),
+            )
+        bridge.validate_script_safety(script)
+        self.assertIn("command.sh", script)
+        self.assertIn("managed_launcher.py", script)
+        self.assertIn("stdout.log", script)
+        self.assertIn("stderr.log", script)
+        self.assertIn("heartbeat.json", script)
+        self.assertIn("pid", script)
+        self.assertIn("subprocess.Popen", script)
+        self.assertNotIn("timeout 900s", script)
+
+    def test_collect_reads_completed_long_run_managed_status(self) -> None:
+        with patched_bridge_paths() as root:
+            paths = bridge.make_generated_paths("bridge_long_run_collect")
+            managed = root / "managed" / "status.json"
+            managed.parent.mkdir(parents=True, exist_ok=True)
+            managed.write_text(json.dumps({"state": "completed", "returncode": 0}), encoding="utf-8")
+            for path in (paths.log, paths.status, paths.summary, paths.report):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            paths.log.write_text(
+                "ODCR_BRIDGE_BEGIN_bridge_long_run_collect\nODCR_BRIDGE_END_bridge_long_run_collect\n",
+                encoding="utf-8",
+            )
+            paths.status.write_text(
+                json.dumps(
+                    {
+                        "kind": "long-run",
+                        "success": True,
+                        "metrics": {"managed_status_path": str(managed)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths.summary.write_text("summary", encoding="utf-8")
+            paths.report.write_text("report", encoding="utf-8")
+            result = bridge.collect_run("bridge_long_run_collect")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["metrics"]["managed_status"]["state"], "completed")
+
     def test_dry_run_does_not_send_keys(self) -> None:
         runner = valid_runner()
         tool = bridge.TmuxGpuBridge(runner=runner, socket_exists=lambda path: str(path) == "/sock/gpu")
@@ -367,11 +455,13 @@ class TmuxGpuBridgeTests(unittest.TestCase):
         self.assertFalse(result["sent"])
         self.assertFalse(any("send-keys" in call for call in runner.calls))
 
-    def test_validate_only_does_not_send_keys(self) -> None:
+    def test_validate_only_no_send_does_not_send_keys(self) -> None:
         runner = valid_runner()
         tool = bridge.TmuxGpuBridge(runner=runner, socket_exists=lambda path: str(path) == "/sock/gpu")
         with patched_bridge_paths():
-            result = tool.run_mode(bridge.BridgeOptions(mode="validate-only", socket="/sock/gpu", target="odcr:0.0"))
+            result = tool.run_mode(
+                bridge.BridgeOptions(mode="validate-only", socket="/sock/gpu", target="odcr:0.0", no_send=True)
+            )
         self.assertFalse(result["sent"])
         self.assertFalse(any("send-keys" in call for call in runner.calls))
 
@@ -408,14 +498,16 @@ class TmuxGpuBridgeTests(unittest.TestCase):
         self.assertIn(("tmux", "-S", "/sock/gpu", "send-keys", "-t", "%0", "-X", "cancel"), runner.calls)
         self.assertIn(("tmux", "-S", "/sock/gpu", "send-keys", "-t", "%0", "Escape"), runner.calls)
 
-    def test_unlock_pane_stops_after_two_fixed_attempts(self) -> None:
+    def test_unlock_pane_stops_after_fixed_attempts_with_q_fallback(self) -> None:
         runner = UnlockPaneRunner(cancel_clears=False, escape_clears=False)
         tool = bridge.TmuxGpuBridge(runner=runner, socket_exists=lambda path: str(path) == "/sock/gpu")
         with patched_bridge_paths():
             result = tool.run_mode(bridge.BridgeOptions(mode="unlock-pane", socket="/sock/gpu", target="odcr:0.0"))
         self.assertFalse(result["success"])
         self.assertEqual(result["stop_reason"], "pane_in_mode_unlock_failed")
-        self.assertEqual(result["metrics"]["attempt_count"], 2)
+        self.assertEqual(result["metrics"]["attempt_count"], 3)
+        self.assertEqual(result["unlock_operations"], ["copy-mode-cancel", "escape", "q"])
+        self.assertIn(("tmux", "-S", "/sock/gpu", "send-keys", "-t", "%0", "q"), runner.calls)
 
     def test_send_keys_defaults_to_pane_id_literal_enter(self) -> None:
         runner = valid_runner()
@@ -519,7 +611,7 @@ class TmuxGpuBridgeTests(unittest.TestCase):
         self.assertNotIn("import torch", script)
         self.assertNotIn("./odcr", script)
 
-    def test_cuda_probe_script_contains_only_whitelist_behavior(self) -> None:
+    def test_cuda_probe_script_contains_runtime_cuda_probe_behavior(self) -> None:
         target = bridge.PaneCandidate(
             socket="/sock/gpu",
             session="odcr",
@@ -676,6 +768,290 @@ class TmuxGpuBridgeTests(unittest.TestCase):
         self.assertFalse(options.bf16_enabled)
         self.assertTrue(options.tf32_enabled)
         self.assertTrue(options.grouped_text_cache_enabled)
+
+    def test_real_data_probe_script_uses_fixed_ai_analysis_probe(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_script_real_data")
+            script = bridge.build_real_data_probe_script(
+                "bridge_script_real_data",
+                paths,
+                bridge.resolve_timeouts("real-data-probe"),
+                target,
+            )
+        bridge.validate_script_safety(script)
+        self.assertIn("preprocess_b_real_probe/preprocess_b_real_data_probe.py", script)
+        self.assertIn('"gpu-probe"', script)
+        self.assertIn("real_data_probe_completed", script)
+        self.assertNotIn("bge-single-batch", script)
+        self.assertNotIn("./odcr preprocess", script)
+        self.assertNotIn("data/", script)
+        self.assertNotIn("merged/", script)
+
+    def test_real_data_probe_cli_accepts_preprocess_c_probe_stage(self) -> None:
+        parser = bridge.build_parser()
+        args = parser.parse_args(["real-data-probe", "--probe-stage", "c"])
+        options = bridge.options_from_args(args)
+        self.assertEqual(options.probe_stage, "c")
+
+    def test_real_data_probe_script_can_target_preprocess_c_probe(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_script_real_data_c")
+            script = bridge.build_real_data_probe_script(
+                "bridge_script_real_data_c",
+                paths,
+                bridge.resolve_timeouts("real-data-probe"),
+                target,
+                "c",
+            )
+        bridge.validate_script_safety(script)
+        self.assertIn("preprocess_c_real_probe/preprocess_c_real_data_probe.py", script)
+        self.assertIn('"gpu-probe"', script)
+        self.assertIn('"probe_stage": \'c\'', script)
+        self.assertNotIn("preprocess_b_real_probe/preprocess_b_real_data_probe.py", script)
+        self.assertNotIn("./odcr preprocess", script)
+        self.assertNotIn("data/", script)
+        self.assertNotIn("merged/", script)
+
+    def test_step3_startup_validation_cli_defaults_to_task2_validation_namespace(self) -> None:
+        parser = bridge.build_parser()
+        args = parser.parse_args(["step3-startup-validation"])
+        options = bridge.options_from_args(args)
+        self.assertEqual(options.mode, "step3-startup-validation")
+        self.assertEqual(options.task_id, 2)
+        self.assertEqual(options.validation_slug, "step3_tmux_gpu_bridge_startup_validation_closeout")
+
+    def test_retired_step3_bridge_modes_are_not_parser_surface(self) -> None:
+        parser = bridge.build_parser()
+        for mode in ("step3-ddp-smoke", "step3-short-pilot"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([mode])
+        args = parser.parse_args(["step3-performance-probe", "--probe-type", "timing-profile-window"])
+        self.assertEqual(args.mode, "step3-performance-probe")
+
+    def test_step3_startup_validation_script_uses_fixed_internal_tool(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_step3_startup")
+            script = bridge.build_step3_startup_validation_script(
+                "bridge_step3_startup",
+                paths,
+                bridge.resolve_timeouts("step3-startup-validation"),
+                target,
+                task_id=2,
+            )
+        bridge.validate_script_safety(script)
+        self.assertIn("code/tools/odcr_step3_startup_validation.py", script)
+        self.assertIn("--mode startup-only", script)
+        self.assertIn("--namespace validation", script)
+        self.assertIn("--task 2", script)
+        self.assertIn("--bridge-status-path", script)
+        self.assertIn(".status.json.child.json", script)
+        self.assertIn("--bridge-log-path", script)
+        self.assertIn("--target-socket /sock/gpu", script)
+        self.assertIn("--target-pane %0", script)
+        self.assertIn("--target-job-id 10", script)
+        self.assertNotIn("./odcr step3", script)
+        self.assertNotIn("python code/odcr.py step3", script)
+        self.assertNotIn("torchrun", script)
+        self.assertNotIn("best.pth", script)
+        self.assertNotIn("odcr_step3_real_data_probe.py", script)
+
+    def test_step3_startup_validation_rejects_wrong_task_and_unsafe_slug(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_step3_limit")
+            with self.assertRaises(bridge.BridgeError):
+                bridge.build_step3_startup_validation_script(
+                    "bridge_step3_limit",
+                    paths,
+                    bridge.resolve_timeouts("step3-startup-validation"),
+                    target,
+                    task_id=3,
+                )
+            with self.assertRaises(bridge.BridgeError):
+                bridge.build_step3_startup_validation_script(
+                    "bridge_step3_limit",
+                    paths,
+                    bridge.resolve_timeouts("step3-startup-validation"),
+                    target,
+                    validation_slug="../bad",
+                )
+            with self.assertRaises(bridge.BridgeError):
+                bridge.make_generated_paths("../bad")
+
+    def test_step3_performance_probe_script_is_closed_choice_validation_namespace(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            paths = bridge.make_generated_paths("bridge_step3_perf")
+            script = bridge.build_step3_performance_probe_script(
+                "bridge_step3_perf",
+                paths,
+                bridge.resolve_timeouts("step3-performance-probe"),
+                target,
+                task_id=2,
+                probe_type="prefetch-ab",
+            )
+        bridge.validate_script_safety(script)
+        self.assertIn("code/tools/odcr_step3_performance_probe.py", script)
+        self.assertIn("--probe-type prefetch-ab", script)
+        self.assertIn("--namespace validation", script)
+        self.assertIn(".status.json.child.json", script)
+        self.assertNotIn("./odcr step3", script)
+        self.assertNotIn("python code/odcr.py step3", script)
+        self.assertNotIn("torchrun", script)
+        self.assertNotIn("best.pth", script)
+        self.assertNotIn("latest.json", script)
+
+    def test_step3_performance_probe_rejects_arbitrary_probe_type(self) -> None:
+        target = bridge.PaneCandidate(
+            socket="/sock/gpu",
+            session="odcr",
+            target="odcr:0.0",
+            pane_id="%0",
+            pane_pid=100,
+            pane_command="srun",
+            cwd=str(bridge.REPO_ROOT),
+            active=True,
+            dead=False,
+            in_mode=False,
+            srun_pid=200,
+            srun_command="srun --jobid=10 --pty bash",
+            job_id="10",
+            step_id="10.0",
+            node="gpu01",
+            gpu="gres/gpu=1,TresPerNode=gpu:A100:1",
+            step_state="RUNNING",
+            job_state="RUNNING",
+        )
+        with patched_bridge_paths():
+            with self.assertRaises(bridge.BridgeError):
+                bridge.build_step3_performance_probe_script(
+                    "bridge_step3_perf_bad",
+                    bridge.make_generated_paths("bridge_step3_perf_bad"),
+                    bridge.resolve_timeouts("step3-performance-probe"),
+                    target,
+                    task_id=2,
+                    probe_type="arbitrary-shell",
+                )
+
+    def test_generated_guard_rejects_formal_step3_and_retired_probe_modes(self) -> None:
+        bridge.validate_script_safety(
+            "python code/tools/odcr_step3_startup_validation.py --task 2 --mode startup-only --namespace validation"
+        )
+        bridge.validate_script_safety(
+            "python code/tools/odcr_step3_performance_probe.py --probe-type timing-profile-window --namespace validation"
+        )
+        for text in (
+            "./odcr step3 --task 4",
+            "python code/odcr.py step3 --task 4",
+            "python code/executors/step3_entry.py train",
+            "torchrun code/executors/step3_entry.py train",
+            "best.pth",
+            "checkpoint_lineage.json",
+            "python code/tools/odcr_step3_real_data_probe.py --mode step3-ddp-smoke --task-id 2",
+            "python code/tools/odcr_step3_real_data_probe.py --mode step3-short-pilot --task-id 2",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.validate_script_safety(text)
 
 
 if __name__ == "__main__":

@@ -163,24 +163,28 @@ def variance_floor_loss(
 def _sample_weight_vector(
     ref: torch.Tensor,
     sample_weight: torch.Tensor | None,
+    *,
+    eps: float = 1e-6,
 ) -> torch.Tensor | None:
     if sample_weight is None:
         return None
     w = sample_weight.reshape(-1).to(device=ref.device, dtype=ref.dtype)
-    return w.clamp_min(1e-6)
+    return w.clamp_min(float(eps))
 
 
 def anchor_score_alignment_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     sample_weight: torch.Tensor | None = None,
+    *,
+    sample_weight_eps: float = 1e-6,
 ) -> torch.Tensor:
     """标量锚预测与 CSV 锚分（0~1）对齐；pred/target 形状 (B,) 或 (B,1)。"""
     p = pred.reshape(-1)
     t = target.reshape(-1).to(dtype=p.dtype)
     if sample_weight is None:
         return F.mse_loss(p, t, reduction="mean")
-    w = _sample_weight_vector(p, sample_weight)
+    w = _sample_weight_vector(p, sample_weight, eps=sample_weight_eps)
     return (((p - t) ** 2) * w).sum() / w.sum()
 
 
@@ -195,13 +199,14 @@ def cosine_pull_loss(
     *,
     sample_weight: torch.Tensor | None = None,
     eps: float = 1e-8,
+    sample_weight_eps: float = 1e-6,
 ) -> torch.Tensor:
     if source.shape != target.shape:
         raise ValueError("cosine_pull_loss 需要 source/target 形状一致")
     loss = 1.0 - F.cosine_similarity(source, target, dim=-1, eps=eps)
     if sample_weight is None:
         return loss.mean()
-    w = _sample_weight_vector(loss, sample_weight)
+    w = _sample_weight_vector(loss, sample_weight, eps=sample_weight_eps)
     return (loss * w).sum() / w.sum()
 
 
@@ -210,15 +215,23 @@ def shared_prototype_pull_loss(
     shared_prototype: torch.Tensor,
     *,
     sample_weight: torch.Tensor | None = None,
+    eps: float = 1e-8,
+    sample_weight_eps: float = 1e-6,
 ) -> torch.Tensor:
-    return cosine_pull_loss(shared_latent, shared_prototype, sample_weight=sample_weight)
+    return cosine_pull_loss(
+        shared_latent,
+        shared_prototype,
+        sample_weight=sample_weight,
+        eps=eps,
+        sample_weight_eps=sample_weight_eps,
+    )
 
 
-def domain_style_prototype_separation(domain_prototypes: torch.Tensor) -> torch.Tensor:
+def domain_style_prototype_separation(domain_prototypes: torch.Tensor, *, eps: float = 1e-8) -> torch.Tensor:
     """domain 风格原型（num_domains, D）非对角 Gram 惩罚（轻量分离）。"""
     if domain_prototypes.shape[0] < 2:
         return graph_tied_zero(domain_prototypes)
-    p = F.normalize(domain_prototypes, dim=-1)
+    p = F.normalize(domain_prototypes, dim=-1, eps=float(eps))
     g = p @ p.T
     eye = torch.eye(p.shape[0], device=p.device, dtype=p.dtype)
     off = g * (1.0 - eye)

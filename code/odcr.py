@@ -20,9 +20,28 @@ from odcr_core.config_resolver import (
     write_resolved_config,
 )
 from odcr_core.config_schema import OneControlConfigError, SourceRecord
+from odcr_core.manifests import (
+    build_formal_source_table_snapshot,
+    build_source_table_snapshot,
+    formal_snapshot_view,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = "configs/odcr.yaml"
+NO_ACCUM_REMOVED_MESSAGE = (
+    "grad_accum has been removed in ODCR no-accum architecture; use per_gpu_batch_size "
+    "and global_batch_size = per_gpu_batch_size * ddp_world_size."
+)
+
+
+class _RetiredAccumulationAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(NO_ACCUM_REMOVED_MESSAGE)
+
+
+def _add_retired_accumulation_args(p: argparse.ArgumentParser) -> None:
+    for opt in ("--grad-accum", "--gradient-accumulation-steps", "--accumulate-grad-batches"):
+        p.add_argument(opt, nargs="?", action=_RetiredAccumulationAction, help=argparse.SUPPRESS)
 
 
 def _utc_now() -> str:
@@ -41,6 +60,7 @@ def _common_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true", help="display-only: expand console detail")
     p.add_argument("--debug", action="store_true", help="display-only: show raw launcher/child output on console")
+    _add_retired_accumulation_args(p)
     return p
 
 
@@ -56,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true", help="display-only: expand console detail")
     p.add_argument("--debug", action="store_true", help="display-only: show raw launcher/child output on console")
+    _add_retired_accumulation_args(p)
     sub = p.add_subparsers(dest="command", required=True)
 
     pp = sub.add_parser("preprocess", parents=[common], help="run preprocess a/b/c")
@@ -65,16 +86,34 @@ def build_parser() -> argparse.ArgumentParser:
     s3.add_argument("--task", type=int, required=True)
     s3.add_argument("--run-id", default="auto")
     s3.add_argument("--mode", choices=("full", "train_only", "eval_only"), default="full")
+    s3.add_argument("--profile", dest="profile", default=None)
+    s3.add_argument("--expect-profile", dest="expect_profile", default=None)
+    s3.add_argument("--cache-check", action="store_true")
+    s3.add_argument("--checkpoint-write-preflight", action="store_true")
+    s3.add_argument("--expect-cache-hit", action="store_true")
+    s3.add_argument("--allow-cold-build", action="store_true")
+    s3.add_argument("--expect-num-proc", type=int, default=None)
+    s3.add_argument("--accept-eval-only", action="store_true")
 
     s4 = sub.add_parser("step4", parents=[common])
     s4.add_argument("--task", type=int, required=True)
-    s4.add_argument("--from-step3", default="latest")
+    s4.add_argument("--from-step3", dest="from_step3", default=None)
+    s4.add_argument("--from-step3-run", dest="from_step3_run", default=None)
     s4.add_argument("--run-id", default="auto")
     s4.add_argument("--profile", dest="eval_profile", default=None)
+    s4.add_argument("--prepare-cache", action="store_true")
+    s4.add_argument("--preflight", action="store_true")
+    s4.add_argument("--preflight-mode", choices=("preview", "gpu-shard"), default="preview")
+    s4.add_argument("--force-gpu-forward", action="store_true")
+    s4.add_argument("--profile-utilization", action="store_true")
+    s4.add_argument("--max-samples", type=int, default=None)
+    s4.add_argument("--validation-namespace", default=None)
+    s4.add_argument("--candidate-config", default=None)
 
     s5 = sub.add_parser("step5", parents=[common])
     s5.add_argument("--task", type=int, required=True)
-    s5.add_argument("--from-step4", default="latest")
+    s5.add_argument("--from-step4", dest="from_step4", default=None)
+    s5.add_argument("--from-step4-run", dest="from_step4_run", default=None)
     s5.add_argument("--run-id", default="auto")
     s5.add_argument("--profile", dest="eval_profile", default=None)
 
@@ -91,11 +130,20 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--profile", dest="eval_profile", default=None)
 
     sh = sub.add_parser("show", parents=[common])
-    sh.add_argument("--stage", choices=("step3", "step4", "step5", "eval"), required=True)
+    sh.add_argument(
+        "--stage",
+        choices=("preprocess_a", "preprocess_b", "preprocess_c", "step3", "step4", "step5", "eval"),
+        required=True,
+    )
     sh.add_argument("--task", type=int, default=None)
     sh.add_argument("--profile", dest="eval_profile", default=None)
 
     sub.add_parser("doctor", parents=[common])
+
+    pr = sub.add_parser("promote-upstream", parents=[common])
+    pr.add_argument("--stage", choices=("step3", "step4", "step5"), required=True)
+    pr.add_argument("--task", type=int, required=True)
+    pr.add_argument("--run-id", required=True)
 
     tl = sub.add_parser("tail", parents=[common])
     tl.add_argument("--stage", choices=("step3", "step4", "step5", "eval"), required=True)
@@ -127,8 +175,26 @@ def _print_sources(records: list[SourceRecord]) -> None:
         print(f"  {record.key}: {record.source}")
 
 
+def _print_source_table_payload(payload: dict[str, Any]) -> None:
+    print(f"Source table ({payload.get('view', 'verbose')}):")
+    for record in payload.get("records") or []:
+        if not isinstance(record, dict):
+            continue
+        key = record.get("key")
+        source = record.get("source")
+        if source is None:
+            continue
+        print(f"  {key}: {source}")
+
+
 def _print_stage_summary(snapshot: dict[str, Any]) -> None:
     print(json.dumps(snapshot, ensure_ascii=False, indent=2, default=str))
+
+
+def _display_snapshot(snapshot: dict[str, Any], *, verbose: bool) -> dict[str, Any]:
+    if verbose:
+        return snapshot
+    return formal_snapshot_view(snapshot)
 
 
 def _console_level(args: argparse.Namespace) -> str:
@@ -141,6 +207,8 @@ def _console_level(args: argparse.Namespace) -> str:
 
 
 def _resolve_for_args(args: argparse.Namespace, command: str):
+    from_step3 = getattr(args, "from_step3_run", None) or getattr(args, "from_step3", None)
+    from_step4 = getattr(args, "from_step4_run", None) or getattr(args, "from_step4", None)
     return resolve_config(
         config_path=_config_path(args),
         command=command,
@@ -148,18 +216,35 @@ def _resolve_for_args(args: argparse.Namespace, command: str):
         set_overrides=_merged_sets(args),
         dry_run=_dry_run(args) or command == "show",
         run_id=getattr(args, "run_id", None),
-        from_step3=getattr(args, "from_step3", None),
-        from_step4=getattr(args, "from_step4", None),
+        from_step3=from_step3,
+        from_step4=from_step4,
         from_step5=getattr(args, "from_step5", None),
         eval_profile=getattr(args, "eval_profile", None),
         mode=getattr(args, "mode", None),
     )
 
 
+def _assert_step3_expected_profile(snapshot: dict[str, Any], expected: str | None) -> None:
+    expected_text = str(expected or "").strip()
+    if not expected_text:
+        return
+    actual = str(
+        (snapshot.get("task") or {}).get("task_profile_id")
+        or (snapshot.get("step3_task_profile") or {}).get("profile_id")
+        or ""
+    ).strip()
+    if actual != expected_text:
+        raise OneControlConfigError(f"expected {expected_text} but resolved {actual}")
+
+
+def _step3_expected_profile_arg(args: argparse.Namespace) -> str | None:
+    return str(getattr(args, "expect_profile", None) or getattr(args, "profile", None) or "").strip() or None
+
+
 def _run_resolved(cfg, snapshot: dict[str, Any], *, dry_run: bool, console_level: str = "summary") -> None:
     write_resolved_config(cfg, snapshot, dry_run=dry_run)
     if dry_run:
-        _print_stage_summary(snapshot)
+        _print_stage_summary(_display_snapshot(snapshot, verbose=console_level != "summary"))
         return
 
     from odcr_core.logging_meta import (
@@ -275,10 +360,97 @@ def cmd_preprocess(args: argparse.Namespace) -> None:
 
 
 def cmd_stage(args: argparse.Namespace, command: str) -> None:
-    cfg, sources, snapshot = _resolve_for_args(args, command)
+    if command == "step4" and getattr(args, "from_step3", None) and getattr(args, "from_step3_run", None):
+        raise OneControlConfigError("use only one of --from-step3 or --from-step3-run")
+    if command == "step4" and bool(getattr(args, "prepare_cache", False)) and bool(getattr(args, "preflight", False)):
+        raise OneControlConfigError("use only one of --prepare-cache or --preflight")
+    if command == "step5" and getattr(args, "from_step4", None) and getattr(args, "from_step4_run", None):
+        raise OneControlConfigError("use only one of --from-step4 or --from-step4-run")
+    if command == "step3" and bool(getattr(args, "accept_eval_only", False)):
+        run_id = str(getattr(args, "run_id", "") or "").strip()
+        if run_id in {"", "auto"}:
+            raise OneControlConfigError("--accept-eval-only requires an explicit --run-id")
+        from odcr_core.step3_eval_handoff import (
+            Step3EvalHandoffError,
+            accept_step3_eval_handoff,
+        )
+
+        try:
+            result = accept_step3_eval_handoff(
+                repo_root=REPO_ROOT,
+                task_id=int(args.task),
+                run_id=run_id,
+                dry_run=_dry_run(args),
+                require_test=True,
+            )
+        except Step3EvalHandoffError as exc:
+            raise OneControlConfigError(str(exc)) from exc
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+        return
+    resolve_args = args
+    if (
+        command == "step3"
+        and (bool(getattr(args, "cache_check", False)) or bool(getattr(args, "checkpoint_write_preflight", False)))
+    ) or (
+        command == "step4"
+        and (bool(getattr(args, "prepare_cache", False)) or bool(getattr(args, "preflight", False)))
+    ):
+        resolve_args = argparse.Namespace(**vars(args))
+        resolve_args.dry_run = True
+    cfg, sources, snapshot = _resolve_for_args(resolve_args, command)
+    if command == "step3":
+        _assert_step3_expected_profile(snapshot, _step3_expected_profile_arg(args))
+        if bool(getattr(args, "cache_check", False)):
+            from tools.odcr_step3_cache_check import run_cache_check
+
+            result = run_cache_check(
+                task_id=int(args.task),
+                expected_profile=_step3_expected_profile_arg(args),
+                expect_cache_hit=bool(getattr(args, "expect_cache_hit", False)),
+                allow_cold_build=bool(getattr(args, "allow_cold_build", False)),
+                expect_num_proc=getattr(args, "expect_num_proc", None),
+                resolved_snapshot=snapshot,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+            return
+        if bool(getattr(args, "checkpoint_write_preflight", False)):
+            from tools.odcr_step3_checkpoint_write_preflight import run_preflight
+
+            result = run_preflight(task_id=int(args.task))
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+            return
     if command == "show":
-        _print_stage_summary(snapshot)
-        _print_sources(sources)
+        verbose = bool(getattr(args, "verbose", False) or getattr(args, "debug", False))
+        _print_stage_summary(_display_snapshot(snapshot, verbose=verbose))
+        if verbose:
+            _print_source_table_payload(build_source_table_snapshot(snapshot))
+        else:
+            _print_source_table_payload(build_formal_source_table_snapshot(snapshot))
+        return
+    if command == "step4" and bool(getattr(args, "prepare_cache", False)):
+        from odcr_core.step4_runtime import prepare_step4_encoded_cache
+
+        result = prepare_step4_encoded_cache(
+            cfg,
+            dry_run=_dry_run(args),
+            build_allowed=not _dry_run(args),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+        return
+    if command == "step4" and bool(getattr(args, "preflight", False)):
+        from odcr_core.step4_runtime import run_step4_bounded_preflight
+
+        result = run_step4_bounded_preflight(
+            cfg,
+            max_samples=getattr(args, "max_samples", None),
+            validation_namespace=getattr(args, "validation_namespace", None),
+            preflight_mode=getattr(args, "preflight_mode", "preview"),
+            force_gpu_forward=bool(getattr(args, "force_gpu_forward", False)),
+            profile_utilization=bool(getattr(args, "profile_utilization", False)),
+            candidate_config=getattr(args, "candidate_config", None),
+            dry_run=_dry_run(args),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
         return
     _run_resolved(cfg, snapshot, dry_run=_dry_run(args), console_level=_console_level(args))
 
@@ -339,31 +511,108 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     checks: list[str] = []
     checks.append(f"config top-level blocks: {', '.join(top)}")
     doctor_snapshot: dict[str, Any] | None = None
+    step3_doctor_snapshot: dict[str, Any] | None = None
+    pending_upstreams: list[str] = []
     for command in ("step3", "step4", "step5", "eval"):
         ns = argparse.Namespace(**vars(args))
-        ns.task = int(raw.get("project", {}).get("default_task", 4))
+        ns.task = int(raw.get("project", {}).get("default_task", 2))
         ns.run_id = "auto"
-        ns.from_step3 = "1"
-        ns.from_step4 = "1_1"
-        ns.from_step5 = "1_1_1"
+        ns.from_step3 = None
+        ns.from_step3_run = None
+        ns.from_step4 = None
+        ns.from_step4_run = None
+        ns.from_step5 = "latest"
         ns.eval_profile = None
         ns.mode = "full"
-        _cfg, _sources, _snapshot = resolve_config(
-            config_path=cfg_path,
-            command=command,
-            task_id=ns.task,
-            set_overrides=_merged_sets(args),
-            dry_run=True,
-            run_id="auto",
-            from_step3="1",
-            from_step4="1_1",
-            from_step5="1_1_1",
-            eval_profile=None,
-            mode="full",
-        )
+        try:
+            _cfg, _sources, _snapshot = _resolve_for_args(ns, command)
+        except OneControlConfigError as exc:
+            if command in {"step5", "eval"}:
+                pending_upstreams.append(f"{command}: {exc}")
+                continue
+            raise
+        if command == "step3":
+            step3_doctor_snapshot = _snapshot
         if command == "step5":
             doctor_snapshot = _snapshot
-    checks.append("step3/step4/step5/eval resolve checks passed")
+    checks.append("step3/step4 resolve checks passed through unified upstream resolver")
+    if pending_upstreams:
+        checks.append("step5/eval resolver fail-fast pending upstream: " + " | ".join(pending_upstreams))
+    if step3_doctor_snapshot:
+        hw = step3_doctor_snapshot.get("hardware") or {}
+        train = step3_doctor_snapshot.get("train") or {}
+        sources = step3_doctor_snapshot.get("field_sources") or {}
+        print("Step3 runtime controls:")
+        print(f"  hardware_profile: {hw.get('profile')} (source: {sources.get('hardware')})")
+        print(
+            "  max_parallel_cpu: "
+            f"{hw.get('max_parallel_cpu')} (source: {sources.get('hardware.max_parallel_cpu')})"
+        )
+        print(f"  num_proc: {hw.get('num_proc')} (source: {sources.get('hardware.num_proc')})")
+        worker_budget = hw.get("worker_budget_formula") or {}
+        if worker_budget:
+            print(
+                "  worker_formula: "
+                "train=(workers_per_rank*ddp_world_size)+reserved_cpu="
+                f"{worker_budget.get('train_active_processes')} <= max_parallel_cpu "
+                f"{worker_budget.get('max_parallel_cpu')} "
+                f"(reserved_cpu={worker_budget.get('reserved_cpu')})"
+            )
+            print(
+                "  tokenization_formula: "
+                f"num_proc+reserved_cpu={worker_budget.get('tokenization_active_processes')} "
+                f"<= max_parallel_cpu {worker_budget.get('max_parallel_cpu')} "
+                f"(reserved_cpu={worker_budget.get('reserved_cpu')})"
+            )
+        print(
+            "  train_precision: "
+            f"{train.get('precision')} (source: {sources.get('train_precision')})"
+        )
+        print(
+            "  optimizer: "
+            f"{(step3_doctor_snapshot.get('step3_optimizer') or {}).get('name')} "
+            f"(source: {sources.get('step3_optimizer')})"
+        )
+        print(
+            "  tokenizer/evidence: "
+            f"{(step3_doctor_snapshot.get('step3_tokenizer') or {}).get('max_length')}/"
+            f"{(step3_doctor_snapshot.get('step3_evidence') or {}).get('max_evidence_length')} "
+            f"(source: {sources.get('step3_tokenizer')} / {sources.get('step3_evidence')})"
+        )
+        print(
+            "  scheduler: "
+            f"{(step3_doctor_snapshot.get('step3_scheduler') or {}).get('name')} "
+            f"warmup_ratio={(step3_doctor_snapshot.get('step3_scheduler') or {}).get('warmup_ratio')} "
+            f"min_lr_ratio={(step3_doctor_snapshot.get('step3_scheduler') or {}).get('min_lr_ratio')}"
+        )
+        print(
+            "  grad_norm/valid_batch: "
+            f"max_grad_norm={train.get('max_grad_norm')} "
+            f"valid={step3_doctor_snapshot.get('step3_eval')}"
+        )
+        print(
+            "  h2d: "
+            f"pin_memory={hw.get('pin_memory')} persistent_workers={hw.get('persistent_workers')} "
+            f"non_blocking_h2d={hw.get('non_blocking_h2d')}"
+        )
+        step3_ddp = step3_doctor_snapshot.get("step3_ddp") or {}
+        print("Step3 DDP policy:")
+        print(
+            "  find_unused_parameters: "
+            f"{step3_ddp.get('ddp_find_unused_parameters')} "
+            "(source: step3.ddp.find_unused_parameters)"
+        )
+        print(
+            "  static_graph: "
+            f"{step3_ddp.get('ddp_static_graph')} "
+            "(source: step3.ddp.static_graph)"
+        )
+        print(
+            "  graph_safety_preflight: "
+            f"{step3_ddp.get('ddp_graph_safety_preflight')} "
+            "(source: step3.ddp.graph_safety_preflight)"
+        )
+        checks.append("step3 max_parallel_cpu, train_precision, and ddp policy resolve from configs/odcr.yaml")
     if doctor_snapshot:
         roots = doctor_snapshot.get("roots") or {}
         models = doctor_snapshot.get("models") or {}
@@ -396,6 +645,34 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         )
         checks.append("roots/models/cache/offline/embed_dim resolve from configs/odcr.yaml")
         checks.append("step5 ddp find_unused policy resolve from configs/odcr.yaml")
+    print("Preprocess CPU/GPU pipeline controls:")
+    for letter in ("b", "c"):
+        pp_cfg = build_preprocess_config(
+            config_path=cfg_path,
+            stage_letter=letter,
+            set_overrides=_merged_sets(args),
+            dry_run=True,
+        )
+        controls = {
+            "workers": pp_cfg.runtime.workers,
+            "gpu_ids": list(pp_cfg.hardware.gpu_ids),
+            "tokenizer_parallelism_enabled": pp_cfg.tokenizer_parallelism_enabled,
+            "tokenizer_threads_per_worker": pp_cfg.tokenizer_threads_per_worker,
+            "tokenizer_total_threads": pp_cfg.tokenizer_total_threads,
+            "prefetch_batches": pp_cfg.prefetch_batches,
+            "pin_memory": pp_cfg.pin_memory,
+            "non_blocking_h2d": pp_cfg.non_blocking_h2d,
+            "async_prefetch_enabled": pp_cfg.async_prefetch_enabled,
+            "cpu_cores_reserved": pp_cfg.cpu_cores_reserved,
+            "cpu_cores_available": pp_cfg.cpu_cores_available,
+        }
+        if letter == "b":
+            controls["token_aware_batching_enabled"] = pp_cfg.token_aware_batching_enabled
+            controls["max_tokens_per_gpu_batch"] = pp_cfg.max_tokens_per_gpu_batch
+        else:
+            controls["scheduling_policy"] = pp_cfg.scheduling_policy
+        print(f"  preprocess_{letter}: {json.dumps(controls, sort_keys=True)}")
+    checks.append("preprocess_b/c CPU tokenizer, prefetch, H2D, and scheduling controls resolve from configs/odcr.yaml")
     retired = REPO_ROOT / "scripts" / "run_stage.sh"
     if retired.exists():
         raise OneControlConfigError("scripts/run_stage.sh must be absent; use ./odcr or python code/odcr.py")
@@ -464,6 +741,8 @@ def _resolve_tail_log_path(args: argparse.Namespace) -> Path:
         key, filename = "errors_log_path", "errors.log"
     elif bool(getattr(args, "full", False)):
         key, filename = "full_log_path", "full.log"
+    elif bool(getattr(args, "debug", False)):
+        key, filename = "debug_log_path", "debug.log"
     else:
         key, filename = "console_log_path", "console.log"
 
@@ -487,6 +766,22 @@ def cmd_tail(args: argparse.Namespace) -> None:
     print(f"==> {log_path} <==")
     for line in lines[-max(1, int(args.lines)) :]:
         print(line)
+
+
+def cmd_promote_upstream(args: argparse.Namespace) -> None:
+    from odcr_core.stage_promotion import StagePromotionError, promote_upstream
+
+    try:
+        result = promote_upstream(
+            repo_root=REPO_ROOT,
+            stage=str(args.stage),
+            task=int(args.task),
+            run_id=str(args.run_id),
+            dry_run=_dry_run(args),
+        )
+    except StagePromotionError as exc:
+        raise OneControlConfigError(str(exc)) from exc
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
 
 
 def maybe_daemonize(args: argparse.Namespace) -> None:
@@ -513,6 +808,24 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "pipeline":
             cmd_pipeline(args)
         elif args.command == "show":
+            if args.stage.startswith("preprocess_"):
+                letter = args.stage[-1]
+                config = build_preprocess_config(
+                    config_path=_config_path(args),
+                    stage_letter=letter,
+                    set_overrides=_merged_sets(args),
+                    dry_run=True,
+                )
+                _print_stage_summary(config.to_dict())
+                from odcr_core.preprocess_runtime import PreprocessRuntime
+
+                runtime = PreprocessRuntime(config)
+                print("Source table:")
+                for record in runtime._source_table_payload()["records"]:
+                    if record.get("value") is None:
+                        continue
+                    print(f"  {record['key']}: {record['source']}")
+                return 0
             cfg, sources, snapshot = resolve_config(
                 config_path=_config_path(args),
                 command=args.stage,
@@ -523,10 +836,16 @@ def main(argv: list[str] | None = None) -> int:
                 mode="full",
             )
             _ = cfg
-            _print_stage_summary(snapshot)
-            _print_sources(sources)
+            verbose = bool(getattr(args, "verbose", False) or getattr(args, "debug", False))
+            _print_stage_summary(_display_snapshot(snapshot, verbose=verbose))
+            if verbose:
+                _print_source_table_payload(build_source_table_snapshot(snapshot))
+            else:
+                _print_source_table_payload(build_formal_source_table_snapshot(snapshot))
         elif args.command == "doctor":
             cmd_doctor(args)
+        elif args.command == "promote-upstream":
+            cmd_promote_upstream(args)
         elif args.command == "tail":
             cmd_tail(args)
         else:

@@ -1,0 +1,29 @@
+{
+  "include": [
+    "code",
+    "test"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/.mypy_cache",
+    "**/.ruff_cache",
+    "**/.venv",
+    "**/venv",
+    ".codex",
+    ".cursor",
+    ".git",
+    ".vscode",
+    "AI_analysis",
+    "_archive",
+    "artifacts",
+    "cache",
+    "code1",
+    "data",
+    "merged",
+    "runs"
+  ],
+  "extraPaths": [
+    "code"
+  ]
+}

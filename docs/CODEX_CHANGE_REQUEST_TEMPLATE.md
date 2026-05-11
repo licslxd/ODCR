@@ -36,13 +36,18 @@ classification and impact rows before asking Codex to edit files.
 - Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`;
   must not create, kill, or switch tmux sessions; and must not manage GPU
   allocation.
-- The only exception is the controlled tmux GPU bridge
-  `python code/tools/odcr_tmux_gpu_bridge.py`. It may send exactly one
-  bridge-generated command to a user-created, already-entered, uniquely
-  validated GPU pane, and only for whitelist short validation scripts. This is
-  not arbitrary send-keys.
-- Controlled bridge outputs must be AI_analysis-only and must use
-  mode-specific adaptive timeout plus `stop_after_first_valid_result`.
+- GPU use is allowed by default for repo-local validation, probe, and bounded
+  runtime when the current pane is a user-created, already-entered, uniquely
+  validated GPU pane.
+- The controlled tmux GPU bridge `python code/tools/odcr_tmux_gpu_bridge.py`
+  may send exactly one bridge-generated command file to that pane. This is not
+  arbitrary send-keys and is no longer limited by a GPU whitelist hard blocker.
+- Controlled bridge outputs must stay under `AI_analysis/06_probe_evidence` or
+  `runs/step3_validation` unless a future request explicitly confirms a formal
+  run. The formal namespace guard remains mandatory.
+- post-edit full is not a GPU prerequisite; fast sanity and current-pane
+  validation are the GPU preflight, and runtime evidence takes priority over
+  static full-suite instability.
 - For `nvidia-smi`, `torch.cuda.is_available()`, preprocess_b, preprocess_c,
   BGE-large, short-window GPU probes, or CUDA admission checks, Codex may trust
   only the current tmux session's real-time CUDA environment. A normal admin
@@ -50,10 +55,8 @@ classification and impact rows before asking Codex to edit files.
   block a later user-entered GPU-node probe.
 - If current tmux CUDA is not visible, fail fast and ask the user to manually
   run `odcr-enter-gpu <JOBID>` in that same tmux, then rerun the probe.
-- Codex GPU validation is limited to <= 3 minutes of short probe, short
-  benchmark, command smoke, or quick parameter comparison. Do not run complete
-  preprocess_b/c, full stages, Step3/Step4/Step5, eval/rerank, or long
-  benchmarks unless a future request explicitly authorizes that real run.
+- Formal full train, complete preprocess_b/c, Step4/Step5/eval/rerank, and
+  downstream paper metrics still require explicit user authorization.
 - Do not allow preprocess_b/c to fall back silently to CPU. Formal GPU stages
   must fail fast before BGE-large load when CUDA is not visible.
 
@@ -100,11 +103,11 @@ preprocess_b, preprocess_c, BGE-large, or embedding/domain probes.
 | Admin tmux command | `tmux -L odcr_gpu new-session -A -s odcr` |
 | User GPU-node entry | User manually runs `odcr-enter-gpu <JOBID>` inside the same tmux |
 | Codex forbidden GPU-management commands | Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create, kill, or switch tmux |
-| Controlled bridge exception | `python code/tools/odcr_tmux_gpu_bridge.py` only; user-created, already-entered, uniquely validated GPU pane; whitelist short validation scripts only; not arbitrary send-keys |
-| Bridge output/timeout | AI_analysis-only outputs; mode-specific adaptive timeout; `stop_after_first_valid_result` |
+| Controlled bridge exception | `python code/tools/odcr_tmux_gpu_bridge.py`; user-created, already-entered, uniquely validated GPU pane; repo-local validation/probe/bounded runtime command files; not arbitrary send-keys |
+| Bridge output/timeout | `AI_analysis/06_probe_evidence` or `runs/step3_validation` by default; formal namespace guard required |
 | CUDA evidence source | Current tmux session real-time CUDA only; not admin shell or old probe output |
 | If CUDA is unavailable | Fail fast and ask the user to manually enter the GPU node in the same tmux, then rerun probe |
-| Short validation budget | <= 3 minutes; short probe/benchmark/command smoke/parameter comparison only |
+| Runtime-first policy | GPU use is allowed by default after fast sanity; post-edit full is not a GPU prerequisite |
 | Commands that require current tmux CUDA context | `nvidia-smi`, `torch.cuda.is_available()`, preprocess_b/c, BGE-large, short-window GPU probes, CUDA admission |
 | CPU fallback allowed | no, except explicit test-only debug probes |
 | Current tmux GPU visibility checked | yes/no/N/A |
@@ -167,15 +170,21 @@ runtime/audit artifacts first:
 `audit.log`, `AI_analysis/`, `AI_analysis/01_raw_logs/codex_hooks/`, `runs/`,
 `cache/`, `artifacts/`, `data/`, `merged/`, `__pycache__/`, `.pytest_cache/`,
 and common temporary/log/bytecode files such as `*.log` and `*.pyc` do not
-trigger heavy validation. If only ignored files changed, the hook skips the
-post-edit checker. If no current-session touched files are available, if the
+trigger heavy validation. If only ignored/audit-runtime files changed, the hook
+skips the post-edit checker with `post_edit_command=null`. If no
+current-session touched files are available, if the
 transcript is missing/parse-failed/empty, if only historical dirty workspace
 state exists, or if current-session files are unknown, the hook selects `skip`
 and does not call `odcr_post_edit_check.py`. Docs/governance hook changes use
-`governance-fast`; `all` is reserved for current-session multi-business-stage
-changes or `ODCR_HOOK_SCOPE=all`. Users can set `ODCR_HOOK_SCOPE=<scope>` to
-force a check. Automatic Stop hook checks use `--max-seconds 180` by default;
-manual deep checks may use `--max-seconds 900`. Successful Stop stdout is
+`governance-fast`; automatic Stop hook inference must not execute `scope: all`
+inside the 180-second wrapper path. If automatic inference or hook override
+resolves to `all`, the hook degrades to `governance-fast` and records
+`manual_followup_required=true` with
+`python code/tools/odcr_post_edit_check.py --scope all --max-seconds 900`.
+Manual users may still run that explicit `all` deep validation command.
+Automatic Stop hook child checks use `--max-seconds 120` by default under the
+180-second wrapper timeout; manual deep checks may use `--max-seconds 900`.
+Successful Stop stdout is
 JSON-only, while human logs and `runtime_last.json` are written under
 `AI_analysis/01_raw_logs/codex_hooks`. This does not require git commit; git
 hook / CI are optional insurance, not the primary workflow.

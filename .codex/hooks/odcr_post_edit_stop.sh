@@ -5,7 +5,8 @@ EXPECTED_REPO_ROOT="/public/home/zhangliml/lc/ODCR/ODCR-main"
 D4C_PYTHON="/public/home/zhangliml/miniconda3/envs/D4C/bin/python"
 LOG_DIR="$EXPECTED_REPO_ROOT/AI_analysis/01_raw_logs/codex_hooks"
 RUNTIME_SCHEMA_VERSION="odcr_codex_hook_runtime/2.2"
-DEFAULT_HOOK_MAX_SECONDS="180"
+DEFAULT_WRAPPER_TIMEOUT_SECONDS="180"
+DEFAULT_HOOK_CHILD_MAX_SECONDS="120"
 LAUNCH_CWD="$(pwd -P 2>/dev/null || pwd)"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
@@ -42,9 +43,12 @@ write_launcher_runtime() {
   local selected_python="${3:-}"
   local selected_version="${4:-}"
   local post_edit_command="${5:-}"
-  local max_seconds="${ODCR_HOOK_MAX_SECONDS:-$DEFAULT_HOOK_MAX_SECONDS}"
+  local max_seconds="${ODCR_HOOK_CHILD_MAX_SECONDS:-${ODCR_HOOK_MAX_SECONDS:-$DEFAULT_HOOK_CHILD_MAX_SECONDS}}"
   if ! [[ "$max_seconds" =~ ^[0-9]+$ ]]; then
-    max_seconds="$DEFAULT_HOOK_MAX_SECONDS"
+    max_seconds="$DEFAULT_HOOK_CHILD_MAX_SECONDS"
+  fi
+  if (( max_seconds >= DEFAULT_WRAPPER_TIMEOUT_SECONDS )); then
+    max_seconds="$DEFAULT_HOOK_CHILD_MAX_SECONDS"
   fi
   mkdir -p "$LOG_DIR"
   {
@@ -81,9 +85,18 @@ write_launcher_runtime() {
     printf '  "post_edit_command": null,\n'
     printf '  "post_edit_returncode": %s,\n' "$post_edit_returncode"
     printf '  "max_seconds": %s,\n' "$max_seconds"
+    printf '  "child_timeout_seconds": %s,\n' "$max_seconds"
+    printf '  "wrapper_timeout_seconds": %s,\n' "$DEFAULT_WRAPPER_TIMEOUT_SECONDS"
     printf '  "failure_stage": "%s",\n' "$(json_escape "$failure_stage")"
+    printf '  "timed_out": false,\n'
     printf '  "stdout_path": "%s",\n' "$(json_escape "$STDOUT_PATH")"
     printf '  "stderr_path": "%s",\n' "$(json_escape "$STDERR_PATH")"
+    printf '  "started_at": "%s",\n' "$(date -u +"%Y-%m-%dT%H:%M:%S%z")"
+    printf '  "post_edit_started_at": null,\n'
+    printf '  "finished_at": "%s",\n' "$(date -u +"%Y-%m-%dT%H:%M:%S%z")"
+    printf '  "original_inferred_scope": null,\n'
+    printf '  "manual_followup_required": false,\n'
+    printf '  "manual_followup_command": null,\n'
     printf '  "timestamp": "%s",\n' "$(json_escape "$TIMESTAMP")"
     printf '  "candidates": "%s"\n' "$(json_escape "${CANDIDATES_TEXT:-}")"
     printf '}\n'

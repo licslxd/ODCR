@@ -167,7 +167,9 @@ Every new public parameter must go through the One-Control flow:
 Batch semantics are fixed:
 
 ```text
-batch_size == micro_batch_size * ddp_world_size * grad_accum
+global_batch_size = per_gpu_batch_size * ddp_world_size
 ```
 
-where `batch_size` is the effective global train batch.
+where `global_batch_size` is the effective optimizer-step batch and
+`per_gpu_batch_size` is the per-rank forward/backward batch. Gradient
+accumulation is retired from active ODCR.

@@ -7,7 +7,9 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from odcr_core.artifacts import ensure_step5_csv_symlink
@@ -15,11 +17,12 @@ from odcr_core.dispatch import TORCHRUN_STEP3_SCRIPT, TORCHRUN_STEP4_SCRIPT, TOR
 from odcr_core.logging_meta import (
     append_debug_log,
     append_error_log,
+    append_full_log,
     emit_console_lines,
     normalize_console_level,
     run_log_paths,
 )
-from odcr_core.manifests import build_run_manifest, write_run_manifest_json
+from odcr_core.manifests import build_run_manifest, write_run_manifest_json, write_training_runtime_config_artifact
 from odcr_core import path_layout
 
 ResolvedConfig = Any
@@ -97,6 +100,8 @@ def _odcr_layout_env(cfg: ResolvedConfig) -> dict[str, str]:
         "ODCR_LOG_CONSOLE": "0",
         "ODCR_RESOLVED_DATA_DIR": str(Path(cfg.data_dir).resolve()),
         "ODCR_RESOLVED_MERGED_DIR": str(Path(cfg.merged_dir).resolve()),
+        "ODCR_RESOLVED_RUNS_DIR": str(Path(cfg.runs_dir).resolve()),
+        "ODCR_RESOLVED_CACHE_DIR": str(Path(cfg.cache_dir).resolve()),
         "ODCR_RESOLVED_MODELS_DIR": str(Path(cfg.models_dir).resolve()),
         "ODCR_RESOLVED_STEP5_TEXT_MODEL": str(Path(cfg.step5_text_model).resolve()),
         "ODCR_RESOLVED_SENTENCE_EMBED_MODEL": str(Path(cfg.sentence_embed_model).resolve()),
@@ -105,10 +110,16 @@ def _odcr_layout_env(cfg: ResolvedConfig) -> dict[str, str]:
     _tp = getattr(cfg, "effective_training_payload_json", "") or ""
     if _tp.strip():
         out["ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON"] = _tp
+    _fs = (getattr(cfg, "config_field_sources_json", "") or "").strip()
+    if _fs:
+        out["ODCR_CONFIG_FIELD_SOURCES_JSON"] = _fs
     if cfg.eval_run_dir:
         out["ODCR_EVAL_RUN_DIR"] = str(Path(cfg.eval_run_dir).resolve())
     if cfg.command == "step4" and cfg.step3_checkpoint_dir:
         out["ODCR_STEP3_RUN_DIR"] = str(Path(cfg.step3_checkpoint_dir).resolve())
+    _ur = (getattr(cfg, "upstream_resolution_json", "") or "").strip()
+    if _ur:
+        out["ODCR_UPSTREAM_RESOLUTION_JSON"] = _ur
     _tfp = (getattr(cfg, "training_semantic_fingerprint", "") or "").strip()
     if _tfp:
         out["ODCR_TRAINING_SEMANTIC_FINGERPRINT"] = _tfp
@@ -132,7 +143,9 @@ def _odcr_layout_env(cfg: ResolvedConfig) -> dict[str, str]:
         out["ODCR_LAUNCHER_ENV_EFFECTIVE_JSON"] = _le
     if cfg.command == "step3":
         out["ODCR_TRAINING_STAGE"] = "step3"
-        out["ODCR_RUNTIME_PRECISION_MODE"] = "fp32"
+        out["ODCR_STEP3_TOKENIZER_CACHE_STARTUP_JSON"] = str(
+            (Path(cfg.manifest_dir).resolve() / "step3_tokenizer_cache_startup.json")
+        )
     return out
 
 
@@ -205,8 +218,9 @@ def _record_child_output(cfg: ResolvedConfig, line: str, *, console_level: str) 
     if not line:
         return
     append_debug_log(cfg, [line])
+    append_full_log(cfg, [f"[raw child] {line}"])
     if _line_is_error_or_warning(line):
-        append_error_log(cfg, [line])
+        append_error_log(cfg, [f"[child stream] {line}"])
     level = normalize_console_level(console_level)
     if level in {"verbose", "debug"} or _line_is_error_or_warning(line) or _line_is_console_summary(line):
         emit_console_lines(cfg, [line])
@@ -244,6 +258,7 @@ def _run_torchrun(
         ),
     ]
     append_debug_log(cfg, launcher_lines)
+    append_full_log(cfg, ["========== LAUNCHER COMMAND ==========", *launcher_lines])
     if normalize_console_level(console_level) in {"verbose", "debug"}:
         emit_console_lines(cfg, launcher_lines)
 
@@ -263,6 +278,7 @@ def _run_torchrun(
     returncode = proc.wait()
     elapsed = time.monotonic() - started
     append_debug_log(cfg, [f"[odcr launcher] returncode={returncode} elapsed={elapsed:.3f}s"])
+    append_full_log(cfg, [f"[odcr launcher] returncode={returncode} elapsed={elapsed:.3f}s"])
     if returncode != 0:
         append_error_log(cfg, [f"[odcr launcher] failed returncode={returncode} elapsed={elapsed:.3f}s"])
         raise subprocess.CalledProcessError(returncode, cmd)
@@ -272,6 +288,100 @@ def _full_log_file(cfg: ResolvedConfig) -> str:
     return str(run_log_paths(cfg)["full"])
 
 
+@contextmanager
+def _patched_env(updates: dict[str, str]):
+    old: dict[str, str | None] = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _write_step3_parent_initial_runtime_config(cfg: ResolvedConfig) -> None:
+    hardware_profile = json.loads(cfg.hardware_profile_json or "{}")
+    worker_budget = hardware_profile.get("worker_budget_formula") if isinstance(hardware_profile, dict) else {}
+    reserved_cpu = int(worker_budget.get("reserved_cpu", 2)) if isinstance(worker_budget, dict) else 2
+    payload = {
+        "phase": "parent_pre_ddp_initial",
+        "status": "initial",
+        "stage": "step3",
+        "task_id": int(cfg.task_id),
+        "source_domain": str(cfg.auxiliary),
+        "target_domain": str(cfg.target),
+        "training_loop_started": False,
+        "checkpoint_created": False,
+        "cache_status": "not_started",
+        "num_proc": int(cfg.num_proc),
+        "max_parallel_cpu": int(getattr(cfg, "max_parallel_cpu", 0) or 0),
+        "reserved_cpu": reserved_cpu,
+        "tokenization_formula": (
+            f"num_proc({int(cfg.num_proc)}) + reserved_cpu({reserved_cpu}) "
+            f"<= max_parallel_cpu({int(getattr(cfg, 'max_parallel_cpu', 0) or 0)})"
+        ),
+        "worker_formula": (
+            f"dataloader_num_workers_train({int(getattr(cfg, 'dataloader_num_workers_train', 0) or 0)}) "
+            f"* ddp_world_size({int(getattr(cfg, 'ddp_world_size', 1) or 1)}) + reserved_cpu({reserved_cpu}) "
+            f"<= max_parallel_cpu({int(getattr(cfg, 'max_parallel_cpu', 0) or 0)})"
+        ),
+        "omp_num_threads": int(cfg.omp_num_threads),
+        "mkl_num_threads": int(cfg.mkl_num_threads),
+        "tokenizers_parallelism": bool(cfg.tokenizers_parallelism),
+        "hardware_profile": hardware_profile,
+        "thread_env_requested": json.loads(getattr(cfg, "thread_env_requested_json", "") or "{}"),
+        "thread_env_effective": json.loads(getattr(cfg, "thread_env_effective_json", "") or "{}"),
+        "launcher_env_requested": json.loads(getattr(cfg, "launcher_env_requested_json", "") or "{}"),
+        "launcher_env_effective": json.loads(getattr(cfg, "launcher_env_effective_json", "") or "{}"),
+        "training_semantic_fingerprint": getattr(cfg, "training_semantic_fingerprint", "") or None,
+        "generation_semantic_fingerprint": getattr(cfg, "generation_semantic_fingerprint", "") or None,
+        "runtime_diagnostics_fingerprint": getattr(cfg, "runtime_diagnostics_fingerprint", "") or None,
+    }
+    write_training_runtime_config_artifact(cfg.manifest_dir, payload)
+
+
+def _ensure_step3_pre_ddp_tokenizer_cache(cfg: ResolvedConfig, *, log_file: str, model_path: str) -> None:
+    from executors.step3_train_core import ensure_step3_tokenizer_cache_ready_pre_ddp
+    from train_logging import LOGGER_NAME, setup_train_logging
+
+    env = dict(_odcr_layout_env(cfg))
+    env.update(_torchrun_hardware_env(cfg))
+    with _patched_env(env):
+        _write_step3_parent_initial_runtime_config(cfg)
+        setup_train_logging(
+            log_file=log_file,
+            task_idx=int(cfg.task_id),
+            rank=0,
+            world_size=1,
+            run_id=str(cfg.run_name or ""),
+        )
+        args = SimpleNamespace(
+            auxiliary=cfg.auxiliary,
+            target=cfg.target,
+            num_proc=cfg.num_proc,
+            seed=cfg.seed,
+            checkpoint_metric="valid_loss",
+            log_file=log_file,
+            save_file=model_path,
+        )
+        try:
+            ensure_step3_tokenizer_cache_ready_pre_ddp(
+                args,
+                rank="parent",
+                world_size=int(cfg.ddp_world_size),
+                build_allowed=True,
+                log_tokenize=True,
+                show_datasets_progress=True,
+            )
+        finally:
+            import logging
+
+            logging.getLogger(LOGGER_NAME).handlers.clear()
+
+
 def _run_step3_train(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
     assert cfg.run_name is not None
     Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -279,6 +389,7 @@ def _run_step3_train(cfg: ResolvedConfig, *, console_level: str = "summary") -> 
     log_file = _full_log_file(cfg)
     model_path = str(path_layout.best_model_path(Path(cfg.checkpoint_dir)))
     Path(model_path).parent.mkdir(parents=True, exist_ok=True)
+    _ensure_step3_pre_ddp_tokenizer_cache(cfg, log_file=log_file, model_path=model_path)
 
     py_args = [
         "train",
@@ -312,7 +423,7 @@ def _run_step3_eval(cfg: ResolvedConfig, *, console_level: str = "summary") -> N
         "--target",
         cfg.target,
         "--batch-size",
-        str(cfg.train_batch_size),
+        str(cfg.valid_batch_size),
         "--num-proc",
         str(cfg.num_proc),
         "--seed",
@@ -321,6 +432,10 @@ def _run_step3_eval(cfg: ResolvedConfig, *, console_level: str = "summary") -> N
         log_file,
         "--save_file",
         model_path,
+        "--eval-protocol",
+        str(getattr(cfg, "step3_eval_protocol", "minimal_eval") or "minimal_eval"),
+        "--eval-split",
+        str(getattr(cfg, "step3_eval_split", "valid") or "valid"),
     ]
     _run_torchrun(cfg, env_extra={}, script=TORCHRUN_STEP3_SCRIPT, py_args=py_args, console_level=console_level)
 
@@ -354,12 +469,21 @@ def run_step4(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
 
     g_eval = int(cfg.global_eval_batch_size)
     e_per_gpu = int(cfg.eval_per_gpu_batch_size)
+    from odcr_core.step4_runtime import (
+        prepare_step4_encoded_cache,
+        reject_step4_formal_env_overrides,
+        step4_runtime_env,
+    )
+
+    reject_step4_formal_env_overrides(mode="formal")
+    prepare_step4_encoded_cache(cfg, dry_run=False, build_allowed=True)
     env_extra = dict(_odcr_profile_env(cfg))
     # Step4 导出到 numpy 路径不接受 bf16，强制用 fp32。
     env_extra["ODCR_RUNTIME_PRECISION_MODE"] = "fp32"
     env_extra["ODCR_GLOBAL_EVAL_BATCH_SIZE"] = str(g_eval)
     env_extra["ODCR_EVAL_PER_GPU_BATCH_SIZE"] = str(e_per_gpu)
     env_extra["ODCR_STEP4_RCR_CONFIG_JSON"] = str(getattr(cfg, "step4_rcr_config_json", "") or "")
+    env_extra.update(step4_runtime_env(cfg, mode="formal"))
     py_args = [
         "--task",
         str(cfg.task_id),
@@ -416,12 +540,27 @@ def _odcr_profile_env(cfg: ResolvedConfig) -> dict[str, str]:
     return out
 
 
+def _runtime_precision_mode(cfg: ResolvedConfig) -> str:
+    precision = str(getattr(cfg, "train_precision", "") or "").strip().lower()
+    if precision not in {"bf16", "fp16", "fp32"}:
+        raise RuntimeError(
+            "ResolvedConfig.train_precision must be one of bf16/fp16/fp32 before torchrun launch; "
+            "use configs/odcr.yaml stage.train.backend.train_precision."
+        )
+    return precision
+
+
 def _torchrun_hardware_env(cfg: ResolvedConfig) -> dict[str, str]:
-    """显式注入子进程：hardware 语义切片 JSON + stem + 线程/CUDA 等 launcher env（不经由训练语义 JSON）。"""
+    """显式注入子进程：hardware JSON/stem、runtime precision transport、线程/CUDA launcher env。"""
     out: dict[str, str] = {
         "ODCR_HARDWARE_PROFILE_JSON": cfg.hardware_profile_json,
         "ODCR_HARDWARE_PRESET": str(cfg.hardware_preset_id),
-        "ODCR_RUNTIME_PRECISION_MODE": "bf16",
+        "ODCR_RUNTIME_PRECISION_MODE": _runtime_precision_mode(cfg),
+        "ODCR_RUNTIME_ALLOW_TF32": "1" if bool(getattr(cfg, "allow_tf32", False)) else "0",
+        "ODCR_RUNTIME_AMP_AUTOCAST": "1" if bool(getattr(cfg, "amp_autocast", True)) else "0",
+        "ODCR_RUNTIME_GRAD_SCALER": "1" if bool(getattr(cfg, "grad_scaler", False)) else "0",
+        "ODCR_STEP3_TOKENIZER_MAX_LENGTH": str(int(getattr(cfg, "tokenizer_max_length", 0) or 0)),
+        "ODCR_STEP3_EVIDENCE_MAX_LENGTH": str(int(getattr(cfg, "evidence_max_length", 0) or 0)),
         "OMP_NUM_THREADS": str(int(cfg.omp_num_threads)),
         "MKL_NUM_THREADS": str(int(cfg.mkl_num_threads)),
         "TOKENIZERS_PARALLELISM": "true" if cfg.tokenizers_parallelism else "false",

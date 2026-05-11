@@ -16,7 +16,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -46,14 +46,39 @@ GUARDRAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("lineage-cache", ("R031", "R032", "R033", "R034", "R035", "R041")),
     ("ddp-loss", ("R036", "R037", "R038", "R040")),
     ("legacy-cleanup", ("R001", "R004", "R095")),
-    ("step3-mainline", ("R010", "R011", "R029")),
+    (
+        "step3-mainline",
+        (
+            "R010",
+            "R011",
+            "R029",
+            "R097",
+            "R099",
+            "R100",
+            "R101",
+            "R102",
+            "R103",
+            "R104",
+            "R105",
+            "R106",
+            "R107",
+            "R108",
+            "R109",
+            "R110",
+            "R111",
+        ),
+    ),
+    ("stage-truth-upstream", ("R112", "R113")),
+    ("step4-runtime-preflight", ("R114", "R115")),
+    ("step4-evidence-level", ("R116",)),
+    ("no-accum-architecture", ("R117",)),
     ("step4-rcr", ("R012", "R013", "R014", "R015")),
     ("step5-innovation", ("R016", "R017", "R018", "R019", "R020", "R021", "R022", "R023", "R030", "R039")),
     ("code-hygiene", ("R007",)),
     ("evolution-protocol", ("R042", "R043", "R044", "R045", "R046", "R047", "R048", "R049", "R050", "R096")),
     ("post-edit-workflow", ("R051", "R052", "R053", "R054", "R055", "R056", "R089")),
     ("run-summary-logging", ("R057", "R058", "R059", "R090", "R091")),
-    ("p0-cache-hard-gates", ("R092", "R093", "R094")),
+    ("p0-cache-hard-gates", ("R092", "R093", "R094", "R098")),
     ("logging-console-file", ("R060", "R061", "R062")),
     ("logging-artifact-evolution", ("R068", "R069", "R070", "R071", "R072")),
     ("logging-directory-boundaries", ("R078", "R079", "R080", "R081", "R082", "R083")),
@@ -163,7 +188,9 @@ EVOLUTION_ALLOWED_ARG_DEFAULT_FLAGS = {
     "--device",
     "--from",
     "--from-step3",
+    "--from-step3-run",
     "--from-step4",
+    "--from-step4-run",
     "--from-step5",
     "--generate-max-samples",
     "--generate-temperature",
@@ -173,6 +200,7 @@ EVOLUTION_ALLOWED_ARG_DEFAULT_FLAGS = {
     "--label-smoothing",
     "--lines",
     "--max-explanation-length",
+    "--max-samples",
     "--mode",
     "--nlayers",
     "--poll-profile",
@@ -183,6 +211,10 @@ EVOLUTION_ALLOWED_ARG_DEFAULT_FLAGS = {
     "--to",
     "--verify-sample-size",
     "--verify-seed",
+    "--prepare-cache",
+    "--preflight",
+    "--preflight-mode",
+    "--validation-namespace",
     "--verbose",
     "--debug",
     "--decode-strategy",
@@ -193,6 +225,7 @@ EVOLUTION_ALLOWED_ARG_DEFAULT_FLAGS = {
 EVOLUTION_ALLOWED_ENV_READS = {
     "CUDA_VISIBLE_DEVICES",
     "ODCR_CONSOLE_LEVEL",
+    "ODCR_CONFIG_FIELD_SOURCES_JSON",
     "ODCR_DAEMON_CHILD",
     "ODCR_DDP_EPOCH_END_BARRIER",
     "ODCR_DDP_FAST",
@@ -226,6 +259,7 @@ EVOLUTION_ALLOWED_ENV_READS = {
     "ODCR_LOG_STEP_JSON",
     "ODCR_LOG_STEP_LOSS_PARTS",
     "ODCR_LOG_STRUCTURED_CONSOLE",
+    "LOCAL_RANK",
     "ODCR_MANIFEST_CLI_INVOCATION",
     "ODCR_MANIFEST_DIR",
     "ODCR_MATRIX_CONTEXT_JSON",
@@ -240,7 +274,14 @@ EVOLUTION_ALLOWED_ENV_READS = {
     "ODCR_RESOLVED_EMBED_DIM",
     "ODCR_ROOT",
     "ODCR_RUNTIME_DIAGNOSTICS_FINGERPRINT",
+    "ODCR_RUNTIME_ALLOW_TF32",
+    "ODCR_RUNTIME_AMP_AUTOCAST",
+    "ODCR_RUNTIME_GRAD_SCALER",
     "ODCR_RUNTIME_PRECISION_MODE",
+    "ODCR_THREAD_ENV_EFFECTIVE_JSON",
+    "ODCR_STEP3_TOKENIZER_MAX_LENGTH",
+    "ODCR_STEP3_EVIDENCE_MAX_LENGTH",
+    "ODCR_STEP3_TOKENIZER_CACHE_STARTUP_JSON",
     "ODCR_STAGE_RUN_DIR",
     "ODCR_STEP3_RUN_DIR",
     "ODCR_STEP4_DECODE_CHUNK",
@@ -249,11 +290,14 @@ EVOLUTION_ALLOWED_ENV_READS = {
     "ODCR_STEP4_PARTIAL_FORMAT",
     "ODCR_STEP4_PERF_LOG_INTERVAL",
     "ODCR_STEP4_RCR_CONFIG_JSON",
+    "ODCR_STEP4_RUNTIME_CONFIG_JSON",
+    "ODCR_STEP4_MODE",
     "ODCR_STEP5_EMBEDDED_EVAL_LOG",
     "ODCR_STEP5_INIT_FLAN_STUB",
     "ODCR_SUMMARY_LOG",
     "ODCR_TRAINING_SEMANTIC_FINGERPRINT",
     "ODCR_TRAINING_STAGE",
+    "ODCR_UPSTREAM_RESOLUTION_JSON",
     "RANK",
     "RUNNING_CPU_COUNT",
     "TOKENIZERS_PARALLELISM",
@@ -364,6 +408,7 @@ EVOLUTION_INTERNAL_FIELD_ALLOWLIST = {
     "rule_v2_score_breakdown",
     "template_downweighted",
     "noisy_tail_downweighted",
+    "training_runtime_config_fingerprint",
 }
 
 
@@ -436,6 +481,14 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+def _json_load(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _text_lines(path: Path) -> list[str]:
     return _read(path).splitlines()
 
@@ -449,6 +502,8 @@ def _iter_repo_files(repo_root: Path, suffixes: tuple[str, ...] | None = None) -
         "data",
         "merged",
         "runs",
+        "cache",
+        "AI_analysis",
         "artifacts",
     }
     stack = [repo_root]
@@ -1234,9 +1289,14 @@ def _check_batch_formula_validation(repo_root: Path) -> RuleResult:
         repo_root / "code" / "odcr_core" / "config_resolver.py",
     ]
     text = "\n".join(_read(path) for path in paths if path.is_file())
-    required_terms = ("batch_size", "micro_batch_size", "grad_accum", "ddp_world_size")
+    required_terms = ("batch_size", "per_gpu_batch_size", "ddp_world_size", "odcr_no_accum/1")
     has_terms = all(term in text for term in required_terms)
-    has_formula = "_validate_train_batch" in text and "micro * int(ddp_world_size) * accum" in text
+    has_formula = (
+        "_validate_train_batch" in text
+        and "per_gpu * int(ddp_world_size)" in text
+        and "global_batch_size = per_gpu_batch_size * ddp_world_size" in text
+        and "_validate_config_shape" in text
+    )
     has_failfast = "OneControlConfigError" in text and "batch formula failed" in text
     if not (has_terms and has_formula and has_failfast):
         result.fail(
@@ -1245,13 +1305,13 @@ def _check_batch_formula_validation(repo_root: Path) -> RuleResult:
                 Finding(
                     "code/odcr_core/config_resolver.py",
                     1,
-                    "batch_size == micro_batch_size * ddp_world_size * grad_accum",
-                    "Validate the formula in resolver/schema and fail with OneControlConfigError.",
+                    "global_batch_size = per_gpu_batch_size * ddp_world_size",
+                    "Validate no-accum formula in resolver/schema and fail with OneControlConfigError.",
                 )
             ],
         )
     else:
-        result.summary = "Resolver validates batch_size == micro_batch_size * ddp_world_size * grad_accum."
+        result.summary = "Resolver validates ODCR no-accum per-GPU/global batch semantics."
     return result
 
 
@@ -2138,6 +2198,8 @@ def _check_child_argparse_payload_transport(repo_root: Path) -> RuleResult:
     result = RuleResult("R026", "child argparse must not override effective payload")
     cfg_py = _read(repo_root / "code" / "config.py")
     runners = _read(repo_root / "code" / "odcr_core" / "runners.py")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    one_control_yaml = _read(repo_root / "configs" / "odcr.yaml")
     step4_entry = _read(repo_root / "code" / "executors" / "step4_entry.py")
     step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
     compute_embeddings = _read(repo_root / "code" / "compute_embeddings.py")
@@ -2160,6 +2222,89 @@ def _check_child_argparse_payload_transport(repo_root: Path) -> RuleResult:
                 "Compare child CLI training args against ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON and fail on conflict.",
             )
         )
+    hardware_required = (
+        "max_parallel_cpu",
+        "HARDWARE_PROFILE_REQUIRED_KEYS",
+        "hardware.profiles.{stem}.max_parallel_cpu",
+        "train_precision_source",
+        "runtime_precision_mode",
+    )
+    missing_resolver = [term for term in hardware_required if term not in resolver]
+    if missing_resolver:
+        findings.append(
+            Finding(
+                "code/odcr_core/config_resolver.py",
+                1,
+                "missing: " + ", ".join(missing_resolver),
+                "Step3 child hardware and precision must resolve through YAML/schema/resolver/source table.",
+            )
+        )
+    if "max_parallel_cpu:" not in one_control_yaml or "train_precision: bf16" not in one_control_yaml:
+        findings.append(
+            Finding(
+                "configs/odcr.yaml",
+                1,
+                "missing max_parallel_cpu or step3 train_precision",
+                "Default Step3 hardware and precision controls must be explicit One-Control YAML values.",
+            )
+        )
+    default_hw_required = (
+        "max_parallel_cpu: 12",
+        "dataloader_num_workers_train: 4",
+        "dataloader_num_workers_valid: 2",
+        "dataloader_num_workers_test: 2",
+        "pin_memory: true",
+        "persistent_workers: true",
+        "non_blocking_h2d: true",
+    )
+    for term in default_hw_required:
+        if term not in one_control_yaml:
+            findings.append(
+                Finding(
+                    "configs/odcr.yaml",
+                    1,
+                    "missing: " + term,
+                    "Current default hardware profile must match the user-confirmed 12 CPU core Slurm allocation.",
+                )
+            )
+    if "max_parallel_cpu: 16" in one_control_yaml:
+        findings.append(
+            Finding(
+                "configs/odcr.yaml",
+                1,
+                "max_parallel_cpu: 16",
+                "Current default hardware truth is 12 cores, not 16.",
+            )
+        )
+    for term in (
+        "Step3 dataloader workers are per rank",
+        "tokenization_active_processes",
+        "reserved_cpu",
+        "worker_budget_formula",
+    ):
+        if term not in resolver:
+            findings.append(
+                Finding(
+                    "code/odcr_core/config_resolver.py",
+                    1,
+                    "missing: " + term,
+                    "Resolver must reject Step3 dataloader/tokenizer CPU worker oversubscription.",
+                )
+            )
+    hardcoded_precision_terms = (
+        'out["ODCR_RUNTIME_PRECISION_MODE"] = "fp32"',
+        '"ODCR_RUNTIME_PRECISION_MODE": "bf16"',
+    )
+    for term in hardcoded_precision_terms:
+        if term in runners:
+            findings.append(
+                Finding(
+                    "code/odcr_core/runners.py",
+                    1,
+                    term,
+                    "Runtime precision transport must use ResolvedConfig.train_precision, not runner/hardware constants.",
+                )
+            )
     for banned in ('"--epochs"', '"--learning_rate"', '"--coef"', '"--eta"'):
         if banned in runners:
             findings.append(
@@ -2203,6 +2348,16 @@ def _check_child_argparse_payload_transport(repo_root: Path) -> RuleResult:
             "--embed-batch-size is required from the resolved preprocess_b payload.",
             "--read-chunk-rows is required from the resolved preprocess_b payload.",
             "--group-shard-size is required from the resolved preprocess_b payload.",
+            "--tokenizer-parallelism/--no-tokenizer-parallelism",
+            "--tokenizer-threads-per-worker",
+            "--tokenizer-total-threads",
+            "--prefetch-batches",
+            "--pin-memory/--no-pin-memory",
+            "--non-blocking-h2d/--no-non-blocking-h2d",
+            "--async-prefetch/--no-async-prefetch",
+            "--token-aware-batching/--no-token-aware-batching",
+            "--cpu-cores-reserved",
+            "--cpu-cores-available",
             "--grouped-text-cache/--no-grouped-text-cache is required from the resolved preprocess_b payload.",
             "--grouped-text-cache-dir is required from the resolved preprocess_b payload.",
             "--grouped-text-cache-version is required from the resolved preprocess_b payload.",
@@ -2214,6 +2369,15 @@ def _check_child_argparse_payload_transport(repo_root: Path) -> RuleResult:
         "code/infer_domain_semantics.py": (
             "must be launched with the resolved preprocess payload from ./odcr",
             "--chunk-batch-size is required from the resolved preprocess_c payload.",
+            "--tokenizer-parallelism/--no-tokenizer-parallelism",
+            "--tokenizer-threads-per-worker",
+            "--tokenizer-total-threads",
+            "--prefetch-batches",
+            "--pin-memory/--no-pin-memory",
+            "--non-blocking-h2d/--no-non-blocking-h2d",
+            "--async-prefetch/--no-async-prefetch",
+            "--cpu-cores-reserved",
+            "--cpu-cores-available",
             "--token-window-cache/--no-token-window-cache",
             "--token-window-cache-dir is required from the resolved preprocess_c payload.",
             "--token-window-cache-version is required from the resolved preprocess_c payload.",
@@ -2419,9 +2583,12 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
     resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
     cfg_py = _read(repo_root / "code" / "config.py")
     engine = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    probe = _read(repo_root / "code" / "tools" / "odcr_step3_real_data_probe.py")
     required = {
         "configs/odcr.yaml": (
             "structured_losses:",
+            "loss_semantics:",
+            "ddp:",
             "orthogonal:",
             "content_alignment_weight:",
             "shared_prototype_weight:",
@@ -2430,17 +2597,30 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
         ),
         "code/odcr_core/config_resolver.py": (
             "_resolve_step3_structured_losses_config",
+            "_resolve_step3_loss_semantics_config",
+            "_resolve_step3_ddp_config",
             "step3_structured_losses",
+            "step3_loss_semantics",
+            "step3_ddp",
             "step3.structured_losses",
         ),
         "code/config.py": (
             "step3_structured_loss_weights_json",
+            "step3_loss_semantics_json",
+            "ddp_graph_safety_preflight",
             "step3.structured_losses",
         ),
         "code/executors/step3_train_core.py": (
             "Step3StructuredLossWeights",
             "step3_structured_loss_weights_from_config",
-            "compose_step3_structured_loss",
+            "Step3ForwardOutput",
+            "Step3LossBundle",
+            "compose_step3_loss_from_forward_output",
+        ),
+        "code/tools/odcr_step3_real_data_probe.py": (
+            "compose_step3_loss_from_forward_output",
+            "validate_step3_graph_safety_preflight",
+            "profile_domain_artifacts",
         ),
     }
     texts = {
@@ -2448,6 +2628,7 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
         "code/odcr_core/config_resolver.py": resolver,
         "code/config.py": cfg_py,
         "code/executors/step3_train_core.py": engine,
+        "code/tools/odcr_step3_real_data_probe.py": probe,
     }
     findings: list[Finding] = []
     for rel, terms in required.items():
@@ -2479,10 +2660,158 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
                     "Do not keep active Step3 structured loss literals in the train loop.",
                 )
             )
+    banned_side_channels = {
+        "code/executors/step3_train_core.py": (
+            "_model.last_odcr_latents",
+            "ddp_model.module",
+            "domain_style_proto.weight",
+            "shared_global_proto",
+            "nn.Parameter(user_content_profiles",
+            "nn.Parameter(domain_content_profiles",
+        ),
+        "code/tools/odcr_step3_real_data_probe.py": (
+            "underlying.last_odcr_latents",
+            "ddp_model.module",
+            "domain_style_proto.weight",
+            "shared_global_proto",
+        ),
+    }
+    for rel, terms in banned_side_channels.items():
+        text = texts[rel]
+        for term in terms:
+            if term in text:
+                findings.append(
+                    Finding(
+                        rel,
+                        1,
+                        term,
+                        "Step3 loss/probe must use Step3ForwardOutput and frozen buffers, not side-channel or direct parameter loss paths.",
+                    )
+                )
     if findings:
         result.fail("Step3 structured loss weights are not fully One-Control-wired.", findings)
     else:
-        result.summary = "Step3 structured loss weights resolve from step3.structured_losses and the train loop reads resolved JSON only."
+        result.summary = "Step3 structured loss weights resolve from step3.structured_losses and the shared Step3ForwardOutput loss builder reads resolved JSON only."
+    return result
+
+
+def _check_step3_upstream_preprocess_hard_gate(repo_root: Path) -> RuleResult:
+    result = RuleResult("R097", "Step3 active loader must require preprocess upstream hard gate")
+    core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    gate = _read(repo_root / "code" / "odcr_core" / "step3_upstream_gate.py")
+    index_contract = _read(repo_root / "code" / "odcr_core" / "index_contract.py")
+    cfg_py = _read(repo_root / "code" / "config.py")
+    findings: list[Finding] = []
+
+    required_gate_terms = (
+        "validate_step3_preprocess_upstream_gate",
+        "latest_summary_path",
+        "run_summary.json",
+        "stage_status.json",
+        "stage_manifest.json",
+        "source_table.json",
+        "metrics_path",
+        "verify_report_path",
+        "source_profile_fingerprints",
+        "preprocess_c_domain_vector/1",
+        "STEP3_REJECTS_PREPROCESS_C_RANK2_DOMAIN_VECTOR",
+        "completed.stamp",
+        "AI_analysis",
+        "history",
+        "fingerprint mismatch",
+    )
+    missing_gate_terms = [term for term in required_gate_terms if term not in gate]
+    if missing_gate_terms:
+        findings.append(
+            Finding(
+                "code/odcr_core/step3_upstream_gate.py",
+                1,
+                "missing: " + ", ".join(missing_gate_terms),
+                "Step3 upstream gate must validate formal latest/run_summary/manifest/verify/fingerprint evidence and reject old domain vector forms.",
+            )
+        )
+
+    required_core_terms = (
+        "validate_step3_preprocess_upstream_gate",
+        "step3_upstream_evidence_json",
+        "step3_upstream_preflight_summary=upstream_evidence",
+        "step3_upstream_preprocess_gate",
+        "load_profile_tensors_dual_first",
+    )
+    missing_core_terms = [term for term in required_core_terms if term not in core]
+    if missing_core_terms:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "missing: " + ", ".join(missing_core_terms),
+                "Step3 train loader must run the upstream gate and carry its summary into checkpoint lineage.",
+            )
+        )
+    gate_pos = core.find("validate_step3_preprocess_upstream_gate(")
+    read_pos = core.find("pd.read_csv(train_path)")
+    profile_pos = core.find("load_profile_tensors_dual_first(")
+    model_pos = core.find("model = Model(")
+    if gate_pos < 0 or read_pos < 0 or gate_pos > read_pos:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "upstream gate is not before pd.read_csv(train_path)",
+                "Run the preprocess upstream hard gate before dataset construction.",
+            )
+        )
+    if gate_pos < 0 or profile_pos < 0 or gate_pos > profile_pos:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "upstream gate is not before load_profile_tensors_dual_first",
+                "Do not path-only consume profile/domain artifacts before contract validation.",
+            )
+        )
+    if gate_pos < 0 or model_pos < 0 or gate_pos > model_pos:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "upstream gate is not before Model construction",
+                "Run the preprocess upstream hard gate before model/loss construction.",
+            )
+        )
+    if "step3_upstream_evidence_json" not in cfg_py:
+        findings.append(
+            Finding(
+                "code/config.py",
+                1,
+                "step3_upstream_evidence_json missing from FinalTrainingConfig",
+                "Carry upstream evidence through the resolved Step3 config for checkpoint sidecars.",
+            )
+        )
+    missing_index_terms = [
+        term
+        for term in (
+            "step3_upstream_preflight_summary",
+            "_require_step3_preflight_profile_paths",
+            "Step3 profile loader path mismatch",
+            "Step3 domain loader path mismatch",
+        )
+        if term not in index_contract
+    ]
+    if missing_index_terms:
+        findings.append(
+            Finding(
+                "code/odcr_core/index_contract.py",
+                1,
+                "missing: " + ", ".join(missing_index_terms),
+                "Step3 profile/domain tensor loader must bind to the preflight-validated artifact summary when Step3 calls it.",
+            )
+        )
+
+    if findings:
+        result.fail("Step3 can still bypass preprocess upstream admission evidence.", findings)
+    else:
+        result.summary = "Step3 train loader runs the preprocess upstream hard gate before data/profile/model construction and records its summary."
     return result
 
 
@@ -2644,25 +2973,45 @@ def _check_step3_checkpoint_step4_lineage_gate(repo_root: Path) -> RuleResult:
     files = {
         "code/executors/step3_train_core.py": (
             "_build_step3_checkpoint_lineage",
+            "STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION",
+            "sidecar_schema_version",
+            "checkpoint_file_hash",
+            "git_code_fingerprint",
+            "resolved_config_compatibility_hash",
+            "source_table_compatibility_hash",
             "one_control_resolved_config_hash",
             "preprocess_contract_version",
+            "preprocess_latest_run_ids",
+            "preprocess_stage_manifest_fingerprints",
+            "preprocess_verify_report_fingerprints",
+            "profile_artifact_fingerprints_hash",
+            "domain_artifact_fingerprints_hash",
+            "step3_tokenizer_cache_manifest_hash",
+            "batch_semantics",
+            "ddp_config_hash",
+            "precision_config_hash",
             "data_merged_artifact_fingerprint",
             "step3_structured_losses_config_hash",
+            "step3_loss_semantics_config_hash",
             "model_architecture_config_hash",
             "source_task",
             "write_checkpoint_lineage",
         ),
         "code/executors/step4_engine.py": (
             "_validate_step3_checkpoint_lineage_for_step4",
-            "read_checkpoint_lineage",
+            "validate_step3_checkpoint_lineage",
             "CheckpointLineageError",
+            "checkpoint_file_hash",
             "Step4 refused Step3 checkpoint",
         ),
         "code/odcr_core/training_checkpoint.py": (
             "LINEAGE_GATE_SCHEMA_VERSION",
+            "STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION",
             "CHECKPOINT_LINEAGE_FILENAME",
+            "STEP3_CHECKPOINT_REQUIRED_FIELDS",
             "read_checkpoint_lineage",
             "write_checkpoint_lineage",
+            "validate_step3_checkpoint_lineage",
         ),
     }
     findings: list[Finding] = []
@@ -2860,10 +3209,10 @@ def _check_step3_finite_loss_global_sync(repo_root: Path) -> RuleResult:
     result = RuleResult("R036", "Step3 finite-loss skip must be globally synchronized")
     core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
     required = (
-        "step3_global_finite_loss_decision",
-        "dist.all_reduce(flag, op=dist.ReduceOp.MIN)",
+        "step3_sync_loss_bundle_finite_status",
+        "dist.all_reduce(local_vec, op=dist.ReduceOp.MIN)",
+        "single_all_reduce_min_vector",
         "global_loss_finite",
-        "window_nonfinite_loss",
         "non-finite loss synchronized skip",
     )
     missing = [term for term in required if term not in core]
@@ -2881,7 +3230,7 @@ def _check_step3_finite_loss_global_sync(repo_root: Path) -> RuleResult:
             ],
         )
     else:
-        result.summary = "Step3 all-reduces local finite flags before backward and skips optimizer by window."
+        result.summary = "Step3 all-reduces local finite flags before backward and skips each optimizer step globally."
     return result
 
 
@@ -3195,7 +3544,7 @@ def _check_evolution_loss_wiring(repo_root: Path) -> RuleResult:
     for rel, text in texts:
         findings.extend(_scan_r047_text(rel, text, all_active_text=corpus))
     required = (
-        "compose_step3_structured_loss",
+        "compose_step3_loss_from_forward_output",
         "compose_step5_total_loss",
         "total loss single insertion point",
     )
@@ -3532,7 +3881,7 @@ def _check_codex_workflow_requires_post_edit(repo_root: Path) -> RuleResult:
 
 
 def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
-    result = RuleResult("R096", "GPU tmux policy must not treat tmux as GPU allocation")
+    result = RuleResult("R096", "GPU runtime-first policy must not restore whitelist or post-edit GPU gates")
     checks = {
         "AGENTS.md": (
             "tmux -L odcr_gpu new-session -A -s odcr",
@@ -3540,61 +3889,58 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
             "Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`",
             "must not create, kill, or switch tmux",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
+            "runtime evidence takes priority over static full-suite instability",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "normal admin shell",
             "old `AI_analysis` probe output",
-            "<= 3 minutes",
         ),
         "docs/CODEX_CHANGE_REQUEST_TEMPLATE.md": (
             "tmux itself as a GPU",
             "odcr-enter-gpu <JOBID>",
             "Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "old `AI_analysis` probe",
-            "<= 3 minutes",
         ),
         "docs/ODCR_ACTIVE_ARCHITECTURE.md": (
             "not itself a GPU allocation",
             "odcr-enter-gpu <JOBID>",
             "Codex does not manage GPU allocation",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "old `AI_analysis` probe output",
-            "<= 3 minutes",
         ),
         "docs/ODCR_EVOLUTION_PROTOCOL.md": (
             "tmux is only the shared session boundary",
             "odcr-enter-gpu <JOBID>",
             "Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "old `AI_analysis` probe output",
-            "<= 3 minutes",
             "R096",
         ),
         "docs/ODCR_ARCHITECTURE_CONTRACT.md": (
@@ -3602,30 +3948,53 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
             "odcr-enter-gpu <JOBID>",
             "Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "old `AI_analysis` probe output",
-            "<= 3 minutes",
         ),
         "docs/AI_PROJECT_CANONICAL.md": (
             "tmux itself is not a GPU allocation",
             "odcr-enter-gpu <JOBID>",
             "Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`",
             "current tmux session's real-time CUDA",
-            "controlled tmux GPU bridge",
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "post-edit full is not a GPU prerequisite",
             "user-created, already-entered, uniquely validated GPU pane",
-            "whitelist short validation scripts",
             "not arbitrary send-keys",
-            "mode-specific adaptive timeout",
-            "stop_after_first_valid_result",
+            "formal namespace guard",
             "AI_analysis",
             "old `AI_analysis` probe output",
-            "<= 3 minutes",
+        ),
+        "docs/ODCR_GPU_RUNTIME_FIRST_EXECUTION_CONTRACT.md": (
+            "GPU use is allowed by default",
+            "repo-local validation, probe, and bounded runtime",
+            "No GPU whitelist hard blocker",
+            "post-edit full is not a GPU prerequisite",
+            "fast sanity",
+            "formal namespace guard",
+            "formal full train still requires user confirmation",
+            "runtime evidence takes priority over static full-suite instability",
+            "Stage2 candidate selection uses real runtime probes",
+        ),
+        "docs/ODCR_TMUX_GPU_BRIDGE_STEP3_VALIDATION.md": (
+            "Codex/admin shell is not the GPU shell",
+            "step3-startup-validation",
+            "fresh discover",
+            "fresh validate",
+            "odcr-enter-gpu <JOBID>",
+            "Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`",
+            "does not create, kill, switch, or attach tmux",
+            "not formal",
+            "not short-pilot",
+            "not a parameter experiment",
+            "AI_analysis/06_probe_evidence",
+            "runs/step3_validation",
         ),
     }
     forbidden_patterns = (
@@ -3640,6 +4009,9 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
         re.compile(r"Codex\s+(?:should|must|may|can)\s+(?:run|execute|start).{0,40}srun", re.IGNORECASE),
         re.compile(r"Codex\s+(?:should|must|may|can)\s+(?:run|execute|start).{0,40}sbatch", re.IGNORECASE),
         re.compile(r"arbitrary\s+(?:tmux\s+)?send-keys\s+(?:is|are)\s+(?:allowed|permitted)", re.IGNORECASE),
+        re.compile(r"whitelist short validation scripts", re.IGNORECASE),
+        re.compile(r"closed-choice whitelist", re.IGNORECASE),
+        re.compile(r"post-edit full.{0,40}(?:must|required|pass).{0,80}(?:GPU prerequisite|before GPU|GPU gate)", re.IGNORECASE),
     )
     findings: list[Finding] = []
     for rel, terms in checks.items():
@@ -3656,7 +4028,7 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
                     rel,
                     1,
                     "missing: " + ", ".join(missing),
-                    "Document admin tmux, user manual GPU-node entry, current-tmux CUDA evidence, controlled bridge limits, and Codex GPU limits.",
+                    "Document runtime-first GPU use, user-managed allocation, current-tmux CUDA evidence, bridge executor boundaries, and formal namespace guards.",
                 )
             )
         for pattern in forbidden_patterns:
@@ -3667,15 +4039,145 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
                         rel,
                         1,
                         match.group(0)[:240],
-                        "Do not imply tmux equals GPU, Codex manages GPU allocation, arbitrary send-keys is allowed, or --scope all is permanently banned.",
+                        "Do not imply tmux equals GPU, Codex manages GPU allocation, arbitrary send-keys is allowed, --scope all is permanently banned, or whitelist/post-edit gates are required for GPU.",
                     )
                 )
+    bridge = _read(repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py")
+    post_edit = _read(repo_root / "code" / "tools" / "odcr_post_edit_check.py")
+    startup = _read(repo_root / "code" / "tools" / "odcr_step3_startup_validation.py")
+    bridge_required = (
+        '"step3-startup-validation"',
+        '"repo-command"',
+        '"repo-script"',
+        '"repo-module"',
+        '"command-file"',
+        "OPERATION_SPECS",
+        "build_repo_runtime_executor_script",
+        "validate_runtime_command_safety",
+        "resolve_runtime_output_dir",
+        "user_confirmed_formal",
+        "formal_namespace_blocked",
+        "gpu_transport_ok",
+        "runtime_evidence_ok",
+        "formal_pollution",
+        "build_step3_startup_validation_script",
+        "code/tools/odcr_step3_startup_validation.py",
+        "--mode startup-only",
+        "--namespace validation",
+        "target_unique_slurm_gpu_repo_nvidia_smi_and_torch_cuda_2plus_valid",
+        "state file",
+        "Retired",
+        "generated bridge script contains forbidden token",
+        "formal step3",
+    )
+    for term in bridge_required:
+        if term not in bridge:
+            findings.append(
+                Finding(
+                    "code/tools/odcr_tmux_gpu_bridge.py",
+                    1,
+                    "missing: " + term,
+                    "Bridge must support runtime-first repo-local execution while preserving formal namespace guards.",
+                )
+            )
+    post_edit_required = (
+        "resource_kill",
+        "flaky_resource_kill",
+        "classification_blocks_gpu_probe",
+        "post_edit_results_block_gpu_probe",
+        "post_edit_results_block_formal",
+        "odcr_post_edit_diagnostic/1",
+    )
+    for term in post_edit_required:
+        if term not in post_edit:
+            findings.append(
+                Finding(
+                    "code/tools/odcr_post_edit_check.py",
+                    1,
+                    "missing: " + term,
+                    "Post-edit diagnostics must classify resource kills and must not be a GPU probe gate.",
+                )
+            )
+    if "MODE_SPECS" in bridge:
+        findings.append(
+            Finding(
+                "code/tools/odcr_tmux_gpu_bridge.py",
+                1,
+                "MODE_SPECS",
+                "Do not restore MODE_SPECS as a whitelist hard blocker; use operation metadata plus runtime namespace guards.",
+            )
+        )
+    specs_start = bridge.find("OPERATION_SPECS")
+    specs_end = bridge.find("GLOBAL_MAX_TIMEOUT_S", specs_start)
+    specs_block = bridge[specs_start:specs_end] if specs_start >= 0 and specs_end > specs_start else ""
+    parser_start = bridge.find("def build_parser")
+    parser_end = bridge.find("def options_from_args", parser_start)
+    parser_block = bridge[parser_start:parser_end] if parser_start >= 0 and parser_end > parser_start else ""
+    for retired in ('"step3-ddp-smoke"', '"step3-short-pilot"'):
+        if retired in specs_block or retired in parser_block:
+            findings.append(
+                Finding(
+                    "code/tools/odcr_tmux_gpu_bridge.py",
+                    1,
+                    retired,
+                    "Retired Step3 bridge probes must not be exposed by MODE_SPECS or argparse.",
+                )
+            )
+    for term in (
+        '"step3-performance-probe"',
+        "STEP3_PERFORMANCE_PROBE_TYPES",
+        "build_step3_performance_probe_script",
+        "code/tools/odcr_step3_performance_probe.py",
+        "--namespace validation",
+    ):
+        if term not in bridge:
+            findings.append(
+                Finding(
+                    "code/tools/odcr_tmux_gpu_bridge.py",
+                    1,
+                    "missing: " + term,
+                    "Step3 performance probe must stay validation-only and non-formal while GPU execution is runtime-first.",
+                )
+            )
+    startup_required = (
+        "SCHEMA_VERSION = \"odcr_step3_startup_validation/1\"",
+        "validation_mode",
+        "startup-only",
+        "validation_namespace",
+        "write_run_summary_json",
+        "update_latest=False",
+        "distributed_collective_calls_in_cache_phase",
+        "nccl_init_after_cache_ready",
+        "formal_namespace_polluted",
+        "formal_latest_updated",
+        "checkpoint_created",
+        "training_loop_full_epoch_started",
+        "TOKENIZERS_PARALLELISM",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "num_proc",
+        "max_parallel_cpu",
+        "reserved_cpu",
+        "tokenization_formula",
+        "worker_formula",
+        "Current tmux does not expose CUDA.",
+    )
+    for term in startup_required:
+        if term not in startup:
+            findings.append(
+                Finding(
+                    "code/tools/odcr_step3_startup_validation.py",
+                    1,
+                    "missing: " + term,
+                    "Step3 startup validation must be AI_analysis/runs step3_validation-only, root-signature capable, and no-checkpoint.",
+                )
+            )
     if findings:
         result.fail("GPU/tmux policy docs are missing required boundaries or contain stale claims.", findings)
     else:
         result.summary = (
-            "GPU/tmux docs require user-managed GPU-node entry, controlled bridge-only send-keys, "
-            "current-tmux CUDA probes, adaptive timeout, AI_analysis output, and short Codex validation only."
+            "GPU/tmux docs require runtime-first repo-local GPU validation, user-managed GPU-node entry, "
+            "current-tmux CUDA probes, AI_analysis output, and formal namespace protection."
         )
     return result
 
@@ -3689,6 +4191,239 @@ def _load_post_edit_module(repo_root: Path):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_bridge_module(repo_root: Path):
+    path = repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py"
+    spec = importlib.util.spec_from_file_location("_odcr_tmux_gpu_bridge_guardrail", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _check_step3_runtime_probe_truth_contract(repo_root: Path) -> RuleResult:
+    result = RuleResult("R110", "Step3 performance probe must require runtime truth evidence")
+    files = {
+        "code/tools/odcr_step3_performance_probe.py": _read(repo_root / "code" / "tools" / "odcr_step3_performance_probe.py"),
+        "code/tools/odcr_tmux_gpu_bridge.py": _read(repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py"),
+        "code/odcr_core/step3_runtime_probe.py": _read(repo_root / "code" / "odcr_core" / "step3_runtime_probe.py"),
+        "code/odcr_core/stage2_runtime_first.py": _read(repo_root / "code" / "odcr_core" / "stage2_runtime_first.py"),
+        "code/executors/step3_train_core.py": _read(repo_root / "code" / "executors" / "step3_train_core.py"),
+        "code/tools/odcr_post_edit_check.py": _read(repo_root / "code" / "tools" / "odcr_post_edit_check.py"),
+        "docs/ODCR_STEP3_RUNTIME_PROBE_TRUTH_CONTRACT.md": _read(repo_root / "docs" / "ODCR_STEP3_RUNTIME_PROBE_TRUTH_CONTRACT.md"),
+    }
+    required = {
+        "code/tools/odcr_step3_performance_probe.py": (
+            "run_step3_validation_window",
+            "child_status_from_report",
+            "runtime_verified",
+            "evidence_complete",
+            "return int(status[\"exit_code\"])",
+        ),
+        "code/tools/odcr_tmux_gpu_bridge.py": (
+            "bridge_transport_ok",
+            "child_process_ok",
+            "runtime_probe_ok",
+            "evidence_complete",
+            "normalize_bridge_runtime_success",
+            "bounded_step3_hot_path_runtime_verified_and_evidence_complete",
+        ),
+        "code/odcr_core/step3_runtime_probe.py": (
+            "Step3ValidationNamespaceGuard",
+            "Step3RuntimeEvidenceSink",
+            "run_step3_validation_window",
+            "evaluate_stage2_probe_evidence",
+            "runtime_verified",
+            "evidence_complete",
+            "timing rows count for rank0 < measured_steps",
+            "plan_only",
+        ),
+        "code/odcr_core/stage2_runtime_first.py": (
+            "runtime_first_flow_order",
+            "post_edit_diagnostic_blocks_gpu_probe",
+            "select_stage2_candidate",
+            "PREREQUISITE_RUNTIME_PROBES",
+        ),
+        "code/executors/step3_train_core.py": (
+            "build_step3_training_components",
+            "run_step3_measured_steps",
+            "run_step3_validation_window",
+        ),
+        "code/tools/odcr_post_edit_check.py": (
+            "test_gpu_bridge_no_whitelist_hard_blocker.py",
+            "test_gpu_runtime_executor_namespace_guard.py",
+            "test_post_edit_not_gpu_gate.py",
+            "test_stage2_runtime_first_flow.py",
+            "test_stage2_candidate_selection_uses_runtime_evidence.py",
+            "test_step3_performance_probe_requires_runtime_verified.py",
+            "test_step3_performance_probe_rejects_status_only.py",
+            "test_tmux_gpu_bridge_runtime_success_semantics.py",
+            "test_step3_performance_probe_metrics_required.py",
+            "test_step3_validation_namespace_guard.py",
+            "test_step3_bounded_hot_path_entry.py",
+            "test_stage2_collector_rejects_null_summaries.py",
+            "test_evidence_level_no_overclaim.py",
+        ),
+        "docs/ODCR_STEP3_RUNTIME_PROBE_TRUTH_CONTRACT.md": (
+            "bridge_transport_ok is not runtime_probe_ok",
+            "runtime_verified=false must fail",
+            "metrics all null must fail",
+            "status-only/plan-only is not performance-probe",
+        ),
+    }
+    findings: list[Finding] = []
+    for rel, terms in required.items():
+        if not files[rel]:
+            findings.append(Finding(rel, 1, "missing file", "Keep Step3 runtime probe truth contract active."))
+            continue
+        missing = [term for term in terms if term not in files[rel]]
+        if missing:
+            findings.append(
+                Finding(
+                    rel,
+                    1,
+                    "missing: " + ", ".join(missing),
+                    "Step3 performance probe truth semantics must not regress to status-only or transport-only success.",
+                )
+            )
+    probe_text = files["code/tools/odcr_step3_performance_probe.py"].lower()
+    if "build_probe_plan" in probe_text or "status writer" in probe_text:
+        findings.append(
+            Finding(
+                "code/tools/odcr_step3_performance_probe.py",
+                1,
+                "plan/status writer token",
+                "Do not let status-only or plan-only code masquerade as step3-performance-probe.",
+            )
+        )
+    if findings:
+        result.fail("Step3 runtime probe truth guardrail failed.", findings)
+    else:
+        result.summary = (
+            "Step3 performance probe requires bounded hot-path runtime, complete evidence rows, "
+            "validation namespace, bridge success split, and Stage2 null-summary rejection."
+        )
+    return result
+
+
+def _check_step3_paper_eval_explicit_damping_contract(repo_root: Path) -> RuleResult:
+    result = RuleResult("R111", "Step3 paper eval and V3 recovery contract must stay active")
+    files = {
+        "configs/odcr.yaml": _read(repo_root / "configs" / "odcr.yaml"),
+        "code/odcr_core/step3_eval_protocol.py": _read(repo_root / "code" / "odcr_core" / "step3_eval_protocol.py"),
+        "code/executors/step3_train_core.py": _read(repo_root / "code" / "executors" / "step3_train_core.py"),
+        "code/odcr_core/config_resolver.py": _read(repo_root / "code" / "odcr_core" / "config_resolver.py"),
+        "code/odcr_core/manifests.py": _read(repo_root / "code" / "odcr_core" / "manifests.py"),
+        "code/tools/odcr_post_edit_check.py": _read(repo_root / "code" / "tools" / "odcr_post_edit_check.py"),
+        "docs/ODCR_STEP3_EVAL_AND_EFFECTIVENESS_CONTRACT.md": _read(repo_root / "docs" / "ODCR_STEP3_EVAL_AND_EFFECTIVENESS_CONTRACT.md"),
+        "docs/ODCR_STEP3_V3_TRAINING_POLICY.md": _read(repo_root / "docs" / "ODCR_STEP3_V3_TRAINING_POLICY.md"),
+    }
+    required = {
+        "configs/odcr.yaml": (
+            "name: warmup_cosine",
+            "safe_damping_v2",
+            "objective_drift:",
+            "recovery:",
+            "phase_loss_schedule:",
+            "paper_candidate_selection:",
+            "paper_target_only_eval",
+            "max_ref_len: 25",
+            "berts_score_enabled: false",
+        ),
+        "code/odcr_core/step3_eval_protocol.py": (
+            "PAPER_TARGET_ONLY_EVAL",
+            "PREDICTION_SHARD_REQUIRED_FIELDS",
+            "sample_integrity_report",
+            "compare_eval_batch_outputs",
+            "scheduler_semantics",
+            "build_training_effectiveness_record",
+            "bertscore_enabled",
+        ),
+        "code/executors/step3_train_core.py": (
+            "prediction_shards",
+            "metrics_from_prediction_rows",
+            "dist.destroy_process_group()",
+            "safe_damping_v2",
+            "detect_objective_drift",
+            "build_recovery_plan",
+            "resolve_phase_for_epoch",
+            "append_step3_training_effectiveness_jsonl",
+            "write_step3_loss_component_trends_json",
+        ),
+        "code/odcr_core/config_resolver.py": (
+            "hidden Step3 LR damping is forbidden",
+            "_resolve_step3_objective_drift_config",
+            "_resolve_step3_recovery_config",
+            "_resolve_step3_phase_loss_schedule_config",
+            "_resolve_step3_paper_candidate_selection_config",
+            "paper_target_only_eval must use max_ref_len=max_decode_len=25",
+            "step3_eval_protocol",
+        ),
+        "code/odcr_core/manifests.py": (
+            "train_status",
+            "eval_status",
+            "post_train_eval",
+            "step3_eval_status.json",
+        ),
+        "code/tools/odcr_post_edit_check.py": (
+            "test_step3_eval_two_phase_no_barrier_after_cpu_metric.py",
+            "test_scheduler_safe_damping_v2_semantics.py",
+            "test_step3_v3_recovery_conflict_paper_selection.py",
+            "test_training_effectiveness_gate_plateau.py",
+            "test_run_status_train_eval_split.py",
+        ),
+        "docs/ODCR_STEP3_EVAL_AND_EFFECTIVENESS_CONTRACT.md": (
+            "paper_target_only_eval",
+            "BERTScore",
+            "Two-Phase Runtime",
+            "Batch Invariance",
+            "Safe Damping",
+            "Training Effectiveness",
+        ),
+        "docs/ODCR_STEP3_V3_TRAINING_POLICY.md": (
+            "Objective Drift",
+            "Recovery",
+            "Phase-Wise",
+            "Paper-Aware",
+            "DIST",
+        ),
+    }
+    findings: list[Finding] = []
+    for rel, terms in required.items():
+        if not files[rel]:
+            findings.append(Finding(rel, 1, "missing file", "Keep the Step3 eval/effectiveness contract active."))
+            continue
+        missing = [term for term in terms if term not in files[rel]]
+        if missing:
+            findings.append(
+                Finding(
+                    rel,
+                    1,
+                    "missing: " + ", ".join(missing),
+                    "Preserve paper target-only eval, no-BERTScore metrics, two-phase eval, V3 recovery, and status split.",
+                )
+            )
+    eval_block = files["code/executors/step3_train_core.py"]
+    if "def _run_eval_ddp" in eval_block and "metrics_from_prediction_rows(" in eval_block:
+        block = eval_block[eval_block.index("def _run_eval_ddp") :]
+        metric_idx = block.index("metrics_from_prediction_rows(")
+        if "dist.barrier()" in block[metric_idx:]:
+            findings.append(
+                Finding(
+                    "code/executors/step3_train_core.py",
+                    1,
+                    "dist.barrier() after CPU metric path",
+                    "Destroy the process group before CPU-heavy metrics and do not re-enter NCCL barriers afterward.",
+                )
+            )
+    if findings:
+        result.fail("Step3 paper eval/effectiveness/V3 guardrail failed.", findings)
+    else:
+        result.summary = "Paper target-only eval, shard sample_id integrity, no-BERTScore metrics, safe V3 recovery policy, and train/eval status split are present."
+    return result
 
 
 def _post_edit_plan_violations(module, repo_root: Path) -> list[str]:
@@ -3982,15 +4717,27 @@ def _check_codex_hook_script_safe(repo_root: Path) -> RuleResult:
         "odcr_codex_hook_runtime/2.2",
         "post_edit_returncode",
         "failure_stage",
+        "timed_out",
+        "started_at",
+        "post_edit_started_at",
+        "finished_at",
         "post_edit_stdout",
         "post_edit_stderr",
-        "DEFAULT_HOOK_MAX_SECONDS = 180",
+        "DEFAULT_WRAPPER_TIMEOUT_SECONDS = 180",
+        "DEFAULT_HOOK_CHILD_MAX_SECONDS = 120",
         "ODCR_HOOK_MAX_SECONDS",
+        "ODCR_HOOK_CHILD_MAX_SECONDS",
+        "child_timeout_seconds",
+        "wrapper_timeout_seconds",
+        "apply_automatic_stop_scope_policy",
+        "auto_all_scope_degraded_to_governance_fast",
+        "MANUAL_ALL_FOLLOWUP_COMMAND",
         "MAX_TOUCHED_FILES_SAMPLE = 50",
         "IGNORED_EXACT_PATHS",
         "IGNORED_DIR_PREFIXES",
         "IGNORED_FILE_PATTERNS",
-        "only_ignored_files_changed",
+        "audit_runtime_only",
+        "ignored_only",
         "transcript_path",
         "infer_scope_for_payload",
         "transcript_parse_failed",
@@ -4308,8 +5055,10 @@ def _check_stop_hook_ignored_path_rules(repo_root: Path) -> RuleResult:
 
     ignored_examples = (
         "audit.log",
+        "./audit.log",
         "/public/home/zhangliml/lc/ODCR/ODCR-main/audit.log",
         "AI_analysis/03_evidence_ledgers/ledger.md",
+        "AI_analysis/history/old_report.md",
         "AI_analysis/01_raw_logs/codex_hooks/runtime_last.json",
         "runs/task4/meta/run_summary.json",
         "cache/foo.bin",
@@ -4378,6 +5127,22 @@ def _check_stop_hook_ignored_only_noop(repo_root: Path) -> RuleResult:
             cwd=repo_root,
             workspace_changed_files_func=lambda _root: ["code/executors/step5_engine.py"],
         )
+        payload = hook_module._runtime_payload(
+            repo_root=repo_root,
+            cwd=repo_root,
+            hook_event_name="Stop",
+            command=None,
+            returncode=0,
+            failure_stage=None,
+            stdout_path=repo_root / "AI_analysis/01_raw_logs/codex_hooks/stdout.log",
+            stderr_path=repo_root / "AI_analysis/01_raw_logs/codex_hooks/stderr.log",
+            inference=inference,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
+            finished_at="2026-05-02T00:00:01+00:00",
+        )
     except Exception as exc:
         result.fail(
             "Could not exercise ignored-only Stop hook inference.",
@@ -4387,8 +5152,8 @@ def _check_stop_hook_ignored_only_noop(repo_root: Path) -> RuleResult:
     if (
         inference.selected_scope != "skip"
         or not inference.skipped
-        or inference.skip_reason != "only_ignored_files_changed"
-        or inference.inference_reason != "only_ignored_files_changed"
+        or inference.skip_reason not in {"audit_runtime_only", "ignored_only"}
+        or inference.inference_reason not in {"audit_runtime_only", "ignored_only"}
     ):
         findings.append(
             Finding(
@@ -4406,6 +5171,15 @@ def _check_stop_hook_ignored_only_noop(repo_root: Path) -> RuleResult:
                 1,
                 json.dumps(summary, ensure_ascii=False, sort_keys=True),
                 "Ignored-only diagnostics must record raw/ignored/effective counts.",
+            )
+        )
+    if payload.get("post_edit_command") is not None:
+        findings.append(
+            Finding(
+                ".codex/hooks/odcr_post_edit_stop.py",
+                1,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True)[:240],
+                "Ignored-only Stop hook runtime must keep post_edit_command=null and skip odcr_post_edit_check.py.",
             )
         )
     if findings:
@@ -4524,11 +5298,26 @@ def _check_stop_hook_auto_timeout_fast(repo_root: Path) -> RuleResult:
             [Finding(".codex/hooks/odcr_post_edit_stop.py", 1, repr(exc), "Keep timeout constants import-safe.")],
         )
         return result
-    auto_timeout = getattr(hook_module, "DEFAULT_HOOK_MAX_SECONDS", None)
+    child_timeout = getattr(hook_module, "DEFAULT_HOOK_CHILD_MAX_SECONDS", None)
+    wrapper_timeout = getattr(hook_module, "DEFAULT_WRAPPER_TIMEOUT_SECONDS", None)
     manual_timeout = getattr(post_module, "DEFAULT_MANUAL_MAX_SECONDS", None)
-    if not isinstance(auto_timeout, int) or auto_timeout > 180:
+    if not isinstance(wrapper_timeout, int) or wrapper_timeout != 180:
         findings.append(
-            Finding(".codex/hooks/odcr_post_edit_stop.py", 1, f"DEFAULT_HOOK_MAX_SECONDS={auto_timeout!r}", "Default automatic max_seconds must be <= 180.")
+            Finding(".codex/hooks/odcr_post_edit_stop.py", 1, f"DEFAULT_WRAPPER_TIMEOUT_SECONDS={wrapper_timeout!r}", "Codex UI wrapper timeout must remain recorded as 180 seconds.")
+        )
+    if (
+        not isinstance(child_timeout, int)
+        or not isinstance(wrapper_timeout, int)
+        or child_timeout >= wrapper_timeout
+        or child_timeout > 150
+    ):
+        findings.append(
+            Finding(
+                ".codex/hooks/odcr_post_edit_stop.py",
+                1,
+                f"DEFAULT_HOOK_CHILD_MAX_SECONDS={child_timeout!r}, wrapper={wrapper_timeout!r}",
+                "Automatic child post-edit timeout must be shorter than the 180-second wrapper timeout.",
+            )
         )
     if not isinstance(manual_timeout, int) or manual_timeout < 900:
         findings.append(
@@ -4541,19 +5330,70 @@ def _check_stop_hook_auto_timeout_fast(repo_root: Path) -> RuleResult:
         for hook in entry.get("hooks", [])
         if isinstance(hook, dict)
     ]
-    if not timeouts or any(not isinstance(timeout, int) or timeout > 180 for timeout in timeouts):
+    if not timeouts or any(not isinstance(timeout, int) or timeout != 180 for timeout in timeouts):
         findings.append(
-            Finding(".codex/hooks.json", 1, f"timeouts={timeouts!r}", "Codex Stop hook config timeout must be <= 180 seconds.")
+            Finding(".codex/hooks.json", 1, f"timeouts={timeouts!r}", "Codex Stop hook config timeout must remain 180 seconds.")
         )
     hook_text = _read(repo_root / ".codex" / "hooks" / "odcr_post_edit_stop.py")
-    if "ODCR_HOOK_MAX_SECONDS" not in hook_text:
+    if "ODCR_HOOK_MAX_SECONDS" not in hook_text or "ODCR_HOOK_CHILD_MAX_SECONDS" not in hook_text:
         findings.append(
-            Finding(".codex/hooks/odcr_post_edit_stop.py", 1, "ODCR_HOOK_MAX_SECONDS missing", "Allow explicit hook timeout override via ODCR_HOOK_MAX_SECONDS.")
+            Finding(".codex/hooks/odcr_post_edit_stop.py", 1, "hook child timeout env missing", "Allow explicit hook child timeout override but clamp it below the wrapper timeout.")
         )
+    try:
+        inferred_all = hook_module.infer_scope_for_payload(
+            {"touched_files": ["code/executors/step4_engine.py", "code/executors/step5_engine.py"]},
+            repo_root=repo_root,
+            cwd=repo_root,
+            workspace_changed_files_func=lambda _root: [],
+        )
+        automatic = hook_module.apply_automatic_stop_scope_policy(inferred_all)
+        command = hook_module._build_post_edit_command(
+            post_edit_path=repo_root / "code" / "tools" / "odcr_post_edit_check.py",
+            scope=automatic.selected_scope,
+            max_seconds=hook_module._child_timeout_seconds(hook_module._wrapper_timeout_seconds()),
+            dry_run=False,
+        )
+    except Exception as exc:
+        findings.append(
+            Finding(".codex/hooks/odcr_post_edit_stop.py", 1, repr(exc), "Auto-all degradation must be import-safe.")
+        )
+    else:
+        if inferred_all.selected_scope != "all":
+            findings.append(
+                Finding(
+                    ".codex/hooks/odcr_post_edit_stop.py",
+                    1,
+                    repr(inferred_all),
+                    "Synthetic multi-stage inference should first identify all before automatic policy degradation.",
+                )
+            )
+        if (
+            automatic.selected_scope == "all"
+            or automatic.original_inferred_scope != "all"
+            or not automatic.manual_followup_required
+            or "odcr_post_edit_check.py --scope all --max-seconds 900" not in (automatic.manual_followup_command or "")
+        ):
+            findings.append(
+                Finding(
+                    ".codex/hooks/odcr_post_edit_stop.py",
+                    1,
+                    repr(automatic),
+                    "Automatic Stop hook must degrade all-scope inference and record the manual all follow-up command.",
+                )
+            )
+        if hook_module._command_scope(command) == "all":
+            findings.append(
+                Finding(
+                    ".codex/hooks/odcr_post_edit_stop.py",
+                    1,
+                    " ".join(command),
+                    "Automatic Stop hook must not execute odcr_post_edit_check.py with --scope all.",
+                )
+            )
     if findings:
         result.fail("Automatic Stop hook timeout is not bounded below manual deep-check timeout.", findings)
     else:
-        result.summary = "Stop hook defaults to <=180 seconds while manual post-edit checks keep a 900 second default."
+        result.summary = "Stop hook wrapper stays 180s, child validation is shorter, auto all is degraded, and manual all remains 900s."
     return result
 
 
@@ -4931,13 +5771,22 @@ def _check_runtime_diagnostics_schema_v22(repo_root: Path) -> RuleResult:
             repo_root=repo_root,
             cwd=repo_root,
             hook_event_name="Stop",
-            command=None,
-            returncode=0,
-            failure_stage=None,
+            command=hook_module._build_post_edit_command(
+                post_edit_path=repo_root / "code" / "tools" / "odcr_post_edit_check.py",
+                scope=inference.selected_scope,
+                max_seconds=120,
+                dry_run=False,
+            ),
+            returncode=None,
+            failure_stage="post_edit_running",
             stdout_path=repo_root / "AI_analysis/01_raw_logs/codex_hooks/stdout.log",
             stderr_path=repo_root / "AI_analysis/01_raw_logs/codex_hooks/stderr.log",
             inference=inference,
-            max_seconds=180,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
+            post_edit_started_at="2026-05-02T00:00:01+00:00",
         )
     except Exception as exc:
         result.fail(
@@ -4954,10 +5803,53 @@ def _check_runtime_diagnostics_schema_v22(repo_root: Path) -> RuleResult:
                 "Runtime diagnostics schema_version must be odcr_codex_hook_runtime/2.2.",
             )
         )
+    required_runtime_fields = (
+        "selected_scope",
+        "inference_reason",
+        "inference_source",
+        "session_touched_files_count",
+        "ignored_files_count",
+        "effective_scope_files_count",
+        "ignored_files_sample",
+        "effective_scope_files_sample",
+        "workspace_dirty_detected",
+        "workspace_changed_files_count",
+        "workspace_git_status_used_for_scope",
+        "post_edit_command",
+        "stdout_path",
+        "stderr_path",
+        "started_at",
+        "post_edit_started_at",
+        "child_timeout_seconds",
+        "wrapper_timeout_seconds",
+        "failure_stage",
+    )
+    missing_runtime_fields = [field for field in required_runtime_fields if field not in payload]
+    if missing_runtime_fields or payload.get("inference_reason") == "initializing":
+        findings.append(
+            Finding(
+                ".codex/hooks/odcr_post_edit_stop.py",
+                1,
+                "missing: " + ", ".join(missing_runtime_fields),
+                "Runtime diagnostics must be finalized after scope inference and before child execution.",
+            )
+        )
+    hook_text = _read(repo_root / ".codex" / "hooks" / "odcr_post_edit_stop.py")
+    prelaunch_pos = hook_text.find('failure_stage="post_edit_running"')
+    child_pos = hook_text.find("child_result = _run_post_edit_child(")
+    if prelaunch_pos < 0 or child_pos < 0 or prelaunch_pos > child_pos:
+        findings.append(
+            Finding(
+                ".codex/hooks/odcr_post_edit_stop.py",
+                1,
+                "pre-child runtime write ordering",
+                "The hook must write selected_scope/command runtime diagnostics before launching the child process.",
+            )
+        )
     if findings:
         result.fail("Runtime diagnostics schema_version is not v2.2.", findings)
     else:
-        result.summary = "Runtime diagnostics schema_version is odcr_codex_hook_runtime/2.2."
+        result.summary = "Runtime diagnostics schema v2.2 records finalized scope/command fields before child execution."
     return result
 
 
@@ -4982,7 +5874,10 @@ def _check_runtime_diagnostics_workspace_scope_flag(repo_root: Path) -> RuleResu
             stdout_path=repo_root / "AI_analysis/01_raw_logs/codex_hooks/stdout.log",
             stderr_path=repo_root / "AI_analysis/01_raw_logs/codex_hooks/stderr.log",
             inference=inference,
-            max_seconds=180,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
         )
     except Exception as exc:
         result.fail(
@@ -4997,6 +5892,15 @@ def _check_runtime_diagnostics_workspace_scope_flag(repo_root: Path) -> RuleResu
                 1,
                 json.dumps(payload, ensure_ascii=False, sort_keys=True)[:240],
                 "Runtime diagnostics must include workspace_git_status_used_for_scope=false.",
+            )
+        )
+    if payload.get("child_timeout_seconds", 999) >= payload.get("wrapper_timeout_seconds", 0):
+        findings.append(
+            Finding(
+                ".codex/hooks/odcr_post_edit_stop.py",
+                1,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True)[:240],
+                "Runtime diagnostics must prove child_timeout_seconds < wrapper_timeout_seconds.",
             )
         )
     if findings:
@@ -5191,13 +6095,16 @@ def _check_latest_points_to_run_summary(repo_root: Path) -> RuleResult:
     findings: list[Finding] = []
     manifests = _read(manifests_path) if manifests_path.is_file() else ""
     resolver = _read(resolver_path) if resolver_path.is_file() else ""
+    upstream_path = repo_root / "code" / "odcr_core" / "upstream_resolver.py"
+    upstream = _read(upstream_path) if upstream_path.is_file() else ""
     required_manifest_terms = (
         "LATEST_FILENAME",
         "latest.json",
         "write_latest_pointer_json",
         "latest_summary_path",
         "latest_run_id",
-        "latest_status",
+        "latest_stage_status_path",
+        "status_claim_source",
         "write_run_summary_json",
     )
     missing_manifest = [term for term in required_manifest_terms if term not in manifests]
@@ -5211,7 +6118,7 @@ def _check_latest_points_to_run_summary(repo_root: Path) -> RuleResult:
             )
         )
     required_resolver_terms = ("latest.json", "latest_run_id", "latest_summary_path", "run_summary.json", "get_stage_task_root")
-    missing_resolver = [term for term in required_resolver_terms if term not in resolver]
+    missing_resolver = [term for term in required_resolver_terms if term not in (resolver + "\n" + upstream)]
     if missing_resolver:
         findings.append(
             Finding(
@@ -5315,21 +6222,25 @@ def _check_latest_lookup_requires_summary_hard_gate(repo_root: Path) -> RuleResu
     resolver_path = repo_root / "code" / "odcr_core" / "config_resolver.py"
     resolver = _read(resolver_path) if resolver_path.is_file() else ""
     block = _latest_run_block(resolver)
+    upstream_path = repo_root / "code" / "odcr_core" / "upstream_resolver.py"
+    upstream = _read(upstream_path) if upstream_path.is_file() else ""
+    combined = block + "\n" + upstream
     findings: list[Finding] = []
     required = (
         "latest.json",
         "latest_run_id",
         "latest_summary_path",
+        "latest_stage_status_path",
         "run_summary.json",
-        'summary.name != "run_summary.json"',
-        'summary.parent.name != "meta"',
-        "not summary.is_file()",
-        "json.loads(summary.read_text",
-        "summary_run_id",
+        "expected_summary",
+        "missing run_summary.json",
+        "resolve_latest",
+        "stage_status.json",
+        "validate_upstream_eligibility",
         "OneControlConfigError",
     )
     for term in required:
-        if term not in block:
+        if term not in combined:
             findings.append(
                 Finding(
                     "code/odcr_core/config_resolver.py",
@@ -5342,6 +6253,190 @@ def _check_latest_lookup_requires_summary_hard_gate(repo_root: Path) -> RuleResu
         result.fail("_latest_run hard gate is incomplete.", findings)
     else:
         result.summary = "_latest_run requires latest.json -> meta/run_summary.json and validates the pointed summary."
+    return result
+
+
+def _check_step3_tokenizer_cache_manifest_hard_gate(repo_root: Path) -> RuleResult:
+    result = RuleResult("R098", "Step3 tokenizer cache must use v2 tokenizer-only compatibility hash split")
+    path = repo_root / "code" / "executors" / "step3_train_core.py"
+    text = _read(path) if path.is_file() else ""
+    findings: list[Finding] = []
+    required = (
+        "STEP3_TOKENIZE_CACHE_SCHEMA_VERSION",
+        "STEP3_TOKENIZE_CACHE_MANIFEST",
+        "STEP3_TOKENIZE_CACHE_COMPLETED_MARKER",
+        "STEP3_TOKENIZE_CACHE_FAILED_MARKER",
+        "STEP3_TOKENIZE_CACHE_ROLE",
+        "manifest_schema_version",
+        "cache_role",
+        "tokenizer_cache_compat_hash",
+        "tokenization_compat_hash",
+        "run_lineage_hash",
+        "data_contract_hash",
+        "preprocessing_artifact_hash",
+        "full_run_config_hash",
+        "train_runtime_config_hash",
+        "optimizer_config_hash",
+        "performance_profile_hash",
+        "source_table_hash",
+        "step3_tokenizer_config",
+        "source_csv_fingerprints",
+        "preprocess_latest_run_ids",
+        "preprocess_manifest_fingerprints",
+        "preprocess_metrics_verify_fingerprints",
+        "profile_artifact_fingerprints",
+        "domain_artifact_fingerprints",
+        "schema_contract_hash",
+        "cache_content_hash",
+        "dataset_dict_fingerprint",
+        "retired_v1_schema_rebuild_required",
+        "compatibility_key",
+        "_step3_tokenize_cache_manifest_matches",
+        "_write_step3_tokenize_cache_manifest",
+        "_step3_tokenize_cache_manifest_decision",
+        "ensure_step3_tokenizer_cache_ready_pre_ddp",
+        "build_or_reuse_step3_tokenizer_cache_atomic",
+        "wait_for_completed_cache_manifest_file_polling",
+        "validate_completed_step3_tokenizer_cache",
+        "load_completed_step3_tokenizer_cache_for_rank",
+        "init_step3_ddp_after_cache_ready",
+        "step3_tokenizer_cache_entry_dir",
+        "formal_cache_namespace",
+        "completed",
+        "_fingerprint_step3_hf_cache_content",
+        "cache_content_fingerprint_mismatch",
+    )
+    for term in required:
+        if term not in text:
+            findings.append(
+                Finding(
+                    "code/executors/step3_train_core.py",
+                    1,
+                    f"missing: {term}",
+                    "Step3 tokenizer cache reuse must be gated by cache_manifest.json v2 tokenizer/data/preprocess compatibility hashes.",
+                )
+            )
+    gate_block = ""
+    for _line, name, block in _iter_python_function_blocks(text):
+        if name == "_step3_tokenize_cache_manifest_gate_fields":
+            gate_block = block
+            break
+    for forbidden in (
+        "full_run_config_hash",
+        "resolved_config",
+        "source_table_hash",
+        "train_runtime_config_hash",
+        "optimizer_config_hash",
+        "performance_profile_hash",
+        "profile_artifact_fingerprints",
+        "domain_artifact_fingerprints",
+        "task_profile_id",
+    ):
+        if forbidden in gate_block:
+            findings.append(
+                Finding(
+                    "code/executors/step3_train_core.py",
+                    1,
+                    forbidden,
+                    "Tokenizer cache hard gate must exclude record-only run/profile/training lineage fields.",
+                )
+            )
+    if not (repo_root / "code" / "tools" / "odcr_step3_cache_check.py").is_file():
+        findings.append(
+            Finding(
+                "code/tools/odcr_step3_cache_check.py",
+                1,
+                "missing cache-check",
+                "Step3 cache-check must exist as a read-only preflight.",
+            )
+        )
+    gate_start = text.find("def _step3_tokenize_cache_manifest_gate_fields")
+    gate_end = text.find("def _step3_tokenize_cache_manifest_sections", gate_start)
+    gate_text = text[gate_start:gate_end] if gate_start >= 0 and gate_end > gate_start else ""
+    for forbidden in ("one_control_resolved_config_hash", '"resolved_config"', "env_embed_dim"):
+        if forbidden in gate_text:
+            findings.append(
+                Finding(
+                    "code/executors/step3_train_core.py",
+                    1,
+                    forbidden,
+                    "Tokenizer cache v2 compatibility gate must not include full resolved config/source_table/runtime-only fields.",
+                )
+            )
+    if "load_from_disk(cache_dir)" in text and "_step3_tokenize_cache_manifest_matches" not in text:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "load_from_disk(cache_dir)",
+                "Step3 must only load tokenizer cache after _step3_tokenize_cache_manifest_matches succeeds.",
+            )
+        )
+    cache_start = text.find("def build_or_reuse_step3_tokenizer_cache_atomic")
+    cache_end = text.find("def _load_step3_artefacts", cache_start)
+    cache_block = text[cache_start:cache_end] if cache_start >= 0 and cache_end > cache_start else ""
+    for forbidden in ("dist.barrier", "dist.all_reduce", "broadcast_object_list", "save_to_disk(cache_dir)"):
+        if forbidden in cache_block:
+            findings.append(
+                Finding(
+                    "code/executors/step3_train_core.py",
+                    1,
+                    forbidden,
+                    "Step3 tokenizer/cache readiness must use pre-DDP atomic manifest/file polling, not distributed collectives or direct final writes.",
+                )
+            )
+    for forbidden in ("get_hf_cache_root(task_idx)", "cache/task{"):
+        if forbidden in text:
+            findings.append(
+                Finding(
+                    "code/executors/step3_train_core.py",
+                    1,
+                    forbidden,
+                    "Step3 formal tokenizer cache path must come from One-Control path_layout namespace.",
+                )
+            )
+    if "os.path.getmtime(" in text:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "os.path.getmtime(",
+                "Step3 tokenizer cache identity must not use path/mtime-only reuse.",
+            )
+        )
+    cache_test = repo_root / "code" / "tests" / "test_step3_cache_path_layout_one_control.py"
+    if not cache_test.is_file():
+        findings.append(
+            Finding(
+                "code/tests/test_step3_cache_path_layout_one_control.py",
+                1,
+                "missing",
+                "Independent Step3 cache path_layout One-Control regression test must exist.",
+            )
+        )
+    else:
+        test_text = _read(cache_test)
+        for term in (
+            "step3_tokenizer_cache_entry_dir",
+            "step3_validation_tokenizer_cache_entry_dir",
+            "cache/step3/tokenizer",
+            "cache/task2/hf",
+            "get_hf_cache_root(task_idx)",
+            "validation namespace",
+        ):
+            if term not in test_text:
+                findings.append(
+                    Finding(
+                        "code/tests/test_step3_cache_path_layout_one_control.py",
+                        1,
+                        "missing: " + term,
+                        "Dedicated cache path layout test must cover formal/validation separation and old path rejection.",
+                    )
+                )
+    if findings:
+        result.fail("Step3 tokenizer cache v2 hard gate is incomplete.", findings)
+    else:
+        result.summary = "Step3 tokenizer cache v2 gates on tokenizer/data/preprocess compatibility and records full config separately."
     return result
 
 
@@ -5451,6 +6546,14 @@ def _check_active_cache_reuse_not_path_mtime_only(repo_root: Path) -> RuleResult
     result = RuleResult("R094", "dataset_info/load_from_disk alone and path/mtime-only cache keys are forbidden")
     findings: list[Finding] = []
     checks = {
+        "code/executors/step3_train_core.py": (
+            "_step3_tokenize_cache_manifest_matches",
+            "_write_step3_tokenize_cache_manifest",
+            "cache_content_hash",
+            "source_csv_fingerprints",
+            "file_fingerprint(",
+            "dataset_dict.json",
+        ),
         "code/executors/step4_engine.py": (
             "_step4_encoded_cache_manifest_matches",
             "_write_step4_encoded_cache_manifest",
@@ -5499,9 +6602,9 @@ def _check_active_cache_reuse_not_path_mtime_only(repo_root: Path) -> RuleResult
                     )
                 )
     if findings:
-        result.fail("Step4/Step5 cache reuse can still be path/mtime-only or dataset-only.", findings)
+        result.fail("Step3/Step4/Step5 cache reuse can still be path/mtime-only or dataset-only.", findings)
     else:
-        result.summary = "Step4/Step5 cache reuse is manifest-gated and content-fingerprint based."
+        result.summary = "Step3/Step4/Step5 cache reuse is manifest-gated and content-fingerprint based."
     return result
 
 
@@ -6152,13 +7255,13 @@ def _check_agents_post_edit_scope_not_fixed_step3(repo_root: Path) -> RuleResult
                     "Replace fixed user-facing Step3 checks with narrowest applicable scope guidance.",
                 )
             )
-    if "./odcr step3 --task 4 --dry-run" in section and "not fixed defaults for every user-facing change" not in section:
-        line = text[: text.find("./odcr step3 --task 4 --dry-run")].count("\n") + 1
+    if "./odcr step3 --task 2 --dry-run" in section and "not fixed defaults for every user-facing change" not in section:
+        line = text[: text.find("./odcr step3 --task 2 --dry-run")].count("\n") + 1
         findings.append(
             Finding(
                 "AGENTS.md",
                 line,
-                "./odcr step3 --task 4 --dry-run",
+                "./odcr step3 --task 2 --dry-run",
                 "Mention Step3 dry-run only as a Step3/config/all scope-owned check.",
             )
         )
@@ -6233,6 +7336,1514 @@ def _check_metrics_filename_canonical(repo_root: Path) -> RuleResult:
     return result
 
 
+def _check_step3_v0_parameter_surface(repo_root: Path) -> RuleResult:
+    result = RuleResult("R099", "Step3 v0 parameter surface must be One-Control and legacy-free")
+    findings: list[Finding] = []
+    cfg_text = _read(repo_root / "configs" / "odcr.yaml")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    schema = _read(repo_root / "code" / "odcr_core" / "config_schema.py")
+    config_py = _read(repo_root / "code" / "config.py")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    required_yaml = (
+        "default_task: 2",
+        "optimizer:",
+        "name: adamw",
+        "train_precision: bf16",
+        "allow_tf32: true",
+        "amp_autocast: true",
+        "grad_scaler: false",
+        "max_grad_norm: 0.5",
+        "max_epochs: 40",
+        "warmup_ratio: 0.06",
+        "min_lr_ratio: 0.05",
+        "valid_batch_size: null",
+        "derive_from_train: true",
+        "strong_related:",
+        "weak_cross_platform:",
+        "cache:",
+        "tokenizer_schema_version: odcr_step3_tokenizer_cache/2",
+        "prefetcher:",
+        "cross_rank_structured_gather:",
+        "enabled: true",
+        "diagnostic_allow_disabled: false",
+        "task_profiles:",
+        "task2_am_movies_to_cds:",
+        "profile_id: task2_strong_forward_g1s",
+        "candidate: G1S",
+        "task5_cds_to_movies:",
+        "profile_id: task5_strong_reverse_g1_init",
+        "task8_tripadvisor_to_yelp:",
+        "profile_id: task8_weak_forward_init",
+        "task7_yelp_to_tripadvisor:",
+        "profile_id: task7_weak_reverse_init",
+        "backup_profiles:",
+        "task2_g1_backup:",
+        "task2_g0_backup:",
+        "exploration_profiles:",
+        "task2_g2_effective_pool_2048:",
+        "formal_allowed: false",
+        "probe_only: true",
+        "backup_only: true",
+        "manual_selection_required: true",
+        "exploration_only: true",
+        "replacement_gate_status: failed_or_not_passed",
+        "activation_checkpointing:",
+        "profile_buffer_policy: gpu_resident",
+        "worker_profiles:",
+        "pin_memory: true",
+        "persistent_workers: true",
+        "non_blocking_h2d: true",
+    )
+    for term in required_yaml:
+        if term not in cfg_text:
+            findings.append(Finding("configs/odcr.yaml", 1, "missing: " + term, "Step3 v0 defaults must be explicit One-Control YAML."))
+    for term in (
+        "2: {source: AM_Movies, target: AM_CDs, scenario: strong_related, direction: forward}",
+        "5: {source: AM_CDs, target: AM_Movies, scenario: strong_related, direction: reverse}",
+        "7: {source: Yelp, target: TripAdvisor, scenario: weak_cross_platform, direction: reverse}",
+        "8: {source: TripAdvisor, target: Yelp, scenario: weak_cross_platform, direction: forward}",
+    ):
+        if term not in cfg_text:
+            findings.append(Finding("configs/odcr.yaml", 1, "missing scenario row: " + term, "Paper-mainline task metadata is required."))
+    banned_yaml = (
+        "step3:\n  train:\n    epochs:",
+        "step3:\n  train:\n    coef:",
+        "train_precision: fp32",
+        "optim.Adam",
+    )
+    for term in banned_yaml:
+        if term in cfg_text:
+            findings.append(Finding("configs/odcr.yaml", 1, term, "Retired Step3 v0 controls must not be active YAML defaults."))
+    try:
+        import yaml
+
+        raw_cfg = yaml.safe_load(cfg_text) or {}
+    except Exception:
+        raw_cfg = {}
+    step3_cfg = raw_cfg.get("step3") if isinstance(raw_cfg, dict) else {}
+    step3_train = (step3_cfg or {}).get("train") if isinstance(step3_cfg, dict) else {}
+    if isinstance(step3_train, dict) and (
+        int(step3_train.get("batch_size") or 0) != 1536
+        or int(step3_train.get("per_gpu_batch_size") or 0) != 768
+    ):
+        findings.append(Finding("configs/odcr.yaml", 1, "step3.train", "Active Step3 formal default must be task2 G1S 1536/768 with per_gpu_batch_size."))
+    if isinstance(raw_cfg, dict) and (raw_cfg.get("project") or {}).get("default_task") != 2:
+        findings.append(Finding("configs/odcr.yaml", 1, "project.default_task", "Paper-mainline default task must remain task2."))
+    gather_cfg = (step3_cfg or {}).get("cross_rank_structured_gather") if isinstance(step3_cfg, dict) else {}
+    if not (isinstance(gather_cfg, dict) and gather_cfg.get("enabled") is True and gather_cfg.get("mode") == "local_gradient_context"):
+        findings.append(Finding("configs/odcr.yaml", 1, "step3.cross_rank_structured_gather", "Formal Step3 gather must default to true/local_gradient_context."))
+    profiles = (step3_cfg or {}).get("task_profiles") if isinstance(step3_cfg, dict) else {}
+    expected_profiles = {
+        "task2_am_movies_to_cds": (2, "task2_strong_forward_g1s"),
+        "task5_cds_to_movies": (5, "task5_strong_reverse_g1_init"),
+        "task8_tripadvisor_to_yelp": (8, "task8_weak_forward_init"),
+        "task7_yelp_to_tripadvisor": (7, "task7_weak_reverse_init"),
+    }
+    if not isinstance(profiles, dict):
+        findings.append(Finding("configs/odcr.yaml", 1, "step3.task_profiles", "Four isolated Step3 task profiles are required."))
+    else:
+        seen_profile_ids: set[str] = set()
+        for key, (task_id, profile_id) in expected_profiles.items():
+            item = profiles.get(key)
+            if not isinstance(item, dict) or int(item.get("task_id") or -1) != task_id or item.get("profile_id") != profile_id:
+                findings.append(Finding("configs/odcr.yaml", 1, key, "Missing or mismatched isolated paper-task profile."))
+            elif profile_id in seen_profile_ids:
+                findings.append(Finding("configs/odcr.yaml", 1, profile_id, "Step3 task profile ids must be unique."))
+            else:
+                seen_profile_ids.add(profile_id)
+    for removed in ("grad_accum", "gradient_accumulation_steps", "accumulate_grad_batches"):
+        if isinstance(step3_train, dict) and removed in step3_train:
+            findings.append(Finding("configs/odcr.yaml", 1, removed, "Step3 no-accum architecture forbids active accumulation controls."))
+    if isinstance(step3_cfg, dict):
+        for removed_block in ("smoke_ladder", "performance_ladder", "performance_probe", "short_pilot"):
+            if removed_block in step3_cfg:
+                findings.append(
+                    Finding(
+                        "configs/odcr.yaml",
+                        1,
+                        f"step3.{removed_block}",
+                        "Step3 clean baseline keeps backup/exploration in isolated profile blocks, not active ladder/probe/pilot blocks.",
+                    )
+                )
+    required_code_terms = {
+        "code/odcr_core/config_resolver.py": (
+            "_validate_config_shape",
+            "_reject_unknown_keys",
+            "_resolve_step3_optimizer_config",
+            "_resolve_step3_backend_config",
+            "_resolve_step3_tokenizer_evidence_config",
+            "_resolve_step3_scheduler_config",
+            "_resolve_step3_eval_config",
+            "_select_step3_task_profile",
+            "_resolve_step3_task_profile_config",
+            "_resolve_step3_exploration_profiles_config",
+            "_resolve_step3_worker_profiles_config",
+            "_resolve_step3_prefetcher_config",
+            "_resolve_step3_cross_rank_gather_config",
+            "_resolve_step3_memory_config",
+            "_resolve_step3_cache_policy_config",
+            "step3.optimizer.name must be 'adamw'",
+        ),
+        "code/odcr_core/config_schema.py": (
+            "optimizer_config_json",
+            "precision_config_json",
+            "tokenizer_max_length",
+            "evidence_max_length",
+            "max_grad_norm",
+            "pin_memory",
+            "non_blocking_h2d",
+            "prefetcher_config_json",
+            "cross_rank_structured_gather_config_json",
+            "memory_config_json",
+            "task_profile_config_json",
+            "exploration_profiles_config_json",
+            "task_profile_id",
+            "profile_isolation_hash",
+        ),
+        "code/config.py": (
+            "Step3 optimizer must be AdamW",
+            "effective Step3 train_precision must be bf16",
+            "ODCR_HARDWARE_PROFILE_JSON missing",
+        ),
+        "code/executors/step3_train_core.py": (
+            "build_step3_optimizer",
+            "optim.AdamW",
+            "float(final_cfg.max_grad_norm)",
+            "resolved.tokenizer_max_length",
+            "resolved.evidence_max_length",
+            "bool(resolved.pin_memory)",
+            "bool(final_cfg.non_blocking_h2d)",
+            "Step3CUDAPrefetcher",
+            "startup_steady_state_timing",
+            "gather_step3_structured_context_local_gradient",
+            "apply_step3_memory_controls",
+        ),
+    }
+    texts = {
+        "code/odcr_core/config_resolver.py": resolver,
+        "code/odcr_core/config_schema.py": schema,
+        "code/config.py": config_py,
+        "code/executors/step3_train_core.py": step3_core,
+    }
+    for rel, terms in required_code_terms.items():
+        missing = [term for term in terms if term not in texts[rel]]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "Step3 v0 controls must flow through resolved payload."))
+    banned_code_terms = {
+        "code/executors/step3_train_core.py": (
+            "optim.Adam(",
+            "weight_decay=1e-5",
+            "clip_grad_norm_(step3_trainable_parameters(model), 1.0)",
+            "self.max_length = 25",
+            "self.evidence_length = 24",
+            "pin_memory = torch.cuda.is_available()",
+        ),
+        "code/odcr_core/runners.py": (
+            '"ODCR_RUNTIME_PRECISION_MODE": "bf16"',
+        ),
+    }
+    for rel, terms in banned_code_terms.items():
+        text = _read(repo_root / rel)
+        for term in terms:
+            if term in text:
+                findings.append(Finding(rel, 1, term, "Retired Step3 active hardcode/fallback is prohibited."))
+    if findings:
+        result.fail("Step3 v0 parameter surface still has legacy drift or missing One-Control fields.", findings)
+    else:
+        result.summary = "Step3 no-accum optimizer/precision/length/scheduler/grad-norm/hardware/scenario controls are One-Control and legacy-free."
+    return result
+
+
+def _check_step3_s2r_perf_cache_downstream_guardrails(repo_root: Path) -> RuleResult:
+    result = RuleResult("R100", "Step3 clean cache/downstream/profile split must stay active")
+    findings: list[Finding] = []
+    cfg_text = _read(repo_root / "configs" / "odcr.yaml")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    checkpoint = _read(repo_root / "code" / "odcr_core" / "training_checkpoint.py")
+    step4 = _read(repo_root / "code" / "executors" / "step4_engine.py")
+    required = {
+        "configs/odcr.yaml": (
+            "task_profiles:",
+            "task2_am_movies_to_cds:",
+            "candidate: G1S",
+            "task2_g1_backup:",
+            "candidate: G1",
+            "backup_profiles:",
+            "task2_g0_backup:",
+            "backup_only: true",
+            "manual_selection_required: true",
+            "exploration_profiles:",
+            "task2_g2_effective_pool_2048:",
+            "profile_buffer_policy: cpu_pinned_batch_gather",
+            "exploration_only: true",
+            "replacement_gate_status: failed_or_not_passed",
+            "worker_profiles:",
+            "W3:",
+            "train_workers_per_rank: 5",
+            "prefetch_factor: 4",
+        ),
+        "code/executors/step3_train_core.py": (
+            "odcr_step3_tokenizer_cache/2",
+            "tokenizer_cache_compat_hash",
+            "record_only_lineage",
+            "retired_v1_schema_rebuild_required",
+            "Step3CUDAPrefetcher",
+            "compute_wait_for_prefetch",
+            "optimizer_time",
+            "scheduler_time",
+        ),
+        "code/odcr_core/training_checkpoint.py": (
+            "odcr_step3_checkpoint_compat/2",
+            "semantic_model_compat_hash",
+            "train_runtime_config_hash",
+            "optimizer_config_hash",
+            "record_only_fields",
+        ),
+        "code/executors/step4_engine.py": (
+            "semantic_model_compat_hash",
+            "data_contract_hash",
+            "artifact_lineage_hash",
+            "validate_step3_checkpoint_lineage",
+        ),
+    }
+    texts = {
+        "configs/odcr.yaml": cfg_text,
+        "code/executors/step3_train_core.py": step3_core,
+        "code/odcr_core/training_checkpoint.py": checkpoint,
+        "code/executors/step4_engine.py": step4,
+    }
+    for rel, terms in required.items():
+        missing = [term for term in terms if term not in texts[rel]]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "S2-R cache/downstream/performance contracts must be explicit."))
+    step4_func = step4[step4.find("def _validate_step3_checkpoint_lineage_for_step4"): step4.find("def ", step4.find("def _validate_step3_checkpoint_lineage_for_step4") + 10)]
+    for forbidden in ("step3_optimizer_config_hash", "optimizer_config_hash", "train_runtime_config_hash", "batch_semantics_hash", "ddp_config_hash"):
+        if forbidden in step4_func:
+            findings.append(
+                Finding(
+                    "code/executors/step4_engine.py",
+                    1,
+                    forbidden,
+                    "Step4 hard gate must not reject semantic checkpoints for record-only optimizer/batch/runtime metadata.",
+                )
+            )
+    try:
+        import yaml
+
+        raw_cfg = yaml.safe_load(cfg_text) or {}
+    except Exception:
+        raw_cfg = {}
+    step3 = raw_cfg.get("step3") if isinstance(raw_cfg, dict) else {}
+    step3_train = (step3 or {}).get("train") if isinstance(step3, dict) else {}
+    if not (
+        isinstance(step3_train, dict)
+        and int(step3_train.get("batch_size") or 0) == 1536
+        and int(step3_train.get("per_gpu_batch_size") or 0) == 768
+        and all(key not in step3_train for key in ("grad_accum", "gradient_accumulation_steps", "accumulate_grad_batches"))
+    ):
+        findings.append(Finding("configs/odcr.yaml", 1, "step3.train", "Active Step3 default must be task2 G1 no-accum 1536/768 with per_gpu_batch_size and no grad_accum field."))
+    exploration = (step3 or {}).get("exploration_profiles") if isinstance(step3, dict) else {}
+    g2 = exploration.get("task2_g2_effective_pool_2048") if isinstance(exploration, dict) else {}
+    if not (isinstance(g2, dict) and g2.get("probe_only") is True and g2.get("formal_allowed") is False):
+        findings.append(Finding("configs/odcr.yaml", 1, "step3.exploration_profiles.task2_g2_effective_pool_2048", "G2 exploration must be probe_only and formal disallowed."))
+    if "_ddp_no_sync_model" in step3_core or ".no_sync(" in step3_core:
+        findings.append(Finding("code/executors/step3_train_core.py", 1, "no_sync", "Step3 no-accum train loop must not keep active no_sync accumulation paths."))
+    if findings:
+        result.fail("Step3 clean cache/downstream/profile guardrails failed.", findings)
+    else:
+        result.summary = "Step3 split remains active with no-accum batch semantics, cache v2 tokenizer compat, semantic downstream gate, prefetcher, and isolated backup/exploration profiles."
+    return result
+
+
+def _check_step3_formal_logging_param_surface(repo_root: Path) -> RuleResult:
+    result = RuleResult("R101", "Step3 formal logging and parameter surface must remain closed")
+    findings: list[Finding] = []
+    runners = _read(repo_root / "code" / "odcr_core" / "runners.py")
+    logging_meta = _read(repo_root / "code" / "odcr_core" / "logging_meta.py")
+    train_logging = _read(repo_root / "code" / "train_logging.py")
+    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
+    odcr_py = _read(repo_root / "code" / "odcr.py")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+
+    checks = {
+        "code/odcr_core/runners.py": (
+            "append_full_log",
+            "[raw child]",
+            "========== LAUNCHER COMMAND ==========",
+        ),
+        "code/odcr_core/logging_meta.py": (
+            "odcr_step3_logging/2",
+            "authoritative_full_log=true",
+            "training_runtime_config_path",
+            "debug.log is only a transport mirror",
+        ),
+        "code/train_logging.py": (
+            "log_run_header",
+            "ROUTE_DETAIL",
+            "append_step3_loss_breakdown_jsonl",
+            "append_step3_timing_profile_jsonl",
+            "append_step3_gpu_profile_jsonl",
+            "append_step3_epoch_summary_csv",
+        ),
+        "code/odcr_core/manifests.py": (
+            "authoritative_full_log_path",
+            "training_runtime_config_path",
+            "formal_snapshot_view",
+            "build_formal_source_table_snapshot",
+        ),
+        "code/odcr.py": (
+            "formal_snapshot_view",
+            "build_formal_source_table_snapshot",
+        ),
+        "code/executors/step3_train_core.py": (
+            "write_training_runtime_config_artifact",
+            "append_step3_loss_breakdown_jsonl",
+            "append_step3_timing_profile_jsonl",
+            "append_step3_gpu_profile_jsonl",
+            "append_step3_epoch_summary_csv",
+        ),
+    }
+    for rel, terms in checks.items():
+        text = {
+            "code/odcr_core/runners.py": runners,
+            "code/odcr_core/logging_meta.py": logging_meta,
+            "code/train_logging.py": train_logging,
+            "code/odcr_core/manifests.py": manifests,
+            "code/odcr.py": odcr_py,
+            "code/executors/step3_train_core.py": step3_core,
+        }[rel]
+        missing = [term for term in terms if term not in text]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "Keep Step3 formal logging closure active."))
+    if 'os.path.dirname(log_path), "resolved_config.json"' in step3_core or "[Config resolved] wrote" in step3_core:
+        findings.append(
+            Finding(
+                "code/executors/step3_train_core.py",
+                1,
+                "child resolved_config writer",
+                "Step3 child must write training_runtime_config.json, never parent canonical resolved_config.json.",
+            )
+        )
+    if "ROUTE_SUMMARY" in train_logging[train_logging.find("def log_config_snapshot"): train_logging.find("def log_run_snapshot")]:
+        findings.append(
+            Finding(
+                "code/train_logging.py",
+                1,
+                "RUN_CONFIG route summary",
+                "RUN_CONFIG must route to detail/full.log, not default console.",
+            )
+        )
+    if findings:
+        result.fail("Step3 logging/config artifact closure regressed.", findings)
+    else:
+        result.summary = "full.log is authoritative, console is compact, child runtime config is split, and structured Step3 metrics are active."
+    return result
+
+
+def _check_step3_formal_view_dynamic(repo_root: Path) -> RuleResult:
+    result = RuleResult("R102", "Step3 formal view must hide backup/exploration/probe/pilot by default")
+    findings: list[Finding] = []
+    code_dir = repo_root / "code"
+    inserted = False
+    if str(code_dir) not in sys.path:
+        sys.path.insert(0, str(code_dir))
+        inserted = True
+    try:
+        from odcr_core.config_resolver import resolve_config
+        from odcr_core.manifests import build_formal_source_table_snapshot, formal_snapshot_view
+
+        _cfg, _sources, snapshot = resolve_config(
+            config_path=repo_root / "configs" / "odcr.yaml",
+            command="step3",
+            task_id=2,
+            set_overrides=[],
+            dry_run=True,
+            run_id="auto",
+            mode="full",
+        )
+        formal = formal_snapshot_view(snapshot)
+        source_table = build_formal_source_table_snapshot(snapshot)
+        formal_text = json.dumps(formal, ensure_ascii=False)
+        source_text = json.dumps(source_table, ensure_ascii=False)
+        forbidden = (
+            "step3_backup_profiles",
+            "step3_exploration_profiles",
+            "step3_performance_ladder",
+            "step3_performance_probe",
+            "step3_short_pilot",
+            "task2_g2_effective_pool_2048",
+            "probe_only",
+        )
+        for term in forbidden:
+            if term in formal_text:
+                findings.append(Finding("code/odcr_core/manifests.py", 1, term, "Default formal Step3 view must hide backup/exploration/probe/pilot."))
+        for term in ("backup", "exploration", "performance_probe", "short_pilot", "step5"):
+            if term in source_text:
+                findings.append(Finding("code/odcr_core/manifests.py", 1, term, "Default formal source_table must exclude non-formal rows."))
+        g2 = snapshot["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]
+        if not bool(g2.get("probe_only")) or bool(g2.get("formal_allowed")):
+            findings.append(Finding("configs/odcr.yaml", 1, repr(g2), "G2 must remain probe_only=true and formal_allowed=false."))
+        for task_id in (5, 8, 7):
+            _cfg_i, _sources_i, snap_i = resolve_config(
+                config_path=repo_root / "configs" / "odcr.yaml",
+                command="step3",
+                task_id=task_id,
+                set_overrides=[],
+                dry_run=True,
+                run_id="auto",
+                mode="full",
+            )
+            role = str((snap_i.get("train") or {}).get("step3_batch_candidate_role") or "")
+            if "task2_" in role:
+                findings.append(
+                    Finding("code/odcr_core/config_resolver.py", 1, f"task{task_id}: {role}", "Non-task2 profiles must not inherit task2 ladder roles.")
+                )
+    except Exception as exc:
+        findings.append(Finding("code/odcr_core/config_resolver.py", 1, repr(exc), "Formal view guardrail must remain import-safe."))
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(str(code_dir))
+            except ValueError:
+                pass
+    if findings:
+        result.fail("Step3 formal view or task-profile role isolation regressed.", findings)
+    else:
+        result.summary = "Default Step3 view/source_table are formal-only, G2 stays probe-only, and task5/8/7 do not leak task2 ladder roles."
+    return result
+
+
+def _check_step3_config_artifact_split(repo_root: Path) -> RuleResult:
+    result = RuleResult("R103", "Step3 child runtime config must not overwrite parent resolved_config")
+    findings: list[Finding] = []
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
+    checkpoint = _read(repo_root / "code" / "odcr_core" / "training_checkpoint.py")
+    if 'resolved_config.json"' in step3_core and "write_training_runtime_config_artifact" not in step3_core:
+        findings.append(Finding("code/executors/step3_train_core.py", 1, "resolved_config.json", "Child runtime snapshots must use training_runtime_config.json."))
+    for rel, text, terms in (
+        ("code/odcr_core/manifests.py", manifests, ("TRAINING_RUNTIME_CONFIG_FILENAME", "write_training_runtime_config_artifact", "training_runtime_config_path")),
+        ("code/odcr_core/training_checkpoint.py", checkpoint, ("current_training_runtime_config_lineage", "training_runtime_config_hash", "training_runtime_config_path")),
+    ):
+        missing = [term for term in terms if term not in text]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "Config artifact split must be lineage-visible."))
+    if findings:
+        result.fail("Step3 child/parent config artifact split is incomplete.", findings)
+    else:
+        result.summary = "Parent resolved_config.json and child training_runtime_config.json are split and lineage-indexed."
+    return result
+
+
+def _check_step3_structured_metric_files_active(repo_root: Path) -> RuleResult:
+    result = RuleResult("R104", "Step3 structured metrics files must be active")
+    findings: list[Finding] = []
+    path_layout = _read(repo_root / "code" / "odcr_core" / "path_layout.py")
+    train_logging = _read(repo_root / "code" / "train_logging.py")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    required = {
+        "code/odcr_core/path_layout.py": (path_layout, ("timing_profile", "loss_breakdown", "gpu_profile", "epoch_summary")),
+        "code/train_logging.py": (
+            train_logging,
+            (
+                "append_step3_loss_breakdown_jsonl",
+                "append_step3_timing_profile_jsonl",
+                "append_step3_gpu_profile_jsonl",
+                "append_step3_epoch_summary_csv",
+            ),
+        ),
+        "code/executors/step3_train_core.py": (
+            step3_core,
+            (
+                "_step3_loss_breakdown_row",
+                "_step3_timing_profile_row",
+                "_step3_gpu_profile_row",
+                "append_step3_epoch_summary_csv",
+            ),
+        ),
+    }
+    for rel, (text, terms) in required.items():
+        missing = [term for term in terms if term not in text]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "Step3 structured metrics must not regress to full.log parsing."))
+    if findings:
+        result.fail("Step3 structured metric files are not fully active.", findings)
+    else:
+        result.summary = "metrics/loss_breakdown/timing_profile/gpu_profile/epoch_summary writers are active."
+    return result
+
+
+def _check_step3_run_summary_log_indexes(repo_root: Path) -> RuleResult:
+    result = RuleResult("R105", "run_summary must index authoritative full/debug/errors/config artifacts")
+    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
+    terms = (
+        "authoritative_full_log_path",
+        "debug_log_path",
+        "training_runtime_config_path",
+        "optional_missing_with_reason",
+        "failure_root_signature",
+        "failure_phase",
+        "fatal_signature",
+        "training_loop_started",
+        "checkpoint_created",
+        "resolved_config_path",
+        "loss_breakdown",
+        "timing_profile",
+        "gpu_profile",
+        "epoch_summary",
+    )
+    missing = [term for term in terms if term not in manifests]
+    if missing:
+        result.fail(
+            "run_summary artifact indexes are incomplete.",
+            [Finding("code/odcr_core/manifests.py", 1, "missing: " + ", ".join(missing), "Index formal log/config/metric artifacts in run_summary.")],
+        )
+    else:
+        result.summary = "run_summary indexes authoritative full.log, debug.log, config split, and Step3 structured metric files."
+    return result
+
+
+def _check_step3_formal_source_table_static(repo_root: Path) -> RuleResult:
+    result = RuleResult("R106", "Step3 source_table default must be formal-only")
+    findings: list[Finding] = []
+    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    odcr_py = _read(repo_root / "code" / "odcr.py")
+    terms = (
+        "_STEP3_FORMAL_SOURCE_EXCLUDE_PARTS",
+        "build_formal_source_table_snapshot",
+        "formal_only_source_table",
+    )
+    combined = "\n".join((manifests, resolver, odcr_py))
+    for term in terms:
+        if term not in combined:
+            findings.append(Finding("code/odcr_core/manifests.py", 1, term, "Formal source_table must stay the default for Step3."))
+    for term in ("backup", "exploration", "step5"):
+        if term not in manifests:
+            findings.append(Finding("code/odcr_core/manifests.py", 1, term, "Formal source_table exclusion list is missing a non-formal surface."))
+    if findings:
+        result.fail("Step3 formal source_table closure is incomplete.", findings)
+    else:
+        result.summary = "Step3 source_table defaults to formal-only with verbose/history rows excluded."
+    return result
+
+
+def _check_step3_non_task2_roles_and_g2_dynamic(repo_root: Path) -> RuleResult:
+    result = RuleResult("R107", "Non-task2 Step3 views must not leak task2 ladder role and G2 stays non-formal")
+    findings: list[Finding] = []
+    code_dir = repo_root / "code"
+    inserted = False
+    if str(code_dir) not in sys.path:
+        sys.path.insert(0, str(code_dir))
+        inserted = True
+    try:
+        from odcr_core.config_resolver import resolve_config
+
+        for task_id in (5, 8, 7):
+            _cfg, _sources, snap = resolve_config(
+                config_path=repo_root / "configs" / "odcr.yaml",
+                command="step3",
+                task_id=task_id,
+                set_overrides=[],
+                dry_run=True,
+                run_id="auto",
+                mode="full",
+            )
+            role = str((snap.get("train") or {}).get("step3_batch_candidate_role") or "")
+            profile_id = str((snap.get("task") or {}).get("task_profile_id") or "")
+            if "task2_" in role or (profile_id and profile_id not in role):
+                findings.append(Finding("code/odcr_core/config_resolver.py", 1, f"task{task_id}: {role}", "Batch candidate role must be task-profile isolated."))
+        _cfg2, _sources2, snap2 = resolve_config(
+            config_path=repo_root / "configs" / "odcr.yaml",
+            command="step3",
+            task_id=2,
+            set_overrides=[],
+            dry_run=True,
+            run_id="auto",
+            mode="full",
+        )
+        g2 = snap2["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]
+        if not bool(g2.get("probe_only")) or bool(g2.get("formal_allowed")):
+            findings.append(Finding("configs/odcr.yaml", 1, repr(g2), "G2 must stay probe_only=true/formal_allowed=false."))
+    except Exception as exc:
+        findings.append(Finding("code/odcr_core/config_resolver.py", 1, repr(exc), "Role/G2 guardrail must remain import-safe."))
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(str(code_dir))
+            except ValueError:
+                pass
+    if findings:
+        result.fail("Step3 task-profile role isolation or G2 non-formal status regressed.", findings)
+    else:
+        result.summary = "task5/8/7 roles are profile-local and G2 remains probe_only/formal disallowed."
+    return result
+
+
+def _check_step3_no_old_param_regressions_static(repo_root: Path) -> RuleResult:
+    result = RuleResult("R108", "Step3 old params must be absent from active clean baseline")
+    findings: list[Finding] = []
+    cfg = _read(repo_root / "configs" / "odcr.yaml")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    schema = _read(repo_root / "code" / "odcr_core" / "config_schema.py")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    required = (
+        "_validate_config_shape",
+        "_reject_unknown_keys",
+        "tokenizer_schema_version must be odcr_step3_tokenizer_cache/2",
+    )
+    for term in required:
+        if term not in resolver:
+            findings.append(Finding("code/odcr_core/config_resolver.py", 1, term, "Step3 unknown keys must be rejected by generic strict schema."))
+    active_forbidden = (
+        "step3:\n  train:\n    grad_accum:",
+        "step3:\n  train:\n    coef:",
+        "optimizer: adam\n",
+        "train_precision: fp32",
+        "max_length: 25",
+        "max_evidence_length: 24",
+        "performance_ladder:",
+        "smoke_ladder:",
+        "performance_probe:",
+        "short_pilot:",
+    )
+    for term in active_forbidden:
+        if term in cfg:
+            findings.append(Finding("configs/odcr.yaml", 1, term, "Do not reintroduce retired Step3 formal defaults."))
+    active_code_forbidden = (
+        "_STEP3_RETIRED_CONTROL_FIELDS",
+        "_STEP3_REMOVED_GRAD_ACCUM_FIELDS",
+        "STEP3_GRAD_ACCUM_REMOVED_MESSAGE",
+        "Step3 child --coef is retired",
+        "_resolve_step3_ladder_config",
+        "_resolve_step3_performance_probe_config",
+        "_resolve_step3_short_pilot_config",
+        "performance_ladder_config_json",
+        "smoke_ladder_config_json",
+        "performance_probe_config_json",
+        "short_pilot_config_json",
+    )
+    for term in active_code_forbidden:
+        if term in resolver or term in schema or term in step3_core:
+            findings.append(Finding("code", 1, term, "Step3 clean baseline must not keep old active parser/resolver/schema branches."))
+    if ".no_sync(" in step3_core or "_ddp_no_sync_model" in step3_core:
+        findings.append(Finding("code/executors/step3_train_core.py", 1, "no_sync", "Step3 no-accum path must not restore accumulation."))
+    if findings:
+        result.fail("Old Step3 parameters or no-accum bypasses are active again.", findings)
+    else:
+        result.summary = "Step3 old parser/resolver/schema fields are absent; generic strict schema owns unknown-key rejection."
+    return result
+
+
+def _check_step3_quality_evidence_performance_rebuild(repo_root: Path) -> RuleResult:
+    result = RuleResult("R109", "Step3 quality/evidence/performance rebuild contracts must stay active")
+    findings: list[Finding] = []
+    cfg = _read(repo_root / "configs" / "odcr.yaml")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    schema = _read(repo_root / "code" / "odcr_core" / "config_schema.py")
+    config_py = _read(repo_root / "code" / "config.py")
+    core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    quality = _read(repo_root / "code" / "odcr_core" / "step3_quality.py")
+    checkpoint = _read(repo_root / "code" / "odcr_core" / "training_checkpoint.py")
+    bridge = _read(repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py")
+    post_edit = _read(repo_root / "code" / "tools" / "odcr_post_edit_check.py")
+    docs = _read(repo_root / "docs" / "ODCR_STEP3_QUALITY_EVIDENCE_PERFORMANCE_CONTRACT.md")
+    tests = _read(repo_root / "code" / "tests" / "test_step3_quality_evidence_performance_rebuild.py")
+    required = {
+        "configs/odcr.yaml": (
+            "checkpoint_policy:",
+            "quality_gate:",
+            "grad_finite:",
+            "diagnostic_eval:",
+            "performance_candidates:",
+            "validation_aware_lr_damping:",
+        ),
+        "code/odcr_core/config_resolver.py": (
+            "_resolve_step3_checkpoint_policy_config",
+            "_resolve_step3_quality_gate_config",
+            "_resolve_step3_grad_finite_config",
+            "_resolve_step3_diagnostic_eval_config",
+            "_resolve_step3_performance_candidates_config",
+        ),
+        "code/odcr_core/stage_status.py": (
+            "do_not_use_quality_audit_as_final_truth",
+            "quality_audit.json.superseded_by.json",
+            "completed_with_eval_handoff",
+        ),
+        "code/odcr_core/config_schema.py": (
+            "checkpoint_policy_config_json",
+            "quality_gate_config_json",
+            "grad_finite_config_json",
+            "diagnostic_eval_config_json",
+            "performance_candidates_config_json",
+        ),
+        "code/config.py": (
+            "checkpoint_policy_config_json",
+            "quality_gate_config_json",
+            "grad_finite_config_json",
+            "diagnostic_eval_config_json",
+            "performance_candidates_config_json",
+        ),
+        "code/odcr_core/step3_quality.py": (
+            "TIMING_REQUIRED_FIELDS",
+            "MEMORY_REQUIRED_FIELDS",
+            "PREFETCH_EVIDENCE_FIELDS",
+            "validate_step3_downstream_quality_gate",
+            "Evidence Level",
+        ),
+        "code/executors/step3_train_core.py": (
+            "best_observed.pth",
+            "best_after_min_epochs.pth",
+            "latest.pth",
+            "grad_check_ms",
+            "optimizer_step_executed",
+            "structured_gather_total_bytes",
+            "collapse_stats_from_predictions",
+            "Step3CUDAPrefetcher",
+        ),
+        "code/odcr_core/training_checkpoint.py": (
+            "checkpoint_epoch",
+            "selection_scope",
+            "CHECKPOINT_EVENT_LEDGER_SCHEMA_VERSION",
+            "never_silently_overwrite_global_best",
+        ),
+        "code/tools/odcr_tmux_gpu_bridge.py": (
+            "step3-performance-probe",
+            "STEP3_PERFORMANCE_PROBE_TYPES",
+            "build_step3_performance_probe_script",
+        ),
+        "code/tools/odcr_post_edit_check.py": (
+            "test_step3_quality_evidence_performance_rebuild.py",
+        ),
+        "docs/ODCR_STEP3_QUALITY_EVIDENCE_PERFORMANCE_CONTRACT.md": (
+            "Evidence Level 1",
+            "run1",
+            "checkpoint policy",
+            "performance-probe bridge",
+        ),
+        "code/tests/test_step3_quality_evidence_performance_rebuild.py": (
+            "this test proves",
+            "this test does not prove",
+            "whether formal hot path is covered",
+            "whether runtime evidence is required",
+            "regression bug it prevents",
+        ),
+    }
+    texts = {
+        "configs/odcr.yaml": cfg,
+        "code/odcr_core/config_resolver.py": resolver,
+        "code/odcr_core/stage_status.py": _read(repo_root / "code" / "odcr_core" / "stage_status.py"),
+        "code/odcr_core/config_schema.py": schema,
+        "code/config.py": config_py,
+        "code/odcr_core/step3_quality.py": quality,
+        "code/executors/step3_train_core.py": core,
+        "code/odcr_core/training_checkpoint.py": checkpoint,
+        "code/tools/odcr_tmux_gpu_bridge.py": bridge,
+        "code/tools/odcr_post_edit_check.py": post_edit,
+        "docs/ODCR_STEP3_QUALITY_EVIDENCE_PERFORMANCE_CONTRACT.md": docs,
+        "code/tests/test_step3_quality_evidence_performance_rebuild.py": tests,
+    }
+    for rel, terms in required.items():
+        missing = [term for term in terms if term not in texts[rel]]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "Step3 quality/evidence/performance rebuild contract regressed."))
+    for forbidden in (
+        "current_valid_loss <= prev_valid_loss",
+        "current_valid_loss < prev_valid_loss",
+    ):
+        if forbidden in core:
+            findings.append(Finding("code/executors/step3_train_core.py", 1, forbidden, "Checkpoint best selection must compare against global best, not previous epoch."))
+    if findings:
+        result.fail("Step3 quality/evidence/performance rebuild guardrail failed.", findings)
+    else:
+        result.summary = "Step3 global-best checkpoints, quality gate, grad finite gate, timing/memory/prefetch evidence, diagnostics, and bridge probe contracts are active."
+    return result
+
+
+def _check_stage_truth_upstream_resolver(repo_root: Path) -> RuleResult:
+    result = RuleResult("R112", "stage truth and unified upstream resolver")
+    required_files = (
+        "code/odcr_core/stage_status.py",
+        "code/odcr_core/upstream_resolver.py",
+        "code/odcr_core/stage_promotion.py",
+        "docs/CURRENT_PROJECT_STATE.md",
+    )
+    findings: list[Finding] = []
+    for rel in required_files:
+        if not (repo_root / rel).is_file():
+            findings.append(Finding(rel, 1, "missing", "Add the stage truth/upstream resolver surface."))
+    text_by_file: dict[str, str] = {}
+    for rel in required_files:
+        path = repo_root / rel
+        if path.is_file():
+            text_by_file[rel] = _read(path)
+    required_terms = {
+        "code/odcr_core/stage_status.py": (
+            "STAGE_STATUS_SCHEMA_VERSION",
+            "quality_audit.json.superseded_by.json",
+            "do_not_use_quality_audit_as_final_truth",
+        ),
+        "code/odcr_core/upstream_resolver.py": (
+            "resolve_upstream",
+            "validate_upstream_eligibility",
+            "validate_stage_status_evidence",
+            "non_latest_eligible_run_requires_promote",
+        ),
+        "code/odcr_core/stage_promotion.py": (
+            "promote_upstream",
+            "historical_stage_status_immutable",
+            "promotion_history.jsonl",
+        ),
+        "docs/CURRENT_PROJECT_STATE.md": (
+            "stage_status.json",
+            "latest.json",
+            "Historical docs and AI_analysis are not live truth",
+            "machine_verdict.json",
+        ),
+    }
+    for rel, terms in required_terms.items():
+        text = text_by_file.get(rel, "")
+        for term in terms:
+            if term not in text:
+                findings.append(Finding(rel, 1, f"missing term: {term}", "Keep the stage truth contract explicit."))
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    for term in ("resolve_upstream", "upstream_resolution_json", "from_step3"):
+        if term not in resolver:
+            findings.append(Finding("code/odcr_core/config_resolver.py", 1, f"missing term: {term}", "Route Step4/Step5 through upstream_resolver."))
+    odcr = _read(repo_root / "code" / "odcr.py")
+    for term in ("--from-step3-run", "promote-upstream"):
+        if term not in odcr:
+            findings.append(Finding("code/odcr.py", 1, f"missing term: {term}", "Expose the governed upstream run selector/promoter."))
+    active_doc_re = re.compile(
+        r"(run2|run 2|run_id\s*=?\s*2).{0,160}(failed|downstream_ready\s*=\s*false|must not be .*downstream|blocked)",
+        re.IGNORECASE,
+    )
+    docs_dir = repo_root / "docs"
+    for path in sorted(docs_dir.glob("*.md")) if docs_dir.is_dir() else []:
+        rel = _rel(path, repo_root)
+        if rel == "docs/CURRENT_PROJECT_STATE.md" or "/history/" in rel:
+            continue
+        text = _read(path)
+        first_lines = "\n".join(text.splitlines()[:6])
+        if "SUPERSEDED / HISTORICAL ONLY" in first_lines:
+            continue
+        for idx, line in enumerate(text.splitlines(), start=1):
+            if active_doc_re.search(line):
+                findings.append(
+                    Finding(
+                        rel,
+                        idx,
+                        line.strip()[:240],
+                        "Mark historical-only or route active state through docs/CURRENT_PROJECT_STATE.md.",
+                    )
+                )
+    if findings:
+        result.fail("Stage truth/upstream resolver guardrail failed.", findings)
+    else:
+        result.summary = "Stage status, active latest pointers, promotion, resolver, and active-doc truth boundaries are present."
+    return result
+
+
+def _check_stage_status_strict_antiforgery_guardrail(repo_root: Path) -> RuleResult:
+    result = RuleResult("R113", "stage_status strict anti-forgery guardrail")
+    findings: list[Finding] = []
+    code_dir = str(repo_root / "code")
+    if code_dir not in sys.path:
+        sys.path.insert(0, code_dir)
+    try:
+        from odcr_core.stage_truth_antiforgery import run_antiforgery_selftest
+
+        payload = run_antiforgery_selftest()
+    except Exception as exc:
+        result.fail(
+            "R113 selftest could not execute.",
+            [Finding("code/odcr_core/stage_truth_antiforgery.py", 1, repr(exc), "Keep R113 import-safe and lightweight.")],
+        )
+        return result
+    required = {
+        "forged_status_rejected": "forged/minimal status must be rejected",
+        "missing_artifact_rejected": "missing artifact must be rejected",
+        "hash_mismatch_rejected": "hash mismatch must be rejected",
+        "stale_exists_rejected": "stale exists=true must be rejected from disk",
+        "promotion_malformed_target_rejected": "promotion dry-run must reject malformed target",
+        "alias_run1_rejected": "manual alias must use the same strict resolver",
+        "latest_pointer_only_passed": "deprecated latest_status must not be final truth",
+    }
+    for key, message in required.items():
+        if payload.get(key) is not True:
+            findings.append(
+                Finding(
+                    "code/odcr_core/stage_truth_antiforgery.py",
+                    1,
+                    f"{key}={payload.get(key)!r}",
+                    message,
+                )
+            )
+    if findings:
+        result.fail("Stage status anti-forgery negative selftest failed.", findings)
+    else:
+        result.summary = "R113 negative cases reject forged status, missing artifacts, hash mismatch, stale exists, malformed promotion, and alias bypass."
+    return result
+
+
+def _check_step4_runtime_preflight_twophase_guardrail(repo_root: Path) -> RuleResult:
+    result = RuleResult("R114", "Step4 pre-DDP cache, preflight, two-phase export, and frozen lineage")
+    findings: list[Finding] = []
+    required_files = {
+        "code/odcr.py": (
+            "--prepare-cache",
+            "--preflight",
+            "--validation-namespace",
+        ),
+        "code/odcr_core/step4_runtime.py": (
+            "prepare_step4_encoded_cache",
+            "run_step4_bounded_preflight",
+            "reject_step4_formal_env_overrides",
+            "runs\" / \"step4_preflight\"",
+            "formal_latest_write",
+            "formal_export_write",
+        ),
+        "code/executors/step4_engine.py": (
+            "pre_ddp_cache_load_start",
+            "cold_build_allowed=False",
+            "destroy_process_group_before_cpu_export=True",
+            "non_rank0_gpu_released_before_cpu_tail=True",
+            "_step4_wait_for_partial_manifests",
+            "partial_artifacts_retained_for_readiness_validator=True",
+        ),
+        "code/odcr_core/step4_export_validator.py": (
+            "validate_step4_export_ready",
+            "index_contract",
+            "frozen Step3 lineage",
+            "step5_required_fields_precheck",
+        ),
+        "code/odcr_core/index_contract.py": (
+            "frozen_step3_lineage",
+            "Step5 refused Step4 export: missing frozen Step3 lineage",
+        ),
+        "configs/odcr.yaml": (
+            "step4:",
+            "runtime:",
+            "partial_wait_timeout_seconds",
+        ),
+    }
+    for rel, terms in required_files.items():
+        path = repo_root / rel
+        if not path.is_file():
+            findings.append(Finding(rel, 1, "missing", "Required Step4 runtime/preflight surface is absent."))
+            continue
+        text = _read(path)
+        for term in terms:
+            if term not in text:
+                findings.append(Finding(rel, 1, f"missing term: {term}", "Keep the Step4 runtime rebuild contract active."))
+    engine = _read(repo_root / "code" / "executors" / "step4_engine.py")
+    cold_pattern = re.compile(r"target_dataset\.map\(.{0,240}dist\.barrier\(", re.DOTALL)
+    if cold_pattern.search(engine):
+        findings.append(
+            Finding(
+                "code/executors/step4_engine.py",
+                1,
+                "target_dataset.map before dist.barrier",
+                "Cold tokenization/cache must not occur inside an active DDP/NCCL section.",
+            )
+        )
+    if "dist.gather_object" in engine or "all_gather_object" in engine:
+        findings.append(
+            Finding(
+                "code/executors/step4_engine.py",
+                1,
+                "distributed object gather present",
+                "Step4 export must use partial manifests, not text/object gather payloads.",
+            )
+        )
+    if "while not os.path.exists" in engine:
+        findings.append(
+            Finding(
+                "code/executors/step4_engine.py",
+                1,
+                "endless file polling present",
+                "Step4 file waiting must have timeout and failed-marker checks.",
+            )
+        )
+    if findings:
+        result.fail("Step4 runtime/preflight/two-phase export guardrail failed.", findings)
+    else:
+        result.summary = "Step4 cache is pre-DDP, preflight is non-formal, CPU export follows PG destroy, readiness is strict, and frozen lineage is required."
+    return result
+
+
+def _check_gpu_bridge_step4_bounded_preflight_admission(repo_root: Path) -> RuleResult:
+    result = RuleResult("R115", "GPU bridge Step4 bounded preflight admission")
+    findings: list[Finding] = []
+    bridge_path = repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py"
+    bridge_text = _read(bridge_path)
+    required_terms = (
+        "BridgeCommandPolicy",
+        "classify_repo_command",
+        "is_allowed_step4_validation_command",
+        "STEP4_BRIDGE_MAX_BOUNDED_LIMIT",
+        "runs\" / \"step4_preflight\"",
+        "runs\" / \"step4_validation\"",
+        "snapshot_formal_namespace",
+        "formal_namespace_polluted",
+        "parse_step4_preflight_evidence",
+        "runtime_evidence_split_present",
+        "command_allowed_by_policy",
+        "formal_pollution_check_passed",
+    )
+    for term in required_terms:
+        if term not in bridge_text:
+            findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, f"missing term: {term}", "Keep Step4 bridge admission policy explicit and testable."))
+    retired_blankets = (
+        '("step4", "step4")',
+        'generated bridge script contains forbidden token: step4',
+        'Step4 launch from validation',
+        r"(?:\./odcr|python\s+code/odcr\.py)\s+step4\b\", \"step4",
+    )
+    for term in retired_blankets:
+        if term in bridge_text:
+            findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, term, "Blanket Step4 forbidden logic must stay retired; command semantics decide."))
+    if "MODE_SPECS" in bridge_text or "closed-choice whitelist" in bridge_text:
+        findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, "MODE_SPECS/closed-choice whitelist", "Old whitelist or closed-choice hard blocker must not return."))
+    try:
+        bridge = _load_bridge_module(repo_root)
+        safe_preflight = (
+            "./odcr",
+            "step4",
+            "--task",
+            "2",
+            "--preflight",
+            "--max-samples",
+            "128",
+            "--validation-namespace",
+            "step4_preflight_smoke",
+        )
+        safe_prepare = (
+            "./odcr",
+            "step4",
+            "--task",
+            "2",
+            "--prepare-cache",
+            "--max-samples",
+            "128",
+            "--validation-namespace",
+            "step4_preflight_smoke",
+        )
+        positive = {
+            "safe Step4 preflight": safe_preflight,
+            "safe Step4 prepare-cache": safe_prepare,
+        }
+        for label, command in positive.items():
+            classification = bridge.BridgeCommandPolicy.classify_repo_command(command)
+            if not classification.allowed:
+                findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, label, f"Expected allow, got: {classification.reason}"))
+        negative = {
+            "formal Step4": ("./odcr", "step4", "--task", "2"),
+            "Step4 without bounded limit": ("./odcr", "step4", "--task", "2", "--preflight", "--validation-namespace", "step4_preflight_smoke"),
+            "Step4 without namespace": ("./odcr", "step4", "--task", "2", "--preflight", "--max-samples", "128"),
+            "bad namespace": ("./odcr", "step4", "--task", "2", "--preflight", "--max-samples", "128", "--validation-namespace", "../bad"),
+            "formal output": (
+                "./odcr",
+                "step4",
+                "--task",
+                "2",
+                "--preflight",
+                "--max-samples",
+                "128",
+                "--validation-namespace",
+                "step4_preflight_smoke",
+                "--output",
+                "runs/step4/task2/latest.json",
+            ),
+            "Step5": ("./odcr", "step5", "--task", "2"),
+            "eval": ("./odcr", "eval", "--task", "2"),
+            "rerank": ("./odcr", "rerank", "--task", "2"),
+            "nohup": ("nohup", "./odcr", "step4"),
+            "allocation": ("srun", "--pty", "bash"),
+            "destructive": ("rm", "-rf", "runs/step4/task2"),
+        }
+        for label, command in negative.items():
+            classification = bridge.BridgeCommandPolicy.classify_repo_command(command)
+            if classification.allowed:
+                findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, label, "Expected rejection, got allowed."))
+        out_dir = bridge.resolve_runtime_output_dir("runs/step4_preflight/task2/step4_preflight_smoke", "guardrail_r115")
+        if "runs/step4_preflight/task2/step4_preflight_smoke" not in str(out_dir):
+            findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, str(out_dir), "Step4 preflight output root must be allowed."))
+        evidence = bridge.parse_step4_preflight_evidence(output_dir=repo_root / "AI_analysis" / "nonexistent_r115")
+        if evidence.get("runtime_evidence_ok") is not False or evidence.get("evidence_complete") is not False:
+            findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, "cuda/probe-only evidence", "Missing Step4 artifacts must not pass runtime evidence."))
+    except Exception as exc:
+        findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, repr(exc), "R115 dynamic policy checks must import and execute."))
+    test_text = _read(repo_root / "code" / "tests" / "test_gpu_bridge_step4_preflight_admission.py")
+    for term in ("SAFE_PREFLIGHT", "test_step4_prepare_cache_repo_command_allowed", "test_cuda_probe_only_is_not_step4_runtime_evidence", "test_formal_pollution_snapshot_change_fails"):
+        if term not in test_text:
+            findings.append(Finding("code/tests/test_gpu_bridge_step4_preflight_admission.py", 1, f"missing term: {term}", "Step4 bridge policy tests must cover positive, negative, evidence, and pollution cases."))
+    if findings:
+        result.fail("GPU bridge Step4 bounded preflight admission guardrail failed.", findings)
+    else:
+        result.summary = "Bridge allows bounded Step4 preflight/prepare-cache validation, rejects formal/destructive/allocation/arbitrary paths, watches formal namespaces, and parses Step4 evidence."
+    return result
+
+
+def _check_step4_evidence_level_antifake_tuning_guardrail(repo_root: Path) -> RuleResult:
+    result = RuleResult("R116", "Step4 evidence-level anti-fake-tuning guardrail")
+    findings: list[Finding] = []
+    required_terms = {
+        "code/odcr_core/evidence_level.py": (
+            "E0_static_config",
+            "E1_schema_preview",
+            "E2_cpu_real_data_no_model",
+            "E3_gpu_transport",
+            "E4_gpu_shard_forward_bounded",
+            "E5_formal_full_run",
+            "require_min_evidence_level",
+            "assert_not_schema_only_for_tuning",
+            "mark_schema_preview",
+            "mark_gpu_shard_forward",
+        ),
+        "code/odcr_core/step4_runtime.py": (
+            "mark_schema_preview",
+            "cpu_preview_proxy_fields",
+            "not_step4_runtime_evidence",
+        ),
+        "code/odcr_core/step4_gpu_preflight_runner.py": (
+            "mark_gpu_shard_forward",
+            "actual_gpu_forward_executed",
+            "actual_model_loaded_on_gpu",
+            "force_gpu_forward",
+        ),
+        "code/odcr_core/step4_tuning_evidence.py": (
+            "rank_step4_candidates",
+            "build_best_candidate_record",
+            "build_patch_suggestion_text",
+            "E4_GPU_SHARD_FORWARD_BOUNDED",
+        ),
+        "code/odcr_core/step4_evidence_machine_verdict.py": (
+            "evidence_level_min_required_for_a",
+            "candidate_ranking_evidence_level",
+            "schema_only_evidence_used_for_tuning",
+            "fake_score_used_for_tuning",
+            "candidate_source_is_cpu_preview",
+        ),
+        "code/tools/odcr_tmux_gpu_bridge.py": (
+            "_step4_runtime_evidence_ok",
+            "actual_gpu_forward_executed",
+            "actual_model_loaded_on_gpu",
+            "force_gpu_forward",
+            "cuda_probe_alone_is_not_step4_runtime_evidence",
+            "E3_GPU_TRANSPORT",
+            "E4_GPU_SHARD_FORWARD_BOUNDED",
+        ),
+        "AI_analysis/06_step4_tuning_c9_neighborhood/run_c9_neighborhood_validation.py": (
+            "historical-invalid",
+            "--allow-schema-preview-report-only",
+            "best_candidate_written",
+            "patch_suggestion_written",
+            "candidate_ranking_requires_e4_or_e5",
+        ),
+    }
+    for rel, terms in required_terms.items():
+        path = repo_root / rel
+        if not path.is_file():
+            findings.append(Finding(rel, 1, "missing", "Required Step4 evidence-level surface is absent."))
+            continue
+        text = _read(path)
+        for term in terms:
+            if term not in text:
+                findings.append(Finding(rel, 1, f"missing term: {term}", "Keep Step4 evidence-level anti-fake tuning hard gates active."))
+    docs_terms = (
+        "E1_schema_preview",
+        "CPU preview",
+        "not tuning evidence",
+        "E4_gpu_shard_forward_bounded",
+        "formal Step4 remains blocked",
+        "C9_bucket_balanced",
+    )
+    for rel in (
+        "docs/CURRENT_PROJECT_STATE.md",
+        "docs/ODCR_ACTIVE_ARCHITECTURE.md",
+        "docs/AI_PROJECT_CANONICAL.md",
+        "docs/ODCR_ARCHITECTURE_CONTRACT.md",
+        "AGENTS.md",
+    ):
+        text = _read(repo_root / rel)
+        for term in docs_terms:
+            if term not in text:
+                findings.append(Finding(rel, 1, f"missing term: {term}", "Active docs must warn CPU preview is E1/schema-only and cannot tune Step4."))
+    superseded_targets = (
+        "AI_analysis/06_step4_tuning/best_candidate.yaml",
+        "AI_analysis/06_step4_tuning/best_candidate_patch_suggestion.md",
+        "AI_analysis/06_step4_tuning_c9_neighborhood/best_candidate.yaml",
+        "AI_analysis/06_step4_tuning_c9_neighborhood/best_candidate_patch_suggestion.md",
+        "AI_analysis/05_final_reports/step4_rcr_param_tuning_bounded_gpu_machine_verdict.json",
+        "AI_analysis/05_final_reports/step4_c9_neighborhood_throughput_validation_machine_verdict.json",
+    )
+    for rel in superseded_targets:
+        sidecar = repo_root / f"{rel}.superseded_by_real_gpu_evidence.json"
+        if not sidecar.is_file():
+            findings.append(Finding(f"{rel}.superseded_by_real_gpu_evidence.json", 1, "missing", "Old CPU-preview best/verdict artifacts must have superseded sidecars."))
+            continue
+        payload = _json_load(sidecar)
+        if payload.get("superseded") is not True or payload.get("not_valid_for_formal_tuning") is not True:
+            findings.append(Finding(str(sidecar.relative_to(repo_root)), 1, "invalid superseded payload", "Sidecar must fail closed for formal tuning/prompt use."))
+    try:
+        code_dir = str(repo_root / "code")
+        if code_dir not in sys.path:
+            sys.path.insert(0, code_dir)
+        from odcr_core.evidence_level import mark_gpu_shard_forward, mark_schema_preview
+        from odcr_core.step4_evidence_machine_verdict import build_step4_evidence_machine_verdict
+        from odcr_core.step4_tuning_evidence import rank_step4_candidates
+
+        cpu_preview = mark_schema_preview({"candidate_id": "cpu", "score": 1.0})
+        try:
+            rank_step4_candidates([cpu_preview])
+            findings.append(Finding("code/odcr_core/step4_tuning_evidence.py", 1, "CPU preview ranked", "E1 schema preview must raise before ranking."))
+        except Exception:
+            pass
+        verdict = build_step4_evidence_machine_verdict(
+            {
+                "candidate_ranking_evidence_level": "E1_schema_preview",
+                "schema_only_evidence_used_for_tuning": True,
+                "proxy_score_present": True,
+                "fake_score_used_for_tuning": True,
+                "guardrail_r116_status": "passed",
+            }
+        )
+        if verdict.get("verdict") == "A":
+            findings.append(Finding("code/odcr_core/step4_evidence_machine_verdict.py", 1, "E1 verdict A", "Machine verdict A must require E4/E5."))
+        e4 = mark_gpu_shard_forward({"candidate_id": "g1", "score": 1.0})
+        if not rank_step4_candidates([e4]):
+            findings.append(Finding("code/odcr_core/step4_tuning_evidence.py", 1, "E4 rejected", "E4 gpu-shard evidence must remain rankable for bounded tuning."))
+        bridge = _load_bridge_module(repo_root)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def w(name: str, payload: dict[str, object]) -> None:
+                (root / name).write_text(json.dumps(payload), encoding="utf-8")
+
+            base_summary = mark_schema_preview(
+                {
+                    "validation_namespace": "guardrail_r116",
+                    "sample_count": 4,
+                    "max_samples": 8,
+                    "formal_latest_write": False,
+                    "formal_export_write": False,
+                    "upstream_step3_run_id": "2",
+                }
+            )
+            w("preflight_summary.json", base_summary)
+            w(
+                "rcr_distribution.json",
+                mark_schema_preview(
+                    {
+                        "sample_count": 4,
+                        "route_scorer_count": 2,
+                        "route_explainer_count": 2,
+                        "train_keep_count": 2,
+                        "confidence_bucket_distribution": {"1": 4},
+                        "sample_weight_hint": {},
+                    }
+                ),
+            )
+            w("required_fields_check.json", mark_schema_preview({"passed": True, "missing": []}))
+            w("manifest_preview.json", mark_schema_preview({"schema_version": "x"}))
+            w("index_contract_preview.json", mark_schema_preview({"schema_version": "x"}))
+            w("lineage_preview.json", {"lineage_hash": "abc"})
+            w("cpu_gpu_utilization_snapshot.json", mark_schema_preview({"cuda_available": True, "gpu_runtime_evidence": False}))
+            evidence = bridge.parse_step4_preflight_evidence(output_dir=root)
+            if evidence.get("runtime_evidence_ok") is not False:
+                findings.append(Finding("code/tools/odcr_tmux_gpu_bridge.py", 1, "cuda_available accepted", "CUDA transport alone must not be Step4 runtime evidence."))
+    except Exception as exc:
+        findings.append(Finding("code/tools/check_one_control_guardrails.py", 1, repr(exc), "R116 dynamic checks must import and execute."))
+    if findings:
+        result.fail("Step4 evidence-level anti-fake-tuning guardrail failed.", findings)
+    else:
+        result.summary = "Step4 evidence levels gate CPU preview, candidate ranking, best candidates, patch suggestions, verdict A, bridge runtime evidence, docs, and superseded C9 artifacts."
+    return result
+
+
+def _check_no_accum_architecture_guardrail(repo_root: Path) -> RuleResult:
+    result = RuleResult("R117", "ODCR no-accum architecture guardrail")
+    findings: list[Finding] = []
+    removed_fields = {"grad_accum", "gradient_accumulation_steps", "accumulate_grad_batches", "accum_steps", "accumulation_steps"}
+    removed_env = {"ODCR_GRAD_ACCUM", "ODCR_GRADIENT_ACCUMULATION_STEPS", "ODCR_ACCUMULATE_GRAD_BATCHES"}
+    message_fragment = "grad_accum has been removed in ODCR no-accum architecture"
+    try:
+        import yaml
+
+        cfg = yaml.safe_load(_read(repo_root / "configs" / "odcr.yaml")) or {}
+    except Exception as exc:
+        result.fail("R117 could not read configs/odcr.yaml.", [Finding("configs/odcr.yaml", 1, repr(exc), "Config must be YAML-readable.")])
+        return result
+
+    def _walk_config(value: object, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                key_s = str(key)
+                child_path = f"{path}.{key_s}" if path else key_s
+                if key_s in removed_fields:
+                    findings.append(Finding("configs/odcr.yaml", 1, child_path, "Retired accumulation field must not be active config."))
+                _walk_config(child, child_path)
+        elif isinstance(value, list):
+            for idx, child in enumerate(value):
+                _walk_config(child, f"{path}[{idx}]")
+
+    _walk_config(cfg, "")
+    try:
+        ddp_world = int((((cfg.get("hardware") or {}).get("profiles") or {}).get("default") or {}).get("ddp_world_size") or 1)
+    except Exception:
+        ddp_world = 1
+
+    def _check_train_row(row: object, ctx: str, *, world: int | None = None) -> None:
+        if not isinstance(row, Mapping):
+            findings.append(Finding("configs/odcr.yaml", 1, ctx, "Train row must be a mapping."))
+            return
+        for key in removed_fields:
+            if key in row:
+                findings.append(Finding("configs/odcr.yaml", 1, f"{ctx}.{key}", "Retired accumulation field must be absent."))
+        if "micro_batch_size" in row:
+            findings.append(Finding("configs/odcr.yaml", 1, f"{ctx}.micro_batch_size", "Use per_gpu_batch_size as active source of truth."))
+        if "batch_size" in row and "per_gpu_batch_size" in row:
+            try:
+                g = int(row["batch_size"])
+                p = int(row["per_gpu_batch_size"])
+                w = int(world or row.get("ddp_world_size") or ddp_world)
+                if g != p * w:
+                    findings.append(Finding("configs/odcr.yaml", 1, ctx, "No-accum formula failed: global_batch_size = per_gpu_batch_size * ddp_world_size."))
+            except Exception as exc:
+                findings.append(Finding("configs/odcr.yaml", 1, ctx, f"Batch formula fields must be integers: {exc!r}."))
+
+    for stage in ("step3", "step4", "step5"):
+        _check_train_row(((cfg.get(stage) or {}).get("train") if isinstance(cfg.get(stage), Mapping) else None), f"{stage}.train")
+    step3 = cfg.get("step3") if isinstance(cfg.get("step3"), Mapping) else {}
+    for block_name in ("task_profiles", "backup_profiles", "exploration_profiles"):
+        block = step3.get(block_name) if isinstance(step3, Mapping) else {}
+        if isinstance(block, Mapping):
+            for name, item in block.items():
+                row = (item.get("train") if block_name == "task_profiles" and isinstance(item, Mapping) else item)
+                world = int((item or {}).get("ddp_world_size") or ddp_world) if isinstance(item, Mapping) else ddp_world
+                _check_train_row(row, f"step3.{block_name}.{name}.train" if block_name == "task_profiles" else f"step3.{block_name}.{name}", world=world)
+    perf = ((step3.get("performance_candidates") or {}).get("batch_ladder") if isinstance(step3, Mapping) else {})
+    if isinstance(perf, Mapping):
+        for name, item in perf.items():
+            _check_train_row(item, f"step3.performance_candidates.batch_ladder.{name}", world=int((item or {}).get("ddp_world_size") or ddp_world) if isinstance(item, Mapping) else ddp_world)
+
+    schema = _read(repo_root / "code" / "odcr_core" / "config_schema.py")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    config_py = _read(repo_root / "code" / "config.py")
+    odcr_py = _read(repo_root / "code" / "odcr.py")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    step5_engine = _read(repo_root / "code" / "executors" / "step5_engine.py")
+    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
+
+    active_field_patterns = {
+        "code/odcr_core/config_schema.py": (schema, (r"^\s*gradient_accumulation_steps\s*:", r"^\s*grad_accum\s*:")),
+        "code/config.py": (config_py, (r"^\s*gradient_accumulation_steps\s*:", r"gradient_accumulation_steps\s*=")),
+        "code/executors/step5_engine.py": (step5_engine, (r"gradient_accumulation_steps", r"\binv_accum\b", r"micro_step_count", r"_ddp_no_sync_model", r"\.no_sync\(")),
+        "code/executors/step3_train_core.py": (step3_core, (r"_ddp_no_sync_model", r"\.no_sync\(", r"odcr_step3_no_accum/1", r"micro_steps?", r"micro_batches_per_epoch")),
+    }
+    for rel, (text, patterns) in active_field_patterns.items():
+        for pattern in patterns:
+            if re.search(pattern, text, flags=re.MULTILINE):
+                findings.append(Finding(rel, 1, pattern, "Active code must not keep accumulation or old micro-step semantics."))
+
+    required_terms = {
+        "code/odcr_core/config_resolver.py": (resolver, ("_reject_retired_accum_env", "_reject_retired_accum_keys", "per_gpu_batch_size", "odcr_no_accum/1", message_fragment)),
+        "code/config.py": (config_py, ("_reject_removed_accumulation_env", "resolve_train_batch_layout", "per_gpu_batch_size", "odcr_no_accum/1", message_fragment)),
+        "code/odcr.py": (odcr_py, ("_RetiredAccumulationAction", "--grad-accum", "--gradient-accumulation-steps", "--accumulate-grad-batches", message_fragment)),
+        "code/odcr_core/manifests.py": (manifests, ("batch_semantics_version", "grad_accum_removed", "per_gpu_batch_size")),
+    }
+    for rel, (text, terms) in required_terms.items():
+        missing = [term for term in terms if term not in text]
+        if missing:
+            findings.append(Finding(rel, 1, "missing: " + ", ".join(missing), "No-accum fail-fast and runtime metadata must remain explicit."))
+
+    for env_name in removed_env:
+        if env_name not in resolver or env_name not in config_py:
+            findings.append(Finding("code/odcr_core/config_resolver.py", 1, env_name, "Retired accumulation env variables must fail fast."))
+
+    active_docs = (
+        "AGENTS.md",
+        "README.md",
+        "docs/ODCR_ARCHITECTURE_CONTRACT.md",
+        "docs/ODCR_ACTIVE_ARCHITECTURE.md",
+        "docs/AI_PROJECT_CANONICAL.md",
+        "docs/ODCR_EVOLUTION_PROTOCOL.md",
+        "docs/ODCR_STEP3_CLEAN_BASELINE.md",
+        "docs/CURRENT_PROJECT_STATE.md",
+    )
+    forbidden_doc_re = re.compile(
+        r"batch_size\s*==\s*micro_batch_size\s*\*\s*ddp_world_size|"
+        r"batch_size\s*==\s*micro_batch_size\s*\*\s*ddp_world_size\s*\*\s*grad_accum|"
+        r"Non-Step3.*grad[-_]accum",
+        re.IGNORECASE,
+    )
+    for rel in active_docs:
+        path = repo_root / rel
+        if not path.exists():
+            continue
+        text = _read(path)
+        match = forbidden_doc_re.search(text)
+        if match:
+            findings.append(Finding(rel, 1, match.group(0), "Active docs must state ODCR no-accum per-GPU/global formula."))
+
+    tests_text = "\n".join(_read(path) for path in (repo_root / "code" / "tests").glob("test_*.py"))
+    for forbidden in ("grad_accum=2", "grad_accum=4", "gradient_accumulation_steps=2", "accumulate_grad_batches=2"):
+        if forbidden in tests_text:
+            findings.append(Finding("code/tests", 1, forbidden, "Tests must not expect active accumulation candidates."))
+
+    code_dir = repo_root / "code"
+    inserted = False
+    if str(code_dir) not in sys.path:
+        sys.path.insert(0, str(code_dir))
+        inserted = True
+    old_env = {name: os.environ.get(name) for name in removed_env}
+    try:
+        for name in removed_env:
+            os.environ.pop(name, None)
+        from odcr_core.config_resolver import resolve_config
+
+        _cfg, _sources, snapshot = resolve_config(
+            config_path=repo_root / "configs" / "odcr.yaml",
+            command="step3",
+            task_id=2,
+            set_overrides=[],
+            dry_run=True,
+            run_id="1",
+            mode="full",
+        )
+        train = snapshot.get("train") or {}
+        for key in removed_fields:
+            if key in train:
+                findings.append(Finding("code/odcr_core/config_resolver.py", 1, key, "Resolved train snapshot must not expose retired accumulation fields."))
+        if (
+            train.get("batch_semantics_version") != "odcr_no_accum/1"
+            or train.get("batch_formula") != "global_batch_size = per_gpu_batch_size * ddp_world_size"
+            or train.get("grad_accum_removed") is not True
+            or int(train.get("global_batch_size") or train.get("batch_size") or 0)
+            != int(train.get("per_gpu_batch_size") or 0) * int(train.get("ddp_world_size") or 1)
+        ):
+            findings.append(Finding("code/odcr_core/config_resolver.py", 1, repr(train), "Resolved train snapshot must expose no-accum formula and flags."))
+    except Exception as exc:
+        findings.append(Finding("code/odcr_core/config_resolver.py", 1, repr(exc), "No-accum dynamic resolver check must pass."))
+    finally:
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if inserted:
+            try:
+                sys.path.remove(str(code_dir))
+            except ValueError:
+                pass
+
+    if findings:
+        result.fail("ODCR no-accum architecture has active drift.", findings)
+    else:
+        result.summary = "No active accumulation parser/config/resolver/training/runtime/doc path remains; per-GPU/global no-accum semantics are enforced."
+    return result
+
+
 def run_checks(*, repo_root: str | Path = REPO_ROOT, strict: bool = False) -> GuardrailReport:
     root = Path(repo_root).resolve()
     checks = [
@@ -6266,6 +8877,26 @@ def run_checks(*, repo_root: str | Path = REPO_ROOT, strict: bool = False) -> Gu
         _check_step4_helper_defaults_strict,
         _check_step5_parser_defaults_strict,
         _check_step3_structured_losses_one_control,
+        _check_step3_upstream_preprocess_hard_gate,
+        _check_step3_v0_parameter_surface,
+        _check_step3_s2r_perf_cache_downstream_guardrails,
+        _check_step3_formal_logging_param_surface,
+        _check_step3_formal_view_dynamic,
+        _check_step3_config_artifact_split,
+        _check_step3_structured_metric_files_active,
+        _check_step3_run_summary_log_indexes,
+        _check_step3_formal_source_table_static,
+        _check_step3_non_task2_roles_and_g2_dynamic,
+        _check_step3_no_old_param_regressions_static,
+        _check_step3_quality_evidence_performance_rebuild,
+        _check_stage_truth_upstream_resolver,
+        _check_stage_status_strict_antiforgery_guardrail,
+        _check_step4_runtime_preflight_twophase_guardrail,
+        _check_gpu_bridge_step4_bounded_preflight_admission,
+        _check_step4_evidence_level_antifake_tuning_guardrail,
+        _check_no_accum_architecture_guardrail,
+        _check_step3_runtime_probe_truth_contract,
+        _check_step3_paper_eval_explicit_damping_contract,
         _check_step5_gate_arch_adv_eta_one_control,
         _check_preprocess_skip_completed_fingerprint_gate,
         _check_step3_checkpoint_step4_lineage_gate,
@@ -6299,6 +8930,7 @@ def run_checks(*, repo_root: str | Path = REPO_ROOT, strict: bool = False) -> Gu
         _check_latest_points_to_run_summary,
         _check_latest_lookup_no_scan_or_legacy_layout,
         _check_latest_lookup_requires_summary_hard_gate,
+        _check_step3_tokenizer_cache_manifest_hard_gate,
         _check_step4_encoded_cache_manifest_hard_gate,
         _check_step5_tokenize_cache_manifest_hard_gate,
         _check_active_cache_reuse_not_path_mtime_only,

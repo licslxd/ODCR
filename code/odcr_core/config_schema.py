@@ -19,6 +19,63 @@ TOP_LEVEL_BLOCKS: tuple[str, ...] = (
     "eval",
 )
 
+HARDWARE_PROFILE_REQUIRED_KEYS: tuple[str, ...] = (
+    "ddp_world_size",
+    "num_proc",
+    "max_num_proc",
+    "reserved_cpu",
+    "max_parallel_cpu",
+    "dataloader_num_workers_train",
+    "dataloader_num_workers_valid",
+    "dataloader_num_workers_test",
+    "dataloader_prefetch_factor_train",
+    "dataloader_prefetch_factor_valid",
+    "dataloader_prefetch_factor_test",
+    "pin_memory",
+    "persistent_workers",
+    "non_blocking_h2d",
+)
+"""Required One-Control child hardware payload fields."""
+
+HARDWARE_PROFILE_THREAD_ENV_KEYS: tuple[str, ...] = (
+    "omp_num_threads",
+    "mkl_num_threads",
+    "tokenizers_parallelism",
+)
+"""Hardware profile fields transported as process/thread launcher env."""
+
+TRAIN_PRECISION_CHOICES: tuple[str, ...] = ("bf16", "fp16", "fp32")
+"""Resolver-owned train precision values transported to children."""
+
+PREPROCESS_CPU_GPU_ONE_CONTROL_KEYS: dict[str, tuple[str, ...]] = {
+    "preprocess.b": (
+        "tokenizer_parallelism_enabled",
+        "tokenizer_threads_per_worker",
+        "tokenizer_total_threads",
+        "prefetch_batches",
+        "pin_memory",
+        "non_blocking_h2d",
+        "async_prefetch_enabled",
+        "token_aware_batching_enabled",
+        "max_tokens_per_gpu_batch",
+        "cpu_cores_reserved",
+        "cpu_cores_available",
+    ),
+    "preprocess.c": (
+        "tokenizer_parallelism_enabled",
+        "tokenizer_threads_per_worker",
+        "tokenizer_total_threads",
+        "prefetch_batches",
+        "pin_memory",
+        "non_blocking_h2d",
+        "async_prefetch_enabled",
+        "scheduling_policy",
+        "cpu_cores_reserved",
+        "cpu_cores_available",
+    ),
+}
+"""One-Control schema anchor for preprocess_b/c CPU tokenizer and GPU transfer controls."""
+
 SAFE_DECODE_PLACEHOLDER: dict[str, Any] = {
     "decode_strategy": "greedy",
     "decode_seed": None,
@@ -54,6 +111,11 @@ class ResolvedConfig:
     task_id: int
     auxiliary: str
     target: str
+    scenario: str
+    direction: str
+    task_profile_id: str
+    task_profile_key: str
+    profile_isolation_hash: str
 
     preset_name: str
     run_name: Optional[str]
@@ -67,15 +129,25 @@ class ResolvedConfig:
 
     learning_rate: float
     coef: float
-    adv: float
-    eta: float
     explainer_loss_weight: float
 
     train_batch_size: int
+    global_batch_size: int
     per_device_train_batch_size: int
-    gradient_accumulation_steps: int
+    per_gpu_batch_size: int
     effective_global_batch_size: int
+    batch_semantics_version: str
+    grad_accum_removed: bool
     epochs: int
+    max_epochs: int
+    min_epochs: int
+    early_stop_patience: int
+    validate_every_epochs: int
+    max_grad_norm: float
+    tokenizer_max_length: int
+    evidence_max_length: int
+    valid_batch_size: int
+    valid_micro_batch_size: int
     num_proc: int
     ddp_world_size: int
     seed: int
@@ -124,6 +196,35 @@ class ResolvedConfig:
     rerank_preset_id: str
 
     hardware_profile_json: str
+    optimizer_config_json: str
+    precision_config_json: str
+    tokenizer_config_json: str
+    evidence_config_json: str
+    scheduler_config_json: str
+    valid_batch_config_json: str
+    scenario_profile_json: str
+    task_profile_config_json: str
+    backup_profiles_config_json: str
+    exploration_profiles_config_json: str
+    worker_profiles_config_json: str
+    prefetcher_config_json: str
+    checkpoint_policy_config_json: str
+    quality_gate_config_json: str
+    grad_finite_config_json: str
+    diagnostic_eval_config_json: str
+    cross_rank_structured_gather_config_json: str
+    memory_config_json: str
+    timing_config_json: str
+    performance_candidates_config_json: str
+    cache_policy_config_json: str
+    objective_drift_config_json: str
+    recovery_config_json: str
+    phase_loss_schedule_config_json: str
+    conflict_aware_config_json: str
+    loss_gradient_conflict_probe_config_json: str
+    adapter_gating_config_json: str
+    paper_candidate_selection_config_json: str
+    checkpoint_averaging_config_json: str
     omp_num_threads: int
     mkl_num_threads: int
     tokenizers_parallelism: bool
@@ -150,10 +251,15 @@ class ResolvedConfig:
     runtime_diagnostics_fingerprint: str
     config_field_sources_json: str
     eval_profile_resolution_json: str
+    upstream_resolution_json: str = ""
     step4_rcr_config_json: str = "{}"
+    step4_runtime_config_json: str = "{}"
     step5_innovation_config_json: str = ""
     ddp_find_unused_parameters: bool = True
     ddp_find_unused_false_preflight: str = "synthetic_one_batch"
+    ddp_static_graph: bool = False
+    ddp_graph_safety_preflight: bool = True
+    step3_loss_semantics_json: str = ""
     data_dir: str = ""
     merged_dir: str = ""
     runs_dir: str = ""
@@ -167,8 +273,18 @@ class ResolvedConfig:
     checkpoint_policy: str = "best"
     full_bleu_eval_resolved: Optional[dict[str, Any]] = None
     full_bleu_decode_strategy: str = "inherit"
+    step3_eval_protocol: str = "minimal_eval"
+    step3_eval_split: str = "valid"
+    step3_eval_batch_candidates_json: str = "[]"
+    step3_eval_protocol_config_json: str = "{}"
     train_mode: str = "full"
     train_precision: str = "bf16"
+    allow_tf32: bool = True
+    amp_autocast: bool = True
+    grad_scaler: bool = False
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    non_blocking_h2d: bool = True
     per_device_eval_batch_size: int = 2
     lora_r: int = 16
     lora_alpha: float = 32.0

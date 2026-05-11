@@ -39,6 +39,10 @@ class TestHardwareControlPlane(unittest.TestCase):
                     "dataloader_num_workers_train": 3,
                     "dataloader_num_workers_valid": 1,
                     "dataloader_num_workers_test": 1,
+                    "dataloader_prefetch_factor_train": 2,
+                    "dataloader_prefetch_factor_valid": 2,
+                    "dataloader_prefetch_factor_test": 2,
+                    "ddp_world_size": 1,
                 },
                 sort_keys=True,
             )

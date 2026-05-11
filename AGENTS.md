@@ -32,10 +32,12 @@ developer before changing ODCR. These are architecture rules, not suggestions.
    checkpoint lineage, manifest snapshots, or explicit resolved values; it must
    not read bare user `ODCR_*` environment variables.
 7. Batch semantics are fixed:
-   - `batch_size` = effective global train batch
-   - `micro_batch_size` = per-GPU train batch
-   - `grad_accum` = gradient accumulation steps
-   - `batch_size == micro_batch_size * ddp_world_size * grad_accum`
+   - `global_batch_size` / `batch_size` = effective optimizer-step train batch
+   - `per_gpu_batch_size` = per-GPU forward/backward train batch
+   - `micro_batch_size` may only appear as a display alias for
+     `per_gpu_batch_size`, never as an accumulation term
+   - All active ODCR train stages use the no-accum architecture:
+     `global_batch_size = per_gpu_batch_size * ddp_world_size`
 8. Logs and run metadata belong under `runs/.../meta`.
 9. Dataset artifacts belong under `data/` and `merged/`.
 10. AI-assisted notes, audits, and generated analysis belong under `AI_analysis/`.
@@ -66,6 +68,16 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     sample-weight policy, and export required fields are One-Control parameters
     under `configs/odcr.yaml: step4.rcr`; do not hardcode active values in the
     Step4 execution path.
+16a. Step4 evidence levels are mandatory. CPU preview is
+    `E1_schema_preview`: it uses proxy diagnostics for schema/contract preview
+    and is not tuning evidence. CPU preview must not rank RCR candidates, write
+    `best_candidate.yaml`, write patch suggestions, support machine verdict A,
+    or support a formal Step4 prompt. CUDA/tmux probe evidence is only
+    `E3_gpu_transport`. Only `E4_gpu_shard_forward_bounded` or
+    `E5_formal_full_run` may support Step4 RCR candidate ranking. Old
+    `C9_balanced_quantile` / `C9_bucket_balanced` CPU-preview candidates are
+    superseded, and formal Step4 remains blocked until real GPU E4 validation
+    completes.
 17. Step5 live semantics are Step5A/Step5B dual paths: Step5A uses
     LCI/UCI for scorer stability on `route_scorer` samples; Step5B uses
     CCV/FCA for controlled explanation on `route_explainer` samples. Step5
@@ -102,22 +114,25 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     manually runs `odcr-enter-gpu <JOBID>` inside that same tmux to enter the
     GPU node. Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or
     `scancel`; must not create, kill, or switch tmux sessions; and must not
-    manage GPU allocation. The narrow exception is the controlled tmux GPU
-    bridge at `python code/tools/odcr_tmux_gpu_bridge.py`: Codex may use that
-    tool to send one bridge-generated command to a user-created,
-    already-entered, uniquely validated GPU pane, and only for whitelist short
-    validation scripts. This is not arbitrary send-keys. Bridge output must
-    live under `AI_analysis`, use mode-specific adaptive timeout, and default
-    to `stop_after_first_valid_result`. Codex may only use the current tmux
+    manage GPU allocation. GPU use is allowed by default for repo-local
+    validation, probe, and bounded runtime when the current tmux GPU pane is
+    user-created, already-entered, uniquely validated GPU pane. The controlled tmux
+    GPU bridge at `python code/tools/odcr_tmux_gpu_bridge.py` may send one
+    bridge-generated command file to that pane; this is not arbitrary
+    send-keys. Bridge output must live under `AI_analysis/06_probe_evidence`
+    or `runs/step3_validation` unless a future request explicitly confirms a
+    formal run. The formal namespace guard remains mandatory: validation must
+    not write formal latest pointers, formal checkpoints, Step4/Step5/eval/
+    rerank outputs, or paper metrics. Codex may only use the current tmux
     session's real-time CUDA environment. If CUDA is not visible in the current
     tmux, fail fast with: "Current tmux does not expose CUDA. Please manually
     run `odcr-enter-gpu <JOBID>` in this same tmux to enter the GPU node, then
     rerun the probe." Do not use a normal admin shell, a tmux session still
     sitting on admin, or old `AI_analysis` probe output as proof that the
-    cluster has no GPU. User-authorized Codex GPU work is limited to
-    <= 3 minutes of short probe, short benchmark, command smoke, or quick
-    parameter comparison; do not run formal preprocess_b/c, complete
-    preprocess stages, Step3/Step4/Step5, eval/rerank, or long benchmarks.
+    cluster has no GPU. post-edit full is not a GPU prerequisite; fast sanity
+    plus current-pane validation is the GPU preflight, and runtime evidence
+    takes priority over static full-suite instability. Formal full train still
+    requires explicit user confirmation.
 
 ## Codex Long-Term Governance Constraints
 
@@ -229,18 +244,21 @@ runtime/audit artifacts such as
 `audit.log`, `AI_analysis/`, `AI_analysis/01_raw_logs/codex_hooks/`, `runs/`,
 `cache/`, `artifacts/`, `data/`, `merged/`, `__pycache__/`,
 `.pytest_cache/`, and `*.log` / `*.pyc` files are filtered before scope
-inference. If only ignored files changed, the hook no-ops and does not call the
-post-edit checker. If no current-session touched files are available, if the
+inference. If only ignored/audit-runtime files changed, the hook no-ops with
+`post_edit_command=null` and does not call the post-edit checker. If no
+current-session touched files are available, if the
 transcript is missing/parse-failed/empty, if only historical dirty workspace
 state exists, or if current-session files are unknown, the hook selects `skip`
 and does not call `odcr_post_edit_check.py`. Docs/governance hook changes use
-`governance-fast`; `all` is allowed only for current-session touched files that
-explicitly hit multiple business stages or an explicit `ODCR_HOOK_SCOPE=all`
-override. Users may set `ODCR_HOOK_SCOPE=<scope>` to force a check, or manually
-run `python code/tools/odcr_post_edit_check.py --scope governance` or
-`python code/tools/odcr_post_edit_check.py --scope all` for deeper validation.
-Automatic Stop hook checks pass `--max-seconds 180` by default; a manual deep
-check may use `--max-seconds 900`. Successful Stop hook
+`governance-fast`; automatic Stop hook inference must not execute `scope: all`
+in the 180-second wrapper path. If automatic inference or hook override resolves
+to `all`, the hook degrades to `governance-fast` and records
+`manual_followup_required=true` with
+`python code/tools/odcr_post_edit_check.py --scope all --max-seconds 900`.
+Manual users may still run that explicit `all` deep validation command.
+Automatic Stop hook child checks
+pass `--max-seconds 120` by default under the 180-second wrapper timeout; a
+manual deep check may use `--max-seconds 900`. Successful Stop hook
 stdout must remain JSON-only, for example `{"continue":true}`; human logs
 and post-edit stdout/stderr go under
 `AI_analysis/01_raw_logs/codex_hooks`, including `runtime_last.json` for the
@@ -330,8 +348,8 @@ python code/tools/check_one_control_guardrails.py --strict
 ```
 
 `./odcr doctor` is owned by the selected post-edit scope or by manual deep
-validation. `./odcr show --stage step3 --task 4` and
-`./odcr step3 --task 4 --dry-run` are required only when the selected scope
+validation. `./odcr show --stage step3 --task 2` and
+`./odcr step3 --task 2 --dry-run` are required only when the selected scope
 actually touches Step3, config changes that affect Step3, or `all`; they are
 not fixed defaults for every user-facing change.
 

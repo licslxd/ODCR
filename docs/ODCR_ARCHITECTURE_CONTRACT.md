@@ -132,6 +132,20 @@ policy, sample-weight policy, and export required fields live under
 `code/odcr_core/config_resolver.py`. Live Step4 receives them from One-Control
 as resolved config; code defaults are fallback-only for isolated unit tests.
 
+Step4 evidence-level rules are hard contract. CPU preview is
+`E1_schema_preview`; it uses proxy diagnostics and is not tuning evidence. CPU
+preview cannot be used for RCR candidate ranking, `best_candidate.yaml`, formal
+patch suggestion, machine verdict A, or a formal Step4 prompt. CUDA/tmux probe
+availability is only `E3_gpu_transport`, not Step4 posterior runtime evidence.
+Only `E4_gpu_shard_forward_bounded` or `E5_formal_full_run` may support Step4
+RCR candidate ranking and verdict-A eligibility. The old `C9_balanced_quantile`
+and `C9_bucket_balanced` CPU-preview candidates are superseded, and formal
+Step4 remains blocked until a real GPU E4 candidate completes required
+validation.
+
+In short: formal Step4 remains blocked whenever the only available Step4
+tuning evidence is CPU preview or CUDA transport evidence.
+
 Step5 has two active paths. Step5A is scorer-only stability optimization:
 `route_scorer` gates scorer-clean samples, UCI weights LCI with Step4 posterior
 reliability/uncertainty/confidence fields, and LCI contributes its own weighted
@@ -268,16 +282,22 @@ accepted as active Step5 aliases.
 
 Training batch terms have fixed meaning:
 
-- `batch_size`: effective global train batch
-- `micro_batch_size`: per-GPU train batch
-- `grad_accum`: gradient accumulation steps
+- `global_batch_size` / `batch_size`: effective optimizer-step train batch
+- `per_gpu_batch_size`: per-GPU forward/backward train batch
+- `micro_batch_size`: display alias only, meaning `per_gpu_batch_size`
 - `ddp_world_size`: DDP process count from the active hardware profile
+- `batch_semantics_version`: `odcr_no_accum/1`
 
-The resolver must enforce:
+All active ODCR train stages use the no-accum architecture. The resolver must
+enforce:
 
 ```text
-batch_size == micro_batch_size * ddp_world_size * grad_accum
+global_batch_size = per_gpu_batch_size * ddp_world_size
 ```
+
+`grad_accum`, `gradient_accumulation_steps`, and `accumulate_grad_batches` are
+retired historical names. They are rejected instead of being migrated,
+defaulted, or used.
 
 ## Path Ownership
 
@@ -315,13 +335,15 @@ itself prove GPU availability. The user manually runs
 `odcr-enter-gpu <JOBID>` inside the same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions; and must not manage GPU allocation.
-The only allowed exception is the controlled tmux GPU bridge at
-`python code/tools/odcr_tmux_gpu_bridge.py`. It can target only a user-created,
-already-entered, uniquely validated GPU pane and can send only
-bridge-generated whitelist short validation scripts. It is not arbitrary
-send-keys. Its outputs are AI_analysis-only, its runtime is bounded by
-mode-specific adaptive timeout, and it defaults to
-`stop_after_first_valid_result`.
+GPU use is allowed by default for repo-local validation, probe, and bounded
+runtime after fast sanity and current-pane validation. The controlled tmux GPU
+bridge at `python code/tools/odcr_tmux_gpu_bridge.py` can target only a
+user-created, already-entered, uniquely validated GPU pane and can send one
+bridge-generated command file. It is not arbitrary send-keys and is no longer
+limited by a GPU whitelist hard blocker. Its validation outputs stay under
+`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default, with a
+mandatory formal namespace guard. post-edit full is not a GPU prerequisite, and
+runtime evidence takes priority over static full-suite instability.
 
 CUDA admission checks and BGE-large use trust only the current tmux session's
 real-time CUDA environment. A normal admin shell reporting no CUDA, a tmux still

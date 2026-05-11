@@ -42,6 +42,8 @@ class TaskConfig(TypedDict):
     target: str
     lr: Union[int, float]
     coef: Union[int, float]
+    scenario: str
+    direction: str
 
 
 class HardwarePresetRow(TypedDict, total=False):
@@ -49,6 +51,9 @@ class HardwarePresetRow(TypedDict, total=False):
 
     max_parallel_cpu: int
     num_proc: int
+    max_num_proc: int
+    reserved_cpu: int
+    tokenization_num_proc: int
     ddp_world_size: int
     dataloader_num_workers_train: int
     dataloader_num_workers_valid: int
@@ -60,6 +65,9 @@ class HardwarePresetRow(TypedDict, total=False):
     omp_num_threads: int
     mkl_num_threads: int
     tokenizers_parallelism: bool
+    pin_memory: bool
+    persistent_workers: bool
+    non_blocking_h2d: bool
 
 
 class TrainingPresetRow(TypedDict, total=False):
@@ -72,8 +80,8 @@ class TrainingPresetRow(TypedDict, total=False):
     min_lr_ratio: float
     lr: float
     coef: float
-    gradient_accumulation_steps: int
     per_device_train_batch_size: int
+    per_gpu_batch_size: int
     train_dynamic_padding: bool
     loss_weight_repeat_ul: float
     loss_weight_terminal_clean: float
@@ -99,7 +107,6 @@ class BaseTrainingDefaults:
 
     epochs: int = 50
     train_batch_size: int = 2048
-    gradient_accumulation_steps: int = 1
     min_lr_ratio: float = 0.1
     train_min_epochs: int = 8
     train_early_stop_patience: int = 6
@@ -120,7 +127,6 @@ DEFAULT_TRAINING_CONFIG = BASE_TRAINING_DEFAULTS
 
 # 模块级便捷常量：与 ``from config import train_batch_size`` / ``epochs`` 等一致（值均来自 BASE_TRAINING_DEFAULTS）
 train_batch_size = BASE_TRAINING_DEFAULTS.train_batch_size
-gradient_accumulation_steps = BASE_TRAINING_DEFAULTS.gradient_accumulation_steps
 epochs = BASE_TRAINING_DEFAULTS.epochs
 
 
@@ -144,7 +150,7 @@ def _coerce_task_param_numeric(v: Any) -> Union[int, float]:
 # ---------------------------------------------------------------------------
 
 
-_TASK_ROW_KEYS: FrozenSet[str] = frozenset({"auxiliary", "target", "lr", "coef"})
+_TASK_ROW_KEYS: FrozenSet[str] = frozenset({"auxiliary", "target", "source", "lr", "coef", "scenario", "direction"})
 
 
 def _normalize_task_row_yaml(v: Any, *, ctx: str) -> TaskConfig:
@@ -153,14 +159,20 @@ def _normalize_task_row_yaml(v: Any, *, ctx: str) -> TaskConfig:
     unk = set(v.keys()) - _TASK_ROW_KEYS
     if unk:
         raise ValueError(f"{ctx} 含有未知字段 {sorted(unk)}")
-    miss = _TASK_ROW_KEYS - set(v.keys())
+    source_present = "auxiliary" in v or "source" in v
+    required = {"target"}
+    miss = required - set(v.keys())
+    if not source_present:
+        miss.add("source")
     if miss:
         raise ValueError(f"{ctx} 缺少字段 {sorted(miss)}")
     return {
-        "auxiliary": str(v["auxiliary"]),
+        "auxiliary": str(v.get("auxiliary", v.get("source"))),
         "target": str(v["target"]),
-        "lr": _coerce_task_param_numeric(v["lr"]),
-        "coef": _coerce_task_param_numeric(v["coef"]),
+        "lr": _coerce_task_param_numeric(v.get("lr", 1e-3)),
+        "coef": _coerce_task_param_numeric(v.get("coef", 0.0)),
+        "scenario": str(v.get("scenario", "legacy_scenario")),
+        "direction": str(v.get("direction", "unspecified")),
     }
 
 
@@ -192,6 +204,11 @@ def _coerce_hardware_yaml_value(key: str, val: Any) -> Any:
     """hardware YAML 标量：整数字段用 int；tokenizers_parallelism 用 bool。"""
     k = str(key)
     if k == "tokenizers_parallelism":
+        if isinstance(val, bool):
+            return val
+        s = str(val).strip().lower()
+        return s in ("true", "1", "yes", "on")
+    if k in ("pin_memory", "persistent_workers", "non_blocking_h2d"):
         if isinstance(val, bool):
             return val
         s = str(val).strip().lower()
@@ -355,6 +372,9 @@ def apply_ddp_fast_torch_backends() -> bool:
     v = os.environ.get("ODCR_DDP_FAST", "1").strip().lower()
     if v in ("0", "false", "no", "off"):
         return False
+    allow_tf32 = os.environ.get("ODCR_RUNTIME_ALLOW_TF32", "1").strip().lower()
+    if allow_tf32 in ("0", "false", "no", "off"):
+        return False
     if not torch.cuda.is_available():
         return False
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -438,8 +458,8 @@ def _get_max_parallel_cpu() -> int:
 # 全局配置（Step 3/4/5 训练与推理）
 # 代码默认已收敛至 BASE_TRAINING_DEFAULTS；本段仅说明语义与覆盖方式。
 #
-# train_batch_size / epochs / gradient_accumulation_steps：见文件顶部别名与 get_*（CLI > ENV > 命名预设 > BASE）。
-#   G = per_device_micro_batch × world_size × gradient_accumulation_steps（P 即 DataLoader batch_size）。
+# train_batch_size / per_gpu_batch_size / epochs：所有 active train stages use no-accum semantics.
+#   G = per_gpu_batch_size × world_size。
 # eval 全局 batch：torchrun 子进程由 build_resolved_training_config 从 effective payload 读取；get_eval_batch_size() 仅服务
 # 未走 odcr torchrun 的辅脚本（CLI > EVAL_BATCH_SIZE > BASE）。
 # 早停与 BLEU 采样默认值：BASE_TRAINING_DEFAULTS.train_min_epochs / train_early_stop_patience / train_bleu4_max_samples。
@@ -530,8 +550,8 @@ _TRAINING_PRESET_ALLOWED_KEYS: FrozenSet[str] = frozenset(
         "nhead",
         "nhid",
         "dropout",
-        "gradient_accumulation_steps",
         "per_device_train_batch_size",
+        "per_gpu_batch_size",
         "train_dynamic_padding",
         "loss_weight_repeat_ul",
         "loss_weight_terminal_clean",
@@ -598,8 +618,8 @@ _TRAINING_PRESET_INT_KEYS: FrozenSet[str] = frozenset(
         "train_batch_size",
         "train_label_max_length",
         "epochs",
-        "gradient_accumulation_steps",
         "per_device_train_batch_size",
+        "per_gpu_batch_size",
         "terminal_clean_span",
         "batch_diversity_warmup_epochs",
         "batch_diversity_ramp_epochs",
@@ -667,22 +687,6 @@ _TRAINING_PRESET_BOOL_KEYS: FrozenSet[str] = frozenset(
         "step5_strict_index_batches",
     }
 )
-
-_STEP3_RETIRED_PAYLOAD_KEYS: FrozenSet[str] = frozenset(
-    {
-        "adv",
-        "eta",
-        "adversarial_coef",
-        "adversarial_alpha",
-        "adversarial_beta",
-        "adversarial_schedule",
-        "adversarial_schedule_enabled",
-        "adversarial_start_epoch",
-        "adversarial_warmup_epochs",
-        "adversarial_coef_target",
-    }
-)
-
 
 def _normalize_training_checkpoint_metric_yaml(raw: Any, *, ctx: str) -> str:
     """训练 preset 行内 checkpoint_metric：仅 valid_loss（别名 loss）。"""
@@ -835,6 +839,13 @@ _HARDWARE_PRESET_ALLOWED_KEYS: FrozenSet[str] = frozenset(
     {
         "max_parallel_cpu",
         "num_proc",
+        "max_num_proc",
+        "reserved_cpu",
+        "tokenization_num_proc",
+        "num_proc_configured",
+        "tokenization_num_proc_source",
+        "tokenization_num_proc_formula",
+        "worker_budget_formula",
         "ddp_world_size",
         "dataloader_num_workers_train",
         "dataloader_num_workers_valid",
@@ -846,13 +857,45 @@ _HARDWARE_PRESET_ALLOWED_KEYS: FrozenSet[str] = frozenset(
         "omp_num_threads",
         "mkl_num_threads",
         "tokenizers_parallelism",
+        "pin_memory",
+        "persistent_workers",
+        "non_blocking_h2d",
         # launcher-only：仅出现在 YAML/命名表校验；不入 ODCR_HARDWARE_PROFILE_JSON 归一化结果
         "cuda_visible_devices",
     }
 )
 
 _HARDWARE_PRESET_INT_KEYS: FrozenSet[str] = _HARDWARE_PRESET_ALLOWED_KEYS - frozenset(
-    {"tokenizers_parallelism", "cuda_visible_devices"}
+    {
+        "tokenizers_parallelism",
+        "pin_memory",
+        "persistent_workers",
+        "non_blocking_h2d",
+        "cuda_visible_devices",
+        "num_proc_configured",
+        "tokenization_num_proc_source",
+        "tokenization_num_proc_formula",
+        "worker_budget_formula",
+    }
+)
+
+_HARDWARE_PRESET_REQUIRED_CHILD_KEYS: FrozenSet[str] = frozenset(
+    {
+        "ddp_world_size",
+        "num_proc",
+        "max_num_proc",
+        "reserved_cpu",
+        "max_parallel_cpu",
+        "dataloader_num_workers_train",
+        "dataloader_num_workers_valid",
+        "dataloader_num_workers_test",
+        "dataloader_prefetch_factor_train",
+        "dataloader_prefetch_factor_valid",
+        "dataloader_prefetch_factor_test",
+        "pin_memory",
+        "persistent_workers",
+        "non_blocking_h2d",
+    }
 )
 
 
@@ -867,7 +910,7 @@ def _normalize_hardware_profile_mapping(obj: Mapping[str, Any]) -> Dict[str, Any
             continue
         if sk == "cuda_visible_devices":
             continue
-        if sk == "tokenizers_parallelism":
+        if sk in ("tokenizers_parallelism", "pin_memory", "persistent_workers", "non_blocking_h2d"):
             if isinstance(v, bool):
                 out[sk] = v
             else:
@@ -898,10 +941,10 @@ def _validate_hardware_presets(presets: Dict[str, Any], *, name: str = "HARDWARE
                         f"{name} 预设 {preset_name!r} 字段 cuda_visible_devices 须为非空 str，当前为 {type(v).__name__}"
                     )
                 continue
-            if k == "tokenizers_parallelism":
+            if k in ("tokenizers_parallelism", "pin_memory", "persistent_workers", "non_blocking_h2d"):
                 if not isinstance(v, bool):
                     raise TypeError(
-                        f"{name} 预设 {preset_name!r} 字段 tokenizers_parallelism 须为 bool，当前为 {type(v).__name__}"
+                        f"{name} 预设 {preset_name!r} 字段 {k} 须为 bool，当前为 {type(v).__name__}"
                     )
                 continue
             if k in _HARDWARE_PRESET_INT_KEYS:
@@ -964,6 +1007,13 @@ def _active_hardware_preset_slice() -> Optional[Dict[str, Any]]:
     norm = _normalize_hardware_profile_mapping(loaded)
     if not norm:
         raise RuntimeError("ODCR_HARDWARE_PROFILE_JSON 无法解析为有效 hardware 切片。")
+    missing = sorted(key for key in _HARDWARE_PRESET_REQUIRED_CHILD_KEYS if key not in norm)
+    if missing:
+        raise RuntimeError(
+            "ODCR_HARDWARE_PROFILE_JSON 缺少必需 hardware 字段: "
+            + ", ".join(missing)
+            + "；请通过 config_resolver 从 configs/odcr.yaml 注入完整 payload。"
+        )
     return norm
 
 
@@ -977,52 +1027,73 @@ def get_task_config(task_idx: int) -> Optional[TaskConfig]:
     return TASK_DEFAULTS.get(int(task_idx))
 
 
+NO_ACCUM_BATCH_SEMANTICS_VERSION = "odcr_no_accum/1"
+NO_ACCUM_REMOVED_MESSAGE = (
+    "grad_accum has been removed in ODCR no-accum architecture; use per_gpu_batch_size "
+    "and global_batch_size = per_gpu_batch_size * ddp_world_size."
+)
+_RETIRED_ACCUMULATION_ENV_NAMES = (
+    "ODCR_GRAD_ACCUM",
+    "ODCR_GRADIENT_ACCUMULATION_STEPS",
+    "ODCR_ACCUMULATE_GRAD_BATCHES",
+    "ODCR_ACCUM_STEPS",
+    "ODCR_ACCUMULATION_STEPS",
+)
+_RETIRED_ACCUMULATION_ROW_KEYS = frozenset(
+    {
+        "grad_accum",
+        "gradient_accumulation_steps",
+        "accumulate_grad_batches",
+        "accum_steps",
+        "accumulation_steps",
+    }
+)
+
+
+def _reject_removed_accumulation_env() -> None:
+    present = [name for name in _RETIRED_ACCUMULATION_ENV_NAMES if (os.environ.get(name) or "").strip()]
+    if present:
+        raise RuntimeError(f"Retired accumulation environment variable(s) set: {present}. {NO_ACCUM_REMOVED_MESSAGE}")
+
+
+def _reject_removed_accumulation_row(row: Mapping[str, Any]) -> None:
+    present = sorted(str(key) for key in row if str(key) in _RETIRED_ACCUMULATION_ROW_KEYS)
+    if present:
+        raise RuntimeError(f"Resolved training payload contains retired accumulation key(s) {present}. {NO_ACCUM_REMOVED_MESSAGE}")
+
+
 def resolve_train_batch_layout(
     global_batch_size: int,
     world_size: int,
     *,
     per_device_batch_size: Optional[int] = None,
-    gradient_accumulation_steps: Optional[int] = None,
 ) -> Tuple[int, int, int]:
-    """由全局 batch G 解析 (G, P, A)，满足 G = P × world_size × A；梯度累积须由 resolve 层显式传入。"""
+    """Resolve no-accum train batch layout: G = per_gpu_batch_size × world_size."""
     G = int(global_batch_size)
     W = int(world_size)
     if G < 1:
         raise ValueError(f"global_batch_size 须 >= 1，当前为 {G}")
     if W < 1:
         raise ValueError(f"world_size 须 >= 1，当前为 {W}")
-
-    explicit_accum_arg = gradient_accumulation_steps is not None
-
-    if per_device_batch_size is not None:
-        P = max(1, int(per_device_batch_size))
-        prod = P * W
-        if G % prod != 0:
-            raise ValueError(
-                f"全局 batch ({G}) 须能被 per_device_batch_size×world_size ({prod}) 整除，"
-                f"请调整 --batch-size、--per-device-batch-size 或进程数。"
-            )
-        A = G // prod
-        if explicit_accum_arg:
-            A_req = max(1, int(gradient_accumulation_steps))
-            if A_req != A:
-                raise ValueError(
-                    f"per_device_batch_size={P} 与 world_size={W} 推得 gradient_accumulation_steps={A}，"
-                    f"与显式指定的 {A_req} 不一致；请只指定一侧或改成相容组合。"
-                )
-        return G, P, A
-
-    if not explicit_accum_arg:
-        raise ValueError("未指定 per_device_batch_size 时必须提供 gradient_accumulation_steps")
-    A = max(1, int(gradient_accumulation_steps))
-    denom = W * A
-    if G % denom != 0:
+    if per_device_batch_size is None:
+        raise ValueError("no-accum batch layout requires per_gpu_batch_size/per_device_train_batch_size")
+    P = max(1, int(per_device_batch_size))
+    expected = P * W
+    if G != expected:
         raise ValueError(
-            f"全局 batch ({G}) 须能被 world_size×gradient_accumulation_steps ({denom}) 整除；"
-            f"当前 world_size={W}，accum={A}。"
+            f"global_batch_size={G} must equal per_gpu_batch_size({P}) * ddp_world_size({W}) = {expected}. "
+            f"ODCR uses {NO_ACCUM_BATCH_SEMANTICS_VERSION}."
         )
-    P = G // denom
-    return G, P, A
+    return G, P, expected
+
+
+def resolve_step3_no_accum_batch_layout(row: Mapping[str, Any], world_size: int) -> Tuple[int, int, int]:
+    _reject_removed_accumulation_row(row)
+    G = _preset_int_min(row.get("train_batch_size", BASE_TRAINING_DEFAULTS.train_batch_size), 1)
+    if "per_device_train_batch_size" not in row:
+        raise ValueError("no-accum batch layout requires per_device_train_batch_size in resolved payload.")
+    P = max(1, int(row["per_device_train_batch_size"]))
+    return resolve_train_batch_layout(G, world_size, per_device_batch_size=P)
 
 
 # 历史名：与 resolve_train_batch_layout 同义（单一实现，避免两套公式漂移）
@@ -1051,33 +1122,26 @@ def resolve_eval_batch_layout(eval_batch_size: int, ddp_world_size: int) -> Tupl
 def resolve_train_batch_from_training_row(
     row: Mapping[str, Any],
     world_size: int,
-) -> Tuple[int, int, int, int]:
+) -> Tuple[int, int, int]:
     """
-    与 ``build_resolved_training_config`` 中 G/P/A 解析一致；返回
-    ``(train_batch_size_G, per_device_train_batch_size, gradient_accumulation_steps, effective_global_batch_size)``。
+    与 ``build_resolved_training_config`` 中 batch 解析一致；返回
+    ``(global_batch_size, per_gpu_batch_size, effective_global_batch_size)``。
     """
+    _reject_removed_accumulation_row(row)
     G = int(BASE_TRAINING_DEFAULTS.train_batch_size)
     if "train_batch_size" in row:
         G = _preset_int_min(row["train_batch_size"], 1)
     p_opt: Optional[int] = None
-    if "per_device_train_batch_size" in row:
+    if "per_gpu_batch_size" in row:
+        p_opt = max(1, int(row["per_gpu_batch_size"]))
+    elif "per_device_train_batch_size" in row:
         p_opt = max(1, int(row["per_device_train_batch_size"]))
-    A0 = int(BASE_TRAINING_DEFAULTS.gradient_accumulation_steps)
-    if "gradient_accumulation_steps" in row:
-        A0 = _preset_int_min(row["gradient_accumulation_steps"], 1)
-    a_cli: Optional[int] = None
-    if p_opt is not None:
-        accum_for_layout: Optional[int] = a_cli
-    else:
-        accum_for_layout = A0
-    G, P, A = resolve_train_batch_layout(
+    G, P, eff = resolve_train_batch_layout(
         G,
         world_size,
         per_device_batch_size=p_opt,
-        gradient_accumulation_steps=accum_for_layout,
     )
-    eff = P * int(world_size) * A
-    return G, P, A, eff
+    return G, P, eff
 
 
 def get_embed_batch_size():
@@ -1229,6 +1293,11 @@ class FinalTrainingConfig:
     task_idx: int
     auxiliary: str
     target: str
+    scenario: str
+    direction: str
+    task_profile_id: str
+    task_profile_key: str
+    profile_isolation_hash: str
     preset_name: Optional[str]
     world_size: int
     sources: Tuple[Tuple[str, str], ...]
@@ -1237,13 +1306,23 @@ class FinalTrainingConfig:
     scheduler_initial_lr: float
     initial_lr: float
     epochs: int
+    max_epochs: int
+    validate_every_epochs: int
+    max_grad_norm: float
+    tokenizer_max_length: int
+    evidence_max_length: int
+    valid_batch_size: int
+    valid_micro_batch_size: int
 
     train_batch_size: int
+    global_batch_size: int
     batch_size_global: int
     batch_size: int
     per_device_train_batch_size: int
-    gradient_accumulation_steps: int
+    per_gpu_batch_size: int
     effective_global_batch_size: int
+    batch_semantics_version: str
+    grad_accum_removed: bool
 
     num_proc: int
     max_parallel_cpu: int
@@ -1254,6 +1333,9 @@ class FinalTrainingConfig:
     dataloader_prefetch_factor_train: Optional[int]
     dataloader_prefetch_factor_valid: Optional[int]
     dataloader_prefetch_factor_test: Optional[int]
+    pin_memory: bool
+    persistent_workers: bool
+    non_blocking_h2d: bool
 
     min_lr_ratio: float
     lr_scheduler: str
@@ -1261,6 +1343,35 @@ class FinalTrainingConfig:
     warmup_epochs: float
     odcr_warmup_steps: Optional[int]
     odcr_warmup_ratio: Optional[float]
+    optimizer_config_json: str
+    precision_config_json: str
+    tokenizer_config_json: str
+    evidence_config_json: str
+    scheduler_config_json: str
+    valid_batch_config_json: str
+    scenario_profile_json: str
+    task_profile_config_json: str
+    backup_profiles_config_json: str
+    exploration_profiles_config_json: str
+    worker_profiles_config_json: str
+    prefetcher_config_json: str
+    checkpoint_policy_config_json: str
+    quality_gate_config_json: str
+    grad_finite_config_json: str
+    diagnostic_eval_config_json: str
+    cross_rank_structured_gather_config_json: str
+    memory_config_json: str
+    timing_config_json: str
+    performance_candidates_config_json: str
+    cache_policy_config_json: str
+    objective_drift_config_json: str
+    recovery_config_json: str
+    phase_loss_schedule_config_json: str
+    conflict_aware_config_json: str
+    loss_gradient_conflict_probe_config_json: str
+    adapter_gating_config_json: str
+    paper_candidate_selection_config_json: str
+    checkpoint_averaging_config_json: str
 
     eval_batch_size: int
     min_epochs: int
@@ -1278,14 +1389,6 @@ class FinalTrainingConfig:
 
     coef: float
     explainer_loss_weight: float
-    eta: float
-    adversarial_coef: float
-    adversarial_alpha: float
-    adversarial_beta: float
-    adversarial_schedule_enabled: bool
-    adversarial_start_epoch: int
-    adversarial_warmup_epochs: int
-    adversarial_coef_target: float
     # 训练期 full BLEU 监控解码：greedy / inherit（inherit=与 decode_strategy 一致）；非正式 eval 口径
     full_bleu_decode_strategy: str = "inherit"
     ema_enabled: bool = True
@@ -1355,6 +1458,9 @@ class FinalTrainingConfig:
     step5_fca_weight: float = 0.08
     step5_innovation_config_json: str = ""
     step3_structured_loss_weights_json: str = ""
+    step3_loss_semantics_json: str = ""
+    step3_upstream_evidence_json: str = ""
+    step3_tokenizer_cache_manifest_json: str = ""
     step4_export_lineage_json: str = ""
     uncertainty_entropy_eps: float = 1e-8
     uncertainty_high_entropy_threshold: float = 1.0
@@ -1376,6 +1482,9 @@ class FinalTrainingConfig:
     # Step5B：训练范式（manifest / config_resolved；train_mode=lora 时由 step5_native_lora 注入）
     train_mode: str = "lora"
     train_precision: str = "bf16"
+    allow_tf32: bool = True
+    amp_autocast: bool = True
+    grad_scaler: bool = False
     per_device_eval_batch_size: int = 2
     lora_r: int = 16
     lora_alpha: float = 32.0
@@ -1393,6 +1502,8 @@ class FinalTrainingConfig:
     # False：吞吐向（降低 DDP 固定开销）；仅建议在计算图各步稳定、常开对抗等场景用预设显式关闭。
     ddp_find_unused_parameters: bool = True
     ddp_find_unused_false_preflight: str = "synthetic_one_batch"
+    ddp_static_graph: bool = False
+    ddp_graph_safety_preflight: bool = True
     # True：Step5 在首包上对 train/valid 再做一次 collate 后索引 min/max 审计（CPU fail-fast）
     step5_strict_index_batches: bool = False
     rank0_only_logging: bool = True
@@ -1406,30 +1517,11 @@ class FinalTrainingConfig:
         d = asdict(self)
         d.pop("logger", None)
         d.pop("valid_dataset", None)
-        d.pop("eta", None)
-        for k in (
-            "adversarial_coef",
-            "adversarial_alpha",
-            "adversarial_beta",
-            "adversarial_schedule_enabled",
-            "adversarial_start_epoch",
-            "adversarial_warmup_epochs",
-            "adversarial_coef_target",
-        ):
-            d.pop(k, None)
+        if self.preset_name == "step3":
+            d.pop("coef", None)
         _src = dict(self.sources)
-        for k in (
-            "adversarial_coef",
-            "adversarial_alpha",
-            "adversarial_beta",
-            "adversarial_schedule_enabled",
-            "adversarial_start_epoch",
-            "adversarial_warmup_epochs",
-            "adversarial_coef_target",
-            "adversarial_schedule",
-        ):
-            _src.pop(k, None)
-        _src.pop("eta", None)
+        if self.preset_name == "step3":
+            _src.pop("coef", None)
         d["sources"] = _src
         return d
 
@@ -1523,6 +1615,7 @@ def build_resolved_training_config(
     - ``hardware_overrides``：保留为内部调用签名兼容；主线不读取它来覆盖 resolved hardware JSON。
     """
     _ = hardware_overrides
+    _reject_removed_accumulation_env()
     src: Dict[str, str] = {}
 
     tid = int(task_idx)
@@ -1548,8 +1641,6 @@ def build_resolved_training_config(
     row = _payload.get("training_row")
     if not isinstance(row, dict):
         raise TypeError("effective payload 缺少 training_row dict")
-    if preset_nm == "step3":
-        row = {k: v for k, v in row.items() if k not in _STEP3_RETIRED_PAYLOAD_KEYS}
 
     def _reject_conflicting_child_cli(attr: str, expected: Any, payload_key: str, *, integer: bool = False) -> None:
         raw_cli = getattr(args, attr, None)
@@ -1569,8 +1660,19 @@ def build_resolved_training_config(
 
     _reject_conflicting_child_cli("epochs", row.get("epochs", BASE_TRAINING_DEFAULTS.epochs), "training_row.epochs", integer=True)
     _reject_conflicting_child_cli("learning_rate", row.get("lr"), "training_row.lr")
-    _reject_conflicting_child_cli("coef", row.get("coef"), "training_row.coef")
+    if preset_nm == "step3":
+        pass
+    else:
+        _reject_conflicting_child_cli("coef", row.get("coef"), "training_row.coef")
     assert_no_forbidden_training_keys(row, ctx="ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON.training_row")
+
+    def _require_step3_row_key(key: str) -> Any:
+        if preset_nm == "step3" and key not in row:
+            raise RuntimeError(
+                f"effective Step3 payload missing training_row.{key}; "
+                "Step3 v0 controls must come from configs/odcr.yaml via config_resolver."
+            )
+        return row.get(key)
 
     auxiliary = str(_payload.get("auxiliary") or "").strip()
     target = str(_payload.get("target") or "").strip()
@@ -1587,22 +1689,24 @@ def build_resolved_training_config(
             "config_resolver 从 configs/odcr.yaml 解析后注入。"
         )
 
-    # ----- global train batch G / P / A（仅父进程下发的 training_row；与 resolve_train_batch_from_training_row 共用）-----
+    # ----- no-accum global/per-GPU train batch（仅父进程下发的 training_row；与 resolve_train_batch_from_training_row 共用）-----
     src["train_batch_size"] = "base"
     if "train_batch_size" in row:
         src["train_batch_size"] = "effective_payload"
     src["per_device_train_batch_size"] = "base"
     if "per_device_train_batch_size" in row:
         src["per_device_train_batch_size"] = "effective_payload"
-    src["gradient_accumulation_steps"] = "base"
-    if "gradient_accumulation_steps" in row:
-        src["gradient_accumulation_steps"] = "effective_payload"
+    src["per_gpu_batch_size"] = "effective_payload" if "per_gpu_batch_size" in row else src["per_device_train_batch_size"]
+    src["batch_semantics_version"] = "effective_payload"
+    src["grad_accum_removed"] = "resolver-fixed"
 
-    G, P, A, eff = resolve_train_batch_from_training_row(row, world_size)
+    G, P, eff = resolve_train_batch_from_training_row(row, world_size)
 
     # ----- epochs -----
     ep = int(BASE_TRAINING_DEFAULTS.epochs)
     src["epochs"] = "base"
+    if preset_nm == "step3":
+        _require_step3_row_key("max_epochs")
     if "epochs" in row:
         ep = _preset_int_min(row["epochs"], 1)
         src["epochs"] = "effective_payload"
@@ -1610,7 +1714,8 @@ def build_resolved_training_config(
         src["epochs_cli_transport"] = "validated_equal_to_effective_payload"
 
     # ----- learning rate / coef：仅 training_row + 可选 CLI（禁止 TASK_DEFAULTS 二次合并）-----
-    for _req in ("lr", "coef"):
+    required_train_keys = ("lr",) if preset_nm == "step3" else ("lr", "coef")
+    for _req in required_train_keys:
         if _req not in row:
             raise RuntimeError(
                 f"ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON.training_row 缺少必需键 {_req!r}；"
@@ -1622,6 +1727,7 @@ def build_resolved_training_config(
     # ----- min_lr_ratio -----
     min_lr = float(BASE_TRAINING_DEFAULTS.min_lr_ratio)
     src["min_lr_ratio"] = "base"
+    _require_step3_row_key("min_lr_ratio")
     if "min_lr_ratio" in row:
         min_lr = float(row["min_lr_ratio"])
         src["min_lr_ratio"] = "effective_payload"
@@ -1629,12 +1735,15 @@ def build_resolved_training_config(
     # ----- lr_scheduler -----
     lr_sched = str(BASE_TRAINING_DEFAULTS.lr_scheduler)
     src["lr_scheduler"] = "base"
+    _require_step3_row_key("lr_scheduler")
     if "lr_scheduler" in row and str(row["lr_scheduler"]).strip():
         v = str(row["lr_scheduler"]).strip().lower()
         if v in ("none", "off", "disabled"):
             lr_sched = "none"
         elif v in ("warmup_cosine", "warmup-cosine", "cosine"):
             lr_sched = "warmup_cosine"
+        elif v in ("warmup_cosine_with_damping", "warmup-cosine-with-damping", "cosine_with_damping"):
+            lr_sched = "warmup_cosine_with_damping"
         else:
             lr_sched = "none"
         src["lr_scheduler"] = "effective_payload"
@@ -1642,6 +1751,9 @@ def build_resolved_training_config(
     # ----- warmup_epochs -----
     wu_ep = float(BASE_TRAINING_DEFAULTS.warmup_epochs)
     src["warmup_epochs"] = "base"
+    if preset_nm == "step3":
+        wu_ep = 0.0
+        src["warmup_epochs"] = "retired_inactive_step3"
     if "warmup_epochs" in row:
         wu_ep = float(row["warmup_epochs"])
         src["warmup_epochs"] = "effective_payload"
@@ -1656,6 +1768,7 @@ def build_resolved_training_config(
 
     wratio: Optional[float] = None
     src["odcr_warmup_ratio"] = "base"
+    _require_step3_row_key("warmup_ratio")
     if "warmup_ratio" in row:
         wratio = float(row["warmup_ratio"])
         src["odcr_warmup_ratio"] = "effective_payload"
@@ -1663,6 +1776,7 @@ def build_resolved_training_config(
     # ----- eval batch -----
     eval_bs = int(BASE_TRAINING_DEFAULTS.eval_batch_size)
     src["eval_batch_size"] = "base"
+    _require_step3_row_key("eval_batch_size")
     if "eval_batch_size" in row:
         eval_bs = max(1, int(row["eval_batch_size"]))
         src["eval_batch_size"] = "effective_payload"
@@ -1670,12 +1784,14 @@ def build_resolved_training_config(
     # ----- early stop -----
     min_ep = max(1, int(BASE_TRAINING_DEFAULTS.train_min_epochs))
     src["min_epochs"] = "base"
+    _require_step3_row_key("min_epochs")
     if "min_epochs" in row:
         min_ep = max(1, int(row["min_epochs"]))
         src["min_epochs"] = "effective_payload"
 
     esp = max(1, int(BASE_TRAINING_DEFAULTS.train_early_stop_patience))
     src["early_stop_patience"] = "base"
+    _require_step3_row_key("early_stop_patience")
     if "early_stop_patience" in row:
         esp = max(1, int(row["early_stop_patience"]))
         src["early_stop_patience"] = "effective_payload"
@@ -1740,11 +1856,12 @@ def build_resolved_training_config(
         row.get("train_time_eval_decode_backend", "sdpa_kv_safe")
     )
 
-    coef_f = float(_coerce_task_param_numeric(row["coef"]))
-    src["coef"] = "effective_payload"
-    adv_f = 0.0
+    coef_f = 0.0
+    src["coef"] = "inactive_step3" if preset_nm == "step3" else "effective_payload"
+    if preset_nm != "step3":
+        coef_f = float(_coerce_task_param_numeric(row["coef"]))
 
-    # ----- Step5B explainer objective weight：旧 eta/adv 语义退役，保留 eta=0 占位避免共享结构破坏。 -----
+    # ----- Step5B explainer objective weight. -----
     explainer_loss_weight_f = 0.0
     src["explainer_loss_weight"] = "inactive"
     if preset_nm == "step5":
@@ -1757,18 +1874,10 @@ def build_resolved_training_config(
         if not math.isfinite(explainer_loss_weight_f) or explainer_loss_weight_f < 0.0:
             raise ValueError("step5.train.explainer_loss_weight 须为有限非负数")
         src["explainer_loss_weight"] = "step5.train.explainer_loss_weight"
-    eta_f = 0.0
-    src["eta"] = "retired_zero"
-
-    # ----- retired branch placeholders：保留内部零值占位，避免共享 config 结构破坏其它阶段 -----
-    adv_sched_on = False
-    adv_skip = 0
-    adv_warm = 0
-    adv_target = 0.0
 
     if getattr(args, "learning_rate", None) is not None:
         src["learning_rate_cli_transport"] = "validated_equal_to_effective_payload"
-    if getattr(args, "coef", None) is not None:
+    if preset_nm != "step3" and getattr(args, "coef", None) is not None:
         src["coef_cli_transport"] = "validated_equal_to_effective_payload"
 
     # ----- hardware preset 元数据（ODCR_HARDWARE_PRESET 由 runners 注入的 stem；未知 stem 时 blob 为 None）-----
@@ -1837,6 +1946,16 @@ def build_resolved_training_config(
         if rp_rt and "dataloader_prefetch_factor_test" in rp_rt
         else "derived"
     )
+    if preset_nm == "step3":
+        for _hw_req in ("pin_memory", "persistent_workers", "non_blocking_h2d"):
+            if _hw_req not in rp_rt:
+                raise RuntimeError(f"ODCR_HARDWARE_PROFILE_JSON missing {_hw_req}; Step3 v0 hardware transfer is One-Control.")
+    pin_memory_v = bool(rp_rt.get("pin_memory", True))
+    persistent_workers_v = bool(rp_rt.get("persistent_workers", True))
+    non_blocking_h2d_v = bool(rp_rt.get("non_blocking_h2d", True))
+    src["pin_memory"] = "hardware_profile_json" if "pin_memory" in rp_rt else "derived"
+    src["persistent_workers"] = "hardware_profile_json" if "persistent_workers" in rp_rt else "derived"
+    src["non_blocking_h2d"] = "hardware_profile_json" if "non_blocking_h2d" in rp_rt else "derived"
 
     _tlm_base = int(max(8, min(512, int(BASE_TRAINING_DEFAULTS.train_label_max_length))))
     src["train_label_max_length"] = "base"
@@ -1920,7 +2039,9 @@ def build_resolved_training_config(
     src["step5_fca_weight"] = "inactive"
 
     step3_structured_loss_weights_json_v = ""
+    step3_loss_semantics_json_v = ""
     src["step3_structured_losses"] = "inactive"
+    src["step3_loss_semantics"] = "inactive"
     if preset_nm == "step3":
         st3_losses = _payload.get("step3_structured_losses")
         if not isinstance(st3_losses, dict):
@@ -1934,6 +2055,18 @@ def build_resolved_training_config(
             sort_keys=True,
         )
         src["step3_structured_losses"] = "step3.structured_losses"
+        st3_semantics = _payload.get("step3_loss_semantics")
+        if not isinstance(st3_semantics, dict):
+            raise RuntimeError(
+                "effective payload missing step3_loss_semantics; "
+                "Step3 active loss semantics must come from configs/odcr.yaml."
+            )
+        step3_loss_semantics_json_v = json.dumps(
+            st3_semantics,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        src["step3_loss_semantics"] = "step3.loss_semantics"
 
     step5_innovation_config_json_v = ""
     src["step5_innovation"] = "inactive"
@@ -2089,9 +2222,7 @@ def build_resolved_training_config(
         cw_dirty = float(row["checkpoint_composite_w_dirty"])
         src["checkpoint_composite_w_dirty"] = "effective_payload"
 
-    # DMPF/多分支训练在单卡 torchrun+DDP 下也可能出现分支参数未参与 loss；
-    # 默认开启 find_unused_parameters 以保证 Step3 主线可训练完成。
-    ddp_find_unused_v = True
+    ddp_find_unused_v = False if preset_nm == "step3" else True
     src["ddp_find_unused_parameters"] = "base"
     if "ddp_find_unused_parameters" in row:
         ddp_find_unused_v = bool(row["ddp_find_unused_parameters"])
@@ -2105,6 +2236,16 @@ def build_resolved_training_config(
         if not ddp_find_unused_v and ddp_find_unused_false_preflight_v != "synthetic_one_batch":
             raise ValueError("ddp_find_unused_parameters=false 需要 synthetic_one_batch preflight")
         src["ddp_find_unused_false_preflight"] = "effective_payload"
+    ddp_static_graph_v = False
+    src["ddp_static_graph"] = "base"
+    if "ddp_static_graph" in row:
+        ddp_static_graph_v = bool(row["ddp_static_graph"])
+        src["ddp_static_graph"] = "effective_payload"
+    ddp_graph_safety_preflight_v = True if preset_nm == "step3" else False
+    src["ddp_graph_safety_preflight"] = "base"
+    if "ddp_graph_safety_preflight" in row:
+        ddp_graph_safety_preflight_v = bool(row["ddp_graph_safety_preflight"])
+        src["ddp_graph_safety_preflight"] = "effective_payload"
 
     step5_strict_index_batches_v = False
     src["step5_strict_index_batches"] = "base"
@@ -2208,10 +2349,99 @@ def build_resolved_training_config(
         row.get("train_mode", "full"), ctx="effective training_row.train_mode"
     )
     src["train_mode"] = "step5.ccv.native_lora" if preset_nm == "step5" else ("effective_payload" if "train_mode" in row else "base")
+    if "train_precision" not in row:
+        if preset_nm == "step3":
+            raise RuntimeError(
+                "effective Step3 payload missing train_precision; "
+                "use step3.train.backend.train_precision in configs/odcr.yaml."
+            )
+        train_precision_raw = "bf16"
+        src["train_precision"] = "base"
+    else:
+        train_precision_raw = row["train_precision"]
+        src["train_precision"] = "effective_payload"
     train_precision_v = parse_train_precision(
-        row.get("train_precision", "bf16"), ctx="effective training_row.train_precision"
+        train_precision_raw, ctx="effective training_row.train_precision"
     )
-    src["train_precision"] = "effective_payload" if "train_precision" in row else "base"
+    if preset_nm == "step3" and train_precision_v != "bf16":
+        raise RuntimeError("effective Step3 train_precision must be bf16.")
+    allow_tf32_v = bool(row.get("allow_tf32", False))
+    amp_autocast_v = bool(row.get("amp_autocast", False))
+    grad_scaler_v = bool(row.get("grad_scaler", False))
+    src["allow_tf32"] = "effective_payload" if "allow_tf32" in row else "base"
+    src["amp_autocast"] = "effective_payload" if "amp_autocast" in row else "base"
+    src["grad_scaler"] = "effective_payload" if "grad_scaler" in row else "base"
+    if preset_nm == "step3":
+        for key in ("allow_tf32", "amp_autocast", "grad_scaler"):
+            _require_step3_row_key(key)
+        if not allow_tf32_v or not amp_autocast_v or grad_scaler_v:
+            raise RuntimeError("Step3 v0 precision backend requires allow_tf32=true, amp_autocast=true, grad_scaler=false.")
+
+    def _payload_obj(key: str) -> dict[str, Any]:
+        obj = _payload.get(key)
+        if preset_nm == "step3" and not isinstance(obj, dict):
+            raise RuntimeError(f"effective Step3 payload missing {key}; configs/odcr.yaml must own this control.")
+        return dict(obj or {})
+
+    optimizer_config_v = _payload_obj("step3_optimizer")
+    precision_config_v = _payload_obj("step3_precision")
+    tokenizer_config_v = _payload_obj("step3_tokenizer")
+    evidence_config_v = _payload_obj("step3_evidence")
+    scheduler_config_v = _payload_obj("step3_scheduler")
+    valid_batch_config_v = _payload_obj("step3_eval")
+    scenario_profile_v = _payload_obj("step3_scenario_profile")
+    task_profile_config_v = _payload_obj("step3_task_profile")
+    backup_profiles_config_v = _payload_obj("step3_backup_profiles")
+    exploration_profiles_config_v = _payload_obj("step3_exploration_profiles")
+    worker_profiles_config_v = _payload_obj("step3_worker_profiles")
+    prefetcher_config_v = _payload_obj("step3_prefetcher")
+    checkpoint_policy_config_v = _payload_obj("step3_checkpoint_policy")
+    quality_gate_config_v = _payload_obj("step3_quality_gate")
+    grad_finite_config_v = _payload_obj("step3_grad_finite")
+    diagnostic_eval_config_v = _payload_obj("step3_diagnostic_eval")
+    cross_rank_structured_gather_config_v = _payload_obj("step3_cross_rank_structured_gather")
+    memory_config_v = _payload_obj("step3_memory")
+    timing_config_v = _payload_obj("step3_timing")
+    performance_candidates_config_v = _payload_obj("step3_performance_candidates")
+    cache_policy_config_v = _payload_obj("step3_cache_policy")
+    objective_drift_config_v = _payload_obj("step3_objective_drift")
+    recovery_config_v = _payload_obj("step3_recovery")
+    phase_loss_schedule_config_v = _payload_obj("step3_phase_loss_schedule")
+    conflict_aware_config_v = _payload_obj("step3_conflict_aware")
+    loss_gradient_conflict_probe_config_v = _payload_obj("step3_loss_gradient_conflict_probe")
+    adapter_gating_config_v = _payload_obj("step3_adapter_gating")
+    paper_candidate_selection_config_v = _payload_obj("step3_paper_candidate_selection")
+    checkpoint_averaging_config_v = _payload_obj("step3_checkpoint_averaging")
+    tokenizer_max_length_v = int(row.get("tokenizer_max_length", 0))
+    evidence_max_length_v = int(row.get("evidence_max_length", 0))
+    max_grad_norm_v = float(row.get("max_grad_norm", 0.0))
+    validate_every_epochs_v = int(row.get("validate_every_epochs", 1))
+    valid_batch_size_v = int(row.get("valid_batch_size", eval_bs))
+    valid_micro_batch_size_v = int(row.get("valid_micro_batch_size", max(1, eval_bs // max(1, world_size))))
+    src["optimizer"] = "step3.optimizer" if preset_nm == "step3" else "inactive"
+    src["tokenizer_max_length"] = "effective_payload" if "tokenizer_max_length" in row else "inactive"
+    src["evidence_max_length"] = "effective_payload" if "evidence_max_length" in row else "inactive"
+    src["max_grad_norm"] = "effective_payload" if "max_grad_norm" in row else "inactive"
+    src["validate_every_epochs"] = "effective_payload" if "validate_every_epochs" in row else "inactive"
+    src["valid_batch_size"] = "effective_payload" if "valid_batch_size" in row else "inactive"
+    src["valid_micro_batch_size"] = "effective_payload" if "valid_micro_batch_size" in row else "inactive"
+    if preset_nm == "step3":
+        for key in (
+            "optimizer",
+            "tokenizer_max_length",
+            "evidence_max_length",
+            "max_grad_norm",
+            "validate_every_epochs",
+            "valid_batch_size",
+            "valid_micro_batch_size",
+        ):
+            _require_step3_row_key(key)
+        if str(optimizer_config_v.get("name") or "").lower() != "adamw":
+            raise RuntimeError("Step3 optimizer must be AdamW in effective payload.")
+        if max_grad_norm_v <= 0.0:
+            raise RuntimeError("Step3 max_grad_norm must be positive.")
+        src["task_profile_id"] = "effective_payload"
+        src["profile_isolation_hash"] = "effective_payload"
     per_device_eval_v = max(1, int(row.get("per_device_eval_batch_size", 2)))
     src["per_device_eval_batch_size"] = "effective_payload" if "per_device_eval_batch_size" in row else "base"
     lora_r_v = max(1, int(row.get("lora_r", 16)))
@@ -2236,6 +2466,11 @@ def build_resolved_training_config(
         task_idx=tid,
         auxiliary=auxiliary,
         target=target,
+        scenario=str(_payload.get("scenario") or row.get("scenario") or "legacy_scenario"),
+        direction=str(_payload.get("direction") or row.get("direction") or "unspecified"),
+        task_profile_id=str(_payload.get("task_profile_id") or row.get("task_profile_id") or ""),
+        task_profile_key=str(_payload.get("task_profile_key") or row.get("task_profile_key") or ""),
+        profile_isolation_hash=str(_payload.get("profile_isolation_hash") or row.get("profile_isolation_hash") or ""),
         preset_name=preset_nm,
         world_size=int(world_size),
         sources=sources_tuple,
@@ -2243,12 +2478,22 @@ def build_resolved_training_config(
         scheduler_initial_lr=initial_f,
         initial_lr=initial_f,
         epochs=ep,
+        max_epochs=int(row.get("max_epochs", ep)),
+        validate_every_epochs=int(validate_every_epochs_v),
+        max_grad_norm=float(max_grad_norm_v),
+        tokenizer_max_length=int(tokenizer_max_length_v),
+        evidence_max_length=int(evidence_max_length_v),
+        valid_batch_size=int(valid_batch_size_v),
+        valid_micro_batch_size=int(valid_micro_batch_size_v),
         train_batch_size=G,
+        global_batch_size=G,
         batch_size_global=G,
         batch_size=P,
         per_device_train_batch_size=P,
-        gradient_accumulation_steps=A,
+        per_gpu_batch_size=P,
         effective_global_batch_size=eff,
+        batch_semantics_version=NO_ACCUM_BATCH_SEMANTICS_VERSION,
+        grad_accum_removed=True,
         num_proc=num_proc_v,
         max_parallel_cpu=max_par_v,
         hardware_preset_name=hardware_preset_nm,
@@ -2258,12 +2503,44 @@ def build_resolved_training_config(
         dataloader_prefetch_factor_train=pf_t,
         dataloader_prefetch_factor_valid=pf_v,
         dataloader_prefetch_factor_test=pf_test,
+        pin_memory=bool(pin_memory_v),
+        persistent_workers=bool(persistent_workers_v),
+        non_blocking_h2d=bool(non_blocking_h2d_v),
         min_lr_ratio=min_lr,
         lr_scheduler=lr_sched,
         scheduler_type=lr_sched,
         warmup_epochs=wu_ep,
         odcr_warmup_steps=wsteps,
         odcr_warmup_ratio=wratio,
+        optimizer_config_json=json.dumps(optimizer_config_v, ensure_ascii=False, sort_keys=True),
+        precision_config_json=json.dumps(precision_config_v, ensure_ascii=False, sort_keys=True),
+        tokenizer_config_json=json.dumps(tokenizer_config_v, ensure_ascii=False, sort_keys=True),
+        evidence_config_json=json.dumps(evidence_config_v, ensure_ascii=False, sort_keys=True),
+        scheduler_config_json=json.dumps(scheduler_config_v, ensure_ascii=False, sort_keys=True),
+        valid_batch_config_json=json.dumps(valid_batch_config_v, ensure_ascii=False, sort_keys=True),
+        scenario_profile_json=json.dumps(scenario_profile_v, ensure_ascii=False, sort_keys=True),
+        task_profile_config_json=json.dumps(task_profile_config_v, ensure_ascii=False, sort_keys=True),
+        backup_profiles_config_json=json.dumps(backup_profiles_config_v, ensure_ascii=False, sort_keys=True),
+        exploration_profiles_config_json=json.dumps(exploration_profiles_config_v, ensure_ascii=False, sort_keys=True),
+        worker_profiles_config_json=json.dumps(worker_profiles_config_v, ensure_ascii=False, sort_keys=True),
+        prefetcher_config_json=json.dumps(prefetcher_config_v, ensure_ascii=False, sort_keys=True),
+        checkpoint_policy_config_json=json.dumps(checkpoint_policy_config_v, ensure_ascii=False, sort_keys=True),
+        quality_gate_config_json=json.dumps(quality_gate_config_v, ensure_ascii=False, sort_keys=True),
+        grad_finite_config_json=json.dumps(grad_finite_config_v, ensure_ascii=False, sort_keys=True),
+        diagnostic_eval_config_json=json.dumps(diagnostic_eval_config_v, ensure_ascii=False, sort_keys=True),
+        cross_rank_structured_gather_config_json=json.dumps(cross_rank_structured_gather_config_v, ensure_ascii=False, sort_keys=True),
+        memory_config_json=json.dumps(memory_config_v, ensure_ascii=False, sort_keys=True),
+        timing_config_json=json.dumps(timing_config_v, ensure_ascii=False, sort_keys=True),
+        performance_candidates_config_json=json.dumps(performance_candidates_config_v, ensure_ascii=False, sort_keys=True),
+        cache_policy_config_json=json.dumps(cache_policy_config_v, ensure_ascii=False, sort_keys=True),
+        objective_drift_config_json=json.dumps(objective_drift_config_v, ensure_ascii=False, sort_keys=True),
+        recovery_config_json=json.dumps(recovery_config_v, ensure_ascii=False, sort_keys=True),
+        phase_loss_schedule_config_json=json.dumps(phase_loss_schedule_config_v, ensure_ascii=False, sort_keys=True),
+        conflict_aware_config_json=json.dumps(conflict_aware_config_v, ensure_ascii=False, sort_keys=True),
+        loss_gradient_conflict_probe_config_json=json.dumps(loss_gradient_conflict_probe_config_v, ensure_ascii=False, sort_keys=True),
+        adapter_gating_config_json=json.dumps(adapter_gating_config_v, ensure_ascii=False, sort_keys=True),
+        paper_candidate_selection_config_json=json.dumps(paper_candidate_selection_config_v, ensure_ascii=False, sort_keys=True),
+        checkpoint_averaging_config_json=json.dumps(checkpoint_averaging_config_v, ensure_ascii=False, sort_keys=True),
         eval_batch_size=eval_bs,
         min_epochs=min_ep,
         train_min_epochs=min_ep,
@@ -2277,14 +2554,6 @@ def build_resolved_training_config(
         quick_eval_max_samples=qeval,
         coef=coef_f,
         explainer_loss_weight=explainer_loss_weight_f,
-        eta=eta_f,
-        adversarial_coef=adv_f,
-        adversarial_alpha=adv_f,
-        adversarial_beta=adv_f,
-        adversarial_schedule_enabled=adv_sched_on,
-        adversarial_start_epoch=adv_skip,
-        adversarial_warmup_epochs=adv_warm,
-        adversarial_coef_target=adv_target,
         full_bleu_decode_strategy=fb_ds,
         ema_enabled=bool(ema_enabled_v),
         ema_decay=float(ema_decay_v),
@@ -2317,6 +2586,7 @@ def build_resolved_training_config(
         step5_fca_weight=float(step5_fca_weight_v),
         step5_innovation_config_json=str(step5_innovation_config_json_v),
         step3_structured_loss_weights_json=str(step3_structured_loss_weights_json_v),
+        step3_loss_semantics_json=str(step3_loss_semantics_json_v),
         uncertainty_entropy_eps=float(uncertainty_entropy_eps_v),
         uncertainty_high_entropy_threshold=float(uncertainty_high_entropy_threshold_v),
         checkpoint_selection_mode=str(checkpoint_selection_mode_v),
@@ -2330,6 +2600,8 @@ def build_resolved_training_config(
         checkpoint_composite_w_dirty=float(cw_dirty),
         ddp_find_unused_parameters=ddp_find_unused_v,
         ddp_find_unused_false_preflight=str(ddp_find_unused_false_preflight_v),
+        ddp_static_graph=bool(ddp_static_graph_v),
+        ddp_graph_safety_preflight=bool(ddp_graph_safety_preflight_v),
         step5_strict_index_batches=bool(step5_strict_index_batches_v),
         label_smoothing=float(label_smoothing_v),
         repetition_penalty=float(repetition_penalty_v),
@@ -2345,6 +2617,9 @@ def build_resolved_training_config(
         dropout=float(dropout_v),
         train_mode=str(train_mode_v),
         train_precision=str(train_precision_v),
+        allow_tf32=bool(allow_tf32_v),
+        amp_autocast=bool(amp_autocast_v),
+        grad_scaler=bool(grad_scaler_v),
         per_device_eval_batch_size=int(per_device_eval_v),
         lora_r=int(lora_r_v),
         lora_alpha=float(lora_alpha_v),

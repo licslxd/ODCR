@@ -26,6 +26,7 @@ import logging
 import os
 import random
 import re
+import socket
 import string
 import sys
 from datetime import datetime
@@ -241,6 +242,14 @@ def setup_train_logging(
     logger.propagate = False
 
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    context_fmt = logging.Formatter(
+        (
+            "%(asctime)s - %(levelname)s - "
+            f"rank={rank} local_rank={os.environ.get('LOCAL_RANK', '') or rank} "
+            f"pid={os.getpid()} hostname={socket.gethostname()} run_id={run_id} - %(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     log_path = log_file
     mirror = _console_mirror_enabled()
@@ -304,7 +313,7 @@ def setup_train_logging(
         errors_path = os.path.join(os.path.dirname(os.path.abspath(log_path)), "errors.log")
         fh_e = logging.FileHandler(errors_path, encoding="utf-8")
         fh_e.setLevel(logging.WARNING)
-        fh_e.setFormatter(fmt)
+        fh_e.setFormatter(context_fmt)
         logger.addHandler(fh_e)
 
     return {
@@ -323,7 +332,7 @@ def log_run_header(logger: logging.Logger, meta: Dict[str, Any]) -> None:
     safe = _json_safe_sorted_dict(meta)
     pretty = _pretty_log_enabled()
     payload = json.dumps(safe, ensure_ascii=False, indent=2 if pretty else None)
-    extra = log_route_extra(logger, ROUTE_SUMMARY)
+    extra = log_route_extra(logger, ROUTE_DETAIL)
     if pretty:
         logger.info("RUN_META\n%s", payload, extra=extra)
     else:
@@ -341,7 +350,7 @@ def log_config_snapshot(
     safe = _json_safe_sorted_dict(trimmed)
     pretty = _pretty_log_enabled()
     payload = json.dumps(safe, ensure_ascii=False, indent=2 if pretty else None)
-    extra = log_route_extra(logger, ROUTE_SUMMARY)
+    extra = log_route_extra(logger, ROUTE_DETAIL)
     if pretty:
         logger.info("RUN_CONFIG\n%s", payload, extra=extra)
     else:
@@ -360,7 +369,7 @@ def log_run_snapshot(
     body = {"meta": _json_safe_sorted_dict(meta), "config": _json_safe_sorted_dict(trimmed)}
     pretty = _pretty_log_enabled()
     payload = json.dumps(body, ensure_ascii=False, indent=2 if pretty else None)
-    extra = log_route_extra(logger, ROUTE_SUMMARY)
+    extra = log_route_extra(logger, ROUTE_DETAIL)
     if pretty:
         logger.info("RUN_SNAPSHOT\n%s", payload, extra=extra)
     else:
@@ -523,8 +532,9 @@ def format_eval_summary_lines(
     dist1_evaluate_text/dist2_evaluate_text 与 FINAL RESULTS 中 paper-compatible DIST 一致；
     ext_* 为 extended_text_metrics_bundle，诊断用，非论文主表 DIST。
     """
-    ex = final["explanation"]
-    bl = ex["bleu"]
+    ex = final.get("explanation") or {}
+    bl = ex.get("bleu") or {}
+    rg = ex.get("rouge") or {}
     lines = [
         "[Eval Summary]",
         f"eval_run_tag={eval_run_tag}" if eval_run_tag else "eval_run_tag=",
@@ -535,16 +545,18 @@ def format_eval_summary_lines(
         f"decode_seed={decode_cfg.get('decode_seed')}",
         f"label_smoothing={decode_cfg.get('label_smoothing')}",
         f"max_explanation_length={decode_cfg.get('max_explanation_length')}",
-        f"mae={final['recommendation']['mae']}",
-        f"rmse={final['recommendation']['rmse']}",
-        f"bleu4={bl['4']}",
-        f"meteor={ex['meteor']}",
-        f"rouge_l={ex['rouge']['l']}",
+        f"mae={(final.get('recommendation') or {}).get('mae')}",
+        f"rmse={(final.get('recommendation') or {}).get('rmse')}",
+        f"bleu4={bl.get('4')}",
+        f"meteor={ex.get('meteor')}",
+        f"rouge_l={rg.get('l')}",
     ]
     ext = final.get("text_metrics_corpus_and_sentence") or {}
     corp = ext.get("corpus_level") or {}
     sent = ext.get("sentence_level_mean") or {}
     di = ex.get("dist") or {}
+    if ex.get("text_metrics_skipped"):
+        lines.append("text_metrics=skipped")
     lines.extend(
         [
             f"dist1_evaluate_text={di.get('1')}",
@@ -615,14 +627,25 @@ def format_final_results_lines(
     )
     lines.extend(
         [
-            f"{tab}MAE = {final['recommendation']['mae']} | RMSE = {final['recommendation']['rmse']} ",
+            f"{tab}MAE = {(final.get('recommendation') or {}).get('mae')} | RMSE = {(final.get('recommendation') or {}).get('rmse')} ",
             "[Explanation]",
-            f"{tab}ROUGE: {final['explanation']['rouge']['1']}, {final['explanation']['rouge']['2']}, {final['explanation']['rouge']['l']} ",
-            f"{tab}BLEU: {final['explanation']['bleu']['1']}, {final['explanation']['bleu']['2']}, {final['explanation']['bleu']['3']}, {final['explanation']['bleu']['4']} ",
-            f"{tab}DIST-1/DIST-2 (evaluate_text, paper-compatible): {final['explanation']['dist']['1']}, {final['explanation']['dist']['2']}",
-            f"{tab}METEOR: {final['explanation']['meteor']} ",
         ]
     )
+    ex = final.get("explanation") or {}
+    if ex.get("text_metrics_skipped"):
+        lines.append(f"{tab}Text metrics skipped for this eval protocol.")
+    else:
+        rouge = ex.get("rouge") or {}
+        bleu = ex.get("bleu") or {}
+        dist = ex.get("dist") or {}
+        lines.extend(
+            [
+                f"{tab}ROUGE: {rouge.get('1')}, {rouge.get('2')}, {rouge.get('l')} ",
+                f"{tab}BLEU: {bleu.get('1')}, {bleu.get('2')}, {bleu.get('3')}, {bleu.get('4')} ",
+                f"{tab}DIST-1/DIST-2 (evaluate_text, paper-compatible): {dist.get('1')}, {dist.get('2')}",
+                f"{tab}METEOR: {ex.get('meteor')} ",
+            ]
+        )
     pm = final.get("paper_metrics")
     if isinstance(pm, dict) and pm.get("bleu"):
         bl = pm["bleu"]
@@ -851,31 +874,47 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, Any]:
 
     dist_1/dist_2 来自 evaluate_text（论文主表口径）；ext_* 列为诊断扩展指标，勿与 dist_* 混读。
     """
-    r = final["recommendation"]
-    e = final["explanation"]
-    rg = e["rouge"]
-    bl = e["bleu"]
-    di = e["dist"]
-
     def _f(x: Any) -> float:
         if hasattr(x, "item"):
             return float(x.item())
         return float(x)
 
-    d: Dict[str, Any] = {
-        "mae": _f(r["mae"]),
-        "rmse": _f(r["rmse"]),
-        "rouge_1": _f(rg["1"]),
-        "rouge_2": _f(rg["2"]),
-        "rouge_l": _f(rg["l"]),
-        "bleu_1": _f(bl["1"]),
-        "bleu_2": _f(bl["2"]),
-        "bleu_3": _f(bl["3"]),
-        "bleu_4": _f(bl["4"]),
-        "dist_1": _f(di["1"]),
-        "dist_2": _f(di["2"]),
-        "meteor": _f(e["meteor"]),
-    }
+    r = final["recommendation"]
+    e = final.get("explanation") or {}
+    if e.get("text_metrics_skipped"):
+        d: Dict[str, Any] = {
+            "mae": _f(r["mae"]),
+            "rmse": _f(r["rmse"]),
+            "rouge_1": "",
+            "rouge_2": "",
+            "rouge_l": "",
+            "bleu_1": "",
+            "bleu_2": "",
+            "bleu_3": "",
+            "bleu_4": "",
+            "dist_1": "",
+            "dist_2": "",
+            "meteor": "",
+        }
+    else:
+        rg = e["rouge"]
+        bl = e["bleu"]
+        di = e["dist"]
+
+        d = {
+            "mae": _f(r["mae"]),
+            "rmse": _f(r["rmse"]),
+            "rouge_1": _f(rg["1"]),
+            "rouge_2": _f(rg["2"]),
+            "rouge_l": _f(rg["l"]),
+            "bleu_1": _f(bl["1"]),
+            "bleu_2": _f(bl["2"]),
+            "bleu_3": _f(bl["3"]),
+            "bleu_4": _f(bl["4"]),
+            "dist_1": _f(di["1"]),
+            "dist_2": _f(di["2"]),
+            "meteor": _f(e["meteor"]),
+        }
 
     ext = final.get("text_metrics_corpus_and_sentence") or {}
     corp = ext.get("corpus_level") or {}
@@ -940,6 +979,242 @@ def append_train_epoch_metrics_jsonl(*, log_file: Optional[str], row: Dict[str, 
             return
         path = os.path.join(d, path_layout.metrics_filename("metrics"))
         _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def _run_meta_metric_path(log_file: Optional[str], kind: str) -> Optional[str]:
+    if not log_file:
+        return None
+    try:
+        d = os.path.dirname(os.path.abspath(os.path.expanduser(log_file)))
+        if not d:
+            return None
+        return os.path.join(d, path_layout.metrics_filename(kind))
+    except Exception:
+        return None
+
+
+def append_step3_loss_breakdown_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 component loss details to ``loss_breakdown.jsonl``."""
+    path = _run_meta_metric_path(log_file, "loss_breakdown")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_timing_profile_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 safe-interval timing detail to ``timing_profile.jsonl``."""
+    path = _run_meta_metric_path(log_file, "timing_profile")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_gpu_profile_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 GPU allocation/reservation profile to ``gpu_profile.jsonl``."""
+    path = _run_meta_metric_path(log_file, "gpu_profile")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_scheduler_events_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 validation-aware LR damping events to ``scheduler_events.jsonl``."""
+    path = _run_meta_metric_path(log_file, "scheduler_events")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_damping_events_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append explicit Step3 damping events to ``damping_events.jsonl``."""
+    path = _run_meta_metric_path(log_file, "damping_events")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_objective_drift_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 V3 objective-drift decisions."""
+    path = _run_meta_metric_path(log_file, "objective_drift")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_recovery_events_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 V3 recovery-controller events."""
+    path = _run_meta_metric_path(log_file, "recovery_events")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def append_step3_training_effectiveness_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 epoch-level training effectiveness diagnostics."""
+    path = _run_meta_metric_path(log_file, "training_effectiveness")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def write_step3_training_effectiveness_summary_json(*, log_file: Optional[str], payload: Dict[str, Any]) -> None:
+    """Write the latest Step3 training effectiveness summary."""
+    path = _run_meta_metric_path(log_file, "training_effectiveness_summary")
+    if not path:
+        return
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def append_step3_samples_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append diagnostic-only Step3 samples to ``samples.jsonl``."""
+    path = _run_meta_metric_path(log_file, "samples")
+    if not path:
+        return
+    try:
+        _append_jsonl(path, row)
+    except Exception:
+        pass
+
+
+def write_step3_collapse_stats_json(*, log_file: Optional[str], payload: Dict[str, Any]) -> None:
+    """Write Step3 diagnostic collapse stats to ``collapse_stats.json``."""
+    path = _run_meta_metric_path(log_file, "collapse_stats")
+    if not path:
+        return
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+_STEP3_EPOCH_SUMMARY_FIELDS: Tuple[str, ...] = (
+    "epoch",
+    "train_loss",
+    "valid_loss",
+    "best_metric",
+    "delta_from_best",
+    "delta_recent",
+    "lr_base",
+    "lr_effective",
+    "base_min_lr",
+    "effective_min_lr",
+    "damping_event",
+    "objective_drift_status",
+    "loss_phase",
+    "checkpoint_improved",
+    "effective_improvement_status",
+    "recommended_action",
+    "elapsed_s",
+    "samples_per_sec",
+    "checkpoint_path",
+    "status",
+)
+
+
+def append_step3_epoch_summary_csv(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
+    """Append Step3 epoch summary to ``epoch_summary.csv``."""
+    path = _run_meta_metric_path(log_file, "epoch_summary")
+    if not path:
+        return
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        need_header = not os.path.isfile(path) or os.path.getsize(path) == 0
+        with open(path, "a", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(_STEP3_EPOCH_SUMMARY_FIELDS), extrasaction="ignore")
+            if need_header:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in _STEP3_EPOCH_SUMMARY_FIELDS})
+    except Exception:
+        pass
+
+
+def write_step3_loss_component_epoch_summary_csv(*, log_file: Optional[str], rows: list[Dict[str, Any]]) -> None:
+    """Write Step3 per-epoch loss component dashboard rows."""
+    path = _run_meta_metric_path(log_file, "loss_component_epoch_summary")
+    if not path:
+        return
+    fieldnames = ("schema_version", "epoch", "loss_name", "raw_mean", "weighted_mean", "count")
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
+            w.writeheader()
+            for row in rows:
+                w.writerow({key: row.get(key, "") for key in fieldnames})
+    except Exception:
+        pass
+
+
+def write_step3_loss_component_trends_json(*, log_file: Optional[str], payload: Dict[str, Any]) -> None:
+    """Write Step3 loss component trend dashboard."""
+    path = _run_meta_metric_path(log_file, "loss_component_trends")
+    if not path:
+        return
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+    except Exception:
+        pass
+
+
+def write_step3_component_contribution_summary_md(*, log_file: Optional[str], text: str) -> None:
+    """Write a compact Step3 component contribution markdown summary."""
+    path = _run_meta_metric_path(log_file, "component_contribution_summary")
+    if not path:
+        return
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(text).rstrip() + "\n")
     except Exception:
         pass
 

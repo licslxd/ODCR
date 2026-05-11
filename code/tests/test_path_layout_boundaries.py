@@ -81,6 +81,7 @@ class TestPathLayoutBoundaries(unittest.TestCase):
         self.assertEqual(path_layout.metrics_filename("metrics"), "metrics.jsonl")
         self.assertEqual(path_layout.metrics_filename("epoch_summary"), "epoch_summary.csv")
         self.assertEqual(path_layout.metrics_filename("loss_breakdown"), "loss_breakdown.jsonl")
+        self.assertEqual(path_layout.metrics_filename("timing_profile"), "timing_profile.jsonl")
         self.assertEqual(path_layout.metrics_filename("gpu_profile"), "gpu_profile.jsonl")
         self.assertEqual(path_layout.metrics_filename("rcr_distribution"), "rcr_distribution.json")
         self.assertEqual(path_layout.metrics_filename("eval_metrics"), "eval_metrics.json")

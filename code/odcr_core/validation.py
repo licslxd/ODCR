@@ -269,6 +269,9 @@ def validate_resolved_config(cfg: ResolvedConfig) -> None:
     t = cfg.task_id
 
     if cmd == "step4":
+        upstream_resolution = (getattr(cfg, "upstream_resolution_json", "") or "").strip()
+        if not upstream_resolution:
+            raise RuntimeError("内部错误: step4 缺少 upstream_resolution_json；Step4 dry-run/runtime 必须复用 upstream_resolver。")
         s3 = Path(cfg.step3_checkpoint_dir or "")
         preflight_findings = _step4_preflight_findings(cfg)
         if preflight_findings:
@@ -291,6 +294,9 @@ def validate_resolved_config(cfg: ResolvedConfig) -> None:
                 + _hint_tail()
             )
     elif cmd == "step5":
+        upstream_resolution = (getattr(cfg, "upstream_resolution_json", "") or "").strip()
+        if not upstream_resolution:
+            raise RuntimeError("内部错误: step5 缺少 upstream_resolution_json；Step5 必须复用 upstream_resolver。")
         assert cfg.from_run is not None
         rid = run_naming.parse_run_id(cfg.from_run)
         step3_dir = path_layout.get_train_step3_run_root(cfg.repo_root, cfg.task_id, cfg.iteration_id, rid)

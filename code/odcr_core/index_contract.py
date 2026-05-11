@@ -184,10 +184,26 @@ def build_step4_export_lineage(
     target_domain: str,
     step3_checkpoint_lineage_hash: str,
     step4_rcr_config: Mapping[str, Any],
+    step4_run: str | None = None,
+    frozen_step3_lineage: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    frozen = dict(
+        frozen_step3_lineage
+        or {
+            "upstream_step3_run_id": "unknown",
+            "step3_checkpoint_path": "unknown",
+            "step3_checkpoint_hash": str(step3_checkpoint_lineage_hash),
+            "step3_checkpoint_lineage_hash": str(step3_checkpoint_lineage_hash),
+            "step3_stage_status_hash": "unknown",
+            "step3_eval_handoff_hash": "unknown",
+        }
+    )
     payload: Dict[str, Any] = {
         "schema_version": STEP4_EXPORT_LINEAGE_SCHEMA_VERSION,
+        "producer_stage": "step4",
+        "step4_run": str(step4_run or "unknown"),
         "step3_checkpoint_lineage_hash": str(step3_checkpoint_lineage_hash),
+        "frozen_step3_lineage": frozen,
         "step4_rcr_config_hash": stable_hash(dict(step4_rcr_config)),
         "step4_export_schema_version": STEP4_RCR_EXPORT_SCHEMA_VERSION,
         "rcr_required_fields_hash": step4_rcr_required_fields_hash(),
@@ -233,13 +249,31 @@ def validate_step4_export_lineage(
         target_domain=str(target_domain),
         step3_checkpoint_lineage_hash=str(lineage.get("step3_checkpoint_lineage_hash") or ""),
         step4_rcr_config=current_step4_rcr_config,
+        step4_run=str(lineage.get("step4_run") or "unknown"),
+        frozen_step3_lineage=dict(lineage.get("frozen_step3_lineage") or {}),
     )
+    frozen = lineage.get("frozen_step3_lineage")
+    if not isinstance(frozen, Mapping):
+        raise CheckpointLineageError("Step5 refused Step4 export: missing frozen Step3 lineage in Step4 export.")
+    for required_key in (
+        "upstream_step3_run_id",
+        "step3_checkpoint_path",
+        "step3_checkpoint_hash",
+        "step3_stage_status_hash",
+        "step3_eval_handoff_hash",
+    ):
+        if not str(frozen.get(required_key) or "").strip():
+            raise CheckpointLineageError(
+                f"Step5 refused Step4 export: frozen Step3 lineage missing {required_key}."
+            )
     comparisons = {
+        "producer_stage": "step4",
         "step4_rcr_config_hash": expected["step4_rcr_config_hash"],
         "step4_export_schema_version": STEP4_RCR_EXPORT_SCHEMA_VERSION,
         "rcr_required_fields_hash": step4_rcr_required_fields_hash(),
         "route_posterior_contract_version": STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION,
         "preprocess_route_prior_boundary": step4_prior_boundary_contract(),
+        "frozen_step3_lineage": dict(frozen),
         "task": {
             "task_id": int(task_id),
             "auxiliary_domain": str(auxiliary_domain),
@@ -392,17 +426,101 @@ def _load_profile_tensors_physical_separate_from_paths(
     return domain_content, domain_style, user_content, user_style, item_content, item_style, meta
 
 
+def _compare_sample_fingerprint(actual: Mapping[str, Any], expected: Mapping[str, Any], *, context: str) -> None:
+    for key in ("exists", "is_file", "size", "mtime_ns", "sample_sha256"):
+        if key in expected and actual.get(key) != expected.get(key):
+            raise IndexContractError(
+                f"{context} fingerprint mismatch for {key}: actual={actual.get(key)!r}, expected={expected.get(key)!r}"
+            )
+
+
+def _require_step3_preflight_profile_paths(
+    *,
+    target_paths: Mapping[str, str],
+    aux_paths: Mapping[str, str],
+    target_domain: str,
+    auxiliary_domain: str,
+    preflight_summary: Mapping[str, Any] | None,
+) -> None:
+    if preflight_summary is None:
+        return
+    if preflight_summary.get("status") != "ok":
+        raise IndexContractError("Step3 upstream preflight summary must have status=ok before profile tensor load.")
+    profile_artifacts = preflight_summary.get("profile_artifacts")
+    domain_artifacts = preflight_summary.get("domain_artifacts")
+    if not isinstance(profile_artifacts, Mapping) or not isinstance(domain_artifacts, Mapping):
+        raise IndexContractError("Step3 upstream preflight summary is missing profile/domain artifact contracts.")
+
+    profile_key_map = {
+        "user_content": "user_content_profiles",
+        "user_style": "user_style_profiles",
+        "item_content": "item_content_profiles",
+        "item_style": "item_style_profiles",
+    }
+    domain_key_map = {
+        "domain_content": "domain_content",
+        "domain_style": "domain_style",
+    }
+    for domain, paths in ((target_domain, target_paths), (auxiliary_domain, aux_paths)):
+        domain_profiles = profile_artifacts.get(domain)
+        domain_domains = domain_artifacts.get(domain)
+        if not isinstance(domain_profiles, Mapping) or not isinstance(domain_domains, Mapping):
+            raise IndexContractError(f"Step3 upstream preflight summary missing artifacts for domain={domain}.")
+        for loader_key, summary_key in profile_key_map.items():
+            contract = domain_profiles.get(summary_key)
+            if not isinstance(contract, Mapping):
+                raise IndexContractError(f"Step3 upstream preflight missing profile contract {domain}:{summary_key}.")
+            expected_path = os.path.abspath(os.path.expanduser(str(contract.get("path", ""))))
+            actual_path = os.path.abspath(os.path.expanduser(str(paths[loader_key])))
+            if actual_path != expected_path:
+                raise IndexContractError(
+                    f"Step3 profile loader path mismatch for {domain}:{summary_key}: {actual_path} != {expected_path}"
+                )
+            expected_fp = contract.get("fingerprint")
+            if isinstance(expected_fp, Mapping):
+                _compare_sample_fingerprint(
+                    file_fingerprint(actual_path, sample_only=True),
+                    expected_fp,
+                    context=f"Step3 profile loader {domain}:{summary_key}",
+                )
+        for loader_key, summary_key in domain_key_map.items():
+            contract = domain_domains.get(summary_key)
+            if not isinstance(contract, Mapping):
+                raise IndexContractError(f"Step3 upstream preflight missing domain contract {domain}:{summary_key}.")
+            expected_path = os.path.abspath(os.path.expanduser(str(contract.get("path", ""))))
+            actual_path = os.path.abspath(os.path.expanduser(str(paths[loader_key])))
+            if actual_path != expected_path:
+                raise IndexContractError(
+                    f"Step3 domain loader path mismatch for {domain}:{summary_key}: {actual_path} != {expected_path}"
+                )
+            expected_fp = contract.get("fingerprint")
+            if isinstance(expected_fp, Mapping):
+                _compare_sample_fingerprint(
+                    file_fingerprint(actual_path, sample_only=True),
+                    expected_fp,
+                    context=f"Step3 domain loader {domain}:{summary_key}",
+                )
+
+
 def load_profile_tensors_dual_first(
     *,
     data_root: str,
     auxiliary_domain: str,
     target_domain: str,
     device_idx: int | str,
+    step3_upstream_preflight_summary: Mapping[str, Any] | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
     """从磁盘双资产加载为六路张量（默认主链物理分离，非融合单向量）。"""
     root = os.path.abspath(os.path.expanduser(data_root))
     target_paths = _domain_profile_paths(root, target_domain)
     aux_paths = _domain_profile_paths(root, auxiliary_domain)
+    _require_step3_preflight_profile_paths(
+        target_paths=target_paths,
+        aux_paths=aux_paths,
+        target_domain=target_domain,
+        auxiliary_domain=auxiliary_domain,
+        preflight_summary=step3_upstream_preflight_summary,
+    )
     return _load_profile_tensors_physical_separate_from_paths(
         target_paths=target_paths,
         aux_paths=aux_paths,

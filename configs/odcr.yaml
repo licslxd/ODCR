@@ -1,6 +1,6 @@
 project:
   name: ODCR
-  default_task: 4
+  default_task: 2
   seed: 3407
   run_root: runs
   cache_dir: cache
@@ -24,20 +24,28 @@ hardware:
   profiles:
     default:
       ddp_world_size: 2
-      num_proc: 8
-      dataloader_num_workers_train: 8
-      dataloader_num_workers_valid: 8
-      dataloader_num_workers_test: 8
+      num_proc: auto
+      max_num_proc: 8
+      reserved_cpu: 2
+      max_parallel_cpu: 12
+      dataloader_num_workers_train: 4
+      dataloader_num_workers_valid: 2
+      dataloader_num_workers_test: 2
       dataloader_prefetch_factor_train: 2
       dataloader_prefetch_factor_valid: 2
       dataloader_prefetch_factor_test: 2
-      omp_num_threads: 8
-      mkl_num_threads: 8
+      omp_num_threads: 1
+      mkl_num_threads: 1
       tokenizers_parallelism: false
+      pin_memory: true
+      persistent_workers: true
+      non_blocking_h2d: true
       cuda_visible_devices: "0,1"
     a100_1gpu_fast:
       ddp_world_size: 1
-      num_proc: 2
+      num_proc: auto
+      max_num_proc: 4
+      reserved_cpu: 2
       dataloader_num_workers_train: 2
       dataloader_num_workers_valid: 2
       dataloader_num_workers_test: 2
@@ -48,17 +56,20 @@ hardware:
       omp_num_threads: 1
       mkl_num_threads: 1
       tokenizers_parallelism: false
+      pin_memory: true
+      persistent_workers: true
+      non_blocking_h2d: true
       cuda_visible_devices: "0"
 
 tasks:
-  1: {source: AM_Electronics, target: AM_CDs, lr: 5.0e-4, coef: 1.0}
-  2: {source: AM_Movies, target: AM_CDs, lr: 1.0e-3, coef: 0.1}
-  3: {source: AM_CDs, target: AM_Electronics, lr: 5.0e-4, coef: 0.5}
-  4: {source: AM_Movies, target: AM_Electronics, lr: 1.0e-3, coef: 0.5}
-  5: {source: AM_CDs, target: AM_Movies, lr: 1.0e-3, coef: 0.5}
-  6: {source: AM_Electronics, target: AM_Movies, lr: 1.0e-3, coef: 0.5}
-  7: {source: Yelp, target: TripAdvisor, lr: 1.0e-4, coef: 0.5}
-  8: {source: TripAdvisor, target: Yelp, lr: 5.0e-4, coef: 1.0}
+  1: {source: AM_Electronics, target: AM_CDs, scenario: legacy_scenario, direction: legacy}
+  2: {source: AM_Movies, target: AM_CDs, scenario: strong_related, direction: forward}
+  3: {source: AM_CDs, target: AM_Electronics, scenario: legacy_scenario, direction: legacy}
+  4: {source: AM_Movies, target: AM_Electronics, scenario: legacy_scenario, direction: legacy}
+  5: {source: AM_CDs, target: AM_Movies, scenario: strong_related, direction: reverse}
+  6: {source: AM_Electronics, target: AM_Movies, scenario: legacy_scenario, direction: legacy}
+  7: {source: Yelp, target: TripAdvisor, scenario: weak_cross_platform, direction: reverse}
+  8: {source: TripAdvisor, target: Yelp, scenario: weak_cross_platform, direction: forward}
 
 preprocess:
   datasets: [AM_Electronics, AM_CDs, AM_Movies, Yelp, TripAdvisor]
@@ -73,6 +84,17 @@ preprocess:
     batch_size: 512
     read_chunk_rows: 100000
     group_shard_size: 4096
+    tokenizer_parallelism_enabled: true
+    tokenizer_threads_per_worker: 4
+    tokenizer_total_threads: 8
+    prefetch_batches: 2
+    pin_memory: true
+    non_blocking_h2d: true
+    async_prefetch_enabled: true
+    token_aware_batching_enabled: false
+    max_tokens_per_gpu_batch: null
+    cpu_cores_reserved: 2
+    cpu_cores_available: 12
     grouped_text_cache_enabled: true
     grouped_text_cache_dir: cache/preprocess_b
     grouped_text_cache_version: preprocess_b_grouped_text_cache_v1
@@ -86,17 +108,44 @@ preprocess:
     datasets: [AM_Electronics, AM_CDs, AM_Movies, Yelp, TripAdvisor]
     gpu_ids: [0, 1]
     chunk_batch_size: 512
+    tokenizer_parallelism_enabled: true
+    tokenizer_threads_per_worker: 4
+    tokenizer_total_threads: 8
+    prefetch_batches: 2
+    pin_memory: true
+    non_blocking_h2d: true
+    async_prefetch_enabled: true
+    scheduling_policy: lpt_by_token_windows
+    cpu_cores_reserved: 2
+    cpu_cores_available: 12
     bf16_enabled: true
     tf32_enabled: true
     tokenizer_hotpath_enabled: true
     token_window_cache_enabled: true
     token_window_cache_dir: cache/preprocess_c
     token_window_cache_version: preprocess_c_token_windows_v3
-    token_window_cache_shard_size: 2048
+    token_window_cache_shard_size: 4096
     resume: true
     skip_completed: true
 
 step3:
+  ddp:
+    find_unused_parameters: false
+    static_graph: false
+    graph_safety_preflight: true
+  loss_semantics:
+    specific_separation_margin: 0.60
+    variance_target_std: 0.70
+    variance_eps: 1.0e-4
+    orthogonal_eps: 1.0e-8
+    cosine_eps: 1.0e-8
+    sample_weight_eps: 1.0e-6
+    prototype_separation_eps: 1.0e-8
+    quality_weight:
+      evidence_base: 0.55
+      evidence_scale: 0.45
+      anchor_base: 0.40
+      anchor_scale: 0.60
   structured_losses:
     orthogonal:
       weight: 0.20
@@ -115,40 +164,679 @@ step3:
     residual_specific_weight: 0.025
     prototype_separation_weight: 0.04
     light_explainer_weight: 0.03
+  scenario_profiles:
+    legacy_scenario:
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      train:
+        lr: 5.0e-4
+    strong_related:
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      train:
+        lr: 7.0e-4
+    weak_cross_platform:
+      tokenizer:
+        max_length: 64
+      evidence:
+        max_evidence_length: 64
+      train:
+        lr: 3.0e-4
+  task_profiles:
+    task2_am_movies_to_cds:
+      task_id: 2
+      source: AM_Movies
+      target: AM_CDs
+      scenario: strong_related
+      direction: forward
+      active_profile: strong_forward_g1s
+      profile_id: task2_strong_forward_g1s
+      candidate: G1S
+      formal_allowed: true
+      probe_only: false
+      train:
+        batch_size: 1536
+        per_gpu_batch_size: 768
+        lr: 7.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1536
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+    task5_cds_to_movies:
+      task_id: 5
+      source: AM_CDs
+      target: AM_Movies
+      scenario: strong_related
+      direction: reverse
+      active_profile: strong_reverse_g1_init
+      profile_id: task5_strong_reverse_g1_init
+      candidate: task5_strong_reverse_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      train:
+        batch_size: 1536
+        per_gpu_batch_size: 768
+        lr: 7.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1536
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+    task8_tripadvisor_to_yelp:
+      task_id: 8
+      source: TripAdvisor
+      target: Yelp
+      scenario: weak_cross_platform
+      direction: forward
+      active_profile: weak_forward_init
+      profile_id: task8_weak_forward_init
+      candidate: task8_weak_forward_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      note: isolated weak profile is initialization only; it is not task2 formal-ready
+      train:
+        batch_size: 1024
+        per_gpu_batch_size: 512
+        lr: 3.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 64
+      evidence:
+        max_evidence_length: 64
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1024
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+    task7_yelp_to_tripadvisor:
+      task_id: 7
+      source: Yelp
+      target: TripAdvisor
+      scenario: weak_cross_platform
+      direction: reverse
+      active_profile: weak_reverse_init
+      profile_id: task7_weak_reverse_init
+      candidate: task7_weak_reverse_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      note: isolated weak profile is initialization only; it is not task2 formal-ready
+      train:
+        batch_size: 1024
+        per_gpu_batch_size: 512
+        lr: 3.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 64
+      evidence:
+        max_evidence_length: 64
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1024
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+  backup_profiles:
+    task2_g1_backup:
+      base_task_profile: task2_am_movies_to_cds
+      task_profile_id: task2_strong_forward_g1
+      candidate: G1
+      batch_size: 1536
+      per_gpu_batch_size: 768
+      ddp_world_size: 2
+      cross_rank_structured_gather: true
+      gather_mode: local_gradient_context
+      effective_pool_expected: 1536
+      activation_checkpointing: off
+      profile_buffer_policy: gpu_resident
+      backup_only: true
+      manual_selection_required: true
+      not_default: true
+      formal_allowed: false
+      probe_only: false
+    task2_g0_backup:
+      base_task_profile: task2_am_movies_to_cds
+      task_profile_id: task2_g0_backup
+      candidate: G0
+      batch_size: 1024
+      per_gpu_batch_size: 512
+      ddp_world_size: 2
+      cross_rank_structured_gather: true
+      gather_mode: local_gradient_context
+      effective_pool_expected: 1024
+      activation_checkpointing: off
+      profile_buffer_policy: gpu_resident
+      backup_only: true
+      manual_selection_required: true
+      not_default: true
+      formal_allowed: false
+      probe_only: false
+  exploration_profiles:
+    task2_g2_effective_pool_2048:
+      base_task_profile: task2_am_movies_to_cds
+      task_profile_id: task2_g2_effective_pool_2048
+      candidate: G2-2048-pool
+      batch_size: 2048
+      per_gpu_batch_size: 1024
+      ddp_world_size: 2
+      cross_rank_structured_gather: true
+      gather_mode: local_gradient_context
+      effective_pool_expected: 2048
+      activation_checkpointing: selective
+      profile_buffer_policy: cpu_pinned_batch_gather
+      formal_allowed: false
+      probe_only: true
+      exploration_only: true
+      replacement_gate_status: failed_or_not_passed
+      promotion_policy: manual_only_after_memory_throughput_and_pilot_all_beat_G1
+  optimizer:
+    name: adamw
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    param_groups:
+      dense_weight_decay: 1.0e-2
+      special_weight_decay: 1.0e-4
+      no_decay: 0.0
+    exclude_frozen_evidence_buffers: true
+  tokenizer:
+    max_length: 48
+  evidence:
+    max_evidence_length: 48
+  scheduler:
+    name: warmup_cosine
+    warmup_ratio: 0.06
+    min_lr_ratio: 0.05
+    validation_aware_lr_damping:
+      enabled: false
+      name: safe_damping_v2
+      base_scheduler: warmup_cosine
+      formal_allowed: false
+      probe_only: true
+      monitor_metric: valid_loss
+      direction: min
+      worsen_abs_threshold: 0.25
+      worsen_ratio_threshold: 0.10
+      worsen_patience: 3
+      lr_decay_factor: 0.5
+      min_lr_ratio: 0.05
+      cooldown_epochs: 3
+      max_damping_events: 2
+      start_epoch: 4
+      recent_trend_epochs: 2
+      recent_recovery_tolerance: 1.0e-3
+      effective_lr_floor_abs: 0.0
+      effective_lr_floor_ratio: 0.25
+      effective_min_lr_policy: safe_floor_no_halve_to_zero
+      action_on_max_events: stop_and_select_candidate
+      action_on_low_lr_no_progress: stop_and_select_candidate
+  objective_drift:
+    enabled: true
+    valid_loss_abs_threshold: 0.25
+    valid_loss_ratio_threshold: 0.10
+    severe_valid_loss_abs_threshold: 0.75
+    severe_valid_loss_ratio_threshold: 0.20
+    component_weighted_delta_threshold: 0.01
+    severe_component_count: 3
+    statuses: [none, warning, objective_drift, severe_objective_drift]
+    actions:
+      warning: monitor_recent_trend
+      objective_drift: plan_recovery_or_loss_rebalance
+      severe_objective_drift: start_recovery
+  recovery:
+    enabled: true
+    trigger: severe_objective_drift
+    restart_lr_ratio: 0.25
+    recovery_epochs: 8
+    max_recoveries: 1
+    source_checkpoint_scope: best_observed
+    save_drift_checkpoint: true
+    recovery_scheduler: short_cosine
+    formal_allowed: true
+  phase_loss_schedule:
+    enabled: true
+    transition: epoch_or_objective_drift
+    phases:
+      - name: alignment_warmup
+        start_epoch: 1
+        end_epoch: 2
+        loss_multipliers:
+          L_content_alignment: 1.0
+          L_style_alignment: 1.0
+          L_shared_proto: 1.0
+          L_domain_style_alignment: 0.9
+          L_specific_separation: 0.6
+          L_variance: 0.7
+          L_light_explainer: 0.8
+      - name: task_refinement
+        start_epoch: 3
+        end_epoch: 24
+        loss_multipliers:
+          L_rating_shared: 1.0
+          L_light_explainer: 1.2
+          L_content_alignment: 0.55
+          L_style_alignment: 0.55
+          L_specific_separation: 0.35
+          L_variance: 0.45
+          L_domain_style_alignment: 0.45
+          L_prototype_separation: 0.5
+      - name: light_regularization
+        start_epoch: 25
+        end_epoch: null
+        loss_multipliers:
+          L_content_alignment: 0.35
+          L_style_alignment: 0.35
+          L_specific_separation: 0.25
+          L_variance: 0.30
+          L_orthogonal: 0.50
+          L_domain_style_alignment: 0.30
+          L_prototype_separation: 0.35
+          L_light_explainer: 1.1
+  conflict_aware:
+    enabled: false
+    mode: "off"
+    allowed_modes: ["off", dynamic_weighting, pcgrad, gradnorm, uncertainty_weighting]
+    default_mode: "off"
+    formal_allowed: false
+    requires_gradient_probe: true
+    ddp_graph_safe_zero_required: true
+  loss_gradient_conflict_probe:
+    enabled: true
+    real_data_only: true
+    synthetic_benchmark_forbidden: true
+    bounded_max_batches: 4
+    output_dir: AI_analysis/06_probe_evidence/step3_loss_gradient_conflict_probe
+    write_formal_checkpoint: false
+  adapter_gating:
+    enabled: false
+    formal_allowed: false
+    requires_gradient_probe: true
+    rating_adapter: off
+    shared_specific_gate: off
+    explainer_adapter: off
+    style_content_residual_gate: off
+    checkpoint_compatibility: disabled_no_state_change
+  paper_candidate_selection:
+    enabled: true
+    eval_protocol: paper_target_only_eval
+    bounded_eval_required: true
+    candidate_pool: [best_observed, best_after_min_epochs, top_k_valid_loss, milestone, recovery, ema, checkpoint_average]
+    no_paper_eval_no_selection: true
+    scorer_explainer_split: true
+    rating_guard:
+      max_mae: 0.65
+      max_rmse: 0.95
+      max_mae_worse_abs: 0.02
+      max_rmse_worse_abs: 0.03
+    diversity_guard:
+      dist1_floor: 0.05
+      dist2_floor: 0.20
+      collapse_penalty: 100.0
+    composite_weights:
+      rouge_l: 0.30
+      bleu4: 0.25
+      meteor: 0.25
+      dist1: 0.10
+      dist2: 0.10
+    outputs:
+      paper_candidate_selection: paper_candidate_selection.json
+      candidate_eval_registry: candidate_eval_registry.jsonl
+  checkpoint_averaging:
+    enabled: false
+    candidate_only: true
+    never_overwrite_best_observed: true
+    requires_lineage: true
+    requires_paper_eval_before_downstream: true
+  eval:
+    protocol: minimal_eval
+    split: valid
+    paper_splits: [valid, test]
+    valid_batch_size: null
+    valid_micro_batch_size: null
+    derive_from_train: true
+    batch_candidates: [1536, 3072, 6144]
+    optional_batch_candidates: [8192]
+    selected_eval_batch: auto_largest_safe
+    invariance_required: true
+    minimal_eval:
+      compute_text_metrics: false
+      berts_score_enabled: false
+      target_only: true
+    odcr_step3_diagnostic:
+      data_protocol: merged_auxiliary_target
+      diagnostic_only: true
+      not_paper_comparable: true
+      max_ref_len: 48
+      max_decode_len: 48
+      berts_score_enabled: false
+    paper_target_only_eval:
+      data_protocol: target_only
+      paper_comparable: true
+      target_only: true
+      max_ref_len: 25
+      max_decode_len: 25
+      berts_score_enabled: false
+      metrics: [MAE, RMSE, ROUGE-1, ROUGE-L, BLEU-1, BLEU-2, BLEU-3, BLEU-4, DIST-1, DIST-2, METEOR]
+    full_pipeline_final_eval:
+      interface_only: true
+      requires: Step4/Step5/eval/rerank
+  cache:
+    tokenizer_schema_version: odcr_step3_tokenizer_cache/2
+    formal_cache_namespace: cache/step3/tokenizer
+  prefetcher:
+    enabled: true
+    double_buffer: true
+    diagnostic_cpu_mode: false
+    measure_cuda_events: false
+    fallback_policy: fail_fast
+  checkpoint_policy:
+    schema_version: odcr_step3_checkpoint_policy/1
+    selection_metric: valid_loss
+    selection_direction: min
+    downstream_default_scope: best_observed
+    best_alias: best_observed
+    keep_best_pth_alias: true
+    top_k: 3
+    per_epoch:
+      enabled: false
+      keep_interval: 1
+    save_optimizer_state: true
+  quality_gate:
+    schema_version: odcr_step3_quality_gate/1
+    missing_quality_sidecar_policy: block
+    grad_inf_count_block_threshold: 0
+    continuous_nonfinite_block_threshold: 3
+    post_clip_zero_block_ratio: 0.20
+    empty_pred_rate_block_threshold: 0.50
+    distinct_zero_blocks: true
+    valid_loss_deterioration_ratio_block_threshold: 0.25
+    timing_unknown_ratio_warn_threshold: 0.05
+    timing_unknown_ratio_block_threshold: 0.50
+    block_on_timing_not_closed: false
+  grad_finite:
+    enabled: true
+    skip_optimizer_on_nonfinite: true
+    scheduler_step_on_skipped_optimizer: false
+    continuous_nonfinite_abort_threshold: 3
+    monitor_interval_steps: 50
+    anomaly_topk: 5
+    full_scan_on_anomaly: true
+  diagnostic_eval:
+    sample_schema_version: odcr_step3_diagnostic_sample/1
+    collapse_schema_version: odcr_step3_collapse_stats/1
+    samples_required: true
+    max_samples: 256
+    protocols:
+      odcr_step3_diagnostic:
+        diagnostic_only: true
+        not_final_paper_metric: true
+      code1_target_only_comparable:
+        diagnostic_only: true
+        not_final_paper_metric: true
+        target_only: true
+      full_pipeline_final:
+        diagnostic_only: false
+        not_final_paper_metric: false
+        requires: Step4/Step5/eval/rerank
+  cross_rank_structured_gather:
+    enabled: true
+    mode: local_gradient_context
+    diagnostic_allow_disabled: false
+    allowed_tensors:
+      - shared_repr
+      - specific_repr
+      - domain_ids
+      - style_ids
+      - structured_masks
+      - quality_weights
+    forbidden_tensors:
+      - raw_text
+      - token_ids
+      - profile_matrices
+      - domain_profile_matrices
+      - full_profile_matrices
+      - large_vocab_logits
+      - raw_vocab_logits
+      - item_user_full_profile_matrix
+      - checkpoint_state_tensors
+  memory:
+    activation_checkpointing:
+      enabled: false
+      policy: selective
+      modules:
+        - odcr_disentangler
+        - structured_projector
+        - representation_mlps
+    profile_buffer_policy: gpu_resident
+    phase_profiler:
+      enabled: true
+      sample_interval_steps: 50
+      empty_cache_policy: phase_boundary_only
+      phases:
+        - after_batch_cpu
+        - after_h2d
+        - after_forward
+        - after_loss_compute
+        - after_structured_gather
+        - after_backward
+        - after_grad_norm
+        - after_optimizer
+        - after_validation
+        - after_eval_decode
+        - after_checkpoint_save
+        - after_epoch_boundary
+    allocator_candidates:
+      expandable_segments: false
+      max_split_size_mb: null
+      garbage_collection_threshold: null
+  timing:
+    enabled: true
+    startup_steady_state_split: true
+    sample_interval_steps: 50
+    unknown_ratio_warn_threshold: 0.05
+    unknown_ratio_block_threshold: 0.50
+    fields:
+      - dataloader_next_wait
+      - h2d_prefetch_time
+      - compute_wait_for_prefetch
+      - forward_time
+      - loss_time
+      - backward_time
+      - optimizer_time
+      - scheduler_time
+      - sync_time
+      - logging_time
+      - total_step_time
+  performance_candidates:
+    schema_version: odcr_step3_a100_candidate_matrix/1
+    selected_candidate: G1S
+    formal_default_profile: task2_strong_forward_g1s
+    formal_default_unchanged: false
+    adopt:
+      zero_grad_set_to_none: true
+      timing_closure_instrumentation: true
+      memory_phase_attribution: true
+      grad_finite_gate: true
+      checkpoint_global_best_policy: true
+      quality_gate: true
+      samples_collapse_stats: true
+    probe:
+      fused_adamw: true
+      foreach_adamw: true
+      ddp_gradient_as_bucket_view: true
+      ddp_bucket_cap_mb_tuning: true
+      ddp_static_graph_feasibility: true
+      torch_compile_forward: true
+      torch_compile_loss_submodule: true
+      cuda_graphs_steady_state: true
+      allocator_expandable_segments: true
+      chunked_structured_loss: true
+      compact_gather_memory_optimization: true
+      worker_prefetch_sweep: true
+    reject:
+      dali_without_data_bottleneck: true
+      flashattention_without_compatible_attention: true
+      two_to_four_sparsity_without_quality_plan: true
+      activation_checkpointing_as_speed_optimization: true
+      bare_torchrun: true
+      g2_direct_formal: true
+      retired_optimizer_delay_training: true
+    batch_ladder:
+      G1S:
+        batch_size: 1536
+        per_gpu_batch_size: 768
+        ddp_world_size: 2
+        lr_candidate: 3.0e-4
+        warmup_ratio_min: 0.03
+        warmup_ratio_max: 0.06
+        formal_allowed: true
+        probe_only: false
+      G1-M:
+        batch_size: 1792
+        per_gpu_batch_size: 896
+        ddp_world_size: 2
+        formal_allowed: false
+        probe_only: true
+      G2-C:
+        batch_size: 2048
+        per_gpu_batch_size: 1024
+        ddp_world_size: 2
+        memory_optimized_only: true
+        formal_allowed: false
+        probe_only: true
+      G3:
+        batch_size: 2304
+        per_gpu_batch_size: 1152
+        ddp_world_size: 2
+        requires_prior_pass: true
+        formal_allowed: false
+        probe_only: true
+  worker_profiles:
+    W0:
+      train_workers_per_rank: 4
+      prefetch_factor: 2
+      role: active_default
+    W1:
+      train_workers_per_rank: 4
+      prefetch_factor: 4
+      role: performance_candidate
+    W2:
+      train_workers_per_rank: 5
+      prefetch_factor: 2
+      role: performance_candidate
+    W3:
+      train_workers_per_rank: 5
+      prefetch_factor: 4
+      role: performance_candidate
+    W4:
+      train_workers_per_rank: 3
+      prefetch_factor: 4
+      role: performance_candidate
   train:
-    batch_size: 1024
-    micro_batch_size: 128
-    grad_accum: 4
-    epochs: 50
+    batch_size: 1536
+    per_gpu_batch_size: 768
+    max_epochs: 40
+    min_epochs: 6
+    early_stop_patience: 5
+    validate_every_epochs: 1
+    max_grad_norm: 0.5
     train_label_max_length: 64
-    min_lr_ratio: 0.1
     checkpoint_metric: valid_loss
     full_bleu_eval: {mode: off}
-    lr: 5.0e-4
-    coef: 0.5
     backend:
+      train_precision: bf16
+      allow_tf32: true
+      amp_autocast: true
+      grad_scaler: false
       train_dynamic_padding: true
       ema_enabled: true
       ema_decay: 0.999
       generate_during_train: false
       full_bleu_decode_strategy: inherit
-  tasks:
-    1: {lr: 5.0e-4, coef: 1.0}
-    2: {lr: 1.0e-3, coef: 0.1}
-    3: {lr: 5.0e-4, coef: 0.5}
-    4: {batch_size: 512, micro_batch_size: 64, grad_accum: 4, lr: 5.0e-4, coef: 0.2}
-    5: {lr: 1.0e-3, coef: 0.5}
-    6: {lr: 1.0e-3, coef: 0.5}
-    7: {lr: 1.0e-4, coef: 0.5}
-    8: {lr: 5.0e-4, coef: 1.0}
 
 step4:
   train:
     batch_size: 2048
-    micro_batch_size: 1024
-    grad_accum: 1
+    per_gpu_batch_size: 1024
     epochs: 1
     train_label_max_length: 64
+  runtime:
+    decode_threads: 4
+    decode_chunk: 8192
+    partial_format: parquet
+    perf_log_interval: 20
+    preflight_default_max_samples: 128
+    partial_wait_timeout_seconds: 600
   rcr:
     cf_reliability_weights:
       content_retention: 0.36
@@ -162,31 +850,31 @@ step4:
       entropy: 0.10
     rating_delta_soft_cap: 1.00
     route_scorer:
-      min_reliability: 0.68
-      min_content_retention: 0.62
-      min_rating_stability: 0.62
-      max_uncertainty: 0.38
-      max_rating_delta: 0.50
-      min_text_quality: 0.40
+      min_reliability: 0.8185
+      min_content_retention: 0.9417
+      min_rating_stability: 0.9729
+      max_uncertainty: 0.0308
+      max_rating_delta: 0.0348
+      min_text_quality: 0.9375
     route_explainer:
-      min_reliability: 0.55
-      relaxed_min_reliability: 0.48
-      min_content_retention: 0.42
-      min_style_shift: 0.50
-      max_uncertainty: 0.62
-      min_text_quality: 0.40
+      min_reliability: 0.807
+      relaxed_min_reliability: 0.807
+      min_content_retention: 0.9415
+      min_style_shift: 0.268
+      max_uncertainty: 0.0349
+      min_text_quality: 0.931
     confidence_bucket:
       high:
         bucket: 2
-        min_reliability: 0.75
-        max_uncertainty: 0.28
-        min_rating_stability: 0.70
-        min_content_retention: 0.65
+        min_reliability: 0.8276
+        max_uncertainty: 0.0247
+        min_rating_stability: 0.9859
+        min_content_retention: 0.9421
       medium:
         bucket: 1
-        min_reliability: 0.50
-        max_uncertainty: 0.58
-        min_content_retention: 0.40
+        min_reliability: 0.8032
+        max_uncertainty: 0.0335
+        min_content_retention: 0.94
       low_bucket: 0
     train_keep:
       reject_when_both_routes_zero: true
@@ -194,10 +882,10 @@ step4:
     sample_weight_hint:
       scorer_route_multiplier: 1.00
       explainer_only_route_multiplier: 0.72
-      reliability_floor: 0.35
-      reliability_scale: 0.65
-      uncertainty_base: 0.75
-      uncertainty_scale: 0.25
+      reliability_floor: 0.30
+      reliability_scale: 0.74
+      uncertainty_base: 0.66
+      uncertainty_scale: 0.34
     export:
       required_fields:
         - train_keep
@@ -306,8 +994,7 @@ step5:
     evidence_alignment_mode: evidence_basis
   train:
     batch_size: 32
-    micro_batch_size: 1
-    grad_accum: 16
+    per_gpu_batch_size: 16
     epochs: 30
     train_label_max_length: 36
     lr: 1.0e-3

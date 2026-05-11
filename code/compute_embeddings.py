@@ -6,8 +6,10 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import shutil
 import sys
+import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -105,8 +107,12 @@ class PhaseTiming:
     group_text_cache_fingerprint_s: float = 0.0
     group_text_cache_load_s: float = 0.0
     group_text_cache_write_s: float = 0.0
+    tokenizer_queue_wait_s: float = 0.0
+    gpu_queue_wait_s: float = 0.0
+    h2d_s: float = 0.0
     tokenize_s: float = 0.0
     gpu_forward_s: float = 0.0
+    encode_wall_s: float = 0.0
     write_npy_s: float = 0.0
     verify_extra_s: float = 0.0
     total_s: float = 0.0
@@ -150,8 +156,13 @@ class PhaseTiming:
             "group_text_cache_fingerprint_s": _round_timing(self.group_text_cache_fingerprint_s),
             "group_text_cache_load_s": _round_timing(self.group_text_cache_load_s),
             "group_text_cache_write_s": _round_timing(self.group_text_cache_write_s),
+            "tokenizer_queue_wait_s": _round_timing(self.tokenizer_queue_wait_s),
+            "gpu_queue_wait_s": _round_timing(self.gpu_queue_wait_s),
+            "h2d_s": _round_timing(self.h2d_s),
             "tokenize_s": _round_timing(self.tokenize_s),
             "gpu_forward_s": _round_timing(self.gpu_forward_s),
+            "encode_wall_s": _round_timing(self.encode_wall_s),
+            "overlap_effectiveness": _round_timing(_overlap_effectiveness(self)),
             "write_npy_s": _round_timing(self.write_npy_s),
             "verify_extra_s": _round_timing(self.verify_extra_s),
             "total_s": _round_timing(self.total_s),
@@ -250,6 +261,25 @@ class PrecisionConfig:
     autocast_dtype: torch.dtype
 
 
+@dataclass(frozen=True)
+class TokenizerPipelineConfig:
+    tokenizer_parallelism_enabled: bool
+    tokenizer_threads_per_worker: int
+    tokenizer_total_threads: int
+    prefetch_batches: int
+    pin_memory: bool
+    non_blocking_h2d: bool
+    async_prefetch_enabled: bool
+    token_aware_batching_enabled: bool
+    max_tokens_per_gpu_batch: int | None
+    cpu_cores_reserved: int
+    cpu_cores_available: int
+
+    @property
+    def cpu_cores_configured(self) -> int:
+        return int(self.tokenizer_total_threads)
+
+
 def _install_resolved_preprocess_context(args: argparse.Namespace) -> None:
     required = {
         "--data-dir": getattr(args, "data_dir", None),
@@ -334,6 +364,19 @@ def _round_optional_timing(value: float | None) -> float | None:
     if value is None:
         return None
     return _round_timing(value)
+
+
+def _overlap_effectiveness(phase_timing: PhaseTiming) -> float:
+    sequential = float(phase_timing.tokenize_s + phase_timing.h2d_s + phase_timing.gpu_forward_s)
+    wall = float(phase_timing.encode_wall_s)
+    overlap_capacity = min(
+        float(phase_timing.tokenize_s),
+        float(phase_timing.h2d_s + phase_timing.gpu_forward_s),
+    )
+    if sequential <= 0.0 or wall <= 0.0 or overlap_capacity <= 0.0:
+        return 0.0
+    hidden = max(0.0, sequential - wall)
+    return max(0.0, min(1.0, hidden / overlap_capacity))
 
 
 def _safe_join(values) -> str:
@@ -437,6 +480,113 @@ def _resolve_precision_config(args: argparse.Namespace, device: torch.device) ->
         autocast_enabled=autocast_enabled,
         autocast_dtype=torch.bfloat16,
     )
+
+
+def _required_int_arg(args: argparse.Namespace, name: str, cli_name: str) -> int:
+    raw = getattr(args, name, None)
+    if raw is None:
+        raise ValueError(f"{cli_name} is required from the resolved preprocess_b payload.")
+    value = int(raw)
+    return value
+
+
+def _resolve_tokenizer_pipeline_config(args: argparse.Namespace) -> TokenizerPipelineConfig:
+    tokenizer_parallelism_enabled = _require_resolved_bool_flag(
+        args,
+        "tokenizer_parallelism_enabled",
+        "--tokenizer-parallelism/--no-tokenizer-parallelism",
+    )
+    pin_memory = _require_resolved_bool_flag(args, "pin_memory", "--pin-memory/--no-pin-memory")
+    non_blocking_h2d = _require_resolved_bool_flag(
+        args,
+        "non_blocking_h2d",
+        "--non-blocking-h2d/--no-non-blocking-h2d",
+    )
+    async_prefetch_enabled = _require_resolved_bool_flag(
+        args,
+        "async_prefetch_enabled",
+        "--async-prefetch/--no-async-prefetch",
+    )
+    token_aware_batching_enabled = _require_resolved_bool_flag(
+        args,
+        "token_aware_batching_enabled",
+        "--token-aware-batching/--no-token-aware-batching",
+    )
+    max_tokens = getattr(args, "max_tokens_per_gpu_batch", None)
+    config = TokenizerPipelineConfig(
+        tokenizer_parallelism_enabled=tokenizer_parallelism_enabled,
+        tokenizer_threads_per_worker=_required_int_arg(
+            args,
+            "tokenizer_threads_per_worker",
+            "--tokenizer-threads-per-worker",
+        ),
+        tokenizer_total_threads=_required_int_arg(args, "tokenizer_total_threads", "--tokenizer-total-threads"),
+        prefetch_batches=_required_int_arg(args, "prefetch_batches", "--prefetch-batches"),
+        pin_memory=pin_memory,
+        non_blocking_h2d=non_blocking_h2d,
+        async_prefetch_enabled=async_prefetch_enabled,
+        token_aware_batching_enabled=token_aware_batching_enabled,
+        max_tokens_per_gpu_batch=None if max_tokens is None else int(max_tokens),
+        cpu_cores_reserved=_required_int_arg(args, "cpu_cores_reserved", "--cpu-cores-reserved"),
+        cpu_cores_available=_required_int_arg(args, "cpu_cores_available", "--cpu-cores-available"),
+    )
+    if config.tokenizer_threads_per_worker <= 0:
+        raise ValueError("tokenizer_threads_per_worker must be positive")
+    if config.tokenizer_total_threads <= 0:
+        raise ValueError("tokenizer_total_threads must be positive")
+    if config.prefetch_batches < 0:
+        raise ValueError("prefetch_batches must be non-negative")
+    if config.async_prefetch_enabled and config.prefetch_batches <= 0:
+        raise ValueError("async_prefetch_enabled requires prefetch_batches > 0")
+    usable_cpu = int(config.cpu_cores_available) - int(config.cpu_cores_reserved)
+    if usable_cpu <= 0 or config.tokenizer_total_threads > usable_cpu:
+        raise ValueError("tokenizer_total_threads must fit within cpu_cores_available - cpu_cores_reserved")
+    if config.token_aware_batching_enabled:
+        raise ValueError(
+            "preprocess_b token_aware_batching_enabled is guarded pending real long-bucket validation; "
+            "keep the formal batch_size at 512."
+        )
+    return config
+
+
+def _install_tokenizer_thread_env(config: TokenizerPipelineConfig) -> None:
+    os.environ["TOKENIZERS_PARALLELISM"] = "true" if config.tokenizer_parallelism_enabled else "false"
+    os.environ["RAYON_NUM_THREADS"] = str(int(config.tokenizer_threads_per_worker))
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_MAX_THREADS"] = "1"
+    os.environ["ODCR_RESOLVED_TOKENIZER_PARALLELISM"] = "1" if config.tokenizer_parallelism_enabled else "0"
+    os.environ["ODCR_RESOLVED_TOKENIZER_THREADS_PER_WORKER"] = str(int(config.tokenizer_threads_per_worker))
+    os.environ["ODCR_RESOLVED_TOKENIZER_TOTAL_THREADS"] = str(int(config.tokenizer_total_threads))
+    os.environ["ODCR_RESOLVED_PREFETCH_BATCHES"] = str(int(config.prefetch_batches))
+
+
+def _tokenizer_pipeline_summary(config: TokenizerPipelineConfig) -> dict[str, object]:
+    return {
+        "tokenizer_threads": int(config.tokenizer_threads_per_worker),
+        "tokenizer_threads_per_worker": int(config.tokenizer_threads_per_worker),
+        "tokenizer_total_threads": int(config.tokenizer_total_threads),
+        "prefetch_batches": int(config.prefetch_batches),
+        "cpu_cores_available": int(config.cpu_cores_available),
+        "cpu_cores_reserved": int(config.cpu_cores_reserved),
+        "cpu_cores_configured": int(config.cpu_cores_configured),
+        "tokenizers_parallelism_enabled": bool(config.tokenizer_parallelism_enabled),
+        "pin_memory": bool(config.pin_memory),
+        "non_blocking_h2d": bool(config.non_blocking_h2d),
+        "async_prefetch_enabled": bool(config.async_prefetch_enabled),
+        "token_aware_batching_enabled": bool(config.token_aware_batching_enabled),
+        "max_tokens_per_gpu_batch": config.max_tokens_per_gpu_batch,
+    }
+
+
+def _sum_phase_timings(phase_timings: list[PhaseTiming]) -> PhaseTiming:
+    out = PhaseTiming()
+    for item in phase_timings:
+        out.tokenize_s += item.tokenize_s
+        out.h2d_s += item.h2d_s
+        out.gpu_forward_s += item.gpu_forward_s
+        out.encode_wall_s += item.encode_wall_s
+    return out
 
 
 def _configure_tf32(device: torch.device, *, enabled: bool) -> None:
@@ -1064,6 +1214,7 @@ def _encode_texts_to_numpy(
     *,
     batch_size: int,
     precision_config: PrecisionConfig,
+    tokenizer_pipeline_config: TokenizerPipelineConfig,
     phase_timing: PhaseTiming,
     spec_started_at: float,
     dataset_started_at: float,
@@ -1075,12 +1226,10 @@ def _encode_texts_to_numpy(
 
     outputs_accum: list[np.ndarray] = []
     model.eval()
-    for start in range(0, len(texts), batch_size):
-        if max_batches is not None and phase_timing.batches_encoded >= max_batches:
-            break
-        end = min(start + batch_size, len(texts))
-        batch_texts = texts[start:end]
+    encode_started_at = perf_counter()
 
+    def tokenize_batch(start: int, end: int) -> dict[str, torch.Tensor]:
+        batch_texts = texts[start:end]
         phase_timing.mark_first_tokenize(
             spec_started_at=spec_started_at,
             dataset_started_at=dataset_started_at,
@@ -1094,8 +1243,22 @@ def _encode_texts_to_numpy(
             return_tensors="pt",
         )
         phase_timing.tokenize_s += perf_counter() - tokenize_started_at
+        if tokenizer_pipeline_config.pin_memory and device.type == "cuda":
+            encoded = {k: v.pin_memory() for k, v in encoded.items()}
+        return encoded
 
-        encoded = {k: v.to(device) for k, v in encoded.items()}
+    def forward_encoded(start: int, end: int, encoded: dict[str, torch.Tensor]) -> None:
+        h2d_started_at = perf_counter()
+        encoded_device = {
+            key: value.to(
+                device,
+                non_blocking=bool(tokenizer_pipeline_config.non_blocking_h2d and device.type == "cuda"),
+            )
+            for key, value in encoded.items()
+        }
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        phase_timing.h2d_s += perf_counter() - h2d_started_at
         phase_timing.mark_first_forward(
             spec_started_at=spec_started_at,
             dataset_started_at=dataset_started_at,
@@ -1114,7 +1277,7 @@ def _encode_texts_to_numpy(
         )
         with torch.inference_mode():
             with autocast_ctx:
-                outputs = model(**encoded)
+                outputs = model(**encoded_device)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         phase_timing.gpu_forward_s += perf_counter() - forward_started_at
@@ -1123,6 +1286,51 @@ def _encode_texts_to_numpy(
         outputs_accum.append(batch_embeddings)
         phase_timing.batches_encoded += 1
         phase_timing.groups_encoded += end - start
+
+    if tokenizer_pipeline_config.async_prefetch_enabled:
+        item_queue: queue.Queue[object] = queue.Queue(maxsize=max(1, int(tokenizer_pipeline_config.prefetch_batches)))
+        sentinel = object()
+
+        def producer() -> None:
+            batches_produced = 0
+            try:
+                for start in range(0, len(texts), batch_size):
+                    if max_batches is not None and batches_produced >= max_batches:
+                        break
+                    end = min(start + batch_size, len(texts))
+                    encoded = tokenize_batch(start, end)
+                    put_started_at = perf_counter()
+                    item_queue.put((start, end, encoded))
+                    phase_timing.tokenizer_queue_wait_s += perf_counter() - put_started_at
+                    batches_produced += 1
+            except Exception as exc:  # pragma: no cover - surfaced to consumer
+                item_queue.put(exc)
+            finally:
+                item_queue.put(sentinel)
+
+        thread = threading.Thread(target=producer, name="preprocess-b-tokenizer-prefetch", daemon=True)
+        thread.start()
+        while True:
+            get_started_at = perf_counter()
+            item = item_queue.get()
+            phase_timing.gpu_queue_wait_s += perf_counter() - get_started_at
+            if item is sentinel:
+                break
+            if isinstance(item, Exception):
+                thread.join()
+                raise item
+            start, end, encoded = item  # type: ignore[misc]
+            forward_encoded(int(start), int(end), encoded)
+        thread.join()
+    else:
+        for start in range(0, len(texts), batch_size):
+            if max_batches is not None and phase_timing.batches_encoded >= max_batches:
+                break
+            end = min(start + batch_size, len(texts))
+            encoded = tokenize_batch(start, end)
+            forward_encoded(start, end, encoded)
+
+    phase_timing.encode_wall_s += perf_counter() - encode_started_at
 
     if not outputs_accum:
         return np.zeros((0, hidden_size), dtype=np.float32)
@@ -1221,6 +1429,7 @@ def _process_compute_spec(
     device: torch.device,
     batch_size: int,
     precision_config: PrecisionConfig,
+    tokenizer_pipeline_config: TokenizerPipelineConfig,
     read_chunk_rows: int,
     group_shard_size: int,
     grouped_text_cache: GroupedTextCacheConfig,
@@ -1300,6 +1509,7 @@ def _process_compute_spec(
             device,
             batch_size=batch_size,
             precision_config=precision_config,
+            tokenizer_pipeline_config=tokenizer_pipeline_config,
             phase_timing=phase_timing,
             spec_started_at=spec_started_at,
             dataset_started_at=dataset_started_at,
@@ -1358,6 +1568,7 @@ def _verify_spec_output(
     device: torch.device,
     batch_size: int,
     precision_config: PrecisionConfig,
+    tokenizer_pipeline_config: TokenizerPipelineConfig,
     read_chunk_rows: int,
     sample_size: int,
     rng: np.random.Generator,
@@ -1442,6 +1653,7 @@ def _verify_spec_output(
             device,
             batch_size=batch_size,
             precision_config=precision_config,
+            tokenizer_pipeline_config=tokenizer_pipeline_config,
             phase_timing=phase_timing,
             spec_started_at=spec_started_at,
             dataset_started_at=dataset_started_at,
@@ -1474,6 +1686,7 @@ def _log_phase_summary(
     phase_timing: PhaseTiming,
     mode: str,
     device: torch.device,
+    tokenizer_pipeline_config: TokenizerPipelineConfig,
 ) -> None:
     payload = {
         "dataset": dataset,
@@ -1482,6 +1695,7 @@ def _log_phase_summary(
         "device": str(device),
         "entity_kind": spec.entity_kind,
         "text_kind": spec.text_kind,
+        **_tokenizer_pipeline_summary(tokenizer_pipeline_config),
         **phase_timing.to_dict(),
     }
     log.info("[phase][%s][%s] %s", dataset, spec.name, json.dumps(payload, sort_keys=True))
@@ -1493,11 +1707,13 @@ def _log_dataset_phase_summary(
     phase_timings: list[PhaseTiming],
     mode: str,
     device: torch.device,
+    tokenizer_pipeline_config: TokenizerPipelineConfig,
 ) -> None:
     summary = {
         "dataset": dataset,
         "mode": mode,
         "device": str(device),
+        **_tokenizer_pipeline_summary(tokenizer_pipeline_config),
         "csv_read_s": _round_timing(sum(item.csv_read_s for item in phase_timings)),
         "group_text_build_s": _round_timing(sum(item.group_text_build_s for item in phase_timings)),
         "group_text_cache_fingerprint_s": _round_timing(
@@ -1505,8 +1721,13 @@ def _log_dataset_phase_summary(
         ),
         "group_text_cache_load_s": _round_timing(sum(item.group_text_cache_load_s for item in phase_timings)),
         "group_text_cache_write_s": _round_timing(sum(item.group_text_cache_write_s for item in phase_timings)),
+        "tokenizer_queue_wait_s": _round_timing(sum(item.tokenizer_queue_wait_s for item in phase_timings)),
+        "gpu_queue_wait_s": _round_timing(sum(item.gpu_queue_wait_s for item in phase_timings)),
+        "h2d_s": _round_timing(sum(item.h2d_s for item in phase_timings)),
         "tokenize_s": _round_timing(sum(item.tokenize_s for item in phase_timings)),
         "gpu_forward_s": _round_timing(sum(item.gpu_forward_s for item in phase_timings)),
+        "encode_wall_s": _round_timing(sum(item.encode_wall_s for item in phase_timings)),
+        "overlap_effectiveness": _round_timing(_overlap_effectiveness(_sum_phase_timings(phase_timings))),
         "write_npy_s": _round_timing(sum(item.write_npy_s for item in phase_timings)),
         "verify_extra_s": _round_timing(sum(item.verify_extra_s for item in phase_timings)),
         "total_s": _round_timing(sum(item.total_s for item in phase_timings)),
@@ -1639,6 +1860,22 @@ def main() -> None:
         metavar="N",
         help="How many grouped texts to finalize per shard before batched tokenize/forward.",
     )
+    parser.add_argument("--tokenizer-parallelism", action="store_true", default=None, dest="tokenizer_parallelism_enabled")
+    parser.add_argument("--no-tokenizer-parallelism", action="store_false", dest="tokenizer_parallelism_enabled")
+    parser.add_argument("--tokenizer-threads-per-worker", type=int, default=None, metavar="N")
+    parser.add_argument("--tokenizer-total-threads", type=int, default=None, metavar="N")
+    parser.add_argument("--prefetch-batches", type=int, default=None, metavar="N")
+    parser.add_argument("--pin-memory", action="store_true", default=None, dest="pin_memory")
+    parser.add_argument("--no-pin-memory", action="store_false", dest="pin_memory")
+    parser.add_argument("--non-blocking-h2d", action="store_true", default=None, dest="non_blocking_h2d")
+    parser.add_argument("--no-non-blocking-h2d", action="store_false", dest="non_blocking_h2d")
+    parser.add_argument("--async-prefetch", action="store_true", default=None, dest="async_prefetch_enabled")
+    parser.add_argument("--no-async-prefetch", action="store_false", dest="async_prefetch_enabled")
+    parser.add_argument("--token-aware-batching", action="store_true", default=None, dest="token_aware_batching_enabled")
+    parser.add_argument("--no-token-aware-batching", action="store_false", dest="token_aware_batching_enabled")
+    parser.add_argument("--max-tokens-per-gpu-batch", type=int, default=None, metavar="N")
+    parser.add_argument("--cpu-cores-reserved", type=int, default=None, metavar="N")
+    parser.add_argument("--cpu-cores-available", type=int, default=None, metavar="N")
     parser.add_argument(
         "--grouped-text-cache",
         action="store_true",
@@ -1776,6 +2013,8 @@ def main() -> None:
         raise ValueError("--grouped-text-cache-dir must be non-empty when grouped-text cache is enabled")
     if grouped_text_cache.enabled and not grouped_text_cache.version.strip():
         raise ValueError("--grouped-text-cache-version must be non-empty when grouped-text cache is enabled")
+    tokenizer_pipeline_config = _resolve_tokenizer_pipeline_config(args)
+    _install_tokenizer_thread_env(tokenizer_pipeline_config)
 
     device = _select_cuda_device_or_fail(args)
 
@@ -1789,7 +2028,9 @@ def main() -> None:
         "compute_embeddings config: device=%s batch_size=%s read_chunk_rows=%s group_shard_size=%s "
         "grouped_text_cache_enabled=%s grouped_text_cache_dir=%s grouped_text_cache_version=%s "
         "bf16_enabled=%s tf32_enabled=%s autocast_enabled=%s "
-        "verify_only=%s probe_only=%s probe_max_groups=%s probe_max_batches=%s specs=%s verify_sample_size=%s",
+        "verify_only=%s probe_only=%s probe_max_groups=%s probe_max_batches=%s specs=%s verify_sample_size=%s "
+        "tokenizer_parallelism=%s tokenizer_threads_per_worker=%s tokenizer_total_threads=%s prefetch_batches=%s "
+        "pin_memory=%s non_blocking_h2d=%s async_prefetch=%s cpu_cores_available=%s cpu_cores_reserved=%s",
         device,
         batch_size,
         read_chunk_rows,
@@ -1806,6 +2047,15 @@ def main() -> None:
         probe_config.max_batches_per_spec,
         [spec.name for spec in specs],
         verify_sample_size,
+        tokenizer_pipeline_config.tokenizer_parallelism_enabled,
+        tokenizer_pipeline_config.tokenizer_threads_per_worker,
+        tokenizer_pipeline_config.tokenizer_total_threads,
+        tokenizer_pipeline_config.prefetch_batches,
+        tokenizer_pipeline_config.pin_memory,
+        tokenizer_pipeline_config.non_blocking_h2d,
+        tokenizer_pipeline_config.async_prefetch_enabled,
+        tokenizer_pipeline_config.cpu_cores_available,
+        tokenizer_pipeline_config.cpu_cores_reserved,
     )
 
     tokenizer, model = _load_sentence_embed_model(device)
@@ -1830,6 +2080,7 @@ def main() -> None:
                     device=device,
                     batch_size=batch_size,
                     precision_config=precision_config,
+                    tokenizer_pipeline_config=tokenizer_pipeline_config,
                     read_chunk_rows=read_chunk_rows,
                     sample_size=verify_sample_size,
                     rng=rng,
@@ -1845,6 +2096,7 @@ def main() -> None:
                     phase_timing=phase_timing,
                     mode="verify",
                     device=device,
+                    tokenizer_pipeline_config=tokenizer_pipeline_config,
                 )
             log.info("[verify][%s] %s", dataset, json.dumps(report, ensure_ascii=False, sort_keys=True))
             _log_dataset_phase_summary(
@@ -1852,6 +2104,7 @@ def main() -> None:
                 phase_timings=phase_timings,
                 mode="verify",
                 device=device,
+                tokenizer_pipeline_config=tokenizer_pipeline_config,
             )
             continue
 
@@ -1865,6 +2118,7 @@ def main() -> None:
                 device=device,
                 batch_size=batch_size,
                 precision_config=precision_config,
+                tokenizer_pipeline_config=tokenizer_pipeline_config,
                 read_chunk_rows=read_chunk_rows,
                 group_shard_size=group_shard_size,
                 grouped_text_cache=grouped_text_cache,
@@ -1878,12 +2132,14 @@ def main() -> None:
                 phase_timing=phase_timing,
                 mode="probe" if probe_config.probe_only else "write",
                 device=device,
+                tokenizer_pipeline_config=tokenizer_pipeline_config,
             )
         _log_dataset_phase_summary(
             dataset=dataset,
             phase_timings=phase_timings,
             mode="probe" if probe_config.probe_only else "write",
             device=device,
+            tokenizer_pipeline_config=tokenizer_pipeline_config,
         )
         log.info("[%s] dataset finished", dataset)
 

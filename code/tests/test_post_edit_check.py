@@ -93,7 +93,8 @@ class TestPostEditCheck(unittest.TestCase):
         self.assertIn("ODCR post-edit validation", proc.stdout)
         self.assertIn("python -m compileall -q code", proc.stdout)
         self.assertIn("python code/tools/check_one_control_guardrails.py --strict", proc.stdout)
-        self.assertIn("./odcr step3 --task 4 --dry-run", proc.stdout)
+        self.assertIn("./odcr step3 --task 2 --dry-run", proc.stdout)
+        self.assertIn("./odcr show --stage step3", proc.stdout)
         self.assertIn("Result: DRY-RUN", proc.stdout)
 
     def test_unknown_scope_fails_fast(self) -> None:
@@ -115,6 +116,15 @@ class TestPostEditCheck(unittest.TestCase):
                 commands = _display_commands(scope)
                 self.assertFalse([command for command in commands if _is_real_stage_run(command)])
 
+    def test_preprocess_scope_does_not_enter_later_stages(self) -> None:
+        commands = _display_commands("preprocess")
+        joined = "\n".join(commands)
+        self.assertNotIn("./odcr step3", joined)
+        self.assertNotIn("./odcr step4", joined)
+        self.assertNotIn("./odcr step5", joined)
+        self.assertNotIn("./odcr eval", joined)
+        self.assertFalse([command for command in commands if _is_real_stage_run(command)])
+
     def test_all_scope_stays_lightweight(self) -> None:
         commands = _display_commands("all")
         joined = "\n".join(commands)
@@ -130,8 +140,8 @@ class TestPostEditCheck(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, joined)
         self.assertFalse([command for command in commands if _is_real_stage_run(command)])
-        self.assertIn("./odcr step4 --task 4 --dry-run", commands)
-        self.assertIn("./odcr step5 --task 4 --dry-run", commands)
+        self.assertIn("./odcr step4 --task 2 --dry-run", commands)
+        self.assertIn("step5 resolver dry-run", "\n".join(commands))
 
     def test_governance_fast_dry_run_is_minimal(self) -> None:
         commands = _display_commands("governance-fast")
@@ -176,21 +186,96 @@ class TestPostEditCheck(unittest.TestCase):
         )
         self.assertEqual(inference.selected_scope, "skip")
         self.assertTrue(inference.skipped)
-        self.assertEqual(inference.skip_reason, "only_ignored_files_changed")
+        self.assertEqual(inference.skip_reason, "audit_runtime_only")
         self.assertEqual(inference.effective_scope_files, ())
         summary = module._inference_summary(inference)
         self.assertFalse(summary["workspace_git_status_used_for_scope"])
+        payload = module._runtime_payload(
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            hook_event_name="Stop",
+            command=None,
+            returncode=0,
+            failure_stage=None,
+            stdout_path=REPO_ROOT / "AI_analysis/01_raw_logs/codex_hooks/stdout.log",
+            stderr_path=REPO_ROOT / "AI_analysis/01_raw_logs/codex_hooks/stderr.log",
+            inference=inference,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
+            finished_at="2026-05-02T00:00:01+00:00",
+        )
+        self.assertIsNone(payload["post_edit_command"])
+
+    def test_stop_hook_absolute_root_audit_log_only_skips(self) -> None:
+        module = _hook_module()
+        inference = module.infer_scope_for_payload(
+            {"touched_files": [str(REPO_ROOT / "audit.log")]},
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            workspace_changed_files_func=lambda _root: [],
+        )
+        self.assertEqual(inference.selected_scope, "skip")
+        self.assertEqual(inference.skip_reason, "audit_runtime_only")
+        self.assertEqual(inference.ignored_files, ("audit.log",))
+        self.assertEqual(inference.effective_scope_files, ())
 
     def test_stop_hook_ai_analysis_runtime_only_skips(self) -> None:
         module = _hook_module()
         inference = module.infer_scope_for_payload(
-            {"touched_files": ["AI_analysis/01_raw_logs/codex_hooks/runtime_last.json"]},
+            {"touched_files": ["AI_analysis/05_final_reports/x_report.md"]},
             repo_root=REPO_ROOT,
             cwd=REPO_ROOT,
             workspace_changed_files_func=lambda _root: [],
         )
         self.assertEqual(inference.selected_scope, "skip")
         self.assertTrue(inference.skipped)
+        self.assertEqual(inference.skip_reason, "audit_runtime_only")
+        self.assertEqual(inference.effective_scope_files, ())
+
+    def test_stop_hook_audit_log_and_ai_analysis_only_skips(self) -> None:
+        module = _hook_module()
+        inference = module.infer_scope_for_payload(
+            {"touched_files": ["audit.log", "AI_analysis/05_final_reports/x_report.md"]},
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            workspace_changed_files_func=lambda _root: ["code/executors/step5_engine.py"],
+        )
+        self.assertEqual(inference.selected_scope, "skip")
+        self.assertEqual(inference.skip_reason, "audit_runtime_only")
+        self.assertEqual(inference.effective_scope_files, ())
+        payload = module._runtime_payload(
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            hook_event_name="Stop",
+            command=None,
+            returncode=0,
+            failure_stage=None,
+            stdout_path=REPO_ROOT / "AI_analysis/01_raw_logs/codex_hooks/stdout.log",
+            stderr_path=REPO_ROOT / "AI_analysis/01_raw_logs/codex_hooks/stderr.log",
+            inference=inference,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
+            finished_at="2026-05-02T00:00:01+00:00",
+        )
+        self.assertTrue(payload["skipped"])
+        self.assertIsNone(payload["post_edit_command"])
+
+    def test_stop_hook_audit_log_plus_code_uses_code_scope(self) -> None:
+        module = _hook_module()
+        inference = module.infer_scope_for_payload(
+            {"touched_files": ["audit.log", "code/tools/odcr_post_edit_check.py"]},
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            workspace_changed_files_func=lambda _root: [],
+        )
+        self.assertEqual(inference.selected_scope, "governance-fast")
+        self.assertFalse(inference.skipped)
+        self.assertEqual(inference.ignored_files, ("audit.log",))
+        self.assertEqual(inference.effective_scope_files, ("code/tools/odcr_post_edit_check.py",))
 
     def test_stop_hook_transcript_docs_only_selects_governance_fast(self) -> None:
         module = _hook_module()
@@ -447,6 +532,39 @@ class TestPostEditCheck(unittest.TestCase):
         self.assertEqual(inference.selected_scope, "all")
         self.assertEqual(inference.inference_source, "explicit_override")
         self.assertEqual(inference.override_source, "env")
+        automatic = module.apply_automatic_stop_scope_policy(inference)
+        self.assertEqual(automatic.original_inferred_scope, "all")
+        self.assertEqual(automatic.selected_scope, "governance-fast")
+        self.assertTrue(automatic.manual_followup_required)
+        self.assertIn("--scope all --max-seconds 900", automatic.manual_followup_command)
+
+    def test_stop_hook_auto_all_scope_degrades_to_governance_fast(self) -> None:
+        module = _hook_module()
+        inferred = module.infer_scope_for_payload(
+            {
+                "touched_files": [
+                    "code/executors/step4_engine.py",
+                    "code/executors/step5_engine.py",
+                ]
+            },
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            workspace_changed_files_func=lambda _root: [],
+        )
+        self.assertEqual(inferred.selected_scope, "all")
+        automatic = module.apply_automatic_stop_scope_policy(inferred)
+        self.assertEqual(automatic.original_inferred_scope, "all")
+        self.assertEqual(automatic.selected_scope, "governance-fast")
+        self.assertEqual(automatic.inference_reason, "auto_all_scope_degraded_to_governance_fast")
+        self.assertTrue(automatic.manual_followup_required)
+        command = module._build_post_edit_command(
+            post_edit_path=REPO_ROOT / "code" / "tools" / "odcr_post_edit_check.py",
+            scope=automatic.selected_scope,
+            max_seconds=module._child_timeout_seconds(module._wrapper_timeout_seconds()),
+            dry_run=False,
+        )
+        self.assertEqual(module._command_scope(command), "governance-fast")
+        self.assertNotIn("all", command)
 
     def test_stop_hook_runtime_payload_schema_v22_matches_scope(self) -> None:
         module = _hook_module()
@@ -459,7 +577,7 @@ class TestPostEditCheck(unittest.TestCase):
         command = module._build_post_edit_command(
             post_edit_path=REPO_ROOT / "code" / "tools" / "odcr_post_edit_check.py",
             scope=inference.selected_scope,
-            max_seconds=180,
+            max_seconds=120,
             dry_run=True,
         )
         payload = module._runtime_payload(
@@ -472,11 +590,20 @@ class TestPostEditCheck(unittest.TestCase):
             stdout_path=REPO_ROOT / "AI_analysis/01_raw_logs/codex_hooks/stdout.log",
             stderr_path=REPO_ROOT / "AI_analysis/01_raw_logs/codex_hooks/stderr.log",
             inference=inference,
-            max_seconds=180,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
+            post_edit_started_at="2026-05-02T00:00:00+00:00",
         )
         self.assertEqual(payload["schema_version"], "odcr_codex_hook_runtime/2.2")
         self.assertEqual(payload["ignored_files_count"], 1)
         self.assertEqual(payload["effective_scope_files_count"], 1)
+        self.assertEqual(payload["child_timeout_seconds"], 120)
+        self.assertEqual(payload["wrapper_timeout_seconds"], 180)
+        self.assertLess(payload["child_timeout_seconds"], payload["wrapper_timeout_seconds"])
+        self.assertEqual(payload["started_at"], "2026-05-02T00:00:00+00:00")
+        self.assertEqual(payload["post_edit_started_at"], "2026-05-02T00:00:00+00:00")
         self.assertFalse(payload["workspace_git_status_used_for_scope"])
         self.assertLessEqual(len(payload["session_touched_files_sample"]), 50)
         self.assertLessEqual(len(payload["ignored_files_sample"]), 50)
@@ -508,7 +635,11 @@ class TestPostEditCheck(unittest.TestCase):
                 cwd=REPO_ROOT,
                 workspace_changed_files_func=lambda _root: [],
             ),
-            max_seconds=180,
+            max_seconds=120,
+            child_timeout_seconds=120,
+            wrapper_timeout_seconds=180,
+            started_at="2026-05-02T00:00:00+00:00",
+            finished_at="2026-05-02T00:00:01+00:00",
         )
         self.assertEqual(skip_payload["selected_scope"], "skip")
         self.assertIsNone(skip_payload["post_edit_command"])
@@ -519,7 +650,65 @@ class TestPostEditCheck(unittest.TestCase):
     def test_all_scope_can_still_be_explicitly_selected(self) -> None:
         self.assertIn("all", SCOPES)
         commands = _display_commands("all")
-        self.assertIn("./odcr step5 --task 4 --dry-run", commands)
+        self.assertIn("step5 resolver dry-run", "\n".join(commands))
+
+    def test_stop_hook_runtime_write_after_inference_contains_command_before_child(self) -> None:
+        module = _hook_module()
+        inference = module.infer_scope_for_payload(
+            {"touched_files": ["docs/ODCR_EVOLUTION_PROTOCOL.md"]},
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            workspace_changed_files_func=lambda _root: [],
+        )
+        command = module._build_post_edit_command(
+            post_edit_path=REPO_ROOT / "code" / "tools" / "odcr_post_edit_check.py",
+            scope=inference.selected_scope,
+            max_seconds=120,
+            dry_run=False,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_path = Path(tmp) / "runtime.json"
+            runtime_last_path = Path(tmp) / "runtime_last.json"
+            old_runtime = os.environ.get("ODCR_HOOK_RUNTIME_PATH")
+            old_runtime_last = os.environ.get("ODCR_HOOK_RUNTIME_LAST_PATH")
+            os.environ["ODCR_HOOK_RUNTIME_PATH"] = str(runtime_path)
+            os.environ["ODCR_HOOK_RUNTIME_LAST_PATH"] = str(runtime_last_path)
+            try:
+                written = module._write_runtime(
+                    repo_root=REPO_ROOT,
+                    stamp="unit",
+                    cwd=REPO_ROOT,
+                    hook_event_name="Stop",
+                    command=command,
+                    returncode=None,
+                    failure_stage="post_edit_running",
+                    stdout_path=Path(tmp) / "stdout.log",
+                    stderr_path=Path(tmp) / "stderr.log",
+                    inference=inference,
+                    max_seconds=120,
+                    child_timeout_seconds=120,
+                    wrapper_timeout_seconds=180,
+                    started_at="2026-05-02T00:00:00+00:00",
+                    post_edit_started_at="2026-05-02T00:00:01+00:00",
+                )
+            finally:
+                if old_runtime is None:
+                    os.environ.pop("ODCR_HOOK_RUNTIME_PATH", None)
+                else:
+                    os.environ["ODCR_HOOK_RUNTIME_PATH"] = old_runtime
+                if old_runtime_last is None:
+                    os.environ.pop("ODCR_HOOK_RUNTIME_LAST_PATH", None)
+                else:
+                    os.environ["ODCR_HOOK_RUNTIME_LAST_PATH"] = old_runtime_last
+            payload = json.loads(written.read_text(encoding="utf-8"))
+            last_payload = json.loads(runtime_last_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload, last_payload)
+        self.assertEqual(payload["selected_scope"], "governance-fast")
+        self.assertEqual(payload["effective_scope_files_count"], 1)
+        self.assertEqual(payload["failure_stage"], "post_edit_running")
+        self.assertEqual(payload["post_edit_command"], command)
+        self.assertFalse(payload["timed_out"])
+        self.assertLess(payload["child_timeout_seconds"], payload["wrapper_timeout_seconds"])
 
 
 if __name__ == "__main__":

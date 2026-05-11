@@ -30,12 +30,17 @@ from odcr_core.preprocess_metadata import (
 )
 from odcr_core.preprocess_schema import (
     COMBINE_TASK_MAP,
+    PREPROCESS_C_DOMAIN_CONTRACT_VERSION,
     PreprocessAConfig,
     PreprocessBConfig,
     PreprocessCConfig,
     PreprocessConfig,
     PreprocessHardwareConfig,
     apply_preprocess_cli_overrides,
+    preprocess_b_expected_shape_dtype,
+    preprocess_b_output_artifact_contract,
+    preprocess_c_expected_shape_dtype,
+    preprocess_c_output_artifact_contract,
     render_preprocess_stage_contract,
     resolve_combine_task_ids,
     validate_preprocess_config,
@@ -78,6 +83,20 @@ def _timestamp_tag() -> str:
 
 def _render_command(cmd: list[str]) -> str:
     return shlex.join(cmd)
+
+
+def _repo_relative_path(repo_root: Path, value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    else:
+        path = path.resolve()
+    try:
+        return path.relative_to(repo_root).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def _safe_run_git(repo_root: Path, *args: str) -> str | None:
@@ -605,6 +624,18 @@ class PreprocessRuntime:
             "embed_batch_size": int(self.config.embed_batch_size),
             "read_chunk_rows": int(self.config.read_chunk_rows),
             "group_shard_size": int(self.config.group_shard_size),
+            "tokenizer_parallelism_enabled": bool(self.config.tokenizer_parallelism_enabled),
+            "tokenizer_threads_per_worker": int(self.config.tokenizer_threads_per_worker),
+            "tokenizer_total_threads": int(self.config.tokenizer_total_threads),
+            "prefetch_batches": int(self.config.prefetch_batches),
+            "pin_memory": bool(self.config.pin_memory),
+            "non_blocking_h2d": bool(self.config.non_blocking_h2d),
+            "async_prefetch_enabled": bool(self.config.async_prefetch_enabled),
+            "token_aware_batching_enabled": bool(self.config.token_aware_batching_enabled),
+            "max_tokens_per_gpu_batch": self.config.max_tokens_per_gpu_batch,
+            "cpu_cores_reserved": int(self.config.cpu_cores_reserved),
+            "cpu_cores_available": int(self.config.cpu_cores_available),
+            "cpu_cores_configured": int(self.config.tokenizer_total_threads),
             "grouped_cache_enabled": bool(self.config.grouped_text_cache_enabled),
             "grouped_cache_dir": str(self.config.grouped_text_cache_dir),
             "grouped_cache_version": str(self.config.grouped_text_cache_version),
@@ -612,10 +643,8 @@ class PreprocessRuntime:
             "tf32": bool(self.config.tf32_enabled),
             "local_files_only": bool(self.config.resolved.local_files_only),
             "profile_output_paths": output_paths,
-            "expected_shape_dtype": {
-                "shape": "[entity_count, env.embed_dim]",
-                "dtype": "float32",
-            },
+            "expected_shape_dtype": preprocess_b_expected_shape_dtype(),
+            "profile_output_artifact_contract": preprocess_b_output_artifact_contract(),
             "source_csv_fingerprints": source_csvs,
             "selected_text_columns": {
                 "content": list(CONTENT_PROFILE_TEXT_COLUMNS),
@@ -666,6 +695,17 @@ class PreprocessRuntime:
             "gpu_ids": list(self.config.hardware.gpu_ids),
             "workers": int(self.config.runtime.workers or len(self.config.hardware.gpu_ids)),
             "chunk_batch_size": int(self.config.chunk_batch_size),
+            "tokenizer_parallelism_enabled": bool(self.config.tokenizer_parallelism_enabled),
+            "tokenizer_threads_per_worker": int(self.config.tokenizer_threads_per_worker),
+            "tokenizer_total_threads": int(self.config.tokenizer_total_threads),
+            "prefetch_batches": int(self.config.prefetch_batches),
+            "pin_memory": bool(self.config.pin_memory),
+            "non_blocking_h2d": bool(self.config.non_blocking_h2d),
+            "async_prefetch_enabled": bool(self.config.async_prefetch_enabled),
+            "scheduling_policy": str(self.config.scheduling_policy),
+            "cpu_cores_reserved": int(self.config.cpu_cores_reserved),
+            "cpu_cores_available": int(self.config.cpu_cores_available),
+            "cpu_cores_configured": int(self.config.tokenizer_total_threads),
             "token_window_max_total_tokens": 512,
             "token_window_payload_budget": "512 - tokenizer.num_special_tokens_to_add(pair=False)",
             "tokenizer_hotpath_enabled": bool(self.config.tokenizer_hotpath_enabled),
@@ -677,10 +717,9 @@ class PreprocessRuntime:
             "tf32": bool(self.config.tf32_enabled),
             "local_files_only": bool(self.config.resolved.local_files_only),
             "domain_output_paths": output_paths,
-            "expected_shape_dtype": {
-                "shape": "[row_count, env.embed_dim]",
-                "dtype": "float32",
-            },
+            "expected_shape_dtype": preprocess_c_expected_shape_dtype(),
+            "domain_shape_contract_version": PREPROCESS_C_DOMAIN_CONTRACT_VERSION,
+            "domain_output_artifact_contract": preprocess_c_output_artifact_contract(),
             "source_profile_fingerprints": {
                 dataset: {
                     "user_content_profiles": _fingerprint_existing(self.data_root / dataset / "user_content_profiles.npy", sample_only=True),
@@ -861,6 +900,34 @@ class PreprocessRuntime:
             "merge_policy": "concatenate auxiliary and target train/valid splits with domain transport labels",
         }
 
+    def _preprocess_gpu_unit_metadata(
+        self,
+        *,
+        unit_kind: str,
+        unit_name: str,
+        output_files: tuple[str, ...],
+    ) -> dict[str, Any] | None:
+        if unit_kind != "dataset" or self.config.stage not in {"preprocess_b", "preprocess_c"}:
+            return None
+        if self.config.stage == "preprocess_b":
+            contract = preprocess_b_output_artifact_contract()
+            expected = preprocess_b_expected_shape_dtype()
+            kind = "profile_matrix"
+        else:
+            contract = preprocess_c_output_artifact_contract()
+            expected = preprocess_c_expected_shape_dtype()
+            kind = "domain_vector"
+        return {
+            "artifact_contract_kind": kind,
+            "expected_shape_dtype": expected,
+            "output_artifact_contract": {
+                Path(path).name: contract.get(Path(path).name)
+                for path in output_files
+                if Path(path).name in contract
+            },
+            "unit_name": unit_name,
+        }
+
     def _write_unit_status(
         self,
         *,
@@ -876,6 +943,7 @@ class PreprocessRuntime:
         worker_id: int | None = None,
         gpu_id: int | None = None,
         command: list[str] | None = None,
+        unit_metadata: dict[str, Any] | None = None,
     ) -> None:
         if self.config.runtime.dry_run:
             return
@@ -885,11 +953,25 @@ class PreprocessRuntime:
             output_files,
             status=status,
         )
+        provided_unit_metadata = dict(unit_metadata or {})
         unit_metadata = self._preprocess_a_unit_metadata(
             unit_kind=unit_kind,
             unit_name=unit_name,
             shell_log_path=shell_log_path,
         )
+        base_metadata = self._preprocess_gpu_unit_metadata(
+            unit_kind=unit_kind,
+            unit_name=unit_name,
+            output_files=output_files,
+        )
+        merged_metadata: dict[str, Any] = {}
+        if base_metadata:
+            merged_metadata.update(base_metadata)
+        if unit_metadata:
+            merged_metadata.update(unit_metadata)
+        if provided_unit_metadata:
+            merged_metadata.update(provided_unit_metadata)
+        unit_metadata = merged_metadata or None
         payload = PreprocessUnitStatus(
             stage=self.config.stage,
             preset=self.config.preset_name,
@@ -951,6 +1033,12 @@ class PreprocessRuntime:
                 "console_log_path": self.paths.console_log_path,
                 "full_log_path": self.paths.full_log_path,
                 "errors_log_path": self.paths.errors_log_path,
+                "metrics_path": str((Path(self.paths.meta_root) / "metrics.json").resolve())
+                if self.config.stage in {"preprocess_b", "preprocess_c"}
+                else "",
+                "verify_report_path": str((Path(self.paths.meta_root) / "verify_report.json").resolve())
+                if self.config.stage in {"preprocess_b", "preprocess_c"}
+                else "",
                 "stage_manifest_path": self.paths.stage_manifest_path,
                 "stage_status_path": self.paths.stage_status_path,
                 "completed_stamp_path": self.paths.completed_stamp_path,
@@ -1021,10 +1109,23 @@ class PreprocessRuntime:
                     "preprocess.b.embed_batch_size": "configs/odcr.yaml:preprocess.b.batch_size -> child --embed-batch-size",
                     "preprocess.b.read_chunk_rows": "configs/odcr.yaml:preprocess.b.read_chunk_rows -> child --read-chunk-rows",
                     "preprocess.b.group_shard_size": "configs/odcr.yaml:preprocess.b.group_shard_size -> child --group-shard-size",
+                    "preprocess.b.tokenizer_parallelism_enabled": "configs/odcr.yaml:preprocess.b.tokenizer_parallelism_enabled -> child --tokenizer-parallelism/--no-tokenizer-parallelism",
+                    "preprocess.b.tokenizer_threads_per_worker": "configs/odcr.yaml:preprocess.b.tokenizer_threads_per_worker -> child --tokenizer-threads-per-worker/RAYON_NUM_THREADS",
+                    "preprocess.b.tokenizer_total_threads": "configs/odcr.yaml:preprocess.b.tokenizer_total_threads",
+                    "preprocess.b.prefetch_batches": "configs/odcr.yaml:preprocess.b.prefetch_batches -> child --prefetch-batches",
+                    "preprocess.b.pin_memory": "configs/odcr.yaml:preprocess.b.pin_memory -> child --pin-memory/--no-pin-memory",
+                    "preprocess.b.non_blocking_h2d": "configs/odcr.yaml:preprocess.b.non_blocking_h2d -> child --non-blocking-h2d/--no-non-blocking-h2d",
+                    "preprocess.b.async_prefetch_enabled": "configs/odcr.yaml:preprocess.b.async_prefetch_enabled -> child --async-prefetch/--no-async-prefetch",
+                    "preprocess.b.token_aware_batching_enabled": "configs/odcr.yaml:preprocess.b.token_aware_batching_enabled -> child --token-aware-batching/--no-token-aware-batching",
+                    "preprocess.b.max_tokens_per_gpu_batch": "configs/odcr.yaml:preprocess.b.max_tokens_per_gpu_batch",
+                    "preprocess.b.cpu_cores_reserved": "configs/odcr.yaml:preprocess.b.cpu_cores_reserved",
+                    "preprocess.b.cpu_cores_available": "configs/odcr.yaml:preprocess.b.cpu_cores_available",
+                    "preprocess.b.cpu_cores_configured": "preprocess.b.tokenizer_total_threads",
                     "preprocess.b.grouped_cache_enabled": "configs/odcr.yaml:preprocess.b.grouped_text_cache_enabled",
                     "preprocess.b.grouped_cache_version": "configs/odcr.yaml:preprocess.b.grouped_text_cache_version",
                     "preprocess.b.profile_output_paths": "project.data_dir/<dataset>/*_profiles.npy",
                     "preprocess.b.expected_shape_dtype": "code/compute_embeddings.py output verifier",
+                    "preprocess.b.profile_output_artifact_contract": "code/odcr_core/preprocess_schema.py profile matrix contract",
                     "preprocess.b.source_csv_fingerprint": "project.data_dir/<dataset>/train.csv",
                     "preprocess.b.cache_key_fields": "code/compute_embeddings.py::_build_grouped_text_cache_request",
                     "preprocess.b.cache_stale_policy": "cache miss/rebuild on contract/source/model/config mismatch",
@@ -1038,6 +1139,17 @@ class PreprocessRuntime:
                     "tf32": sources.get("tf32", "preprocess.c.tf32_enabled"),
                     "preprocess.c.workers": "configs/odcr.yaml:preprocess.c.workers or len(gpu_ids)",
                     "preprocess.c.chunk_batch_size": "configs/odcr.yaml:preprocess.c.chunk_batch_size -> child --chunk-batch-size",
+                    "preprocess.c.tokenizer_parallelism_enabled": "configs/odcr.yaml:preprocess.c.tokenizer_parallelism_enabled -> child --tokenizer-parallelism/--no-tokenizer-parallelism",
+                    "preprocess.c.tokenizer_threads_per_worker": "configs/odcr.yaml:preprocess.c.tokenizer_threads_per_worker -> child --tokenizer-threads-per-worker/RAYON_NUM_THREADS",
+                    "preprocess.c.tokenizer_total_threads": "configs/odcr.yaml:preprocess.c.tokenizer_total_threads",
+                    "preprocess.c.prefetch_batches": "configs/odcr.yaml:preprocess.c.prefetch_batches -> child --prefetch-batches",
+                    "preprocess.c.pin_memory": "configs/odcr.yaml:preprocess.c.pin_memory -> child --pin-memory/--no-pin-memory",
+                    "preprocess.c.non_blocking_h2d": "configs/odcr.yaml:preprocess.c.non_blocking_h2d -> child --non-blocking-h2d/--no-non-blocking-h2d",
+                    "preprocess.c.async_prefetch_enabled": "configs/odcr.yaml:preprocess.c.async_prefetch_enabled -> child --async-prefetch/--no-async-prefetch",
+                    "preprocess.c.scheduling_policy": "configs/odcr.yaml:preprocess.c.scheduling_policy",
+                    "preprocess.c.cpu_cores_reserved": "configs/odcr.yaml:preprocess.c.cpu_cores_reserved",
+                    "preprocess.c.cpu_cores_available": "configs/odcr.yaml:preprocess.c.cpu_cores_available",
+                    "preprocess.c.cpu_cores_configured": "preprocess.c.tokenizer_total_threads",
                     "preprocess.c.token_window_max_total_tokens": "code/infer_domain_semantics.py::MAX_TOTAL_TOKENS",
                     "preprocess.c.token_window_payload_budget": "tokenizer.num_special_tokens_to_add(pair=False)",
                     "preprocess.c.tokenizer_hotpath_enabled": "configs/odcr.yaml:preprocess.c.tokenizer_hotpath_enabled",
@@ -1046,6 +1158,8 @@ class PreprocessRuntime:
                     "preprocess.c.token_window_cache_shard_size": "configs/odcr.yaml:preprocess.c.token_window_cache_shard_size",
                     "preprocess.c.domain_output_paths": "project.data_dir/<dataset>/domain_*.npy",
                     "preprocess.c.expected_shape_dtype": "code/infer_domain_semantics.py output verifier",
+                    "preprocess.c.domain_shape_contract_version": "code/odcr_core/preprocess_schema.py domain vector contract",
+                    "preprocess.c.domain_output_artifact_contract": "code/odcr_core/preprocess_schema.py domain vector contract",
                     "preprocess.c.source_profile_fingerprints": "project.data_dir/<dataset>/*_profiles.npy",
                     "preprocess.c.source_csv_fingerprint": "project.data_dir/<dataset>/train.csv",
                     "preprocess.c.cache_key_fields": "code/infer_domain_semantics.py::_token_window_cache_fingerprint",
@@ -1159,6 +1273,18 @@ class PreprocessRuntime:
         if self.config.runtime.dry_run:
             return
         unit = self.config.stage[-1]
+        metrics_path = None
+        verify_report_path = None
+        key_artifacts: dict[str, Any] = {
+            "stage_manifest": self.paths.stage_manifest_path,
+            "stage_status": self.paths.stage_status_path,
+            "completed_stamp": self.paths.completed_stamp_path,
+        }
+        if self.config.stage in {"preprocess_b", "preprocess_c"}:
+            metrics_path = Path(self.paths.meta_root) / "metrics.json"
+            verify_report_path = Path(self.paths.meta_root) / "verify_report.json"
+            key_artifacts["metrics"] = metrics_path
+            key_artifacts["verify_report"] = verify_report_path
         summary = build_run_summary(
             repo_root=self.repo_root,
             run_dir=self.run_root,
@@ -1173,17 +1299,17 @@ class PreprocessRuntime:
             console_log_path=self.paths.console_log_path,
             full_log_path=self.paths.full_log_path,
             errors_log_path=self.paths.errors_log_path,
-            metrics_path=None,
+            metrics_path=metrics_path,
             lineage_path=self.paths.stage_status_path,
             manifest_path=self.paths.stage_manifest_path,
-            key_artifacts={
-                "stage_manifest": self.paths.stage_manifest_path,
-                "stage_status": self.paths.stage_status_path,
-                "completed_stamp": self.paths.completed_stamp_path,
-            },
+            key_artifacts=key_artifacts,
             latest_error=error_message,
             validation_status="ok" if status == "ok" else ("failed" if status == "failed" else "pending"),
         )
+        if verify_report_path is not None:
+            summary["verify_report_path"] = _repo_relative_path(self.repo_root, verify_report_path)
+        if self.config.stage == "preprocess_c":
+            summary["domain_shape_contract_version"] = PREPROCESS_C_DOMAIN_CONTRACT_VERSION
         summary["fingerprint_hash"] = self.stage_fingerprint_hash
         summary["preprocess_metadata"] = {
             "metadata_schema_version": self.stage_metadata["metadata_schema_version"],
@@ -1201,6 +1327,8 @@ class PreprocessRuntime:
             "stage_status_path": self.paths.stage_status_path,
             "lineage_stale_policy": self.stage_metadata["lineage_stale_policy"],
         }
+        if self.config.stage == "preprocess_c":
+            summary["preprocess_metadata"]["domain_shape_contract_version"] = PREPROCESS_C_DOMAIN_CONTRACT_VERSION
         write_run_summary_json(summary, repo_root=self.repo_root, update_latest=True)
 
     def _write_stage_status(
@@ -1244,6 +1372,12 @@ class PreprocessRuntime:
                 "console_log_path": self.paths.console_log_path,
                 "full_log_path": self.paths.full_log_path,
                 "errors_log_path": self.paths.errors_log_path,
+                "metrics_path": str((Path(self.paths.meta_root) / "metrics.json").resolve())
+                if self.config.stage in {"preprocess_b", "preprocess_c"}
+                else "",
+                "verify_report_path": str((Path(self.paths.meta_root) / "verify_report.json").resolve())
+                if self.config.stage in {"preprocess_b", "preprocess_c"}
+                else "",
                 "stage_manifest_path": self.paths.stage_manifest_path,
                 "stage_status_path": self.paths.stage_status_path,
                 "completed_stamp_path": self.paths.completed_stamp_path,
@@ -1317,6 +1451,21 @@ class PreprocessRuntime:
                 "ODCR_RESOLVED_LOCAL_FILES_ONLY": "1" if resolved.local_files_only else "0",
             }
         )
+        if isinstance(self.config, (PreprocessBConfig, PreprocessCConfig)):
+            env.update(
+                {
+                    "ODCR_RESOLVED_TOKENIZER_PARALLELISM": (
+                        "1" if self.config.tokenizer_parallelism_enabled else "0"
+                    ),
+                    "ODCR_RESOLVED_TOKENIZER_THREADS_PER_WORKER": str(
+                        int(self.config.tokenizer_threads_per_worker)
+                    ),
+                    "ODCR_RESOLVED_TOKENIZER_TOTAL_THREADS": str(int(self.config.tokenizer_total_threads)),
+                    "ODCR_RESOLVED_PREFETCH_BATCHES": str(int(self.config.prefetch_batches)),
+                    "ODCR_RESOLVED_CPU_CORES_RESERVED": str(int(self.config.cpu_cores_reserved)),
+                    "ODCR_RESOLVED_CPU_CORES_AVAILABLE": str(int(self.config.cpu_cores_available)),
+                }
+            )
         return env
 
     def _run_preprocess_a(self) -> int:
@@ -1620,6 +1769,26 @@ class PreprocessRuntime:
             base.extend(["--embed-batch-size", str(config.embed_batch_size)])
             base.extend(["--read-chunk-rows", str(config.read_chunk_rows)])
             base.extend(["--group-shard-size", str(config.group_shard_size)])
+            base.append(
+                "--tokenizer-parallelism"
+                if config.tokenizer_parallelism_enabled
+                else "--no-tokenizer-parallelism"
+            )
+            base.extend(["--tokenizer-threads-per-worker", str(config.tokenizer_threads_per_worker)])
+            base.extend(["--tokenizer-total-threads", str(config.tokenizer_total_threads)])
+            base.extend(["--prefetch-batches", str(config.prefetch_batches)])
+            base.append("--pin-memory" if config.pin_memory else "--no-pin-memory")
+            base.append("--non-blocking-h2d" if config.non_blocking_h2d else "--no-non-blocking-h2d")
+            base.append("--async-prefetch" if config.async_prefetch_enabled else "--no-async-prefetch")
+            base.append(
+                "--token-aware-batching"
+                if config.token_aware_batching_enabled
+                else "--no-token-aware-batching"
+            )
+            if config.max_tokens_per_gpu_batch is not None:
+                base.extend(["--max-tokens-per-gpu-batch", str(config.max_tokens_per_gpu_batch)])
+            base.extend(["--cpu-cores-reserved", str(config.cpu_cores_reserved)])
+            base.extend(["--cpu-cores-available", str(config.cpu_cores_available)])
             base.append("--grouped-text-cache" if config.grouped_text_cache_enabled else "--no-grouped-text-cache")
             base.extend(["--grouped-text-cache-dir", str(config.grouped_text_cache_dir)])
             base.extend(["--grouped-text-cache-version", str(config.grouped_text_cache_version)])
@@ -1639,6 +1808,19 @@ class PreprocessRuntime:
                     )
         else:
             base.extend(["--chunk-batch-size", str(config.chunk_batch_size)])
+            base.append(
+                "--tokenizer-parallelism"
+                if config.tokenizer_parallelism_enabled
+                else "--no-tokenizer-parallelism"
+            )
+            base.extend(["--tokenizer-threads-per-worker", str(config.tokenizer_threads_per_worker)])
+            base.extend(["--tokenizer-total-threads", str(config.tokenizer_total_threads)])
+            base.extend(["--prefetch-batches", str(config.prefetch_batches)])
+            base.append("--pin-memory" if config.pin_memory else "--no-pin-memory")
+            base.append("--non-blocking-h2d" if config.non_blocking_h2d else "--no-non-blocking-h2d")
+            base.append("--async-prefetch" if config.async_prefetch_enabled else "--no-async-prefetch")
+            base.extend(["--cpu-cores-reserved", str(config.cpu_cores_reserved)])
+            base.extend(["--cpu-cores-available", str(config.cpu_cores_available)])
             base.append("--bf16" if config.bf16_enabled else "--no-bf16")
             base.append("--tf32" if config.tf32_enabled else "--no-tf32")
             base.append("--tokenizer-hotpath" if config.tokenizer_hotpath_enabled else "--no-tokenizer-hotpath")
@@ -1649,6 +1831,112 @@ class PreprocessRuntime:
             if config.runtime.verify_only:
                 base.append("--verify-only")
         return base
+
+    def _latest_preprocess_c_metrics(self) -> dict[str, Any] | None:
+        metrics_root = Path(self.config.resolved.runs_dir).resolve() / "preprocess" / "c"
+        candidates = sorted(metrics_root.glob("*/meta/metrics.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0)
+        for path in reversed(candidates):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    def _estimate_preprocess_c_workloads(self, datasets: list[str]) -> dict[str, dict[str, Any]]:
+        metrics = self._latest_preprocess_c_metrics()
+        token_windows_by_dataset: dict[str, int] = {}
+        elapsed_by_dataset: dict[str, float] = {}
+        if isinstance(metrics, dict):
+            for item in metrics.get("per_domain", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                dataset = str(item.get("dataset") or "")
+                if dataset not in datasets:
+                    continue
+                token_windows_by_dataset[dataset] = token_windows_by_dataset.get(dataset, 0) + int(
+                    item.get("token_window_count") or 0
+                )
+                elapsed_by_dataset[dataset] = elapsed_by_dataset.get(dataset, 0.0) + float(item.get("elapsed_s") or 0.0)
+        estimates: dict[str, dict[str, Any]] = {}
+        for dataset in datasets:
+            train_csv = self.data_root / dataset / "train.csv"
+            train_size = int(train_csv.stat().st_size) if train_csv.exists() else 0
+            token_windows = int(token_windows_by_dataset.get(dataset, 0))
+            historical_elapsed_s = float(elapsed_by_dataset.get(dataset, 0.0))
+            if token_windows > 0:
+                estimated = float(token_windows)
+                basis = "historical_token_window_count"
+            elif historical_elapsed_s > 0:
+                estimated = historical_elapsed_s
+                basis = "historical_elapsed_s"
+            else:
+                estimated = float(max(train_size, 1))
+                basis = "train_csv_size_bytes"
+            estimates[dataset] = {
+                "dataset": dataset,
+                "estimated_workload": estimated,
+                "workload_basis": basis,
+                "historical_token_windows": token_windows,
+                "historical_elapsed_s": historical_elapsed_s,
+                "train_csv_size_bytes": train_size,
+            }
+        return estimates
+
+    def _lpt_worker_assignments(
+        self,
+        *,
+        workers: list[tuple[int, int]],
+        pending: list[str],
+        estimates: dict[str, dict[str, Any]],
+    ) -> tuple[dict[int, list[str]], dict[int, float]]:
+        assignments = {worker_id: [] for worker_id, _ in workers}
+        totals = {worker_id: 0.0 for worker_id, _ in workers}
+        sorted_pending = sorted(
+            pending,
+            key=lambda dataset: (
+                -float(estimates.get(dataset, {}).get("estimated_workload") or 0.0),
+                dataset,
+            ),
+        )
+        for dataset in sorted_pending:
+            worker_id = min(totals, key=lambda item: (totals[item], item))
+            assignments[worker_id].append(dataset)
+            totals[worker_id] += float(estimates.get(dataset, {}).get("estimated_workload") or 0.0)
+        return assignments, totals
+
+    def _gpu_worker_assignments(
+        self,
+        *,
+        workers: list[tuple[int, int]],
+        pending: list[str],
+    ) -> tuple[dict[int, list[str]], dict[str, dict[str, Any]], dict[int, float], str]:
+        if not isinstance(self.config, PreprocessCConfig) or self.config.scheduling_policy == "dataset_order":
+            assignments = {worker_id: [] for worker_id, _ in workers}
+            for idx, dataset in enumerate(pending):
+                worker_id = workers[idx % len(workers)][0]
+                assignments[worker_id].append(dataset)
+            estimates = {
+                dataset: {
+                    "dataset": dataset,
+                    "estimated_workload": float(idx + 1),
+                    "workload_basis": "dataset_order",
+                }
+                for idx, dataset in enumerate(pending)
+            }
+            totals = {
+                worker_id: float(sum(estimates[dataset]["estimated_workload"] for dataset in datasets))
+                for worker_id, datasets in assignments.items()
+            }
+            return assignments, estimates, totals, "dataset_order"
+        estimates = self._estimate_preprocess_c_workloads(pending)
+        assignments, totals = self._lpt_worker_assignments(
+            workers=workers,
+            pending=pending,
+            estimates=estimates,
+        )
+        return assignments, estimates, totals, "lpt_by_token_windows"
 
     def _run_preprocess_gpu(self) -> int:
         assert isinstance(self.config, (PreprocessBConfig, PreprocessCConfig))
@@ -1665,26 +1953,60 @@ class PreprocessRuntime:
         if not pending:
             return 0
 
-        work_queue: queue.Queue[str] = queue.Queue()
-        for dataset in pending:
-            work_queue.put(dataset)
+        assignments, workload_estimates, worker_estimated_totals, scheduling_policy = self._gpu_worker_assignments(
+            workers=workers,
+            pending=pending,
+        )
+        nonzero_estimates = [value for value in worker_estimated_totals.values() if value > 0]
+        imbalance_ratio = (
+            (max(nonzero_estimates) / max(min(nonzero_estimates), 1e-12)) if nonzero_estimates else 1.0
+        )
+        static_assignments_enabled = isinstance(self.config, PreprocessCConfig) and scheduling_policy == "lpt_by_token_windows"
+        scheduling_payload = {
+            "policy": scheduling_policy,
+            "assignments": assignments,
+            "estimated_workload": workload_estimates,
+            "worker_estimated_total": worker_estimated_totals,
+            "imbalance_ratio": round(float(imbalance_ratio), 6),
+            "assignment_mode": "static_lpt" if static_assignments_enabled else "dynamic_queue",
+        }
+        self._log(f"[{self.config.stage}] scheduling={json.dumps(scheduling_payload, sort_keys=True)}")
+
+        work_queue: queue.Queue[str] | None = None
+        if not static_assignments_enabled:
+            work_queue = queue.Queue()
+            for dataset in pending:
+                work_queue.put(dataset)
 
         failure_event = threading.Event()
         results_lock = threading.Lock()
+        worker_actual_totals: dict[int, float] = {worker_id: 0.0 for worker_id, _ in workers}
 
         def worker_main(worker_id: int, gpu_id: int) -> None:
             handled: list[str] = []
             exit_code = 0
+            worker_actual_total_s = 0.0
+            static_iter = iter(assignments.get(worker_id, []))
             while not failure_event.is_set():
-                try:
-                    dataset = work_queue.get_nowait()
-                except queue.Empty:
+                if static_assignments_enabled:
+                    try:
+                        dataset = next(static_iter)
+                    except StopIteration:
+                        break
+                else:
+                    assert work_queue is not None
+                    try:
+                        dataset = work_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                if failure_event.is_set():
                     break
                 outputs = self._dataset_output_paths(dataset)
                 dataset_log = self._dataset_log_path(dataset, f"worker{worker_id}")
                 command = self._gpu_dataset_command(self.config, dataset=dataset, gpu_id=gpu_id)
                 label = f"{self.stage_label}[worker={worker_id} gpu={gpu_id} dataset={dataset}]"
                 started_at = _utc_now()
+                dataset_started_perf = time.perf_counter()
                 self._write_unit_status(
                     unit_kind="dataset",
                     unit_name=dataset,
@@ -1696,6 +2018,14 @@ class PreprocessRuntime:
                     gpu_id=gpu_id,
                     reason="subprocess_running",
                     command=command,
+                    unit_metadata={
+                        "scheduling_policy": scheduling_policy,
+                        "estimated_workload": workload_estimates.get(dataset),
+                        "assigned_worker": worker_id,
+                        "worker_estimated_total": worker_estimated_totals.get(worker_id),
+                        "worker_actual_total": round(float(worker_actual_total_s), 6),
+                        "scheduling_imbalance_ratio": round(float(imbalance_ratio), 6),
+                    },
                 )
                 try:
                     rc = self._run_logged_subprocess(
@@ -1724,8 +2054,11 @@ class PreprocessRuntime:
                     failure_event.set()
                     exit_code = rc
                     handled.append(dataset)
-                    work_queue.task_done()
+                    if not static_assignments_enabled and work_queue is not None:
+                        work_queue.task_done()
                     break
+                dataset_actual_s = time.perf_counter() - dataset_started_perf
+                worker_actual_total_s += dataset_actual_s
                 if rc == 0:
                     self._write_unit_status(
                         unit_kind="dataset",
@@ -1739,6 +2072,15 @@ class PreprocessRuntime:
                         gpu_id=gpu_id,
                         reason="completed",
                         command=command,
+                        unit_metadata={
+                            "scheduling_policy": scheduling_policy,
+                            "estimated_workload": workload_estimates.get(dataset),
+                            "assigned_worker": worker_id,
+                            "worker_estimated_total": worker_estimated_totals.get(worker_id),
+                            "actual_dataset_wall_s": round(float(dataset_actual_s), 6),
+                            "worker_actual_total": round(float(worker_actual_total_s), 6),
+                            "scheduling_imbalance_ratio": round(float(imbalance_ratio), 6),
+                        },
                     )
                 else:
                     self._write_unit_status(
@@ -1754,14 +2096,25 @@ class PreprocessRuntime:
                         reason="subprocess_failed",
                         error_message=f"subprocess exited with code {rc}",
                         command=command,
+                        unit_metadata={
+                            "scheduling_policy": scheduling_policy,
+                            "estimated_workload": workload_estimates.get(dataset),
+                            "assigned_worker": worker_id,
+                            "worker_estimated_total": worker_estimated_totals.get(worker_id),
+                            "actual_dataset_wall_s": round(float(dataset_actual_s), 6),
+                            "worker_actual_total": round(float(worker_actual_total_s), 6),
+                            "scheduling_imbalance_ratio": round(float(imbalance_ratio), 6),
+                        },
                     )
                     failure_event.set()
                     exit_code = rc
                 handled.append(dataset)
-                work_queue.task_done()
+                if not static_assignments_enabled and work_queue is not None:
+                    work_queue.task_done()
                 if rc != 0:
                     break
             with results_lock:
+                worker_actual_totals[worker_id] = worker_actual_total_s
                 self._worker_results.append(
                     PreprocessWorkerResult(
                         worker_id=worker_id,
@@ -1784,6 +2137,15 @@ class PreprocessRuntime:
 
         for thread in threads:
             thread.join()
+
+        nonzero_actual = [value for value in worker_actual_totals.values() if value > 0]
+        actual_imbalance_ratio = (
+            (max(nonzero_actual) / max(min(nonzero_actual), 1e-12)) if nonzero_actual else 1.0
+        )
+        self._log(
+            f"[{self.config.stage}] scheduling_result="
+            f"{json.dumps({'policy': scheduling_policy, 'assignment_mode': 'static_lpt' if static_assignments_enabled else 'dynamic_queue', 'worker_estimated_total': worker_estimated_totals, 'worker_actual_total': worker_actual_totals, 'estimated_imbalance_ratio': round(float(imbalance_ratio), 6), 'actual_imbalance_ratio': round(float(actual_imbalance_ratio), 6)}, sort_keys=True)}"
+        )
 
         if failure_event.is_set():
             return 1

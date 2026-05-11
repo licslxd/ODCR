@@ -88,7 +88,6 @@ from torch.nn.modules.transformer import _get_activation_fn
 import argparse
 import gzip
 import json
-import contextlib
 import math
 from functools import partial
 from dataclasses import replace
@@ -2253,18 +2252,8 @@ def run_step5_find_unused_parameters_preflight(
         )
 
 
-@contextlib.contextmanager
-def _ddp_no_sync_model(model, world_size: int, sync_gradients: bool):
-    """梯度累积非边界微批上使用 DDP no_sync。"""
-    if world_size <= 1 or sync_gradients:
-        yield
-    else:
-        with model.no_sync():
-            yield
-
-
 def odcr_profile_step_components_enabled() -> bool:
-    """ODCR_PROFILE_STEP_COMPONENTS=1 时开启 Step5 微批热点计时（仅用于验证优化，默认关闭）。"""
+    """ODCR_PROFILE_STEP_COMPONENTS=1 时开启 Step5 单步热点计时（仅用于验证优化，默认关闭）。"""
     v = os.environ.get("ODCR_PROFILE_STEP_COMPONENTS", "").strip().lower()
     return v in ("1", "true", "yes", "on")
 
@@ -2347,7 +2336,6 @@ def trainModel_ddp(
     epochs = final_cfg.epochs
     G = int(final_cfg.train_batch_size)
     P = int(final_cfg.per_device_train_batch_size)
-    A = max(1, int(final_cfg.gradient_accumulation_steps))
     eff = int(final_cfg.effective_global_batch_size)
     initial_lr = float(final_cfg.scheduler_initial_lr)
     learning_rate = initial_lr
@@ -2356,12 +2344,12 @@ def trainModel_ddp(
     _model = get_underlying_model(model)
     device = final_cfg.device
     use_bf16 = odcr_cuda_bf16_autocast_enabled()
-    n_micro = len(train_dataloader)
-    n_steps = max(1, n_micro // A)
+    n_batches = len(train_dataloader)
+    n_steps = max(1, n_batches)
     train_info = (
         f"[Train] global_batch_size={G} effective_global_batch_size={eff} "
-        f"per_device_batch_size={P} gradient_accumulation_steps={A} world_size={world_size} "
-        f"micro_batches_per_epoch={n_micro} optimizer_steps_per_epoch={n_steps} epochs={epochs}"
+        f"per_gpu_batch_size={P} batch_semantics_version=odcr_no_accum/1 world_size={world_size} "
+        f"batches_per_epoch={n_batches} optimizer_steps_per_epoch={n_steps} epochs={epochs}"
     )
     _lg = final_cfg.logger
     min_epochs = int(final_cfg.min_epochs)
@@ -2476,7 +2464,7 @@ def trainModel_ddp(
     profile_step_iv = max(100, step_iv * 20)
     grad_iv = max(1, odcr_log_grad_interval())
     _finite_mode, _finite_warn = parse_odcr_finite_check_mode()
-    micro_step_count = 0
+    batch_step_count = 0
     lambda_ortho_step5 = float(getattr(final_cfg, "lambda_ortho_step5", 0.2))
     orth5_w_xcov = float(getattr(final_cfg, "lambda_ortho_xcov", 1.0))
     orth5_w_cos = float(getattr(final_cfg, "lambda_ortho_cos", 0.25))
@@ -2583,17 +2571,12 @@ def trainModel_ddp(
             loss_c_sum = torch.zeros((), dtype=torch.double, device=device)
             loss_e_sum = torch.zeros((), dtype=torch.double, device=device)
             n_samples = torch.zeros((), dtype=torch.double, device=device)
-            micro_step_epoch = 0
             optimizer.zero_grad(set_to_none=True)
-            inv_accum = 1.0 / float(A)
             iterator = train_dataloader
             if rank == 0:
                 iterator = tqdm(train_dataloader, total=len(train_dataloader))
             for batch in iterator:
-                micro_step_epoch += 1
-                micro_step_count += 1
-                sync = micro_step_epoch % A == 0
-                sync_ctx = _ddp_no_sync_model(model, world_size, sync)
+                batch_step_count += 1
                 gb = require_gathered_batch(_model.gather(batch, device))
                 user_idx = gb.user_idx
                 item_idx = gb.item_idx
@@ -2639,369 +2622,366 @@ def trainModel_ddp(
                 _do_step_profile = (
                     rank == 0
                     and odcr_profile_step_components_enabled()
-                    and (micro_step_count % profile_step_iv == 0)
+                    and (batch_step_count % profile_step_iv == 0)
                 )
                 _use_cuda_prof = _do_step_profile and torch.cuda.is_available()
                 _step_timer = _StepComponentCudaTimer(_do_step_profile, use_cuda_events=_use_cuda_prof)
-                with sync_ctx:
-                    with odcr_cuda_bf16_autocast():
-                        _step_timer.start("forward")
-                        pred_rating, context_dist, word_dist = model(
-                            user_idx,
-                            item_idx,
-                            tgt_input,
-                            domain_idx,
-                            target_tokens=tgt_output,
-                            evidence_features=evidence_f,
-                            content_anchor_score=c_anchor,
-                            style_anchor_score=s_anchor,
-                            ccv_control_packet=ccv_packet,
-                        )
-                        _step_timer.end("forward")
-                        word_logp = F.log_softmax(word_dist, dim=-1)
-                        _step_timer.start("exp_ce")
-                        ls = float(final_cfg.label_smoothing)
-                        loss_r_ps = F.mse_loss(pred_rating, rating, reduction="none")
-                        loss_flan_ps = per_sample_decoder_ce_from_logits(
-                            word_dist, tgt_output, ignore_index=0, label_smoothing=ls
-                        )
-                        loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
-                        loss_e_ps = loss_flan_ps
-                        scorer_only = loss_r_ps
-                        explainer_only = coef * loss_c_ps + loss_e_ps
+                with odcr_cuda_bf16_autocast():
+                    _step_timer.start("forward")
+                    pred_rating, context_dist, word_dist = model(
+                        user_idx,
+                        item_idx,
+                        tgt_input,
+                        domain_idx,
+                        target_tokens=tgt_output,
+                        evidence_features=evidence_f,
+                        content_anchor_score=c_anchor,
+                        style_anchor_score=s_anchor,
+                        ccv_control_packet=ccv_packet,
+                    )
+                    _step_timer.end("forward")
+                    word_logp = F.log_softmax(word_dist, dim=-1)
+                    _step_timer.start("exp_ce")
+                    ls = float(final_cfg.label_smoothing)
+                    loss_r_ps = F.mse_loss(pred_rating, rating, reduction="none")
+                    loss_flan_ps = per_sample_decoder_ce_from_logits(
+                        word_dist, tgt_output, ignore_index=0, label_smoothing=ls
+                    )
+                    loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
+                    loss_e_ps = loss_flan_ps
+                    scorer_only = loss_r_ps
+                    explainer_only = coef * loss_c_ps + loss_e_ps
 
-                        dom = domain_idx.view(-1)
-                        w = exp_w.view(-1)
-                        rs = route_scorer_mask.view(-1)
-                        re = route_explainer_mask.view(-1)
-                        f_mask = (dom == 1).to(dtype=scorer_only.dtype)
-                        c_mask = (dom == 0).to(dtype=scorer_only.dtype)
-                        scorer_w = step5a_gate.scorer_weight.to(dtype=w.dtype)
-                        explainer_w = step5b_gate.explainer_weight.to(dtype=w.dtype)
-                        loss_factual = route_weighted_mean(scorer_only, scorer_w, f_mask)
-                        loss_counterfactual = explainer_loss_weight * route_weighted_mean(
-                            explainer_only,
-                            explainer_w,
-                            c_mask,
+                    dom = domain_idx.view(-1)
+                    w = exp_w.view(-1)
+                    rs = route_scorer_mask.view(-1)
+                    re = route_explainer_mask.view(-1)
+                    f_mask = (dom == 1).to(dtype=scorer_only.dtype)
+                    c_mask = (dom == 0).to(dtype=scorer_only.dtype)
+                    scorer_w = step5a_gate.scorer_weight.to(dtype=w.dtype)
+                    explainer_w = step5b_gate.explainer_weight.to(dtype=w.dtype)
+                    loss_factual = route_weighted_mean(scorer_only, scorer_w, f_mask)
+                    loss_counterfactual = explainer_loss_weight * route_weighted_mean(
+                        explainer_only,
+                        explainer_w,
+                        c_mask,
+                    )
+                    spec_lat = _model._last_specific_latent
+                    shared_lat = _model._last_shared_latent
+                    noise = float(step5_innov_cfg.lci.perturb_std) * torch.randn_like(spec_lat)
+                    score_pert = _model.odcr_scorer(
+                        shared_lat, _model.user_content_profiles[user_idx], spec_lat + noise
+                    )
+                    score_robust = _model.odcr_scorer(
+                        shared_lat.detach() + 0.0 * shared_lat,
+                        _model.user_content_profiles[user_idx],
+                        spec_lat + noise.flip(0),
+                    )
+                    lci_bundle = lci_score_invariance_loss(
+                        factual_score=pred_rating,
+                        cf_score=score_pert,
+                        robust_score=score_robust,
+                        target_rating=rating,
+                        gate=step5a_gate,
+                        cfg=step5_innov_cfg,
+                    )
+                    fca_bundle = evidence_basis_fca_loss(
+                        scorer_hidden=_model._last_h_score,
+                        explainer_hidden=_model._last_h_explain_aligned,
+                        shared_latent=shared_lat,
+                        content_profile=_model._last_content_profile,
+                        content_evidence_latent=_model._last_content_evidence_latent,
+                        packet=ccv_packet,
+                        gate=step5b_gate,
+                        cfg=step5_innov_cfg,
+                    )
+                    l_lci = lci_bundle.lci_loss
+                    l_fca = fca_bundle.fca_loss
+                    loss_ortho_keep = word_dist.sum() * 0.0
+                    loss_ortho_xcov_log = 0.0
+                    loss_ortho_cos_log = 0.0
+                    if lambda_ortho_step5 > 0.0 and bsz > 0:
+                        _ob = build_orthogonal_losses(
+                            shared_lat,
+                            spec_lat,
+                            w_xcov=orth5_w_xcov,
+                            w_cos=orth5_w_cos,
                         )
-                        spec_lat = _model._last_specific_latent
-                        shared_lat = _model._last_shared_latent
-                        noise = float(step5_innov_cfg.lci.perturb_std) * torch.randn_like(spec_lat)
-                        score_pert = _model.odcr_scorer(
-                            shared_lat, _model.user_content_profiles[user_idx], spec_lat + noise
-                        )
-                        score_robust = _model.odcr_scorer(
-                            shared_lat.detach() + 0.0 * shared_lat,
-                            _model.user_content_profiles[user_idx],
-                            spec_lat + noise.flip(0),
-                        )
-                        lci_bundle = lci_score_invariance_loss(
-                            factual_score=pred_rating,
-                            cf_score=score_pert,
-                            robust_score=score_robust,
-                            target_rating=rating,
-                            gate=step5a_gate,
-                            cfg=step5_innov_cfg,
-                        )
-                        fca_bundle = evidence_basis_fca_loss(
-                            scorer_hidden=_model._last_h_score,
-                            explainer_hidden=_model._last_h_explain_aligned,
-                            shared_latent=shared_lat,
-                            content_profile=_model._last_content_profile,
-                            content_evidence_latent=_model._last_content_evidence_latent,
-                            packet=ccv_packet,
-                            gate=step5b_gate,
-                            cfg=step5_innov_cfg,
-                        )
-                        l_lci = lci_bundle.lci_loss
-                        l_fca = fca_bundle.fca_loss
+                        loss_ortho_keep = _ob.loss_ortho_total
+                        loss_ortho_xcov_log = float(_ob.loss_ortho_xcov.detach().item())
+                        loss_ortho_cos_log = float(_ob.loss_ortho_cos.detach().item())
+                        _epoch_orth_sum += float(_ob.loss_ortho_total.detach().item())
+                        _epoch_orth_batches += 1
+                    elif lambda_ortho_step5 > 0.0 and bsz == 0:
                         loss_ortho_keep = word_dist.sum() * 0.0
-                        loss_ortho_xcov_log = 0.0
-                        loss_ortho_cos_log = 0.0
-                        if lambda_ortho_step5 > 0.0 and bsz > 0:
-                            _ob = build_orthogonal_losses(
-                                shared_lat,
-                                spec_lat,
-                                w_xcov=orth5_w_xcov,
-                                w_cos=orth5_w_cos,
-                            )
-                            loss_ortho_keep = _ob.loss_ortho_total
-                            loss_ortho_xcov_log = float(_ob.loss_ortho_xcov.detach().item())
-                            loss_ortho_cos_log = float(_ob.loss_ortho_cos.detach().item())
-                            _epoch_orth_sum += float(_ob.loss_ortho_total.detach().item())
-                            _epoch_orth_batches += 1
-                        elif lambda_ortho_step5 > 0.0 and bsz == 0:
-                            loss_ortho_keep = word_dist.sum() * 0.0
-                        _step_timer.end("exp_ce")
-                        w_ul = float(final_cfg.loss_weight_repeat_ul)
-                        w_tc = float(final_cfg.loss_weight_terminal_clean)
-                        loss_ul = graph_tied_zero(word_dist)
-                        loss_tc = graph_tied_zero(word_dist)
-                        _step_timer.start("repeat_ul")
-                        if w_ul > 0:
-                            loss_ul = odcr_anti_repeat_unlikelihood_loss_from_logp(
-                                word_logp, tgt_output
-                            )
-                        _step_timer.end("repeat_ul")
-                        _step_timer.start("terminal_clean")
-                        if w_tc > 0:
-                            loss_tc = odcr_terminal_cleanliness_loss(
-                                word_dist,
-                                tgt_output,
-                                list(_model.bad_terminal_token_ids_resolved),
-                                int(final_cfg.terminal_clean_span),
-                            )
-                        _step_timer.end("terminal_clean")
-                        loss_bd_raw_preclamp = graph_tied_zero(word_dist)
-                        batch_div_skipped = False
-                        batch_div_valid_tokens = 0
-                        w_bd_eff = float(_epoch_bd_eff_weight)
-                        warm_bd = int(_bd_warm)
-                        mode_bd = str(getattr(final_cfg, "batch_diversity_mode", "mean_prob_neg_entropy")).strip().lower()
-                        eps_bd = float(getattr(final_cfg, "batch_diversity_eps", 1e-8))
-                        use_ema_bd = bool(getattr(final_cfg, "batch_diversity_use_ema", True))
-                        ema_dec_bd = float(getattr(final_cfg, "batch_diversity_ema_decay", 0.9))
-                        ema_init_mode = str(
-                            getattr(final_cfg, "batch_diversity_ema_init_mode", "uniform")
-                        ).strip().lower()
-                        min_tok_bd = int(getattr(final_cfg, "batch_diversity_min_valid_tokens", 64))
-                        clamp_bd = float(getattr(final_cfg, "batch_diversity_loss_clamp_abs", 0.2))
-                        loss_bd = graph_tied_zero(word_dist)
-                        if (
-                            _w_bd_base > 0.0
-                            and float(_epoch_bd_ramp_factor) > 0.0
-                            and int(epoch_1) > warm_bd
-                            and mode_bd == "mean_prob_neg_entropy"
-                        ):
-                            pad_id = 0
-                            m = (tgt_output != pad_id).float().unsqueeze(-1)
-                            batch_div_valid_tokens = int(m.sum().item())
-                            if batch_div_valid_tokens < min_tok_bd:
-                                batch_div_skipped = True
-                            else:
-                                probs = F.softmax(word_dist, dim=-1)
-                                denom = m.sum(dim=(0, 1)).clamp(min=1.0)
-                                mean_probs = (probs * m).sum(dim=(0, 1)) / denom
-                                mean_probs = torch.nan_to_num(
-                                    mean_probs, nan=0.0, posinf=0.0, neginf=0.0
-                                )
-                                if use_ema_bd:
-                                    ema_buf = _model.batch_diversity_ema_mean_probs
-                                    if not getattr(_model, "_batch_div_ema_seeded", False):
-                                        if ema_init_mode == "uniform":
-                                            with torch.no_grad():
-                                                _vn = max(int(ema_buf.numel()), 1)
-                                                ema_buf.fill_(1.0 / float(_vn))
-                                        _model._batch_div_ema_seeded = True
-                                    blend = ema_dec_bd * ema_buf.detach() + (1.0 - ema_dec_bd) * mean_probs
-                                    blend = torch.nan_to_num(
-                                        blend, nan=0.0, posinf=0.0, neginf=0.0
-                                    )
-                                    loss_bd_raw_preclamp = torch.sum(blend * torch.log(blend + eps_bd))
-                                    with torch.no_grad():
-                                        ema_buf.mul_(ema_dec_bd).add_(
-                                            mean_probs.detach(), alpha=(1.0 - ema_dec_bd)
-                                        )
-                                else:
-                                    loss_bd_raw_preclamp = torch.sum(
-                                        mean_probs * torch.log(mean_probs + eps_bd)
-                                    )
-                                loss_bd_raw_preclamp = torch.nan_to_num(
-                                    loss_bd_raw_preclamp,
-                                    nan=0.0,
-                                    posinf=0.0,
-                                    neginf=0.0,
-                                )
-                                loss_bd = torch.clamp(
-                                    loss_bd_raw_preclamp, min=-clamp_bd, max=clamp_bd
-                                )
-                                if not getattr(_model, "_batch_div_loss_warned", False):
-                                    _raw_dbg = float(loss_bd_raw_preclamp.detach().item())
-                                    _wtd_dbg = float((w_bd_eff * loss_bd).detach().item())
-                                    if (
-                                        not math.isfinite(_raw_dbg)
-                                        or not math.isfinite(_wtd_dbg)
-                                        or abs(_raw_dbg) > 1e5
-                                        or abs(_wtd_dbg) > 1e5
-                                    ):
-                                        _model._batch_div_loss_warned = True
-                                        if _lg is not None:
-                                            _lg.warning(
-                                                "[BatchDiversity] abnormal loss_batch_div_raw=%.6g "
-                                                "loss_batch_div_weighted=%.6g (one-shot)",
-                                                _raw_dbg,
-                                                _wtd_dbg,
-                                                extra=log_route_extra(_lg, ROUTE_SUMMARY),
-                                            )
-                        loss = compose_step5_total_loss(
-                            loss_factual=loss_factual,
-                            loss_counterfactual=loss_counterfactual,
-                            loss_repeat_ul=loss_ul,
-                            loss_terminal_clean=loss_tc,
-                            loss_batch_diversity=loss_bd,
-                            repeat_ul_weight=w_ul,
-                            terminal_clean_weight=w_tc,
-                            batch_diversity_weight=w_bd_eff,
-                            lci_weighted_loss=lci_bundle.lci_weighted_loss,
-                            fca_weighted_loss=fca_bundle.fca_weighted_loss,
-                            ortho_keep_loss=loss_ortho_keep,
-                            ortho_keep_weight=lambda_ortho_step5,
+                    _step_timer.end("exp_ce")
+                    w_ul = float(final_cfg.loss_weight_repeat_ul)
+                    w_tc = float(final_cfg.loss_weight_terminal_clean)
+                    loss_ul = graph_tied_zero(word_dist)
+                    loss_tc = graph_tied_zero(word_dist)
+                    _step_timer.start("repeat_ul")
+                    if w_ul > 0:
+                        loss_ul = odcr_anti_repeat_unlikelihood_loss_from_logp(
+                            word_logp, tgt_output
                         )
+                    _step_timer.end("repeat_ul")
+                    _step_timer.start("terminal_clean")
+                    if w_tc > 0:
+                        loss_tc = odcr_terminal_cleanliness_loss(
+                            word_dist,
+                            tgt_output,
+                            list(_model.bad_terminal_token_ids_resolved),
+                            int(final_cfg.terminal_clean_span),
+                        )
+                    _step_timer.end("terminal_clean")
+                    loss_bd_raw_preclamp = graph_tied_zero(word_dist)
+                    batch_div_skipped = False
+                    batch_div_valid_tokens = 0
+                    w_bd_eff = float(_epoch_bd_eff_weight)
+                    warm_bd = int(_bd_warm)
+                    mode_bd = str(getattr(final_cfg, "batch_diversity_mode", "mean_prob_neg_entropy")).strip().lower()
+                    eps_bd = float(getattr(final_cfg, "batch_diversity_eps", 1e-8))
+                    use_ema_bd = bool(getattr(final_cfg, "batch_diversity_use_ema", True))
+                    ema_dec_bd = float(getattr(final_cfg, "batch_diversity_ema_decay", 0.9))
+                    ema_init_mode = str(
+                        getattr(final_cfg, "batch_diversity_ema_init_mode", "uniform")
+                    ).strip().lower()
+                    min_tok_bd = int(getattr(final_cfg, "batch_diversity_min_valid_tokens", 64))
+                    clamp_bd = float(getattr(final_cfg, "batch_diversity_loss_clamp_abs", 0.2))
+                    loss_bd = graph_tied_zero(word_dist)
+                    if (
+                        _w_bd_base > 0.0
+                        and float(_epoch_bd_ramp_factor) > 0.0
+                        and int(epoch_1) > warm_bd
+                        and mode_bd == "mean_prob_neg_entropy"
+                    ):
+                        pad_id = 0
+                        m = (tgt_output != pad_id).float().unsqueeze(-1)
+                        batch_div_valid_tokens = int(m.sum().item())
+                        if batch_div_valid_tokens < min_tok_bd:
+                            batch_div_skipped = True
+                        else:
+                            probs = F.softmax(word_dist, dim=-1)
+                            denom = m.sum(dim=(0, 1)).clamp(min=1.0)
+                            mean_probs = (probs * m).sum(dim=(0, 1)) / denom
+                            mean_probs = torch.nan_to_num(
+                                mean_probs, nan=0.0, posinf=0.0, neginf=0.0
+                            )
+                            if use_ema_bd:
+                                ema_buf = _model.batch_diversity_ema_mean_probs
+                                if not getattr(_model, "_batch_div_ema_seeded", False):
+                                    if ema_init_mode == "uniform":
+                                        with torch.no_grad():
+                                            _vn = max(int(ema_buf.numel()), 1)
+                                            ema_buf.fill_(1.0 / float(_vn))
+                                    _model._batch_div_ema_seeded = True
+                                blend = ema_dec_bd * ema_buf.detach() + (1.0 - ema_dec_bd) * mean_probs
+                                blend = torch.nan_to_num(
+                                    blend, nan=0.0, posinf=0.0, neginf=0.0
+                                )
+                                loss_bd_raw_preclamp = torch.sum(blend * torch.log(blend + eps_bd))
+                                with torch.no_grad():
+                                    ema_buf.mul_(ema_dec_bd).add_(
+                                        mean_probs.detach(), alpha=(1.0 - ema_dec_bd)
+                                    )
+                            else:
+                                loss_bd_raw_preclamp = torch.sum(
+                                    mean_probs * torch.log(mean_probs + eps_bd)
+                                )
+                            loss_bd_raw_preclamp = torch.nan_to_num(
+                                loss_bd_raw_preclamp,
+                                nan=0.0,
+                                posinf=0.0,
+                                neginf=0.0,
+                            )
+                            loss_bd = torch.clamp(
+                                loss_bd_raw_preclamp, min=-clamp_bd, max=clamp_bd
+                            )
+                            if not getattr(_model, "_batch_div_loss_warned", False):
+                                _raw_dbg = float(loss_bd_raw_preclamp.detach().item())
+                                _wtd_dbg = float((w_bd_eff * loss_bd).detach().item())
+                                if (
+                                    not math.isfinite(_raw_dbg)
+                                    or not math.isfinite(_wtd_dbg)
+                                    or abs(_raw_dbg) > 1e5
+                                    or abs(_wtd_dbg) > 1e5
+                                ):
+                                    _model._batch_div_loss_warned = True
+                                    if _lg is not None:
+                                        _lg.warning(
+                                            "[BatchDiversity] abnormal loss_batch_div_raw=%.6g "
+                                            "loss_batch_div_weighted=%.6g (one-shot)",
+                                            _raw_dbg,
+                                            _wtd_dbg,
+                                            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                                        )
+                    loss = compose_step5_total_loss(
+                        loss_factual=loss_factual,
+                        loss_counterfactual=loss_counterfactual,
+                        loss_repeat_ul=loss_ul,
+                        loss_terminal_clean=loss_tc,
+                        loss_batch_diversity=loss_bd,
+                        repeat_ul_weight=w_ul,
+                        terminal_clean_weight=w_tc,
+                        batch_diversity_weight=w_bd_eff,
+                        lci_weighted_loss=lci_bundle.lci_weighted_loss,
+                        fca_weighted_loss=fca_bundle.fca_weighted_loss,
+                        ortho_keep_loss=loss_ortho_keep,
+                        ortho_keep_weight=lambda_ortho_step5,
+                    )
                     with torch.no_grad():
                         wsum = w.sum().clamp(min=1e-8)
                         _tr = (loss_r_ps * w).sum() / wsum
                         _tc = (loss_c_ps * w).sum() / wsum
                         _te = (loss_e_ps * w).sum() / wsum
                     _step_timer.start("backward")
-                    (loss * inv_accum).backward()
+                    loss.backward()
                     _step_timer.end("backward")
-                if sync:
-                    _step_timer.start("optim")
-                    _log_grad = rank == 0 and _lg is not None and (global_step + 1) % grad_iv == 0
-                    _pre_gn = None
-                    _tops = None
-                    if _log_grad:
-                        _pre_gn = grad_norm_total(model.parameters())
-                        _tops = grad_topk_param_norms(model, odcr_grad_topk())
-                    nn.utils.clip_grad_norm_(model.parameters(), 1)
-                    if _log_grad:
-                        _post_gn = grad_norm_total(model.parameters())
-                        _tp = (
-                            " top_params=" + json.dumps(_tops, ensure_ascii=False)
-                            if _tops
-                            else ""
-                        )
-                        _lg.info(
-                            "[GradClip] global_step=%d epoch=%d grad_norm_pre_clip=%.6g grad_norm_post_clip=%.6g%s",
-                            global_step + 1,
-                            epoch_1,
-                            float(_pre_gn),
-                            float(_post_gn),
-                            _tp,
-                            extra=log_route_extra(_lg, ROUTE_DETAIL),
-                        )
-                    optimizer.step()
-                    if ema_model is not None:
-                        ema_model.update_parameters(_model)
-                    optimizer.zero_grad(set_to_none=True)
-                    # LambdaLR：必须在 optimizer.step() 之后调用，使内部 step 与全局优化步一致
-                    if sched is not None:
-                        sched.step()
-                        scheduler_steps += 1
-                    global_step += 1
-                    _wbd = float(_epoch_bd_eff_weight)
+                _step_timer.start("optim")
+                _log_grad = rank == 0 and _lg is not None and (global_step + 1) % grad_iv == 0
+                _pre_gn = None
+                _tops = None
+                if _log_grad:
+                    _pre_gn = grad_norm_total(model.parameters())
+                    _tops = grad_topk_param_norms(model, odcr_grad_topk())
+                nn.utils.clip_grad_norm_(model.parameters(), 1)
+                if _log_grad:
+                    _post_gn = grad_norm_total(model.parameters())
+                    _tp = (
+                        " top_params=" + json.dumps(_tops, ensure_ascii=False)
+                        if _tops
+                        else ""
+                    )
+                    _lg.info(
+                        "[GradClip] global_step=%d epoch=%d grad_norm_pre_clip=%.6g grad_norm_post_clip=%.6g%s",
+                        global_step + 1,
+                        epoch_1,
+                        float(_pre_gn),
+                        float(_post_gn),
+                        _tp,
+                        extra=log_route_extra(_lg, ROUTE_DETAIL),
+                    )
+                optimizer.step()
+                if ema_model is not None:
+                    ema_model.update_parameters(_model)
+                optimizer.zero_grad(set_to_none=True)
+                # LambdaLR：必须在 optimizer.step() 之后调用，使内部 step 与全局优化步一致
+                if sched is not None:
+                    sched.step()
+                    scheduler_steps += 1
+                global_step += 1
+                _wbd = float(_epoch_bd_eff_weight)
+                if (
+                    _w_bd_base > 0.0
+                    and float(_epoch_bd_ramp_factor) > 0.0
+                    and int(epoch_1) > int(_bd_warm)
+                ):
+                    if not batch_div_skipped:
+                        _epoch_loss_bd_sum += float(loss_bd.detach().item())
+                        _epoch_loss_bd_wsum += float((_wbd * loss_bd).detach().item())
+                        _epoch_loss_bd_batches += 1
+                        _epoch_loss_bd_raw_sum += float(loss_bd_raw_preclamp.detach().item())
+                        if use_ema_bd:
+                            _epoch_bd_ema_batches += 1
+                    else:
+                        _epoch_bd_skip_batches += 1
+                maybe_log_grad_norm_diff_ddp(
+                    model,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    global_step=global_step,
+                    logger=_lg,
+                    route_detail=ROUTE_DETAIL,
+                )
+                if rank == 0 and _lg and global_step > 0 and global_step % step_iv == 0:
+                    _lr_now = optimizer.param_groups[0]["lr"]
+                    _extra = None
+                    with torch.no_grad():
+                        _wsum = w.sum().clamp(min=1e-8)
+                        _lr_h = (loss_r_ps * w).sum() / _wsum
+                        _lc_h = (loss_c_ps * w).sum() / _wsum
+                        _le_h = (loss_e_ps * w).sum() / _wsum
+                    w_ul = float(final_cfg.loss_weight_repeat_ul)
+                    w_tc = float(final_cfg.loss_weight_terminal_clean)
+                    _lul = float(loss_ul.detach().item()) if w_ul > 0 else 0.0
+                    _ltc = float(loss_tc.detach().item()) if w_tc > 0 else 0.0
+                    _brk = {
+                        "main": float((loss_factual + loss_counterfactual).detach().item()),
+                        "weighted_repeat_ul": w_ul * _lul,
+                        "weighted_terminal_clean": w_tc * _ltc,
+                    }
+                    if odcr_log_step_loss_parts():
+                        _extra = {
+                            "loss_factual": float(loss_factual.detach().item()),
+                            "loss_counterfactual": float(loss_counterfactual.detach().item()),
+                            "loss_r": float(_lr_h.item()),
+                            "loss_c": float(_lc_h.item()),
+                            "loss_e": float(_le_h.item()),
+                            "loss_repeat_ul": _lul,
+                            "loss_terminal_clean": _ltc,
+                            "total_loss_breakdown": _brk,
+                        }
+                    else:
+                        _extra = {
+                            "loss_r": float(_lr_h.item()),
+                            "loss_c": float(_lc_h.item()),
+                            "loss_e": float(_le_h.item()),
+                            "loss_repeat_ul": _lul,
+                            "loss_terminal_clean": _ltc,
+                            "total_loss_breakdown": _brk,
+                        }
+                    _extra["loss_lci"] = float(l_lci.detach().item())
+                    _extra["loss_lci_weighted"] = float(lci_bundle.lci_weighted_loss.detach().item())
+                    _extra["loss_lci_consistency"] = float(lci_bundle.lci_consistency_loss.detach().item())
+                    _extra["loss_lci_cf_score"] = float(lci_bundle.lci_cf_score_loss.detach().item())
+                    _extra["loss_lci_robustness"] = float(lci_bundle.lci_robustness_loss.detach().item())
+                    _extra["uci_weight"] = float(lci_bundle.uci_weight_mean.detach().item())
+                    _extra["step5a_scorer_weight"] = float(lci_bundle.scorer_weight_mean.detach().item())
+                    _extra["loss_fca"] = float(l_fca.detach().item())
+                    _extra["loss_fca_weighted"] = float(fca_bundle.fca_weighted_loss.detach().item())
+                    _extra["step5b_fca_weight"] = float(fca_bundle.fca_weight_mean.detach().item())
+                    _extra["step5b_explainer_weight"] = float(step5b_gate.explainer_weight.detach().mean().item())
+                    _extra.update(getattr(_model, "_last_ccv_control_stats", {}) or {})
+                    _extra["loss_ortho"] = float(loss_ortho_keep.detach().item())
+                    _extra["loss_ortho_xcov"] = float(loss_ortho_xcov_log)
+                    _extra["loss_ortho_cos"] = float(loss_ortho_cos_log)
+                    _extra["loss_ortho_keep_weighted"] = float(
+                        (lambda_ortho_step5 * loss_ortho_keep).detach().item()
+                    )
+                    _wbd_log = float(_epoch_bd_eff_weight)
                     if (
                         _w_bd_base > 0.0
                         and float(_epoch_bd_ramp_factor) > 0.0
                         and int(epoch_1) > int(_bd_warm)
                     ):
-                        if not batch_div_skipped:
-                            _epoch_loss_bd_sum += float(loss_bd.detach().item())
-                            _epoch_loss_bd_wsum += float((_wbd * loss_bd).detach().item())
-                            _epoch_loss_bd_batches += 1
-                            _epoch_loss_bd_raw_sum += float(loss_bd_raw_preclamp.detach().item())
-                            if use_ema_bd:
-                                _epoch_bd_ema_batches += 1
-                        else:
-                            _epoch_bd_skip_batches += 1
-                    maybe_log_grad_norm_diff_ddp(
-                        model,
-                        rank=rank,
-                        world_size=world_size,
-                        device=device,
+                        _extra["loss_batch_div_raw"] = float(loss_bd_raw_preclamp.detach().item())
+                        _extra["loss_batch_div_weighted"] = float(
+                            (_wbd_log * loss_bd).detach().item()
+                        )
+                        _extra["batch_div_weight_effective"] = float(_wbd_log)
+                        _extra["batch_div_ramp_factor"] = float(_epoch_bd_ramp_factor)
+                        _extra["batch_div_ema_initialized"] = bool(
+                            getattr(_model, "_batch_div_ema_seeded", False)
+                        )
+                        _extra["batch_div_valid_tokens"] = int(batch_div_valid_tokens)
+                        _extra["batch_div_skipped_low_tokens"] = bool(batch_div_skipped)
+                        _extra["batch_div_use_ema"] = bool(use_ema_bd)
+                    log_step_sample(
+                        _lg,
                         global_step=global_step,
-                        logger=_lg,
-                        route_detail=ROUTE_DETAIL,
+                        epoch=epoch_1,
+                        lr=float(_lr_now),
+                        train_loss_batch=float(loss.detach().item()),
+                        extra=_extra,
                     )
-                    if rank == 0 and _lg and global_step > 0 and global_step % step_iv == 0:
-                        _lr_now = optimizer.param_groups[0]["lr"]
-                        _extra = None
-                        with torch.no_grad():
-                            _wsum = w.sum().clamp(min=1e-8)
-                            _lr_h = (loss_r_ps * w).sum() / _wsum
-                            _lc_h = (loss_c_ps * w).sum() / _wsum
-                            _le_h = (loss_e_ps * w).sum() / _wsum
-                        w_ul = float(final_cfg.loss_weight_repeat_ul)
-                        w_tc = float(final_cfg.loss_weight_terminal_clean)
-                        _lul = float(loss_ul.detach().item()) if w_ul > 0 else 0.0
-                        _ltc = float(loss_tc.detach().item()) if w_tc > 0 else 0.0
-                        _brk = {
-                            "main": float((loss_factual + loss_counterfactual).detach().item()),
-                            "weighted_repeat_ul": w_ul * _lul,
-                            "weighted_terminal_clean": w_tc * _ltc,
-                        }
-                        if odcr_log_step_loss_parts():
-                            _extra = {
-                                "loss_factual": float(loss_factual.detach().item()),
-                                "loss_counterfactual": float(loss_counterfactual.detach().item()),
-                                "loss_r": float(_lr_h.item()),
-                                "loss_c": float(_lc_h.item()),
-                                "loss_e": float(_le_h.item()),
-                                "loss_repeat_ul": _lul,
-                                "loss_terminal_clean": _ltc,
-                                "total_loss_breakdown": _brk,
-                            }
-                        else:
-                            _extra = {
-                                "loss_r": float(_lr_h.item()),
-                                "loss_c": float(_lc_h.item()),
-                                "loss_e": float(_le_h.item()),
-                                "loss_repeat_ul": _lul,
-                                "loss_terminal_clean": _ltc,
-                                "total_loss_breakdown": _brk,
-                            }
-                        _extra["loss_lci"] = float(l_lci.detach().item())
-                        _extra["loss_lci_weighted"] = float(lci_bundle.lci_weighted_loss.detach().item())
-                        _extra["loss_lci_consistency"] = float(lci_bundle.lci_consistency_loss.detach().item())
-                        _extra["loss_lci_cf_score"] = float(lci_bundle.lci_cf_score_loss.detach().item())
-                        _extra["loss_lci_robustness"] = float(lci_bundle.lci_robustness_loss.detach().item())
-                        _extra["uci_weight"] = float(lci_bundle.uci_weight_mean.detach().item())
-                        _extra["step5a_scorer_weight"] = float(lci_bundle.scorer_weight_mean.detach().item())
-                        _extra["loss_fca"] = float(l_fca.detach().item())
-                        _extra["loss_fca_weighted"] = float(fca_bundle.fca_weighted_loss.detach().item())
-                        _extra["step5b_fca_weight"] = float(fca_bundle.fca_weight_mean.detach().item())
-                        _extra["step5b_explainer_weight"] = float(step5b_gate.explainer_weight.detach().mean().item())
-                        _extra.update(getattr(_model, "_last_ccv_control_stats", {}) or {})
-                        _extra["loss_ortho"] = float(loss_ortho_keep.detach().item())
-                        _extra["loss_ortho_xcov"] = float(loss_ortho_xcov_log)
-                        _extra["loss_ortho_cos"] = float(loss_ortho_cos_log)
-                        _extra["loss_ortho_keep_weighted"] = float(
-                            (lambda_ortho_step5 * loss_ortho_keep).detach().item()
-                        )
-                        _wbd_log = float(_epoch_bd_eff_weight)
-                        if (
-                            _w_bd_base > 0.0
-                            and float(_epoch_bd_ramp_factor) > 0.0
-                            and int(epoch_1) > int(_bd_warm)
-                        ):
-                            _extra["loss_batch_div_raw"] = float(loss_bd_raw_preclamp.detach().item())
-                            _extra["loss_batch_div_weighted"] = float(
-                                (_wbd_log * loss_bd).detach().item()
-                            )
-                            _extra["batch_div_weight_effective"] = float(_wbd_log)
-                            _extra["batch_div_ramp_factor"] = float(_epoch_bd_ramp_factor)
-                            _extra["batch_div_ema_initialized"] = bool(
-                                getattr(_model, "_batch_div_ema_seeded", False)
-                            )
-                            _extra["batch_div_valid_tokens"] = int(batch_div_valid_tokens)
-                            _extra["batch_div_skipped_low_tokens"] = bool(batch_div_skipped)
-                            _extra["batch_div_use_ema"] = bool(use_ema_bd)
-                        log_step_sample(
-                            _lg,
-                            global_step=global_step,
-                            epoch=epoch_1,
-                            lr=float(_lr_now),
-                            train_loss_batch=float(loss.detach().item()),
-                            extra=_extra,
-                        )
-                    _step_timer.end("optim")
+                _step_timer.end("optim")
                 if _do_step_profile:
                     _pf = (
-                        "[StepProfile] micro_step=%d sync=%s forward_ms=%.3f exp_ce_ms=%.3f "
+                        "[StepProfile] batch_step=%d forward_ms=%.3f exp_ce_ms=%.3f "
                         "repeat_ul_ms=%.3f terminal_clean_ms=%.3f backward_ms=%.3f optim_ms=%.3f"
                     ) % (
-                        micro_step_count,
-                        str(bool(sync)),
+                        batch_step_count,
                         _step_timer.ms("forward"),
                         _step_timer.ms("exp_ce"),
                         _step_timer.ms("repeat_ul"),
@@ -3018,7 +2998,7 @@ def trainModel_ddp(
                 loss_c_sum = loss_c_sum + _tc.double() * bsz
                 loss_e_sum = loss_e_sum + _te.double() * bsz
                 n_samples += bsz
-                if micro_step_count % step_iv == 0 and rank == 0:
+                if batch_step_count % step_iv == 0 and rank == 0:
                     run_training_finite_checks(
                         _finite_mode,
                         loss,
@@ -6037,7 +6017,10 @@ def _run_ddp(args):
                         if int(final_cfg.eval_batch_size) % world_size == 0
                         else None
                     ),
-                    "gradient_accumulation_steps": final_cfg.gradient_accumulation_steps,
+                    "batch_semantics_version": getattr(final_cfg, "batch_semantics_version", "odcr_no_accum/1"),
+                    "grad_accum_removed": bool(getattr(final_cfg, "grad_accum_removed", True)),
+                    "global_batch_size": int(getattr(final_cfg, "global_batch_size", final_cfg.train_batch_size)),
+                    "per_gpu_batch_size": int(getattr(final_cfg, "per_gpu_batch_size", final_cfg.per_device_train_batch_size)),
                     "effective_global_batch_size": final_cfg.effective_global_batch_size,
                     "train_mode": str(getattr(final_cfg, "train_mode", "lora")),
                     "train_precision": str(getattr(final_cfg, "train_precision", "bf16")),
@@ -6134,8 +6117,7 @@ def _run_ddp(args):
                 collate_fn=step5_collate_fn,
             )
         if not eval_only:
-            _A = max(1, int(final_cfg.gradient_accumulation_steps))
-            train_drop_last = _A > 1
+            train_drop_last = False
             sampler = DistributedSampler(
                 train_dataset,
                 num_replicas=world_size,
@@ -6155,12 +6137,6 @@ def _run_ddp(args):
                 drop_last=train_drop_last,
                 collate_fn=step5_collate_fn,
             )
-            _n_train_micro = len(train_dataloader)
-            if _A > 1 and _n_train_micro % _A != 0:
-                raise ValueError(
-                    f"train DataLoader 每 epoch 批次数为 {_n_train_micro}，无法被 gradient_accumulation_steps={_A} 整除。"
-                    f"请调整全局 batch、--per-device-batch-size、world_size 或数据划分；或令 accum=1。"
-                )
             if not bool(final_cfg.ddp_find_unused_parameters):
                 run_step5_find_unused_parameters_preflight(
                     model,

@@ -199,14 +199,14 @@ role and boundary. Use `N/A - reason` only when the row truly does not apply.
 | guardrail command | `python code/tools/check_one_control_guardrails.py --strict` |
 | post_edit_scope |  |
 | post_edit_check_command | `python code/tools/odcr_post_edit_check.py --scope <scope>` |
-| narrowest scope rule | choose the smallest scope matching current-session touched files; `all` is for explicit multi-business-stage changes or manual deep validation |
+| narrowest scope rule | choose the smallest scope matching current-session touched files; automatic Stop hook degrades `all` to `governance-fast` and records manual follow-up; manual deep validation may use `all` |
 | Step3 dry-run applicability | only when the selected scope touches Step3, config changes that affect Step3, or `all`; not a fixed default for every user-facing change |
 | post_edit_check_result |  |
 | governance-fast applicability | current-session docs/governance hook/tool/test/doc changes only |
 | ignored-only hook behavior | `audit.log`, `AI_analysis/`, hook runtime logs, `runs/`, `cache/`, `artifacts/`, `data/`, `merged/`, caches, `*.log`, and `*.pyc` select `skip` when no effective source/config/doc files remain |
 | dirty workspace hook behavior | dirty workspace is not a post-edit signal; git status is not used for scope inference and dirty-only state selects `skip` |
 | no-session hook behavior | missing/parse-failed/empty transcript, no payload touched files, and unknown current-session touched files select `skip` unless `ODCR_HOOK_SCOPE=<scope>` explicitly overrides |
-| automatic hook timeout | `--max-seconds 180` by default; `ODCR_HOOK_MAX_SECONDS` may explicitly override |
+| automatic hook timeout | wrapper timeout 180 seconds; child `--max-seconds 120` by default and must remain below wrapper timeout |
 | manual deep-check timeout | `--max-seconds 900` may be used manually |
 | validation_block_in_final_response | yes/no |
 | post_edit_validation_scope |  |
@@ -242,7 +242,7 @@ role and boundary. Use `N/A - reason` only when the row truly does not apply.
 | `R064` ignored-only no-op fast path |  |
 | `R065` governance-fast scope |  |
 | `R066` unknown/dirty/parse-failed/no-session cases skip, not governance-fast/all |  |
-| `R067` automatic hook timeout <= 180 and manual deep-check 900 |  |
+| `R067` automatic hook child timeout < wrapper timeout, auto all degraded, manual deep-check 900 |  |
 | `R068` log/report/metrics/cache outputs declare artifact role |  |
 | `R069` run-facing outputs update run_summary/latest decisions |  |
 | `R070` AI_analysis is not a full training log mirror |  |

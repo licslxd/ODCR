@@ -80,6 +80,62 @@ PREPROCESS_STAGE_CONTRACTS: dict[PreprocessStage, PreprocessStageContract] = {
 }
 
 
+PREPROCESS_B_PROFILE_CONTRACT_VERSION = "preprocess_b_profile_matrix/1"
+PREPROCESS_C_DOMAIN_CONTRACT_VERSION = "preprocess_c_domain_vector/1"
+
+
+def preprocess_b_expected_shape_dtype() -> dict[str, Any]:
+    return {
+        "shape": "[entity_count, env.embed_dim]",
+        "dtype": "float32",
+        "rank": 2,
+        "contract_version": PREPROCESS_B_PROFILE_CONTRACT_VERSION,
+    }
+
+
+def preprocess_c_expected_shape_dtype() -> dict[str, Any]:
+    return {
+        "shape": "[env.embed_dim]",
+        "dtype": "float32",
+        "rank": 1,
+        "contract_version": PREPROCESS_C_DOMAIN_CONTRACT_VERSION,
+    }
+
+
+def preprocess_b_output_artifact_contract() -> dict[str, dict[str, Any]]:
+    item = {
+        "shape": ["entity_count", "env.embed_dim"],
+        "dtype": "float32",
+        "contract_version": PREPROCESS_B_PROFILE_CONTRACT_VERSION,
+    }
+    return {
+        "user_content_profiles.npy": dict(item, entity_kind="user"),
+        "user_style_profiles.npy": dict(item, entity_kind="user"),
+        "item_content_profiles.npy": dict(item, entity_kind="item"),
+        "item_style_profiles.npy": dict(item, entity_kind="item"),
+    }
+
+
+def preprocess_c_output_artifact_contract() -> dict[str, dict[str, Any]]:
+    item = {
+        "shape": ["env.embed_dim"],
+        "dtype": "float32",
+        "contract_version": PREPROCESS_C_DOMAIN_CONTRACT_VERSION,
+    }
+    return {
+        "domain_content.npy": dict(item),
+        "domain_style.npy": dict(item),
+    }
+
+
+def preprocess_stage_output_artifact_contract(stage: PreprocessStage) -> dict[str, dict[str, Any]]:
+    if stage == "preprocess_b":
+        return preprocess_b_output_artifact_contract()
+    if stage == "preprocess_c":
+        return preprocess_c_output_artifact_contract()
+    return {}
+
+
 def render_preprocess_stage_contract(stage: PreprocessStage) -> dict[str, Any]:
     contract = PREPROCESS_STAGE_CONTRACTS[stage].to_dict()
     contract["preprocess_contract_version"] = PREPROCESS_CONTRACT_VERSION
@@ -93,9 +149,14 @@ def render_preprocess_stage_contract(stage: PreprocessStage) -> dict[str, Any]:
     elif stage == "preprocess_b":
         contract["content_channel_text_sources"] = list(CONTENT_PROFILE_TEXT_COLUMNS)
         contract["style_channel_text_sources"] = list(STYLE_PROFILE_TEXT_COLUMNS)
+        contract["expected_shape_dtype"] = preprocess_b_expected_shape_dtype()
+        contract["output_artifact_contract"] = preprocess_b_output_artifact_contract()
     else:
         contract["content_channel_text_sources"] = list(DOMAIN_CONTENT_TEXT_COLUMNS)
         contract["style_channel_text_sources"] = list(DOMAIN_STYLE_TEXT_COLUMNS)
+        contract["expected_shape_dtype"] = preprocess_c_expected_shape_dtype()
+        contract["domain_shape_contract_version"] = PREPROCESS_C_DOMAIN_CONTRACT_VERSION
+        contract["output_artifact_contract"] = preprocess_c_output_artifact_contract()
     return contract
 
 
@@ -274,6 +335,17 @@ class PreprocessBConfig(PreprocessBaseConfig):
     embed_batch_size: int = 512
     read_chunk_rows: int = 100_000
     group_shard_size: int = 4_096
+    tokenizer_parallelism_enabled: bool = True
+    tokenizer_threads_per_worker: int = 4
+    tokenizer_total_threads: int = 8
+    prefetch_batches: int = 2
+    pin_memory: bool = True
+    non_blocking_h2d: bool = True
+    async_prefetch_enabled: bool = True
+    token_aware_batching_enabled: bool = False
+    max_tokens_per_gpu_batch: int | None = None
+    cpu_cores_reserved: int = 2
+    cpu_cores_available: int = 12
     grouped_text_cache_enabled: bool = True
     grouped_text_cache_dir: str = "cache/preprocess_b"
     grouped_text_cache_version: str = "preprocess_b_grouped_text_cache_v1"
@@ -290,17 +362,72 @@ class PreprocessBConfig(PreprocessBaseConfig):
 class PreprocessCConfig(PreprocessBaseConfig):
     hardware: PreprocessHardwareConfig = PreprocessHardwareConfig()
     chunk_batch_size: int = 256
+    tokenizer_parallelism_enabled: bool = True
+    tokenizer_threads_per_worker: int = 4
+    tokenizer_total_threads: int = 8
+    prefetch_batches: int = 2
+    pin_memory: bool = True
+    non_blocking_h2d: bool = True
+    async_prefetch_enabled: bool = True
+    scheduling_policy: str = "lpt_by_token_windows"
+    cpu_cores_reserved: int = 2
+    cpu_cores_available: int = 12
     bf16_enabled: bool = True
     tf32_enabled: bool = True
     tokenizer_hotpath_enabled: bool = True
     token_window_cache_enabled: bool = True
     token_window_cache_dir: str = "cache/preprocess_c"
     token_window_cache_version: str = "preprocess_c_token_windows_v3"
-    token_window_cache_shard_size: int = 2048
+    token_window_cache_shard_size: int = 4096
     stage: Literal["preprocess_c"] = "preprocess_c"
 
 
 PreprocessConfig = PreprocessAConfig | PreprocessBConfig | PreprocessCConfig
+
+
+def _validate_cpu_gpu_pipeline(
+    *,
+    stage: str,
+    workers: int,
+    tokenizer_threads_per_worker: int,
+    tokenizer_total_threads: int,
+    prefetch_batches: int,
+    cpu_cores_reserved: int,
+    cpu_cores_available: int,
+    async_prefetch_enabled: bool,
+    token_aware_batching_enabled: bool | None = None,
+    max_tokens_per_gpu_batch: int | None = None,
+) -> None:
+    if tokenizer_threads_per_worker <= 0:
+        raise ValueError(f"{stage} tokenizer_threads_per_worker must be positive")
+    if tokenizer_total_threads <= 0:
+        raise ValueError(f"{stage} tokenizer_total_threads must be positive")
+    if prefetch_batches < 0:
+        raise ValueError(f"{stage} prefetch_batches must be non-negative")
+    if async_prefetch_enabled and prefetch_batches <= 0:
+        raise ValueError(f"{stage} async_prefetch_enabled requires prefetch_batches > 0")
+    if cpu_cores_available <= 0:
+        raise ValueError(f"{stage} cpu_cores_available must be positive")
+    if cpu_cores_reserved < 0:
+        raise ValueError(f"{stage} cpu_cores_reserved must be non-negative")
+    usable_cpu = int(cpu_cores_available) - int(cpu_cores_reserved)
+    if usable_cpu <= 0:
+        raise ValueError(f"{stage} cpu_cores_available must exceed cpu_cores_reserved")
+    if tokenizer_total_threads > usable_cpu:
+        raise ValueError(
+            f"{stage} tokenizer_total_threads={tokenizer_total_threads} exceeds "
+            f"cpu_cores_available({cpu_cores_available}) - cpu_cores_reserved({cpu_cores_reserved}) = {usable_cpu}"
+        )
+    requested_threads = int(tokenizer_threads_per_worker) * int(workers)
+    if requested_threads > int(tokenizer_total_threads):
+        raise ValueError(
+            f"{stage} tokenizer_threads_per_worker({tokenizer_threads_per_worker}) * "
+            f"workers({workers}) = {requested_threads} exceeds tokenizer_total_threads={tokenizer_total_threads}"
+        )
+    if token_aware_batching_enabled and (max_tokens_per_gpu_batch is None or int(max_tokens_per_gpu_batch) <= 0):
+        raise ValueError(f"{stage} token_aware_batching_enabled requires positive max_tokens_per_gpu_batch")
+    if max_tokens_per_gpu_batch is not None and int(max_tokens_per_gpu_batch) <= 0:
+        raise ValueError(f"{stage} max_tokens_per_gpu_batch must be positive when configured")
 
 
 def _validate_paths(paths: PreprocessPathsConfig, *, stage: str) -> None:
@@ -361,6 +488,18 @@ def validate_preprocess_config(config: PreprocessConfig) -> PreprocessConfig:
             raise ValueError("preprocess_b verify_sample_size must be non-negative")
         if config.verify_seed < 0:
             raise ValueError("preprocess_b verify_seed must be non-negative")
+        _validate_cpu_gpu_pipeline(
+            stage="preprocess_b",
+            workers=workers,
+            tokenizer_threads_per_worker=int(config.tokenizer_threads_per_worker),
+            tokenizer_total_threads=int(config.tokenizer_total_threads),
+            prefetch_batches=int(config.prefetch_batches),
+            cpu_cores_reserved=int(config.cpu_cores_reserved),
+            cpu_cores_available=int(config.cpu_cores_available),
+            async_prefetch_enabled=bool(config.async_prefetch_enabled),
+            token_aware_batching_enabled=bool(config.token_aware_batching_enabled),
+            max_tokens_per_gpu_batch=config.max_tokens_per_gpu_batch,
+        )
         return replace(
             config,
             datasets=datasets,
@@ -391,9 +530,25 @@ def validate_preprocess_config(config: PreprocessConfig) -> PreprocessConfig:
             raise ValueError("preprocess_c token_window_cache_version must be non-empty")
         if config.token_window_cache_shard_size <= 0:
             raise ValueError("preprocess_c token_window_cache_shard_size must be positive")
+        scheduling_policy = str(config.scheduling_policy).strip()
+        if scheduling_policy not in {"dataset_order", "lpt_by_token_windows"}:
+            raise ValueError(
+                "preprocess_c scheduling_policy must be one of: dataset_order, lpt_by_token_windows"
+            )
+        _validate_cpu_gpu_pipeline(
+            stage="preprocess_c",
+            workers=workers,
+            tokenizer_threads_per_worker=int(config.tokenizer_threads_per_worker),
+            tokenizer_total_threads=int(config.tokenizer_total_threads),
+            prefetch_batches=int(config.prefetch_batches),
+            cpu_cores_reserved=int(config.cpu_cores_reserved),
+            cpu_cores_available=int(config.cpu_cores_available),
+            async_prefetch_enabled=bool(config.async_prefetch_enabled),
+        )
         return replace(
             config,
             datasets=datasets,
+            scheduling_policy=scheduling_policy,
             runtime=replace(runtime, workers=workers),
             hardware=PreprocessHardwareConfig(gpu_ids=gpu_ids),
             resolved=replace(
@@ -449,6 +604,18 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
             "verify_seed",
             "verify_user_indices",
             "verify_item_indices",
+            "tokenizer_parallelism_enabled",
+            "tokenizer_threads_per_worker",
+            "tokenizer_total_threads",
+            "prefetch_batches",
+            "pin_memory",
+            "non_blocking_h2d",
+            "async_prefetch_enabled",
+            "token_aware_batching_enabled",
+            "max_tokens_per_gpu_batch",
+            "scheduling_policy",
+            "cpu_cores_reserved",
+            "cpu_cores_available",
         ):
             if getattr(args, flag_name, None) is not None:
                 invalid.append(flag_name)
@@ -466,6 +633,7 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
             "token_window_cache_dir",
             "token_window_cache_version",
             "token_window_cache_shard_size",
+            "scheduling_policy",
         ):
             if getattr(args, flag_name, None) is not None:
                 invalid.append(flag_name)
@@ -509,6 +677,55 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
         verify_seed = (
             int(args.verify_seed) if getattr(args, "verify_seed", None) is not None else config.verify_seed
         )
+        tokenizer_parallelism_enabled = (
+            bool(args.tokenizer_parallelism_enabled)
+            if getattr(args, "tokenizer_parallelism_enabled", None) is not None
+            else config.tokenizer_parallelism_enabled
+        )
+        tokenizer_threads_per_worker = (
+            int(args.tokenizer_threads_per_worker)
+            if getattr(args, "tokenizer_threads_per_worker", None) is not None
+            else config.tokenizer_threads_per_worker
+        )
+        tokenizer_total_threads = (
+            int(args.tokenizer_total_threads)
+            if getattr(args, "tokenizer_total_threads", None) is not None
+            else config.tokenizer_total_threads
+        )
+        prefetch_batches = (
+            int(args.prefetch_batches) if getattr(args, "prefetch_batches", None) is not None else config.prefetch_batches
+        )
+        pin_memory = bool(args.pin_memory) if getattr(args, "pin_memory", None) is not None else config.pin_memory
+        non_blocking_h2d = (
+            bool(args.non_blocking_h2d)
+            if getattr(args, "non_blocking_h2d", None) is not None
+            else config.non_blocking_h2d
+        )
+        async_prefetch_enabled = (
+            bool(args.async_prefetch_enabled)
+            if getattr(args, "async_prefetch_enabled", None) is not None
+            else config.async_prefetch_enabled
+        )
+        token_aware_batching_enabled = (
+            bool(args.token_aware_batching_enabled)
+            if getattr(args, "token_aware_batching_enabled", None) is not None
+            else config.token_aware_batching_enabled
+        )
+        max_tokens_per_gpu_batch = (
+            int(args.max_tokens_per_gpu_batch)
+            if getattr(args, "max_tokens_per_gpu_batch", None) is not None
+            else config.max_tokens_per_gpu_batch
+        )
+        cpu_cores_reserved = (
+            int(args.cpu_cores_reserved)
+            if getattr(args, "cpu_cores_reserved", None) is not None
+            else config.cpu_cores_reserved
+        )
+        cpu_cores_available = (
+            int(args.cpu_cores_available)
+            if getattr(args, "cpu_cores_available", None) is not None
+            else config.cpu_cores_available
+        )
         updated = replace(
             config,
             datasets=datasets,
@@ -524,6 +741,17 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
             tf32_enabled=tf32_enabled,
             verify_sample_size=verify_sample_size,
             verify_seed=verify_seed,
+            tokenizer_parallelism_enabled=tokenizer_parallelism_enabled,
+            tokenizer_threads_per_worker=tokenizer_threads_per_worker,
+            tokenizer_total_threads=tokenizer_total_threads,
+            prefetch_batches=prefetch_batches,
+            pin_memory=pin_memory,
+            non_blocking_h2d=non_blocking_h2d,
+            async_prefetch_enabled=async_prefetch_enabled,
+            token_aware_batching_enabled=token_aware_batching_enabled,
+            max_tokens_per_gpu_batch=max_tokens_per_gpu_batch,
+            cpu_cores_reserved=cpu_cores_reserved,
+            cpu_cores_available=cpu_cores_available,
             verify_user_indices=normalize_optional_indices(
                 getattr(args, "verify_user_indices", None) or config.verify_user_indices
             ),
@@ -545,6 +773,8 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
         "verify_seed",
         "verify_user_indices",
         "verify_item_indices",
+        "token_aware_batching_enabled",
+        "max_tokens_per_gpu_batch",
     ):
         if getattr(args, flag_name, None) is not None:
             invalid.append(flag_name)
@@ -584,6 +814,48 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
         if getattr(args, "token_window_cache_shard_size", None) is not None
         else config.token_window_cache_shard_size
     )
+    tokenizer_parallelism_enabled = (
+        bool(args.tokenizer_parallelism_enabled)
+        if getattr(args, "tokenizer_parallelism_enabled", None) is not None
+        else config.tokenizer_parallelism_enabled
+    )
+    tokenizer_threads_per_worker = (
+        int(args.tokenizer_threads_per_worker)
+        if getattr(args, "tokenizer_threads_per_worker", None) is not None
+        else config.tokenizer_threads_per_worker
+    )
+    tokenizer_total_threads = (
+        int(args.tokenizer_total_threads)
+        if getattr(args, "tokenizer_total_threads", None) is not None
+        else config.tokenizer_total_threads
+    )
+    prefetch_batches = (
+        int(args.prefetch_batches) if getattr(args, "prefetch_batches", None) is not None else config.prefetch_batches
+    )
+    pin_memory = bool(args.pin_memory) if getattr(args, "pin_memory", None) is not None else config.pin_memory
+    non_blocking_h2d = (
+        bool(args.non_blocking_h2d)
+        if getattr(args, "non_blocking_h2d", None) is not None
+        else config.non_blocking_h2d
+    )
+    async_prefetch_enabled = (
+        bool(args.async_prefetch_enabled)
+        if getattr(args, "async_prefetch_enabled", None) is not None
+        else config.async_prefetch_enabled
+    )
+    scheduling_policy = (
+        str(args.scheduling_policy) if getattr(args, "scheduling_policy", None) is not None else config.scheduling_policy
+    )
+    cpu_cores_reserved = (
+        int(args.cpu_cores_reserved)
+        if getattr(args, "cpu_cores_reserved", None) is not None
+        else config.cpu_cores_reserved
+    )
+    cpu_cores_available = (
+        int(args.cpu_cores_available)
+        if getattr(args, "cpu_cores_available", None) is not None
+        else config.cpu_cores_available
+    )
     updated = replace(
         config,
         datasets=datasets,
@@ -597,5 +869,15 @@ def apply_preprocess_cli_overrides(config: PreprocessConfig, args: Any) -> Prepr
         token_window_cache_dir=token_window_cache_dir,
         token_window_cache_version=token_window_cache_version,
         token_window_cache_shard_size=token_window_cache_shard_size,
+        tokenizer_parallelism_enabled=tokenizer_parallelism_enabled,
+        tokenizer_threads_per_worker=tokenizer_threads_per_worker,
+        tokenizer_total_threads=tokenizer_total_threads,
+        prefetch_batches=prefetch_batches,
+        pin_memory=pin_memory,
+        non_blocking_h2d=non_blocking_h2d,
+        async_prefetch_enabled=async_prefetch_enabled,
+        scheduling_policy=scheduling_policy,
+        cpu_cores_reserved=cpu_cores_reserved,
+        cpu_cores_available=cpu_cores_available,
     )
     return validate_preprocess_config(updated)

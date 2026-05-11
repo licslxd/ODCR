@@ -18,10 +18,8 @@ def collect_training_hardware_overrides_from_args(args: Any) -> Dict[str, Any]:
     pairs = [
         ("batch_size", "batch_size"),
         ("epochs", "epochs"),
-        ("coef", "coef"),
         ("num_proc", "num_proc"),
         ("per_device_batch_size", "per_device_batch_size"),
-        ("gradient_accumulation_steps", "gradient_accumulation_steps"),
         ("scheduler_initial_lr", "scheduler_initial_lr"),
         ("learning_rate", "learning_rate"),
         ("warmup_steps", "warmup_steps"),

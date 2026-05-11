@@ -7,11 +7,23 @@ live under each run's ``meta/`` directory; data remains outside ``runs/``.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 from odcr_core import run_naming
+
+
+def _safe_namespace_component(value: str, *, label: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{label} must be non-empty")
+    if raw in {".", ".."} or "/" in raw or "\\" in raw or ".." in raw:
+        raise ValueError(f"invalid {label}: {value!r}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", raw):
+        raise ValueError(f"invalid {label}: {value!r}")
+    return raw
 
 
 @dataclass(frozen=True)
@@ -65,7 +77,7 @@ _ARTIFACT_ROLE_SPECS: dict[str, ArtifactRoleSpec] = {
     "metrics": ArtifactRoleSpec(
         role="metrics",
         default_directory="runs/<stage>/<unit>/<run_id>/meta or eval/rerank run root",
-        filename_convention="metrics.jsonl, eval_metrics.json, rerank_summary.json, epoch_summary.csv, loss_breakdown.jsonl, gpu_profile.jsonl, rcr_distribution.json",
+        filename_convention="metrics.jsonl, eval_metrics.json, rerank_summary.json, epoch_summary.csv, loss_breakdown.jsonl, timing_profile.jsonl, gpu_profile.jsonl, rcr_distribution.json",
         producer="stage/eval/rerank metric writers",
         consumer="summaries, analysis packs, baselines, humans",
         retention_note="small structured metrics may be retained with the producing run",
@@ -131,7 +143,24 @@ _METRIC_FILENAMES: dict[str, str] = {
     "metrics": "metrics.jsonl",
     "epoch_summary": "epoch_summary.csv",
     "loss_breakdown": "loss_breakdown.jsonl",
+    "timing_profile": "timing_profile.jsonl",
     "gpu_profile": "gpu_profile.jsonl",
+    "scheduler_events": "scheduler_events.jsonl",
+    "damping_events": "damping_events.jsonl",
+    "objective_drift": "objective_drift.jsonl",
+    "recovery_events": "recovery_events.jsonl",
+    "training_effectiveness": "training_effectiveness.jsonl",
+    "training_effectiveness_summary": "training_effectiveness_summary.json",
+    "loss_component_epoch_summary": "loss_component_epoch_summary.csv",
+    "loss_component_trends": "loss_component_trends.json",
+    "component_contribution_summary": "component_contribution_summary.md",
+    "step3_eval_status": "step3_eval_status.json",
+    "samples": "samples.jsonl",
+    "collapse_stats": "collapse_stats.json",
+    "eval_summary": "eval_summary.json",
+    "eval_protocol": "eval_protocol.json",
+    "sample_integrity_report": "sample_integrity_report.json",
+    "quality_audit": "quality_audit.json",
     "rcr_distribution": "rcr_distribution.json",
     "eval_metrics": "eval_metrics.json",
     "rerank_summary": "rerank_summary.json",
@@ -352,3 +381,78 @@ def state_dir(stage_run_root: Path) -> Path:
 
 def hf_cache_root(repo_root: Path, task_id: int) -> Path:
     return (repo_root / "cache" / f"task{int(task_id)}" / "hf").resolve()
+
+
+def step3_tokenizer_cache_root(repo_root: Path, formal_cache_namespace: str) -> Path:
+    namespace = str(formal_cache_namespace or "").strip().strip("/")
+    if not namespace:
+        raise ValueError("step3 tokenizer formal_cache_namespace must be non-empty")
+    if Path(namespace).is_absolute() or ".." in Path(namespace).parts:
+        raise ValueError(f"invalid step3 tokenizer formal_cache_namespace: {formal_cache_namespace!r}")
+    return (repo_root / namespace).resolve()
+
+
+def step3_tokenizer_cache_entry_dir(
+    repo_root: Path,
+    *,
+    formal_cache_namespace: str,
+    task_id: int,
+    source_domain: str,
+    target_domain: str,
+    compatibility_key: str,
+) -> Path:
+    key = str(compatibility_key or "").strip()
+    if not key:
+        raise ValueError("step3 tokenizer cache compatibility_key must be non-empty")
+    domain_ns = f"{str(source_domain).replace('/', '_')}_to_{str(target_domain).replace('/', '_')}"
+    return (
+        step3_tokenizer_cache_root(repo_root, formal_cache_namespace)
+        / f"task{int(task_id)}"
+        / domain_ns
+        / key
+    ).resolve()
+
+
+def get_step3_validation_root(repo_root: Path, validation_slug: str) -> Path:
+    slug = _safe_namespace_component(str(validation_slug), label="step3 validation slug")
+    return runs_root(repo_root) / "step3_validation" / slug
+
+
+def get_step3_validation_run_root(repo_root: Path, validation_slug: str, run_id: str) -> Path:
+    rid = _safe_namespace_component(str(run_id), label="step3 validation run_id")
+    return get_step3_validation_root(repo_root, validation_slug) / rid
+
+
+def get_step3_validation_meta_dir(repo_root: Path, validation_slug: str, run_id: str) -> Path:
+    return (get_step3_validation_run_root(repo_root, validation_slug, run_id) / "meta").resolve()
+
+
+def step3_validation_evidence_root(repo_root: Path, validation_slug: str, run_id: str) -> Path:
+    slug = _safe_namespace_component(str(validation_slug), label="step3 validation slug")
+    rid = _safe_namespace_component(str(run_id), label="step3 validation run_id")
+    return (repo_root / "AI_analysis" / "06_probe_evidence" / slug / rid).resolve()
+
+
+def step3_validation_tokenizer_cache_entry_dir(
+    repo_root: Path,
+    *,
+    validation_slug: str,
+    run_id: str,
+    task_id: int,
+    source_domain: str,
+    target_domain: str,
+    compatibility_key: str,
+) -> Path:
+    key = str(compatibility_key or "").strip()
+    if not key:
+        raise ValueError("step3 validation tokenizer cache compatibility_key must be non-empty")
+    domain_ns = f"{str(source_domain).replace('/', '_')}_to_{str(target_domain).replace('/', '_')}"
+    return (
+        step3_validation_evidence_root(repo_root, validation_slug, run_id)
+        / "cache"
+        / "step3"
+        / "tokenizer"
+        / f"task{int(task_id)}"
+        / domain_ns
+        / key
+    ).resolve()

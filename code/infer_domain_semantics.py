@@ -5,7 +5,10 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import shutil
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -182,6 +185,74 @@ class ProbeConfig:
     max_chunks_per_domain: int | None
 
 
+@dataclass(frozen=True)
+class TokenizerPipelineConfig:
+    tokenizer_parallelism_enabled: bool
+    tokenizer_threads_per_worker: int
+    tokenizer_total_threads: int
+    prefetch_batches: int
+    pin_memory: bool
+    non_blocking_h2d: bool
+    async_prefetch_enabled: bool
+    cpu_cores_reserved: int
+    cpu_cores_available: int
+
+    @property
+    def cpu_cores_configured(self) -> int:
+        return int(self.tokenizer_total_threads)
+
+
+@dataclass
+class DomainTiming:
+    csv_read_s: float = 0.0
+    token_window_cache_manifest_s: float = 0.0
+    token_window_cache_load_s: float = 0.0
+    token_window_cache_write_s: float = 0.0
+    token_window_cache_build_s: float = 0.0
+    tokenizer_queue_wait_s: float = 0.0
+    gpu_queue_wait_s: float = 0.0
+    h2d_s: float = 0.0
+    tokenize_s: float = 0.0
+    gpu_forward_s: float = 0.0
+    encode_wall_s: float = 0.0
+    total_s: float = 0.0
+    token_windows: int = 0
+    cache_status: str = "disabled"
+    cache_shards_loaded: int = 0
+    cache_shards_written: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "csv_read_s": round(float(self.csv_read_s), 6),
+            "token_window_cache_manifest_s": round(float(self.token_window_cache_manifest_s), 6),
+            "token_window_cache_load_s": round(float(self.token_window_cache_load_s), 6),
+            "token_window_cache_write_s": round(float(self.token_window_cache_write_s), 6),
+            "token_window_cache_build_s": round(float(self.token_window_cache_build_s), 6),
+            "tokenizer_queue_wait_s": round(float(self.tokenizer_queue_wait_s), 6),
+            "gpu_queue_wait_s": round(float(self.gpu_queue_wait_s), 6),
+            "h2d_s": round(float(self.h2d_s), 6),
+            "tokenize_s": round(float(self.tokenize_s), 6),
+            "gpu_forward_s": round(float(self.gpu_forward_s), 6),
+            "encode_wall_s": round(float(self.encode_wall_s), 6),
+            "overlap_effectiveness": round(float(_overlap_effectiveness(self)), 6),
+            "total_s": round(float(self.total_s), 6),
+            "token_window_count": int(self.token_windows),
+            "token_window_cache_status": self.cache_status,
+            "token_window_cache_shards_loaded": int(self.cache_shards_loaded),
+            "token_window_cache_shards_written": int(self.cache_shards_written),
+        }
+
+
+def _overlap_effectiveness(timing: DomainTiming) -> float:
+    sequential = float(timing.tokenize_s + timing.h2d_s + timing.gpu_forward_s)
+    wall = float(timing.encode_wall_s)
+    overlap_capacity = min(float(timing.tokenize_s), float(timing.h2d_s + timing.gpu_forward_s))
+    if sequential <= 0.0 or wall <= 0.0 or overlap_capacity <= 0.0:
+        return 0.0
+    hidden = max(0.0, sequential - wall)
+    return max(0.0, min(1.0, hidden / overlap_capacity))
+
+
 def _resolve_datasets(raw: str | None) -> list[str]:
     if raw is None or not str(raw).strip():
         return list(ALL_DATASETS)
@@ -307,6 +378,81 @@ def _resolve_probe_config(args: argparse.Namespace) -> ProbeConfig:
         probe_only=probe_only,
         max_chunks_per_domain=max_chunks,
     )
+
+
+def _required_int_arg(args: argparse.Namespace, name: str, cli_name: str) -> int:
+    raw = getattr(args, name, None)
+    if raw is None:
+        raise ValueError(f"{cli_name} is required from the resolved preprocess_c payload.")
+    return int(raw)
+
+
+def _resolve_tokenizer_pipeline_config(args: argparse.Namespace) -> TokenizerPipelineConfig:
+    config = TokenizerPipelineConfig(
+        tokenizer_parallelism_enabled=_require_resolved_bool_flag(
+            args,
+            "tokenizer_parallelism_enabled",
+            "--tokenizer-parallelism/--no-tokenizer-parallelism",
+        ),
+        tokenizer_threads_per_worker=_required_int_arg(
+            args,
+            "tokenizer_threads_per_worker",
+            "--tokenizer-threads-per-worker",
+        ),
+        tokenizer_total_threads=_required_int_arg(args, "tokenizer_total_threads", "--tokenizer-total-threads"),
+        prefetch_batches=_required_int_arg(args, "prefetch_batches", "--prefetch-batches"),
+        pin_memory=_require_resolved_bool_flag(args, "pin_memory", "--pin-memory/--no-pin-memory"),
+        non_blocking_h2d=_require_resolved_bool_flag(
+            args,
+            "non_blocking_h2d",
+            "--non-blocking-h2d/--no-non-blocking-h2d",
+        ),
+        async_prefetch_enabled=_require_resolved_bool_flag(
+            args,
+            "async_prefetch_enabled",
+            "--async-prefetch/--no-async-prefetch",
+        ),
+        cpu_cores_reserved=_required_int_arg(args, "cpu_cores_reserved", "--cpu-cores-reserved"),
+        cpu_cores_available=_required_int_arg(args, "cpu_cores_available", "--cpu-cores-available"),
+    )
+    usable_cpu = int(config.cpu_cores_available) - int(config.cpu_cores_reserved)
+    if config.tokenizer_threads_per_worker <= 0 or config.tokenizer_total_threads <= 0:
+        raise ValueError("tokenizer thread counts must be positive")
+    if config.prefetch_batches < 0:
+        raise ValueError("prefetch_batches must be non-negative")
+    if config.async_prefetch_enabled and config.prefetch_batches <= 0:
+        raise ValueError("async_prefetch_enabled requires prefetch_batches > 0")
+    if usable_cpu <= 0 or config.tokenizer_total_threads > usable_cpu:
+        raise ValueError("tokenizer_total_threads must fit within cpu_cores_available - cpu_cores_reserved")
+    return config
+
+
+def _install_tokenizer_thread_env(config: TokenizerPipelineConfig) -> None:
+    os.environ["TOKENIZERS_PARALLELISM"] = "true" if config.tokenizer_parallelism_enabled else "false"
+    os.environ["RAYON_NUM_THREADS"] = str(int(config.tokenizer_threads_per_worker))
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_MAX_THREADS"] = "1"
+    os.environ["ODCR_RESOLVED_TOKENIZER_PARALLELISM"] = "1" if config.tokenizer_parallelism_enabled else "0"
+    os.environ["ODCR_RESOLVED_TOKENIZER_THREADS_PER_WORKER"] = str(int(config.tokenizer_threads_per_worker))
+    os.environ["ODCR_RESOLVED_TOKENIZER_TOTAL_THREADS"] = str(int(config.tokenizer_total_threads))
+    os.environ["ODCR_RESOLVED_PREFETCH_BATCHES"] = str(int(config.prefetch_batches))
+
+
+def _tokenizer_pipeline_summary(config: TokenizerPipelineConfig) -> dict[str, object]:
+    return {
+        "tokenizer_threads": int(config.tokenizer_threads_per_worker),
+        "tokenizer_threads_per_worker": int(config.tokenizer_threads_per_worker),
+        "tokenizer_total_threads": int(config.tokenizer_total_threads),
+        "prefetch_batches": int(config.prefetch_batches),
+        "cpu_cores_available": int(config.cpu_cores_available),
+        "cpu_cores_reserved": int(config.cpu_cores_reserved),
+        "cpu_cores_configured": int(config.cpu_cores_configured),
+        "tokenizers_parallelism_enabled": bool(config.tokenizer_parallelism_enabled),
+        "pin_memory": bool(config.pin_memory),
+        "non_blocking_h2d": bool(config.non_blocking_h2d),
+        "async_prefetch_enabled": bool(config.async_prefetch_enabled),
+    }
 
 
 def _configure_tf32(device: torch.device, *, enabled: bool) -> None:
@@ -437,21 +583,35 @@ def _load_token_window_cache_manifest(
     *,
     expected_fingerprint: dict[str, object],
     payload_budget: int,
+    timing: DomainTiming | None = None,
 ) -> TokenWindowCacheManifest | None:
+    started_at = time.perf_counter()
     manifest_path = _token_window_cache_manifest_path(cache_path)
-    if not manifest_path.exists():
-        return None
     try:
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except Exception as exc:
-        log.warning("[cache] failed to load %s: %s", manifest_path, exc)
-        return None
+        if not manifest_path.exists():
+            if timing is not None:
+                timing.cache_status = "miss"
+            return None
+        try:
+            with manifest_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            log.warning("[cache] failed to load %s: %s", manifest_path, exc)
+            if timing is not None:
+                timing.cache_status = "stale"
+            return None
+    finally:
+        if timing is not None:
+            timing.token_window_cache_manifest_s += time.perf_counter() - started_at
     if not isinstance(payload, dict):
         log.warning("[cache] invalid payload type in %s: %s", manifest_path, type(payload).__name__)
+        if timing is not None:
+            timing.cache_status = "stale"
         return None
     if payload.get("fingerprint") != expected_fingerprint:
         log.warning("[cache] fingerprint mismatch for %s; cache will be rebuilt.", cache_path)
+        if timing is not None:
+            timing.cache_status = "stale"
         return None
     if str(payload.get("cache_contract_version")) != TOKEN_WINDOW_CACHE_CONTRACT_VERSION:
         log.warning("[cache] contract mismatch for %s; cache will be rebuilt.", cache_path)
@@ -467,15 +627,23 @@ def _load_token_window_cache_manifest(
             manifest_payload_budget,
             payload_budget,
         )
+        if timing is not None:
+            timing.cache_status = "stale"
         return None
     if shard_size <= 0 or shard_count < 0 or window_count < 0:
         log.warning("[cache] invalid manifest values in %s: %s", cache_path, payload)
+        if timing is not None:
+            timing.cache_status = "stale"
         return None
     for shard_index in range(shard_count):
         shard_path = _token_window_cache_shard_path(cache_path, shard_index)
         if not shard_path.exists():
             log.warning("[cache] missing shard %s for %s", shard_path.name, cache_path)
+            if timing is not None:
+                timing.cache_status = "stale"
             return None
+    if timing is not None:
+        timing.cache_status = "hit"
     return TokenWindowCacheManifest(
         fingerprint=expected_fingerprint,
         payload_budget=payload_budget,
@@ -555,6 +723,7 @@ def _iter_token_window_shards_from_cells(
     batch_size: int = DEFAULT_TOKENIZER_BATCH_SIZE,
     max_chunks: int | None = None,
     prepend_space_between_cells: bool = True,
+    timing: DomainTiming | None = None,
 ) -> Iterable[TokenWindowShard]:
     if shard_size <= 0:
         raise ValueError(f"shard_size must be positive, got {shard_size}")
@@ -598,7 +767,12 @@ def _iter_token_window_shards_from_cells(
         prepend_space_between_cells=prepend_space_between_cells,
     ):
         seen_any_cell = True
-        for piece_ids in _encode_piece_batch(tokenizer, batch_text):
+        tokenize_started_at = time.perf_counter()
+        encoded_batch = _encode_piece_batch(tokenizer, batch_text)
+        if timing is not None:
+            timing.tokenize_s += time.perf_counter() - tokenize_started_at
+        build_started_at = time.perf_counter()
+        for piece_ids in encoded_batch:
             if not piece_ids:
                 continue
             start = 0
@@ -624,6 +798,8 @@ def _iter_token_window_shards_from_cells(
                         break
             if stop_requested:
                 break
+        if timing is not None:
+            timing.token_window_cache_build_s += time.perf_counter() - build_started_at
         if stop_requested:
             break
 
@@ -667,6 +843,7 @@ def _iter_and_maybe_cache_token_window_shards(
     persist_cache: bool,
     dataset: str,
     spec: DomainSpec,
+    timing: DomainTiming | None = None,
 ) -> Iterable[TokenWindowShard]:
     tmp_cache_dir: Path | None = None
     shard_count = 0
@@ -689,16 +866,21 @@ def _iter_and_maybe_cache_token_window_shards(
                     shard_size,
                 )
             if tmp_cache_dir is not None:
+                write_started_at = time.perf_counter()
                 _write_token_window_cache_shard(
                     tmp_cache_dir,
                     shard=shard,
                     payload_budget=payload_budget,
                 )
+                if timing is not None:
+                    timing.token_window_cache_write_s += time.perf_counter() - write_started_at
+                    timing.cache_shards_written += 1
             shard_count += 1
             window_count += shard.window_count
             yield shard
         if tmp_cache_dir is None:
             return
+        write_started_at = time.perf_counter()
         atomic_write_json(
             _token_window_cache_manifest_path(tmp_cache_dir),
             {
@@ -710,6 +892,9 @@ def _iter_and_maybe_cache_token_window_shards(
                 "window_count": int(window_count),
             },
         )
+        if timing is not None:
+            timing.token_window_cache_write_s += time.perf_counter() - write_started_at
+            timing.cache_status = "miss_written"
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         if cache_path.exists():
             log.info(
@@ -741,8 +926,10 @@ def _load_cached_token_window_shard(
     *,
     shard_index: int,
     payload_budget: int,
+    timing: DomainTiming | None = None,
 ) -> TokenWindowShard:
     shard_path = _token_window_cache_shard_path(cache_path, shard_index)
+    started_at = time.perf_counter()
     try:
         try:
             payload = torch.load(str(shard_path), map_location="cpu", weights_only=False)
@@ -750,6 +937,9 @@ def _load_cached_token_window_shard(
             payload = torch.load(str(shard_path), map_location="cpu")
     except Exception as exc:
         raise ValueError(f"failed to load shard {shard_path}: {exc}") from exc
+    if timing is not None:
+        timing.token_window_cache_load_s += time.perf_counter() - started_at
+        timing.cache_shards_loaded += 1
     if not isinstance(payload, dict):
         raise ValueError(f"invalid shard payload type in {shard_path}: {type(payload).__name__}")
     if int(payload.get("payload_budget") or 0) != payload_budget:
@@ -776,6 +966,7 @@ def _iter_cached_token_window_shards(
     *,
     manifest: TokenWindowCacheManifest,
     max_chunks: int | None = None,
+    timing: DomainTiming | None = None,
 ) -> Iterable[TokenWindowShard]:
     remaining = None if max_chunks is None else int(max_chunks)
     for shard_index in range(manifest.shard_count):
@@ -785,6 +976,7 @@ def _iter_cached_token_window_shards(
             cache_path,
             shard_index=shard_index,
             payload_budget=manifest.payload_budget,
+            timing=timing,
         )
         if remaining is not None and shard.window_count > remaining:
             shard = TokenWindowShard(
@@ -807,6 +999,41 @@ def _placeholder_payload_ids(tokenizer: AutoTokenizer, *, payload_budget: int) -
             raise ValueError("Tokenizer returned no ids for empty_text and has no unk_token_id fallback")
         placeholder = [int(unk_id)]
     return placeholder[:payload_budget]
+
+
+def _prefetch_token_window_shards(
+    shard_iter: Iterable[TokenWindowShard],
+    *,
+    timing: DomainTiming,
+    prefetch_batches: int,
+) -> Iterable[TokenWindowShard]:
+    item_queue: queue.Queue[object] = queue.Queue(maxsize=max(1, int(prefetch_batches)))
+    sentinel = object()
+
+    def producer() -> None:
+        try:
+            for shard in shard_iter:
+                put_started_at = time.perf_counter()
+                item_queue.put(shard)
+                timing.tokenizer_queue_wait_s += time.perf_counter() - put_started_at
+        except Exception as exc:  # pragma: no cover - surfaced to consumer
+            item_queue.put(exc)
+        finally:
+            item_queue.put(sentinel)
+
+    thread = threading.Thread(target=producer, name="preprocess-c-token-window-prefetch", daemon=True)
+    thread.start()
+    while True:
+        get_started_at = time.perf_counter()
+        item = item_queue.get()
+        timing.gpu_queue_wait_s += time.perf_counter() - get_started_at
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            thread.join()
+            raise item
+        yield item  # type: ignore[misc]
+    thread.join()
 
 
 def _legacy_tokenize_piece(tokenizer: AutoTokenizer, text: str) -> list[int]:
@@ -879,11 +1106,23 @@ def _streaming_chunk_mean_embedding_from_shards(
     max_total_tokens: int,
     precision_config: PrecisionConfig,
     total_chunks: int | None = None,
+    pipeline_config: TokenizerPipelineConfig | None = None,
+    timing: DomainTiming | None = None,
 ) -> tuple[np.ndarray, int]:
     sum_vec = torch.zeros(hidden_size, dtype=torch.float64, device="cpu")
     chunk_count = 0
     progress = tqdm(total=total_chunks, desc=desc, unit="chunk")
-    for shard in shard_iter:
+    iter_for_forward = (
+        _prefetch_token_window_shards(
+            shard_iter,
+            timing=timing,
+            prefetch_batches=pipeline_config.prefetch_batches,
+        )
+        if timing is not None and pipeline_config is not None and pipeline_config.async_prefetch_enabled
+        else shard_iter
+    )
+    encode_started_at = time.perf_counter()
+    for shard in iter_for_forward:
         for start in range(0, shard.window_count, forward_batch_size):
             end = min(start + forward_batch_size, shard.window_count)
             pooled = _forward_attention_mask_mean_pool(
@@ -894,12 +1133,18 @@ def _streaming_chunk_mean_embedding_from_shards(
                 device,
                 max_total_tokens=max_total_tokens,
                 precision_config=precision_config,
+                pipeline_config=pipeline_config,
+                timing=timing,
             )
             batch_count = end - start
             sum_vec += pooled.detach().cpu().to(torch.float64).sum(dim=0)
             chunk_count += batch_count
+            if timing is not None:
+                timing.token_windows += int(batch_count)
             progress.update(batch_count)
     progress.close()
+    if timing is not None:
+        timing.encode_wall_s += time.perf_counter() - encode_started_at
     if chunk_count == 0:
         return np.zeros(hidden_size, dtype=np.float32), 0
     mean = (sum_vec / float(chunk_count)).to(torch.float32).numpy()
@@ -920,6 +1165,8 @@ def _compute_hotpath_domain_embedding(
     source_path: str,
     cache_config: TokenWindowCacheConfig,
     precision_config: PrecisionConfig,
+    pipeline_config: TokenizerPipelineConfig,
+    timing: DomainTiming,
     max_chunks_per_domain: int | None = None,
 ) -> tuple[np.ndarray, int]:
     payload_budget = _token_window_budget(tokenizer, max_total_tokens=max_total_tokens)
@@ -947,6 +1194,7 @@ def _compute_hotpath_domain_embedding(
             cache_path,
             expected_fingerprint=fingerprint,
             payload_budget=payload_budget,
+            timing=timing,
         )
         if cached_manifest is not None:
             total_chunks = _effective_chunk_count(cached_manifest.window_count, max_chunks=max_chunks_per_domain)
@@ -964,6 +1212,7 @@ def _compute_hotpath_domain_embedding(
                         cache_path,
                         manifest=cached_manifest,
                         max_chunks=max_chunks_per_domain,
+                        timing=timing,
                     ),
                     tokenizer=tokenizer,
                     model=model,
@@ -974,6 +1223,8 @@ def _compute_hotpath_domain_embedding(
                     max_total_tokens=max_total_tokens,
                     precision_config=precision_config,
                     total_chunks=total_chunks,
+                    pipeline_config=pipeline_config,
+                    timing=timing,
                 )
             except Exception as exc:
                 log.warning(
@@ -993,7 +1244,9 @@ def _compute_hotpath_domain_embedding(
         else:
             log.info("[cache][%s][%s] miss dir=%s reason=not_found", dataset, spec.name, cache_path)
 
+    read_started_at = time.perf_counter()
     data = data_loader()
+    timing.csv_read_s += time.perf_counter() - read_started_at
     persist_cache = bool(cache_config.enabled)
     shard_iter = _iter_token_window_shards_from_cells(
         cell_iter=_iter_domain_cells(data, spec.column_names),
@@ -1001,6 +1254,7 @@ def _compute_hotpath_domain_embedding(
         max_total_tokens=max_total_tokens,
         shard_size=cache_config.shard_size,
         max_chunks=max_chunks_per_domain,
+        timing=timing,
     )
     cached_iter = _iter_and_maybe_cache_token_window_shards(
         shard_iter=shard_iter,
@@ -1011,6 +1265,7 @@ def _compute_hotpath_domain_embedding(
         persist_cache=persist_cache,
         dataset=dataset,
         spec=spec,
+        timing=timing,
     )
     return _streaming_chunk_mean_embedding_from_shards(
         shard_iter=cached_iter,
@@ -1023,6 +1278,8 @@ def _compute_hotpath_domain_embedding(
         max_total_tokens=max_total_tokens,
         precision_config=precision_config,
         total_chunks=None,
+        pipeline_config=pipeline_config,
+        timing=timing,
     )
 
 
@@ -1033,6 +1290,8 @@ def _prepare_chunk_batch(
     device: torch.device,
     *,
     max_total_tokens: int,
+    pipeline_config: TokenizerPipelineConfig | None = None,
+    timing: DomainTiming | None = None,
 ) -> dict[str, torch.Tensor]:
     if token_windows.ndim != 2:
         raise ValueError(f"token_windows must be rank-2, got shape={token_windows.shape}")
@@ -1066,10 +1325,22 @@ def _prepare_chunk_batch(
         row = torch.tensor(features, dtype=torch.long)
         input_ids[row_idx, : row.numel()] = row
         attention_mask[row_idx, : row.numel()] = 1
-    return {
-        "input_ids": input_ids.to(device, non_blocking=True),
-        "attention_mask": attention_mask.to(device, non_blocking=True),
+    if pipeline_config is not None and pipeline_config.pin_memory and device.type == "cuda":
+        input_ids = input_ids.pin_memory()
+        attention_mask = attention_mask.pin_memory()
+    h2d_started_at = time.perf_counter()
+    non_blocking = bool(
+        pipeline_config is not None and pipeline_config.non_blocking_h2d and device.type == "cuda"
+    )
+    out = {
+        "input_ids": input_ids.to(device, non_blocking=non_blocking),
+        "attention_mask": attention_mask.to(device, non_blocking=non_blocking),
     }
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    if timing is not None:
+        timing.h2d_s += time.perf_counter() - h2d_started_at
+    return out
 
 
 def _legacy_prepare_chunk_batch(
@@ -1078,6 +1349,8 @@ def _legacy_prepare_chunk_batch(
     device: torch.device,
     *,
     max_total_tokens: int,
+    pipeline_config: TokenizerPipelineConfig | None = None,
+    timing: DomainTiming | None = None,
 ) -> dict[str, torch.Tensor]:
     prepared = []
     for window_ids in token_windows:
@@ -1094,7 +1367,18 @@ def _legacy_prepare_chunk_batch(
             )
         prepared.append(features)
     batch = tokenizer.pad(prepared, padding=True, return_tensors="pt")
-    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+    if pipeline_config is not None and pipeline_config.pin_memory and device.type == "cuda":
+        batch = {key: value.pin_memory() for key, value in batch.items()}
+    h2d_started_at = time.perf_counter()
+    non_blocking = bool(
+        pipeline_config is not None and pipeline_config.non_blocking_h2d and device.type == "cuda"
+    )
+    out = {key: value.to(device, non_blocking=non_blocking) for key, value in batch.items()}
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    if timing is not None:
+        timing.h2d_s += time.perf_counter() - h2d_started_at
+    return out
 
 
 def _effective_chunk_count(chunk_count: int, *, max_chunks: int | None) -> int:
@@ -1113,6 +1397,8 @@ def _forward_attention_mask_mean_pool(
     *,
     max_total_tokens: int,
     precision_config: PrecisionConfig,
+    pipeline_config: TokenizerPipelineConfig | None = None,
+    timing: DomainTiming | None = None,
 ) -> torch.Tensor:
     inputs = _prepare_chunk_batch(
         token_windows,
@@ -1120,7 +1406,12 @@ def _forward_attention_mask_mean_pool(
         tokenizer,
         device,
         max_total_tokens=max_total_tokens,
+        pipeline_config=pipeline_config,
+        timing=timing,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    forward_started_at = time.perf_counter()
     with torch.inference_mode():
         with torch.autocast(
             device_type="cuda",
@@ -1128,6 +1419,10 @@ def _forward_attention_mask_mean_pool(
             enabled=precision_config.autocast_enabled,
         ):
             outputs = model(**inputs)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    if timing is not None:
+        timing.gpu_forward_s += time.perf_counter() - forward_started_at
     hidden = outputs.last_hidden_state
     attn = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
     pooled = (hidden * attn).sum(dim=1) / attn.sum(dim=1).clamp(min=1.0)
@@ -1142,13 +1437,20 @@ def _legacy_forward_attention_mask_mean_pool(
     *,
     max_total_tokens: int,
     precision_config: PrecisionConfig,
+    pipeline_config: TokenizerPipelineConfig | None = None,
+    timing: DomainTiming | None = None,
 ) -> torch.Tensor:
     inputs = _legacy_prepare_chunk_batch(
         token_windows,
         tokenizer,
         device,
         max_total_tokens=max_total_tokens,
+        pipeline_config=pipeline_config,
+        timing=timing,
     )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    forward_started_at = time.perf_counter()
     with torch.inference_mode():
         with torch.autocast(
             device_type="cuda",
@@ -1156,6 +1458,10 @@ def _legacy_forward_attention_mask_mean_pool(
             enabled=precision_config.autocast_enabled,
         ):
             outputs = model(**inputs)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    if timing is not None:
+        timing.gpu_forward_s += time.perf_counter() - forward_started_at
     hidden = outputs.last_hidden_state
     attn = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
     pooled = (hidden * attn).sum(dim=1) / attn.sum(dim=1).clamp(min=1.0)
@@ -1174,6 +1480,8 @@ def _legacy_streaming_chunk_mean_embedding(
     max_total_tokens: int,
     precision_config: PrecisionConfig,
     max_chunks: int | None = None,
+    pipeline_config: TokenizerPipelineConfig | None = None,
+    timing: DomainTiming | None = None,
 ) -> tuple[np.ndarray, int]:
     sum_vec = torch.zeros(hidden_size, dtype=torch.float64, device="cpu")
     chunk_count = 0
@@ -1192,12 +1500,17 @@ def _legacy_streaming_chunk_mean_embedding(
             device,
             max_total_tokens=max_total_tokens,
             precision_config=precision_config,
+            pipeline_config=pipeline_config,
+            timing=timing,
         )
         sum_vec += pooled.detach().cpu().to(torch.float64).sum(dim=0)
         chunk_count += pooled.shape[0]
+        if timing is not None:
+            timing.token_windows += int(pooled.shape[0])
         progress.update(len(batch))
         batch = []
 
+    encode_started_at = time.perf_counter()
     for token_window in chunk_iter:
         if target_chunk_count is not None and chunk_count >= target_chunk_count:
             break
@@ -1212,6 +1525,8 @@ def _legacy_streaming_chunk_mean_embedding(
                 break
     flush_batch()
     progress.close()
+    if timing is not None:
+        timing.encode_wall_s += time.perf_counter() - encode_started_at
 
     if chunk_count == 0:
         return np.zeros(hidden_size, dtype=np.float32), 0
@@ -1248,10 +1563,14 @@ def _compute_domain_embedding(
     cache_config: TokenWindowCacheConfig,
     precision_config: PrecisionConfig,
     tokenizer_path_config: TokenizerPathConfig,
+    pipeline_config: TokenizerPipelineConfig,
+    timing: DomainTiming,
     max_chunks_per_domain: int | None = None,
 ) -> tuple[np.ndarray, int]:
     if not tokenizer_path_config.hotpath_enabled:
+        read_started_at = time.perf_counter()
         data = data_loader()
+        timing.csv_read_s += time.perf_counter() - read_started_at
         chunk_iter = _legacy_iter_token_windows_from_cells(
             _iter_domain_cells(data, spec.column_names),
             tokenizer,
@@ -1268,6 +1587,8 @@ def _compute_domain_embedding(
             max_total_tokens=max_total_tokens,
             precision_config=precision_config,
             max_chunks=max_chunks_per_domain,
+            pipeline_config=pipeline_config,
+            timing=timing,
         )
 
     return _compute_hotpath_domain_embedding(
@@ -1283,6 +1604,8 @@ def _compute_domain_embedding(
         source_path=source_path,
         cache_config=cache_config,
         precision_config=precision_config,
+        pipeline_config=pipeline_config,
+        timing=timing,
         max_chunks_per_domain=max_chunks_per_domain,
     )
 
@@ -1320,6 +1643,7 @@ def _verify_outputs(
     cache_config: TokenWindowCacheConfig,
     precision_config: PrecisionConfig,
     tokenizer_path_config: TokenizerPathConfig,
+    pipeline_config: TokenizerPipelineConfig,
     domain_specs: tuple[DomainSpec, ...],
 ) -> dict[str, object]:
     data_loader = _make_preprocess_data_loader(dataset=dataset, source_path=source_path)
@@ -1330,6 +1654,8 @@ def _verify_outputs(
             raise FileNotFoundError(f"Missing verify target: {output_path}")
         stored = np.load(output_path)
         _validate_domain_output(stored, output_name=spec.output_name, hidden_size=hidden_size)
+        timing = DomainTiming()
+        started_at = time.perf_counter()
         recomputed, chunk_count = _compute_domain_embedding(
             data_loader=data_loader,
             spec=spec,
@@ -1344,8 +1670,11 @@ def _verify_outputs(
             cache_config=cache_config,
             precision_config=precision_config,
             tokenizer_path_config=tokenizer_path_config,
+            pipeline_config=pipeline_config,
+            timing=timing,
             max_chunks_per_domain=None,
         )
+        timing.total_s = time.perf_counter() - started_at
         allclose_ok = bool(np.allclose(stored, recomputed, atol=1e-5, rtol=1e-4))
         max_abs_diff = float(np.max(np.abs(stored - recomputed)))
         cosine = _cosine_similarity(stored, recomputed)
@@ -1361,8 +1690,80 @@ def _verify_outputs(
             "allclose": allclose_ok,
             "cosine": cosine,
             "max_abs_diff": max_abs_diff,
+            "phase_timing": timing.to_dict(),
         }
     return report
+
+
+def _sum_domain_timings(phase_timings: list[DomainTiming]) -> DomainTiming:
+    out = DomainTiming()
+    for item in phase_timings:
+        out.tokenize_s += item.tokenize_s
+        out.h2d_s += item.h2d_s
+        out.gpu_forward_s += item.gpu_forward_s
+        out.encode_wall_s += item.encode_wall_s
+    return out
+
+
+def _log_domain_phase_summary(
+    *,
+    dataset: str,
+    spec: DomainSpec,
+    timing: DomainTiming,
+    mode: str,
+    device: torch.device,
+    pipeline_config: TokenizerPipelineConfig,
+) -> None:
+    payload = {
+        "dataset": dataset,
+        "domain": spec.name,
+        "mode": mode,
+        "device": str(device),
+        **_tokenizer_pipeline_summary(pipeline_config),
+        **timing.to_dict(),
+    }
+    log.info("[phase][%s][%s] %s", dataset, spec.name, json.dumps(payload, sort_keys=True))
+
+
+def _log_dataset_phase_summary(
+    *,
+    dataset: str,
+    phase_timings: list[DomainTiming],
+    mode: str,
+    device: torch.device,
+    pipeline_config: TokenizerPipelineConfig,
+) -> None:
+    summary_timing = _sum_domain_timings(phase_timings)
+    payload = {
+        "dataset": dataset,
+        "mode": mode,
+        "device": str(device),
+        **_tokenizer_pipeline_summary(pipeline_config),
+        "csv_read_s": round(float(sum(item.csv_read_s for item in phase_timings)), 6),
+        "token_window_cache_manifest_s": round(
+            float(sum(item.token_window_cache_manifest_s for item in phase_timings)),
+            6,
+        ),
+        "token_window_cache_load_s": round(float(sum(item.token_window_cache_load_s for item in phase_timings)), 6),
+        "token_window_cache_write_s": round(float(sum(item.token_window_cache_write_s for item in phase_timings)), 6),
+        "token_window_cache_build_s": round(float(sum(item.token_window_cache_build_s for item in phase_timings)), 6),
+        "tokenizer_queue_wait_s": round(float(sum(item.tokenizer_queue_wait_s for item in phase_timings)), 6),
+        "gpu_queue_wait_s": round(float(sum(item.gpu_queue_wait_s for item in phase_timings)), 6),
+        "h2d_s": round(float(summary_timing.h2d_s), 6),
+        "tokenize_s": round(float(summary_timing.tokenize_s), 6),
+        "gpu_forward_s": round(float(summary_timing.gpu_forward_s), 6),
+        "encode_wall_s": round(float(summary_timing.encode_wall_s), 6),
+        "overlap_effectiveness": round(float(_overlap_effectiveness(summary_timing)), 6),
+        "total_s": round(float(sum(item.total_s for item in phase_timings)), 6),
+        "token_windows": int(sum(item.token_windows for item in phase_timings)),
+        "token_window_cache_hits": int(sum(1 for item in phase_timings if item.cache_status == "hit")),
+        "token_window_cache_misses": int(
+            sum(1 for item in phase_timings if item.cache_status in {"miss", "miss_written", "stale"})
+        ),
+        "token_window_cache_shards_loaded": int(sum(item.cache_shards_loaded for item in phase_timings)),
+        "token_window_cache_shards_written": int(sum(item.cache_shards_written for item in phase_timings)),
+    }
+    log.info("[phase-summary][%s] %s", dataset, json.dumps(payload, sort_keys=True))
 
 
 def _run_infer(
@@ -1378,13 +1779,17 @@ def _run_infer(
     cache_config: TokenWindowCacheConfig,
     precision_config: PrecisionConfig,
     tokenizer_path_config: TokenizerPathConfig,
+    pipeline_config: TokenizerPipelineConfig,
     domain_specs: tuple[DomainSpec, ...],
     probe_config: ProbeConfig,
 ) -> None:
     data_dir = os.path.join(_resolved_data_dir(), dataset)
     os.makedirs(data_dir, exist_ok=True)
     data_loader = _make_preprocess_data_loader(dataset=dataset, source_path=source_path)
+    phase_timings: list[DomainTiming] = []
     for spec in domain_specs:
+        timing = DomainTiming()
+        started_at = time.perf_counter()
         embedding, chunk_count = _compute_domain_embedding(
             data_loader=data_loader,
             spec=spec,
@@ -1399,7 +1804,19 @@ def _run_infer(
             cache_config=cache_config,
             precision_config=precision_config,
             tokenizer_path_config=tokenizer_path_config,
+            pipeline_config=pipeline_config,
+            timing=timing,
             max_chunks_per_domain=probe_config.max_chunks_per_domain,
+        )
+        timing.total_s = time.perf_counter() - started_at
+        phase_timings.append(timing)
+        _log_domain_phase_summary(
+            dataset=dataset,
+            spec=spec,
+            timing=timing,
+            mode="probe" if probe_config.probe_only else "write",
+            device=device,
+            pipeline_config=pipeline_config,
         )
         if probe_config.probe_only:
             log.info(
@@ -1418,6 +1835,13 @@ def _run_infer(
             chunk_count,
             max_total_tokens,
         )
+    _log_dataset_phase_summary(
+        dataset=dataset,
+        phase_timings=phase_timings,
+        mode="probe" if probe_config.probe_only else "write",
+        device=device,
+        pipeline_config=pipeline_config,
+    )
 
 
 def main() -> None:
@@ -1485,6 +1909,19 @@ def main() -> None:
         metavar="N",
         help="Number of token windows to forward per batch from the resolved preprocess_c payload.",
     )
+    parser.add_argument("--tokenizer-parallelism", action="store_true", default=None, dest="tokenizer_parallelism_enabled")
+    parser.add_argument("--no-tokenizer-parallelism", action="store_false", dest="tokenizer_parallelism_enabled")
+    parser.add_argument("--tokenizer-threads-per-worker", type=int, default=None, metavar="N")
+    parser.add_argument("--tokenizer-total-threads", type=int, default=None, metavar="N")
+    parser.add_argument("--prefetch-batches", type=int, default=None, metavar="N")
+    parser.add_argument("--pin-memory", action="store_true", default=None, dest="pin_memory")
+    parser.add_argument("--no-pin-memory", action="store_false", dest="pin_memory")
+    parser.add_argument("--non-blocking-h2d", action="store_true", default=None, dest="non_blocking_h2d")
+    parser.add_argument("--no-non-blocking-h2d", action="store_false", dest="non_blocking_h2d")
+    parser.add_argument("--async-prefetch", action="store_true", default=None, dest="async_prefetch_enabled")
+    parser.add_argument("--no-async-prefetch", action="store_false", dest="async_prefetch_enabled")
+    parser.add_argument("--cpu-cores-reserved", type=int, default=None, metavar="N")
+    parser.add_argument("--cpu-cores-available", type=int, default=None, metavar="N")
     parser.add_argument(
         "--verify-only",
         action="store_true",
@@ -1582,6 +2019,8 @@ def main() -> None:
     if chunk_batch_size is None:
         raise ValueError("--chunk-batch-size is required from the resolved preprocess_c payload.")
     chunk_batch_size = max(1, int(chunk_batch_size))
+    pipeline_config = _resolve_tokenizer_pipeline_config(args)
+    _install_tokenizer_thread_env(pipeline_config)
     precision_config = _resolve_precision_config(args, device)
     cache_config = _resolve_token_window_cache_config(args)
     tokenizer_path_config = _resolve_tokenizer_path_config(args)
@@ -1600,7 +2039,7 @@ def main() -> None:
         raise ValueError("--verify-only cannot be combined with --probe-only")
 
     log.info(
-        "infer_domain_semantics config: device=%s chunk_batch_size=%s max_total_tokens=%s verify_only=%s probe_only=%s probe_max_chunks=%s domains=%s bf16=%s autocast=%s tf32=%s tokenizer_hotpath=%s token_window_cache=%s cache_dir=%s cache_version=%s cache_shard_size=%s",
+        "infer_domain_semantics config: device=%s chunk_batch_size=%s max_total_tokens=%s verify_only=%s probe_only=%s probe_max_chunks=%s domains=%s bf16=%s autocast=%s tf32=%s tokenizer_hotpath=%s token_window_cache=%s cache_dir=%s cache_version=%s cache_shard_size=%s tokenizer_parallelism=%s tokenizer_threads_per_worker=%s tokenizer_total_threads=%s prefetch_batches=%s pin_memory=%s non_blocking_h2d=%s async_prefetch=%s cpu_cores_available=%s cpu_cores_reserved=%s",
         device,
         chunk_batch_size,
         MAX_TOTAL_TOKENS,
@@ -1616,6 +2055,15 @@ def main() -> None:
         cache_config.cache_dir,
         cache_config.version,
         cache_config.shard_size,
+        pipeline_config.tokenizer_parallelism_enabled,
+        pipeline_config.tokenizer_threads_per_worker,
+        pipeline_config.tokenizer_total_threads,
+        pipeline_config.prefetch_batches,
+        pipeline_config.pin_memory,
+        pipeline_config.non_blocking_h2d,
+        pipeline_config.async_prefetch_enabled,
+        pipeline_config.cpu_cores_available,
+        pipeline_config.cpu_cores_reserved,
     )
 
     tokenizer, model = _load_sentence_embed_model(device)
@@ -1638,6 +2086,7 @@ def main() -> None:
                 cache_config=cache_config,
                 precision_config=precision_config,
                 tokenizer_path_config=tokenizer_path_config,
+                pipeline_config=pipeline_config,
                 domain_specs=domain_specs,
             )
             log.info("[verify][%s] %s", dataset, json.dumps(report, ensure_ascii=False, sort_keys=True))
@@ -1655,6 +2104,7 @@ def main() -> None:
             cache_config=cache_config,
             precision_config=precision_config,
             tokenizer_path_config=tokenizer_path_config,
+            pipeline_config=pipeline_config,
             domain_specs=domain_specs,
             probe_config=probe_config,
         )

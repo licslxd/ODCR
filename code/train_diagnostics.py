@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from train_logging import ROUTE_DETAIL, ROUTE_SUMMARY, log_route_extra
+from odcr_core.file_atomic import atomic_torch_save, atomic_write_json
 from odcr_core.training_diagnostics import odcr_grad_topk, parse_odcr_finite_check_mode
 
 _LOGGER = logging.getLogger("odcr")
@@ -27,13 +28,23 @@ _LOGGER = logging.getLogger("odcr")
 def odcr_cuda_bf16_autocast_enabled() -> bool:
     """
     CUDA 且 ``torch.cuda.is_bf16_supported()`` 为真时默认启用 bf16 混合精度前向。
-    由 runtime preset 注入 ``ODCR_RUNTIME_PRECISION_MODE`` 控制（bf16/fp16/fp32）；
-    Step3 由 runners 注入 ``ODCR_TRAINING_STAGE=step3`` 强制关闭 bf16。
+    由 resolver 注入的 ``ODCR_RUNTIME_PRECISION_MODE`` 传输值控制（bf16/fp16/fp32）。
     """
-    if (os.environ.get("ODCR_TRAINING_STAGE") or "").strip().lower() == "step3":
+    raw = (os.environ.get("ODCR_RUNTIME_PRECISION_MODE") or "").strip()
+    if not raw:
+        if (os.environ.get("ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON") or "").strip():
+            raise RuntimeError(
+                "缺少 ODCR_RUNTIME_PRECISION_MODE：训练精度必须由 configs/odcr.yaml "
+                "经 resolver 注入，不能从 helper default 或裸 env 决定。"
+            )
         return False
-    v = os.environ.get("ODCR_RUNTIME_PRECISION_MODE", "bf16").strip().lower()
+    v = raw.lower()
+    if v not in ("bf16", "fp16", "fp32"):
+        raise RuntimeError(f"ODCR_RUNTIME_PRECISION_MODE must be bf16/fp16/fp32, got {raw!r}")
     if v in ("fp32", "fp16"):
+        return False
+    amp = (os.environ.get("ODCR_RUNTIME_AMP_AUTOCAST") or "1").strip().lower()
+    if amp in ("0", "false", "no", "off"):
         return False
     if not torch.cuda.is_available():
         return False
@@ -199,8 +210,6 @@ def log_grad_monitor(
     warn_norm: Optional[float] = None,
     grad_norm_pre_clip: Optional[float] = None,
     grad_norm_post_clip: Optional[float] = None,
-    current_accum: Optional[int] = None,
-    is_tail_window: Optional[bool] = None,
     skip_param_topk: bool = False,
 ) -> None:
     if logger is None:
@@ -222,10 +231,6 @@ def log_grad_monitor(
         f"grad_norm_pre_clip={pre_v:.6g}",
         f"grad_norm_post_clip={post_v:.6g}",
     ]
-    if current_accum is not None:
-        parts.append(f"current_accum={int(current_accum)}")
-    if is_tail_window is not None:
-        parts.append(f"is_tail_window={bool(is_tail_window)}")
     if not skip_param_topk and topk > 0:
         tops = grad_topk_param_norms(model, topk)
         if tops:
@@ -256,7 +261,7 @@ def odcr_save_checkpoint(
     d = os.path.dirname(p)
     if d:
         os.makedirs(d, exist_ok=True)
-    torch.save(state_dict, p)
+    atomic_torch_save(p, state_dict)
     if not os.path.isfile(p):
         raise RuntimeError(f"[Checkpoint] save failed: file missing after torch.save: {p}")
     sz = os.path.getsize(p)
@@ -270,8 +275,7 @@ def odcr_save_checkpoint(
                 "checkpoint_size_bytes": int(sz),
             }
             payload.update(metadata)
-            with open(meta_path, "w", encoding="utf-8") as mf:
-                json.dump(payload, mf, ensure_ascii=False, indent=2, default=str)
+            atomic_write_json(meta_path, payload)
         except Exception:
             pass
     if is_last:

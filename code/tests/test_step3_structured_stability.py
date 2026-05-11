@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import sys
 import unittest
@@ -13,21 +14,65 @@ sys.path.insert(0, _CODE_DIR)
 
 from executors.step3_train_core import (  # noqa: E402
     Model,
-    compose_step3_structured_loss,
-    parse_step3_structured_loss_weights,
+    STEP3_TOTAL_LOSS_COMPONENT_KEYS,
+    Step3ForwardOutput,
+    compose_step3_loss_from_forward_output,
+    duplicate_step3_loss_check,
     step3_global_finite_decision_from_local,
+    step3_sync_loss_bundle_finite_status,
+    summarize_step3_profile_buffers,
+    validate_step3_graph_safety_preflight,
 )
 from odcr_core.odcr_losses import (  # noqa: E402
-    anchor_score_alignment_loss,
     build_orthogonal_losses,
-    cosine_pull_loss,
-    domain_style_prototype_separation,
-    residual_l2_penalty,
     shared_invariance_loss,
-    shared_prototype_pull_loss,
     specific_separation_loss,
     variance_floor_loss,
 )
+
+
+class _Cfg:
+    step3_structured_loss_weights_json = json.dumps(
+        {
+            "orthogonal": {"weight": 0.20, "xcov_weight": 1.0, "cosine_weight": 0.25},
+            "variance_weight": 0.10,
+            "shared_invariance_weight": 0.18,
+            "specific_separation_weight": 0.16,
+            "anchor_alignment_weight": 0.08,
+            "content_alignment_weight": 0.12,
+            "style_alignment_weight": 0.12,
+            "shared_prototype_weight": 0.08,
+            "domain_style_alignment_weight": 0.06,
+            "local_style_alignment_weight": 0.06,
+            "polarity_alignment_weight": 0.05,
+            "residual_specific_weight": 0.025,
+            "prototype_separation_weight": 0.04,
+            "light_explainer_weight": 0.03,
+        },
+        sort_keys=True,
+    )
+    step3_loss_semantics_json = json.dumps(
+        {
+            "specific_separation_margin": 0.6,
+            "variance_target_std": 0.7,
+            "variance_eps": 1e-4,
+            "orthogonal_eps": 1e-8,
+            "cosine_eps": 1e-8,
+            "sample_weight_eps": 1e-6,
+            "prototype_separation_eps": 1e-8,
+            "quality_weight": {
+                "evidence_base": 0.55,
+                "evidence_scale": 0.45,
+                "anchor_base": 0.40,
+                "anchor_scale": 0.60,
+            },
+        },
+        sort_keys=True,
+    )
+
+
+class _Batch:
+    pass
 
 
 def _build_model() -> Model:
@@ -57,7 +102,7 @@ def _build_model() -> Model:
     )
 
 
-def _synthetic_loss_bundle(model: Model) -> tuple[torch.Tensor, dict[str, float]]:
+def _synthetic_forward_batch(model: Model) -> tuple[Step3ForwardOutput, _Batch]:
     torch.manual_seed(17)
     bsz, seq_len = 8, 12
     user = torch.randint(0, 16, (bsz,))
@@ -74,7 +119,7 @@ def _synthetic_loss_bundle(model: Model) -> tuple[torch.Tensor, dict[str, float]
     polarity_ids = torch.randint(0, 3, (bsz,))
     evidence_quality = torch.rand(bsz)
 
-    pred_rating, _, word_dist, _, _ = model(
+    out = model(
         user,
         item,
         tgt,
@@ -88,57 +133,90 @@ def _synthetic_loss_bundle(model: Model) -> tuple[torch.Tensor, dict[str, float]
         polarity_ids=polarity_ids,
         evidence_quality_prior=evidence_quality,
     )
-    lat = model.last_odcr_latents
-    q_w = (0.55 + 0.45 * evidence_quality.clamp(0.0, 1.0)).detach()
-    q_content = q_w * (0.40 + 0.60 * content_anchor.clamp(0.0, 1.0))
-    q_style = q_w * (0.40 + 0.60 * style_anchor.clamp(0.0, 1.0))
+    self_batch = _Batch()
+    self_batch.rating = rating
+    self_batch.tgt_output = tgt
+    self_batch.domain_idx = domain
+    self_batch.content_anchor_score = content_anchor
+    self_batch.style_anchor_score = style_anchor
+    self_batch.evidence_quality_prior = evidence_quality
+    return out, self_batch
 
-    l_anchor_sh = anchor_score_alignment_loss(lat.anchor_pred_content, content_anchor, sample_weight=q_content)
-    l_anchor_sp = anchor_score_alignment_loss(lat.anchor_pred_style, style_anchor, sample_weight=q_style)
-    l_content_align = cosine_pull_loss(lat.shared_latent, lat.content_evidence_target, sample_weight=q_content)
-    l_style_align = cosine_pull_loss(lat.specific_latent, lat.style_evidence_target, sample_weight=q_style)
-    l_shared_proto = shared_prototype_pull_loss(lat.shared_latent, lat.shared_prototype, sample_weight=q_content)
-    l_domain_style_align = cosine_pull_loss(lat.domain_style_component, lat.domain_style_target, sample_weight=q_style)
-    l_local_style_align = cosine_pull_loss(lat.residual_local, lat.local_style_target, sample_weight=q_style)
-    l_polarity_align = cosine_pull_loss(lat.specific_latent, lat.polarity_target, sample_weight=q_style)
-    l_residual = residual_l2_penalty(lat.residual_local)
-    l_proto = domain_style_prototype_separation(model.odcr_disentangler.domain_style_proto.weight)
-    l_rating = model.rating_loss_fn(pred_rating, rating)
-    l_explainer = 0.15 * model.exp_loss_fn(word_dist.view(-1, model.ntoken), tgt.reshape(-1))
-    orth = build_orthogonal_losses(lat.shared_latent, lat.specific_latent)
-    var = variance_floor_loss(lat.shared_latent, lat.specific_latent)
-    l_shared_inv = shared_invariance_loss(lat.shared_latent, domain)
-    l_specific_sep = specific_separation_loss(lat.specific_latent, domain)
 
-    loss = (
-        l_rating
-        + 0.2 * l_explainer
-        + 0.2 * orth.loss_ortho_total
-        + 0.10 * var.loss_var_total
-        + 0.18 * l_shared_inv
-        + 0.16 * l_specific_sep
-        + 0.08 * l_anchor_sh
-        + 0.08 * l_anchor_sp
-        + 0.12 * l_content_align
-        + 0.12 * l_style_align
-        + 0.08 * l_shared_proto
-        + 0.06 * l_domain_style_align
-        + 0.06 * l_local_style_align
-        + 0.05 * l_polarity_align
-        + 0.025 * l_residual
-        + 0.04 * l_proto
+def _synthetic_loss_bundle(model: Model) -> tuple[torch.Tensor, dict[str, float]]:
+    out, self_batch = _synthetic_forward_batch(model)
+    bundle = compose_step3_loss_from_forward_output(
+        forward_output=out,
+        batch=self_batch,
+        final_cfg=_Cfg(),
     )
+    validate_step3_graph_safety_preflight(
+        forward_output=out,
+        loss_bundle=bundle,
+        underlying_model=model,
+        ctx="unit",
+    )
+    loss = bundle.total_loss
     stats = {
         "loss_total": float(loss.detach().item()),
-        "ortho_xcov": float(orth.loss_ortho_xcov.detach().item()),
-        "var_total": float(var.loss_var_total.detach().item()),
-        "shared_std_mean": float(var.shared_std_mean.detach().item()),
-        "specific_std_mean": float(var.specific_std_mean.detach().item()),
+        "ortho_xcov": float(bundle.diagnostics["L_orthogonal_xcov"].detach().item()),
+        "var_total": float(bundle.components["L_variance"].detach().item()),
+        "shared_std_mean": float(bundle.diagnostics["shared_std_mean"].detach().item()),
+        "specific_std_mean": float(bundle.diagnostics["specific_std_mean"].detach().item()),
     }
     return loss, stats
 
 
 class TestStep3StructuredStability(unittest.TestCase):
+    def test_forward_returns_step3_output_and_detached_debug_latents(self) -> None:
+        model = _build_model()
+        bsz, seq_len = 4, 6
+        out = model(
+            torch.randint(0, 16, (bsz,)),
+            torch.randint(0, 20, (bsz,)),
+            torch.randint(1, 100, (bsz, seq_len)),
+            torch.randint(0, 2, (bsz,)),
+            content_anchor=torch.rand(bsz),
+            style_anchor=torch.rand(bsz),
+            content_evidence_ids=torch.randint(0, 100, (bsz, 24)),
+            style_evidence_ids=torch.randint(0, 100, (bsz, 24)),
+            domain_style_anchor_ids=torch.randint(0, 100, (bsz, 24)),
+            local_style_hint_ids=torch.randint(0, 100, (bsz, 24)),
+            polarity_ids=torch.randint(0, 3, (bsz,)),
+            evidence_quality_prior=torch.rand(bsz),
+        )
+        self.assertIsInstance(out, Step3ForwardOutput)
+        for key in ("shared_prototype", "domain_style_proto", "shared_latent", "specific_latent"):
+            self.assertIn(key, out.structured_loss_inputs)
+            self.assertTrue(out.structured_loss_inputs[key].requires_grad)
+        self.assertIsNotNone(model.last_odcr_latents)
+        self.assertFalse(model.last_odcr_latents.shared_prototype.requires_grad)
+        self.assertFalse(model.last_shared_proj.requires_grad)
+
+    def test_profile_domain_artifacts_are_frozen_buffers(self) -> None:
+        model = _build_model()
+        summary = summarize_step3_profile_buffers(model)
+        self.assertTrue(summary["profile_domain_requires_grad_false"])
+        self.assertTrue(summary["profile_domain_not_trainable_parameters"])
+        self.assertGreater(summary["profile_domain_memory_bytes"], 0)
+        params = dict(model.named_parameters())
+        for name in (
+            "domain_content_profiles",
+            "domain_style_profiles",
+            "user_content_profiles",
+            "user_style_profiles",
+            "item_content_profiles",
+            "item_style_profiles",
+        ):
+            self.assertNotIn(name, params)
+            self.assertIn(name, dict(model.named_buffers()))
+
+    def test_duplicate_loss_check_detects_semantic_duplicates(self) -> None:
+        clean = duplicate_step3_loss_check(STEP3_TOTAL_LOSS_COMPONENT_KEYS)
+        self.assertEqual(clean["status"], "unique_semantic_components")
+        dup = duplicate_step3_loss_check(["L_rating_shared", "L_rating_shared"])
+        self.assertEqual(dup["duplicates"], ["L_rating_shared"])
+
     def test_global_finite_decision_helper_is_all_rank_min(self) -> None:
         self.assertTrue(step3_global_finite_decision_from_local(True, world_size=1))
         self.assertTrue(
@@ -148,6 +226,15 @@ class TestStep3StructuredStability(unittest.TestCase):
                 reduce_min=lambda local: min(local, 1),
             )
         )
+
+    def test_loss_bundle_finite_status_has_single_vector_sync_contract(self) -> None:
+        model = _build_model()
+        out, batch = _synthetic_forward_batch(model)
+        bundle = compose_step3_loss_from_forward_output(forward_output=out, batch=batch, final_cfg=_Cfg())
+        sync = step3_sync_loss_bundle_finite_status(bundle, world_size=1)
+        self.assertTrue(sync["global_total_finite"])
+        self.assertEqual(sync["sync_method"], "single_all_reduce_min_vector")
+        self.assertEqual(set(sync["global_component_finite_status"]), set(STEP3_TOTAL_LOSS_COMPONENT_KEYS))
         self.assertFalse(
             step3_global_finite_decision_from_local(
                 True,
@@ -178,52 +265,18 @@ class TestStep3StructuredStability(unittest.TestCase):
         self.assertTrue(torch.equal(specific.grad, torch.zeros_like(specific.grad)))
 
     def test_structured_loss_weight_config_changes_weighted_loss(self) -> None:
-        base = {
-            "orthogonal": {"weight": 0.20, "xcov_weight": 1.0, "cosine_weight": 0.25},
-            "variance_weight": 0.10,
-            "shared_invariance_weight": 0.18,
-            "specific_separation_weight": 0.16,
-            "anchor_alignment_weight": 0.08,
-            "content_alignment_weight": 0.12,
-            "style_alignment_weight": 0.12,
-            "shared_prototype_weight": 0.08,
-            "domain_style_alignment_weight": 0.06,
-            "local_style_alignment_weight": 0.06,
-            "polarity_alignment_weight": 0.05,
-            "residual_specific_weight": 0.025,
-            "prototype_separation_weight": 0.04,
-            "light_explainer_weight": 0.03,
-        }
-        changed = {**base, "content_alignment_weight": 0.50}
-        terms = {
-            "rating_shared": torch.tensor(1.0),
-            "light_explainer": torch.tensor(2.0),
-            "orthogonal_total": torch.tensor(3.0),
-            "variance_total": torch.tensor(4.0),
-            "shared_invariance": torch.tensor(5.0),
-            "specific_separation": torch.tensor(6.0),
-            "anchor_shared": torch.tensor(7.0),
-            "anchor_specific": torch.tensor(8.0),
-            "content_alignment": torch.tensor(9.0),
-            "style_alignment": torch.tensor(10.0),
-            "shared_prototype": torch.tensor(11.0),
-            "domain_style_alignment": torch.tensor(12.0),
-            "local_style_alignment": torch.tensor(13.0),
-            "polarity_alignment": torch.tensor(14.0),
-            "residual_specific": torch.tensor(15.0),
-            "prototype_separation": torch.tensor(16.0),
-        }
-        loss_base = compose_step3_structured_loss(
-            weights=parse_step3_structured_loss_weights(base),
-            **terms,
-        )
-        loss_changed = compose_step3_structured_loss(
-            weights=parse_step3_structured_loss_weights(changed),
-            **terms,
-        )
+        class _CfgChanged(_Cfg):
+            _weights = json.loads(_Cfg.step3_structured_loss_weights_json)
+            _weights["content_alignment_weight"] = 0.50
+            step3_structured_loss_weights_json = json.dumps(_weights, sort_keys=True)
+
+        model = _build_model()
+        out, batch = _synthetic_forward_batch(model)
+        base = compose_step3_loss_from_forward_output(forward_output=out, batch=batch, final_cfg=_Cfg())
+        changed = compose_step3_loss_from_forward_output(forward_output=out, batch=batch, final_cfg=_CfgChanged())
         self.assertAlmostEqual(
-            float(loss_changed - loss_base),
-            float((0.50 - 0.12) * terms["content_alignment"]),
+            float((changed.total_loss - base.total_loss).detach().item()),
+            float((0.50 - 0.12) * base.components["L_content_alignment"].detach().item()),
             places=6,
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -14,6 +15,12 @@ import data_contract as dc  # noqa: E402
 import preprocess_data as pp  # noqa: E402
 import split_data  # noqa: E402
 from odcr_core.preprocess_metadata import csv_header_metadata  # noqa: E402
+from odcr_core.preprocess_schema import (  # noqa: E402
+    PREPROCESS_C_DOMAIN_CONTRACT_VERSION,
+    preprocess_b_expected_shape_dtype,
+    preprocess_c_expected_shape_dtype,
+    render_preprocess_stage_contract,
+)
 from odcr_core.training_checkpoint import stable_hash  # noqa: E402
 
 
@@ -46,6 +53,38 @@ def _processed_df() -> pd.DataFrame:
 
 
 class TestPreprocessContractCleanup(unittest.TestCase):
+    def test_preprocess_b_profile_contract_remains_entity_matrix(self) -> None:
+        expected = preprocess_b_expected_shape_dtype()
+        contract = render_preprocess_stage_contract("preprocess_b")
+        self.assertEqual(expected["shape"], "[entity_count, env.embed_dim]")
+        self.assertEqual(expected["dtype"], "float32")
+        for name in (
+            "user_content_profiles.npy",
+            "user_style_profiles.npy",
+            "item_content_profiles.npy",
+            "item_style_profiles.npy",
+        ):
+            self.assertEqual(
+                contract["output_artifact_contract"][name]["shape"],
+                ["entity_count", "env.embed_dim"],
+            )
+
+    def test_preprocess_c_domain_contract_is_embed_dim_vector(self) -> None:
+        expected = preprocess_c_expected_shape_dtype()
+        contract = render_preprocess_stage_contract("preprocess_c")
+        self.assertEqual(expected["shape"], "[env.embed_dim]")
+        self.assertEqual(expected["dtype"], "float32")
+        self.assertEqual(expected["contract_version"], PREPROCESS_C_DOMAIN_CONTRACT_VERSION)
+        self.assertEqual(contract["domain_shape_contract_version"], PREPROCESS_C_DOMAIN_CONTRACT_VERSION)
+        for name in ("domain_content.npy", "domain_style.npy"):
+            self.assertEqual(contract["output_artifact_contract"][name]["shape"], ["env.embed_dim"])
+            self.assertEqual(contract["output_artifact_contract"][name]["dtype"], "float32")
+        rendered = json.dumps(contract, sort_keys=True)
+        self.assertNotIn("[row_count, env.embed_dim]", rendered)
+        self.assertNotIn("[token_window_count, env.embed_dim]", rendered)
+        self.assertNotIn("[nitems, env.embed_dim]", rendered)
+        self.assertNotIn("[nusers, env.embed_dim]", rendered)
+
     def test_retired_detail_fields_are_not_contract_columns(self) -> None:
         retired = set(dc.DEPRECATED_PREPROCESS_DETAIL_COLUMNS)
         posterior = set(dc.STEP4_POSTERIOR_ROUTE_COLUMNS)

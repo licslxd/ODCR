@@ -135,6 +135,8 @@ class TestPreprocessBPrecision(unittest.TestCase):
             "preprocess.c.cache_stale_policy",
         ):
             self.assertIn(key, keys_c)
+        self.assertEqual(cfg_c.token_window_cache_shard_size, 4096)
+        self.assertEqual(runtime_c.stage_metadata["stage_specific"]["token_window_cache_shard_size"], 4096)
 
     def test_preprocess_a_metadata_records_internal_chunk_size(self) -> None:
         cfg = build_preprocess_config(

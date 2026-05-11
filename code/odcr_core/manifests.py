@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,6 +28,8 @@ MANIFEST_SCHEMA_VERSION = "4.5"
 MANIFEST_FILENAME = "manifest.json"
 RESOLVED_CONFIG_FILENAME = "resolved_config.json"
 SOURCE_TABLE_FILENAME = "source_table.json"
+SOURCE_TABLE_VERBOSE_FILENAME = "source_table_verbose.json"
+TRAINING_RUNTIME_CONFIG_FILENAME = "training_runtime_config.json"
 RUN_SUMMARY_FILENAME = "run_summary.json"
 CONSOLE_LOG_FILENAME = "console.log"
 FULL_LOG_FILENAME = "full.log"
@@ -35,11 +38,52 @@ SAMPLES_LOG_FILENAME = "samples.jsonl"
 LATEST_FILENAME = "latest.json"
 RUN_SUMMARY_SCHEMA_VERSION = "1.0"
 SOURCE_TABLE_SCHEMA_VERSION = "1.0"
+FORMAL_VIEW_SCHEMA_VERSION = "odcr_formal_config_view/1"
+TRAINING_RUNTIME_CONFIG_SCHEMA_VERSION = "odcr_training_runtime_config/1"
 OPTIONAL_ARTIFACT_REASONS = {
     "errors_log": "no_error",
     "debug_log": "debug_disabled",
     "samples_log": "samples_not_requested",
+    "training_runtime_config": "optional_missing_with_reason",
 }
+
+_STEP3_FORMAL_VIEW_KEYS = (
+    "task",
+    "hardware",
+    "train",
+    "step3_structured_losses",
+    "step3_loss_semantics",
+    "step3_ddp",
+    "step3_task_profile",
+    "step3_optimizer",
+    "step3_precision",
+    "step3_tokenizer",
+    "step3_evidence",
+    "step3_scheduler",
+    "step3_eval",
+    "step3_worker_profiles",
+    "step3_prefetcher",
+    "step3_cross_rank_structured_gather",
+    "step3_memory",
+    "step3_timing",
+    "step3_cache_policy",
+    "runtime_env",
+    "run",
+    "active_stage_status",
+    "roots",
+    "models",
+    "embed_dim",
+    "offline",
+    "local_files_only",
+)
+
+_STEP3_FORMAL_SOURCE_EXCLUDE_PARTS = (
+    "backup",
+    "exploration",
+    "step5",
+    "decode",
+    "rerank",
+)
 
 
 def _utc_now() -> str:
@@ -76,6 +120,113 @@ def _artifact_exists(repo_root: Path, value: Any) -> bool:
     else:
         path = path.resolve()
     return path.exists()
+
+
+def _artifact_hash(repo_root: Path, value: Any) -> str | None:
+    if not isinstance(value, (str, Path)):
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (repo_root / path).resolve()
+    else:
+        path = path.resolve()
+    if not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read_text_if_file(path: Path, *, max_chars: int = 2_000_000) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+def _extract_failure_root_signature(
+    *,
+    meta: Path,
+    latest_error: str | None,
+    repo_root: Path,
+    checkpoint_path: str | Path | None,
+) -> dict[str, Any]:
+    text = "\n".join(
+        _read_text_if_file(meta / name)
+        for name in ("errors.log", FULL_LOG_FILENAME, CONSOLE_LOG_FILENAME, DEBUG_LOG_FILENAME)
+    )
+    cache_key_match = re.search(r"\[Tokenize\].*?fingerprint=([^|\s]+).*?cache_dir=([^|\n]+)", text)
+    nccl_match = re.search(
+        r"WorkNCCL\(SeqNum=(?P<seq>\d+),\s*OpType=(?P<op>[^,\)]+),\s*"
+        r"NumelIn=(?P<numel_in>\d+),\s*NumelOut=(?P<numel_out>\d+),\s*"
+        r"Timeout\(ms\)=(?P<timeout>\d+)\)",
+        text,
+    )
+    rank_match = re.search(r"rank\s*[:=]\s*(\d+).*?local_rank\s*[:=]\s*(\d+)", text, flags=re.IGNORECASE | re.DOTALL)
+    progress_matches = re.findall(r"Tokenize \(num_proc=\d+\):\s+\d+%.*?\|\s*(\d+)/(\d+)", text)
+    details: dict[str, Any] = {
+        "failure_phase": "unknown",
+        "fatal_signature": str(latest_error or "").strip(),
+        "fatal_source": "latest_error",
+        "training_loop_started": any(token in text for token in ("[Epoch Summary]", "[Train/no_accum]", "n_optimizer_steps=")),
+        "checkpoint_created": bool(checkpoint_path and _artifact_exists(repo_root, checkpoint_path)),
+    }
+    if "Tokenize" in text or cache_key_match:
+        details["failure_phase"] = "tokenization_cache"
+    eval_runtime_seen = any(
+        token in text
+        for token in (
+            "executors/step3_entry.py eval",
+            "Step3 eval",
+            "Step 3 two-phase eval",
+            '"mode": "eval_ddp',
+            "eval_ddp_gpu_inference_phase",
+        )
+    )
+    if nccl_match:
+        details["failure_phase"] = "post_train_eval" if eval_runtime_seen else ("tokenization_cache" if "Tokenize" in text else "ddp_startup")
+        details["fatal_source"] = "logs"
+        details["fatal_signature"] = nccl_match.group(0)
+        details["nccl"] = {
+            "seq_num": int(nccl_match.group("seq")),
+            "op_type": nccl_match.group("op"),
+            "numel_in": int(nccl_match.group("numel_in")),
+            "numel_out": int(nccl_match.group("numel_out")),
+            "timeout_ms": int(nccl_match.group("timeout")),
+        }
+    if rank_match:
+        details["rank"] = int(rank_match.group(1))
+        details["local_rank"] = int(rank_match.group(2))
+    if progress_matches:
+        cur, total = progress_matches[-1]
+        details["tokenization_progress"] = {"current": int(cur), "total": int(total)}
+    if cache_key_match:
+        details["cache_key"] = cache_key_match.group(1).strip()
+        details["cache_dir"] = cache_key_match.group(2).strip()
+        cdir = Path(details["cache_dir"]).expanduser()
+        details["cache_status"] = "completed" if (cdir / "cache_manifest.json").is_file() else "failed_or_missing"
+    startup = meta / "step3_tokenizer_cache_startup.json"
+    if startup.is_file():
+        try:
+            startup_payload = json.loads(startup.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            startup_payload = {}
+        if isinstance(startup_payload, Mapping):
+            details["cache_status"] = startup_payload.get("status") or details.get("cache_status")
+            details["cache_dir"] = startup_payload.get("cache_dir") or details.get("cache_dir")
+            details["cache_key"] = startup_payload.get("cache_key") or details.get("cache_key")
+            details["startup_cache_payload_path"] = _repo_relative(repo_root, startup)
+    return details
 
 
 def _artifact_optional_record(repo_root: Path, key: str, value: Any, *, latest_error: str | None) -> dict[str, Any]:
@@ -115,6 +266,14 @@ def source_table_path(meta_dir: str | Path) -> Path:
     return Path(meta_dir).expanduser().resolve() / SOURCE_TABLE_FILENAME
 
 
+def source_table_verbose_path(meta_dir: str | Path) -> Path:
+    return Path(meta_dir).expanduser().resolve() / SOURCE_TABLE_VERBOSE_FILENAME
+
+
+def training_runtime_config_path(meta_dir: str | Path) -> Path:
+    return Path(meta_dir).expanduser().resolve() / TRAINING_RUNTIME_CONFIG_FILENAME
+
+
 def run_summary_path(meta_dir: str | Path) -> Path:
     return Path(meta_dir).expanduser().resolve() / RUN_SUMMARY_FILENAME
 
@@ -123,11 +282,91 @@ def latest_pointer_path(stage_unit_dir: str | Path) -> Path:
     return Path(stage_unit_dir).expanduser().resolve() / LATEST_FILENAME
 
 
+def _is_step3_snapshot(snapshot: Mapping[str, Any]) -> bool:
+    train = snapshot.get("train")
+    if not isinstance(train, Mapping):
+        return False
+    return str(train.get("stage") or "").strip() == "step3"
+
+
+def _formal_field_sources(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    raw = snapshot.get("field_sources")
+    field_sources = dict(raw) if isinstance(raw, Mapping) else {}
+    if not _is_step3_snapshot(snapshot):
+        return field_sources
+    out: dict[str, Any] = {}
+    for key, value in field_sources.items():
+        text = f"{key} {value}".lower()
+        if any(part in text for part in _STEP3_FORMAL_SOURCE_EXCLUDE_PARTS):
+            continue
+        out[key] = value
+    return out
+
+
+def _strip_formal_probe_markers(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_formal_probe_markers(item)
+            for key, item in value.items()
+            if key != "probe_only"
+        }
+    if isinstance(value, list):
+        return [_strip_formal_probe_markers(item) for item in value]
+    return value
+
+
+def formal_snapshot_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the default user-facing formal view for ``odcr show`` and dry-run."""
+    if not _is_step3_snapshot(snapshot):
+        return dict(snapshot)
+    out: dict[str, Any] = {
+        "view_schema_version": FORMAL_VIEW_SCHEMA_VERSION,
+        "view": "formal",
+    }
+    for key in _STEP3_FORMAL_VIEW_KEYS:
+        if key in snapshot and snapshot.get(key) is not None:
+            if key == "models" and isinstance(snapshot.get(key), Mapping):
+                models = dict(snapshot.get(key) or {})
+                source = models.get("source") if isinstance(models.get("source"), Mapping) else {}
+                out[key] = {
+                    "sentence_embed_model": models.get("sentence_embed_model"),
+                    "source": {"sentence_embed_model": source.get("sentence_embed_model")},
+                }
+            elif key == "step3_task_profile" and isinstance(snapshot.get(key), Mapping):
+                profile = dict(snapshot.get(key) or {})
+                profile.pop("formal_allowed", None)
+                profile.pop("probe_only", None)
+                out[key] = _strip_formal_probe_markers(profile)
+            elif key == "step3_cache_policy" and isinstance(snapshot.get(key), Mapping):
+                cache_policy = dict(snapshot.get(key) or {})
+                cache_policy.pop("probe_cache_namespace", None)
+                out[key] = _strip_formal_probe_markers(cache_policy)
+            else:
+                out[key] = _strip_formal_probe_markers(snapshot.get(key))
+    out["field_sources"] = _formal_field_sources(snapshot)
+    return out
+
+
 def build_source_table_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     raw = snapshot.get("field_sources")
     field_sources = dict(raw) if isinstance(raw, Mapping) else {}
     return {
         "source_table_schema_version": SOURCE_TABLE_SCHEMA_VERSION,
+        "view": "verbose",
+        "generated_at_utc": _utc_now(),
+        "field_sources": field_sources,
+        "records": [
+            {"key": str(key), "source": value}
+            for key, value in sorted(field_sources.items(), key=lambda item: str(item[0]))
+        ],
+    }
+
+
+def build_formal_source_table_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    field_sources = _formal_field_sources(snapshot)
+    return {
+        "source_table_schema_version": SOURCE_TABLE_SCHEMA_VERSION,
+        "view": "formal",
         "generated_at_utc": _utc_now(),
         "field_sources": field_sources,
         "records": [
@@ -142,14 +381,36 @@ def write_resolved_config_artifacts(
     snapshot: Mapping[str, Any],
     *,
     source_table: Mapping[str, Any] | None = None,
+    formal_only_source_table: bool = False,
+    write_verbose_source_table: bool = False,
 ) -> tuple[Path, Path]:
     meta = Path(meta_dir).expanduser().resolve()
     config_path = resolved_config_path(meta)
     source_path = source_table_path(meta)
-    source_payload = dict(source_table) if source_table is not None else build_source_table_snapshot(snapshot)
+    if source_table is not None:
+        source_payload = dict(source_table)
+    elif formal_only_source_table:
+        source_payload = build_formal_source_table_snapshot(snapshot)
+    else:
+        source_payload = build_source_table_snapshot(snapshot)
     atomic_write_json(config_path, dict(snapshot))
     atomic_write_json(source_path, source_payload)
+    if write_verbose_source_table and formal_only_source_table:
+        atomic_write_json(source_table_verbose_path(meta), build_source_table_snapshot(snapshot))
     return config_path, source_path
+
+
+def write_training_runtime_config_artifact(
+    meta_dir: str | Path,
+    runtime_snapshot: Mapping[str, Any],
+) -> Path:
+    meta = Path(meta_dir).expanduser().resolve()
+    payload = dict(runtime_snapshot)
+    payload.setdefault("training_runtime_config_schema_version", TRAINING_RUNTIME_CONFIG_SCHEMA_VERSION)
+    payload.setdefault("generated_at_utc", _utc_now())
+    out = training_runtime_config_path(meta)
+    atomic_write_json(out, payload)
+    return out
 
 
 def build_run_summary(
@@ -195,6 +456,7 @@ def build_run_summary(
         "errors_log": errors_log_path,
         "debug_log": meta / DEBUG_LOG_FILENAME,
         "samples_log": meta / SAMPLES_LOG_FILENAME,
+        "training_runtime_config": training_runtime_config_path(meta),
     }
     artifact_map.update(dict(key_artifacts or {}))
     key_artifact_payload: dict[str, Any] = {}
@@ -211,6 +473,10 @@ def build_run_summary(
         key_artifact_payload[str(key)] = (
             _repo_relative(root, value) if isinstance(value, (str, Path)) else value
         )
+    runtime_config = training_runtime_config_path(meta)
+    runtime_config_exists = runtime_config.is_file()
+    runtime_config_rel = _repo_relative(root, runtime_config) if runtime_config_exists else None
+    runtime_config_hash = _artifact_hash(root, runtime_config) if runtime_config_exists else None
     payload = {
         "run_summary_schema_version": RUN_SUMMARY_SCHEMA_VERSION,
         "run_id": str(run_id),
@@ -227,10 +493,17 @@ def build_run_summary(
         "run_dir": _repo_relative(root, run_root),
         "meta_dir": _repo_relative(root, meta),
         "resolved_config_path": _repo_relative(root, resolved_config_path(meta)),
+        "resolved_config_hash": _artifact_hash(root, resolved_config_path(meta)),
+        "training_runtime_config_path": runtime_config_rel,
+        "training_runtime_config_hash": runtime_config_hash,
         "source_table_path": _repo_relative(root, source_table_path(meta)),
+        "source_table_hash": _artifact_hash(root, source_table_path(meta)),
+        "source_table_verbose_path": _repo_relative(root, source_table_verbose_path(meta)),
         "console_log_path": _repo_relative(root, console_log_path),
         "full_log_path": _repo_relative(root, full_log_path),
+        "authoritative_full_log_path": _repo_relative(root, full_log_path),
         "errors_log_path": _repo_relative(root, errors_log_path),
+        "debug_log_path": _repo_relative(root, meta / DEBUG_LOG_FILENAME),
         "metrics_path": _repo_relative(root, metrics_path),
         "lineage_path": _repo_relative(root, lineage_path),
         "manifest_path": _repo_relative(root, manifest_path),
@@ -240,7 +513,125 @@ def build_run_summary(
         "validation_status": validation_status,
         "post_edit_scope": post_edit_scope,
     }
+    if canonical_stage_name(stage) == "step3":
+        payload.update(
+            {
+                "quality_status": "not_evaluated",
+                "downstream_ready": False,
+                "quality_block_reasons": [],
+                "quality_warnings": [],
+                "quality_gate_version": "odcr_step3_quality_gate/1",
+                "quality_gate_inputs": {},
+                "selected_downstream_checkpoint": None,
+                "selected_downstream_checkpoint_scope": None,
+                "selected_downstream_checkpoint_epoch": None,
+                "selected_downstream_checkpoint_metric": None,
+                "runtime_evidence": {
+                    "code_present": True,
+                    "active_path": False,
+                    "runtime_verified": False,
+                    "formal_verified": False,
+                },
+            }
+        )
+    if str(status).lower() in {"failed", "partial", "interrupted"}:
+        checkpoint_value = key_artifacts.get("model") if isinstance(key_artifacts, Mapping) else None
+        failure = _extract_failure_root_signature(
+            meta=meta,
+            latest_error=latest_error,
+            repo_root=root,
+            checkpoint_path=checkpoint_value,
+        )
+        payload["failure_root_signature"] = failure
+        payload["failure_phase"] = failure.get("failure_phase")
+        payload["fatal_signature"] = failure.get("fatal_signature")
+        payload["training_loop_started"] = failure.get("training_loop_started")
+        payload["checkpoint_created"] = failure.get("checkpoint_created")
+        if failure.get("cache_status") is not None:
+            payload["cache_status"] = failure.get("cache_status")
+        if failure.get("cache_dir") is not None:
+            payload["cache_dir"] = failure.get("cache_dir")
+        if failure.get("cache_key") is not None:
+            payload["cache_key"] = failure.get("cache_key")
     return payload
+
+
+def _read_step3_eval_status_sidecar(meta: Path) -> dict[str, Any]:
+    path = meta / "step3_eval_status.json"
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _apply_step3_train_eval_status_split(
+    payload: dict[str, Any],
+    *,
+    cfg: ResolvedConfig,
+    meta: Path,
+    status: str,
+    latest_error: str | None,
+    key_artifacts: Mapping[str, Any],
+) -> None:
+    sidecar = _read_step3_eval_status_sidecar(meta)
+    if sidecar:
+        for key in (
+            "train_status",
+            "eval_status",
+            "quality_status",
+            "downstream_ready",
+            "failure_phase",
+            "eval_protocol",
+            "eval_scope",
+            "paper_comparable",
+            "selected_checkpoint",
+            "selected_checkpoint_scope",
+        ):
+            if key in sidecar:
+                payload[key] = sidecar[key]
+        payload["step3_eval_status_sidecar"] = _repo_relative(Path(cfg.repo_root), meta / "step3_eval_status.json")
+        return
+
+    mode = str(getattr(cfg, "step3_mode", "") or "full")
+    status_l = str(status or "").lower()
+    checkpoint_value = key_artifacts.get("model") if isinstance(key_artifacts, Mapping) else None
+    checkpoint_exists = bool(checkpoint_value and _artifact_exists(Path(cfg.repo_root), checkpoint_value))
+    failure_phase = str(payload.get("failure_phase") or "")
+    err = str(latest_error or "")
+    eval_failure = (
+        failure_phase == "post_train_eval"
+        or ("step3_entry.py eval" in err)
+        or (" eval " in err and checkpoint_exists)
+    )
+    payload.setdefault("eval_protocol", getattr(cfg, "step3_eval_protocol", "") or "minimal_eval")
+    payload.setdefault("eval_scope", getattr(cfg, "step3_eval_split", "") or "valid")
+    payload.setdefault("paper_comparable", False)
+    payload.setdefault("selected_checkpoint", _repo_relative(Path(cfg.repo_root), checkpoint_value) if checkpoint_value else None)
+    payload.setdefault("selected_checkpoint_scope", "best_observed")
+    if status_l == "ok":
+        if mode == "train_only":
+            payload.update({"train_status": "completed", "eval_status": "not_requested"})
+        elif mode == "eval_only":
+            payload.update({"train_status": "completed" if checkpoint_exists else "not_run", "eval_status": "completed"})
+        else:
+            payload.update({"train_status": "completed", "eval_status": "completed"})
+    elif status_l in {"failed", "partial", "interrupted"} and eval_failure:
+        payload.update(
+            {
+                "train_status": "completed",
+                "eval_status": "failed",
+                "quality_status": "not_evaluated",
+                "downstream_ready": False,
+                "failure_phase": "post_train_eval",
+            }
+        )
+    elif status_l in {"failed", "partial", "interrupted"}:
+        payload.update({"train_status": "failed", "eval_status": "not_started"})
+    else:
+        payload.update({"train_status": "running", "eval_status": "pending" if mode == "full" else "not_requested"})
 
 
 def write_latest_pointer_json(
@@ -255,12 +646,16 @@ def write_latest_pointer_json(
 ) -> Path:
     root = Path(repo_root).expanduser().resolve()
     payload = {
+        "schema_version": "odcr_latest_pointer/active_stage_status/1",
+        "active_run_id": str(run_id),
         "latest_run_id": str(run_id),
         "latest_run_dir": _repo_relative(root, run_dir),
         "latest_summary_path": _repo_relative(root, summary_path),
-        "latest_status": status,
+        "latest_stage_status_path": _repo_relative(root, Path(run_dir) / "meta" / "stage_status.json"),
         "updated_at": updated_at or _utc_now(),
+        "status_claim_source": "stage_status_strict_verifier",
     }
+    _ = status
     return atomic_write_json(latest_pointer_path(stage_unit_dir), payload)
 
 
@@ -277,15 +672,30 @@ def write_run_summary_json(
     meta = Path(str(meta_dir_value))
     if not meta.is_absolute():
         meta = (root / meta).resolve()
-    out = run_summary_path(meta)
-    atomic_write_json(out, dict(summary))
-    if update_latest:
-        run_dir_value = summary.get("run_dir")
-        if not run_dir_value:
-            raise ValueError("run_summary requires run_dir to update latest.json")
+    run_dir_value = summary.get("run_dir")
+    run_dir = None
+    if run_dir_value:
         run_dir = Path(str(run_dir_value))
         if not run_dir.is_absolute():
             run_dir = (root / run_dir).resolve()
+    out = run_summary_path(meta)
+    atomic_write_json(out, dict(summary))
+    stage = canonical_stage_name(str(summary.get("stage") or ""))
+    stage_status_payload = None
+    if stage in {"step3", "step4", "step5"} and summary.get("task_id") is not None and run_dir is not None:
+        from odcr_core.stage_status import build_and_write_stage_status
+
+        stage_status_payload = build_and_write_stage_status(
+            repo_root=root,
+            stage=stage,
+            task=int(summary.get("task_id")),
+            run_id=str(summary.get("run_id") or run_dir.name),
+        )
+        if stage == "step4" and stage_status_payload.get("downstream_ready") is not True:
+            update_latest = False
+    if update_latest:
+        if run_dir is None:
+            raise ValueError("run_summary requires run_dir to update latest.json")
         write_latest_pointer_json(
             repo_root=root,
             stage_unit_dir=run_dir.parent,
@@ -346,14 +756,23 @@ def build_run_summary_for_config(
     key_artifacts: dict[str, Any] = {
         "manifest": meta / MANIFEST_FILENAME,
         "resolved_config": resolved_config_path(meta),
+        "training_runtime_config": training_runtime_config_path(meta),
         "source_table": source_table_path(meta),
         "console_log": meta / CONSOLE_LOG_FILENAME,
         "full_log": meta / FULL_LOG_FILENAME,
+        "authoritative_full_log": meta / FULL_LOG_FILENAME,
         "debug_log": meta / DEBUG_LOG_FILENAME,
         "samples_log": meta / SAMPLES_LOG_FILENAME,
     }
     if cfg.command in ("step3", "step5", "eval", "eval-rerank"):
         key_artifacts["model"] = path_layout.best_model_path(Path(cfg.checkpoint_dir))
+    if cfg.command == "step3":
+        key_artifacts["source_table_verbose"] = source_table_verbose_path(meta)
+        key_artifacts["metrics"] = meta / path_layout.metrics_filename("metrics")
+        key_artifacts["loss_breakdown"] = meta / path_layout.metrics_filename("loss_breakdown")
+        key_artifacts["timing_profile"] = meta / path_layout.metrics_filename("timing_profile")
+        key_artifacts["gpu_profile"] = meta / path_layout.metrics_filename("gpu_profile")
+        key_artifacts["epoch_summary"] = meta / path_layout.metrics_filename("epoch_summary")
     if cfg.command in ("step4", "step5"):
         try:
             key_artifacts["training_csv"] = train_csv_path(cfg)
@@ -361,7 +780,7 @@ def build_run_summary_for_config(
             pass
     if stage in ("eval", "rerank"):
         key_artifacts["metrics"] = metrics_path
-    return build_run_summary(
+    payload = build_run_summary(
         repo_root=cfg.repo_root,
         run_dir=run_dir,
         meta_dir=meta,
@@ -386,6 +805,29 @@ def build_run_summary_for_config(
         validation_status=validation_status,
         post_edit_scope=post_edit_scope,
     )
+    if cfg.command == "step3":
+        _apply_step3_train_eval_status_split(
+            payload,
+            cfg=cfg,
+            meta=meta,
+            status=status,
+            latest_error=latest_error,
+            key_artifacts=key_artifacts,
+        )
+    if cfg.command in {"step4", "step5", "eval", "eval-rerank"}:
+        if cfg.from_run is not None:
+            payload["from_step3"] = cfg.from_run
+        if cfg.step4_run is not None:
+            payload["from_step4"] = cfg.step4_run
+        if cfg.step5_run is not None:
+            payload["from_step5"] = cfg.step5_run
+        upstream_resolution = getattr(cfg, "upstream_resolution_json", "") or ""
+        if upstream_resolution.strip():
+            try:
+                payload["upstream_resolution"] = json.loads(upstream_resolution)
+            except json.JSONDecodeError:
+                payload["upstream_resolution"] = {"unparsed": upstream_resolution}
+    return payload
 
 
 def write_run_summary_for_config(
@@ -506,14 +948,20 @@ def _manifest_backbones_block(cfg: ResolvedConfig) -> dict[str, Any]:
 
 
 def _manifest_training_runtime_block(cfg: ResolvedConfig) -> dict[str, Any]:
-    return {
+    out = {
         "precision": str(getattr(cfg, "train_precision", "bf16")),
+        "batch_semantics_version": str(getattr(cfg, "batch_semantics_version", "odcr_no_accum/1")),
+        "grad_accum_removed": bool(getattr(cfg, "grad_accum_removed", True)),
+        "global_batch_size": int(getattr(cfg, "global_batch_size", cfg.train_batch_size)),
+        "per_gpu_batch_size": int(getattr(cfg, "per_gpu_batch_size", cfg.per_device_train_batch_size)),
         "per_device_train_batch_size": int(cfg.per_device_train_batch_size),
         "per_device_eval_batch_size": int(getattr(cfg, "per_device_eval_batch_size", 2)),
-        "gradient_accumulation_steps": int(cfg.gradient_accumulation_steps),
         "effective_batch_size": int(cfg.effective_global_batch_size),
         "ddp_world_size": int(cfg.ddp_world_size),
     }
+    if cfg.command == "step3":
+        out["step3_batch_semantics"] = "odcr_no_accum/1"
+    return out
 
 
 def _manifest_peft_block(cfg: ResolvedConfig) -> dict[str, Any]:
@@ -736,16 +1184,39 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         },
         "hyperparameters": {
             "learning_rate": cfg.learning_rate,
-            "coef": cfg.coef,
+            **({} if cfg.command == "step3" else {"coef": cfg.coef}),
             **(
                 {"explainer_loss_weight": cfg.explainer_loss_weight}
                 if cfg.command == "step5"
                 else {}
             ),
+            **(
+                {
+                    "optimizer": json.loads(str(getattr(cfg, "optimizer_config_json", "{}") or "{}")),
+                    "precision": json.loads(str(getattr(cfg, "precision_config_json", "{}") or "{}")),
+                    "tokenizer": json.loads(str(getattr(cfg, "tokenizer_config_json", "{}") or "{}")),
+                    "evidence": json.loads(str(getattr(cfg, "evidence_config_json", "{}") or "{}")),
+                    "scheduler": json.loads(str(getattr(cfg, "scheduler_config_json", "{}") or "{}")),
+                    "valid_batch": json.loads(str(getattr(cfg, "valid_batch_config_json", "{}") or "{}")),
+                    "scenario_profile": json.loads(str(getattr(cfg, "scenario_profile_json", "{}") or "{}")),
+                    "max_grad_norm": getattr(cfg, "max_grad_norm", None),
+                    "validate_every_epochs": getattr(cfg, "validate_every_epochs", None),
+                }
+                if cfg.command == "step3"
+                else {}
+            ),
             **(_training_row_slice_for_manifest(cfg)),
             "train_global_batch_size": cfg.train_batch_size,
             "train_per_device_batch_size": cfg.per_device_train_batch_size,
-            "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+            **(
+                {"step3_batch_semantics": "odcr_no_accum/1"}
+                if cfg.command == "step3"
+                else {}
+            ),
+            "batch_semantics_version": getattr(cfg, "batch_semantics_version", "odcr_no_accum/1"),
+            "grad_accum_removed": bool(getattr(cfg, "grad_accum_removed", True)),
+            "global_batch_size": getattr(cfg, "global_batch_size", cfg.train_batch_size),
+            "per_gpu_batch_size": getattr(cfg, "per_gpu_batch_size", cfg.per_device_train_batch_size),
             "effective_global_batch_size": cfg.effective_global_batch_size,
             "epochs": cfg.epochs,
             "num_proc": cfg.num_proc,
