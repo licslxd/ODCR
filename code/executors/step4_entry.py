@@ -40,7 +40,7 @@ def run_step4_cli() -> None:
         sys.argv,
         executor_label=_STEP4_RUNNER,
         torchrun_hint=(
-            "推荐: python code/odcr.py step4 --task N --preset … --from-run …\n"
+            "推荐: python code/odcr.py step4 --task N --from-step3 latest …\n"
             "须自行 torchrun 时见 docs/ODCR_Scripts_and_Runtime_Guide.md 附录。\n"
         ),
     )

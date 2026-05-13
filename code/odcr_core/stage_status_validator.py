@@ -15,7 +15,6 @@ from typing import Any, Mapping
 
 from odcr_core import path_layout, run_naming
 from odcr_core.stage_status import BAD_FINAL_STATUSES, STAGE_STATUS_SCHEMA_VERSION
-from odcr_core.step3_eval_handoff import EVAL_HANDOFF_SCHEMA_VERSION, PAPER_TARGET_ONLY_EVAL
 from odcr_core.training_checkpoint import (
     CHECKPOINT_EVENT_LEDGER_SCHEMA_VERSION,
     LINEAGE_GATE_SCHEMA_VERSION,
@@ -27,7 +26,7 @@ from odcr_core.training_checkpoint import (
 
 STAGE_STATUS_VALIDATOR_VERSION = "odcr_stage_status_validator/2"
 
-STEP3_READY_FINAL_STATUSES = {"completed_with_eval_handoff", "eval_handoff_accepted"}
+STEP3_READY_FINAL_STATUSES = {"step4_ready"}
 
 STEP3_STEP4_REQUIRED_FIELDS = (
     "schema_version",
@@ -44,7 +43,7 @@ STEP3_STEP4_REQUIRED_FIELDS = (
     "ready_for",
     "selected_checkpoint",
     "selected_checkpoint_hash",
-    "eval_handoff",
+    "readiness_audit",
     "run_summary",
     "checkpoint_lineage",
     "source_table",
@@ -58,7 +57,7 @@ STEP3_STEP4_REQUIRED_FIELDS = (
 
 STEP3_STEP4_REQUIRED_ARTIFACTS = (
     "run_summary",
-    "eval_handoff",
+    "readiness_audit",
     "selected_checkpoint",
     "checkpoint_lineage",
     "source_table",
@@ -82,7 +81,7 @@ class StageStatusValidation:
     status_path: Path
     selected_checkpoint: Path | None = None
     selected_checkpoint_hash: str | None = None
-    eval_handoff: Path | None = None
+    readiness_audit: Path | None = None
     run_summary: Path | None = None
     checkpoint_lineage: Path | None = None
     source_table: Path | None = None
@@ -104,7 +103,7 @@ class StageStatusValidation:
             "status_path": _repo_relative(root, self.status_path),
             "selected_checkpoint": _repo_relative(root, self.selected_checkpoint),
             "selected_checkpoint_hash": self.selected_checkpoint_hash,
-            "eval_handoff": _repo_relative(root, self.eval_handoff),
+            "readiness_audit": _repo_relative(root, self.readiness_audit),
             "run_summary": _repo_relative(root, self.run_summary),
             "checkpoint_lineage": _repo_relative(root, self.checkpoint_lineage),
             "source_table": _repo_relative(root, self.source_table),
@@ -366,7 +365,10 @@ def _validate_step3_step4_ready(
     _require(payload.get("downstream_ready") is True, "downstream_ready must be true for accepted Step3 handoff")
     ready_for = {str(item) for item in payload.get("ready_for") or []}
     _require("step4" in ready_for, "ready_for must include step4")
-    _require(str(payload.get("status_source") or "") == "eval_handoff", "status_source must be eval_handoff")
+    _require(
+        str(payload.get("status_source") or "") == "step3_upstream_readiness_gate",
+        "status_source must be step3_upstream_readiness_gate",
+    )
     _require(payload.get("failure_history_preserved") is True, "failure_history_preserved must be true")
     _require(
         payload.get("do_not_use_quality_audit_as_final_truth") is True,
@@ -386,7 +388,7 @@ def _validate_step3_step4_ready(
         checkpoint_hash == str(payload.get("selected_checkpoint_hash") or ""),
         "selected_checkpoint_hash mismatch",
     )
-    for key in ("selected_checkpoint", "run_summary", "eval_handoff", "checkpoint_lineage", "source_table", "resolved_config"):
+    for key in ("selected_checkpoint", "run_summary", "readiness_audit", "checkpoint_lineage", "source_table", "resolved_config"):
         artifact_path = _artifact_path(payload, "selected_checkpoint" if key == "selected_checkpoint" else key)
         if artifact_path:
             item_path = _repo_path(repo_root, artifact_path, field=f"artifacts.{key}.path")
@@ -401,12 +403,12 @@ def _validate_step3_step4_ready(
         artifact_key="run_summary",
         must_be_under=meta,
     )
-    eval_handoff_path = _path_from_status(
+    readiness_audit_path = _path_from_status(
         repo_root=repo_root,
         run_dir=run_dir,
         payload=payload,
-        field="eval_handoff",
-        artifact_key="eval_handoff",
+        field="readiness_audit",
+        artifact_key="readiness_audit",
         must_be_under=meta,
     )
     checkpoint_lineage_path = _path_from_status(
@@ -437,24 +439,23 @@ def _validate_step3_step4_ready(
     _require(str(run_summary.get("stage") or "") == "step3", "run_summary stage mismatch")
     _require(int(run_summary.get("task_id") or -1) == int(task), "run_summary task_id mismatch")
     _require(str(run_summary.get("run_id") or "") == str(run_id), "run_summary run_id mismatch")
-    _require(str(run_summary.get("status") or "") in STEP3_READY_FINAL_STATUSES, "run_summary status mismatch")
+    _require(str(run_summary.get("status") or "") in STEP3_READY_FINAL_STATUSES | {"ok", "completed", "success"}, "run_summary status mismatch")
     _require(run_summary.get("downstream_ready") is True, "run_summary downstream_ready must be true")
     if run_summary.get("selected_checkpoint_hash"):
         _require(
             str(run_summary.get("selected_checkpoint_hash")) == checkpoint_hash,
             "run_summary selected_checkpoint_hash mismatch",
         )
-    eval_handoff = _load_json(eval_handoff_path, field="eval_handoff")
-    _require(str(eval_handoff.get("schema_version") or "") == EVAL_HANDOFF_SCHEMA_VERSION, "eval_handoff schema mismatch")
-    _require(int(eval_handoff.get("task_id") or -1) == int(task), "eval_handoff task_id mismatch")
-    _require(str(eval_handoff.get("run_id") or "") == str(run_id), "eval_handoff run_id mismatch")
-    _require(str(eval_handoff.get("train_status") or "") == "completed", "eval_handoff train_status must be completed")
-    _require(str(eval_handoff.get("paper_eval_status") or "") == "completed", "eval_handoff paper_eval_status must be completed")
-    _require(str(eval_handoff.get("paper_eval_protocol") or "") == PAPER_TARGET_ONLY_EVAL, "eval_handoff protocol mismatch")
-    _require(eval_handoff.get("old_failure_history_preserved") is True, "eval_handoff must preserve old failure history")
-    _require(str(eval_handoff.get("checkpoint_hash") or "") == checkpoint_hash, "eval_handoff checkpoint_hash mismatch")
-    handoff_checkpoint = _repo_path(repo_root, eval_handoff.get("checkpoint_path"), field="eval_handoff.checkpoint_path")
-    _require(handoff_checkpoint.resolve() == checkpoint.resolve(), "eval_handoff checkpoint_path mismatch")
+    readiness_audit = _load_json(readiness_audit_path, field="readiness_audit")
+    _require(str(readiness_audit.get("schema_version") or "") == "odcr_step3_readiness_audit/1", "readiness_audit schema mismatch")
+    _require(str(readiness_audit.get("readiness_gate") or "") == "step3_upstream_readiness_gate", "readiness gate mismatch")
+    _require(str(readiness_audit.get("readiness_status") or readiness_audit.get("quality_status") or "") == "pass", "readiness_audit status must pass")
+    _require(readiness_audit.get("downstream_ready") is True, "readiness_audit downstream_ready must be true")
+    _require(str(readiness_audit.get("selected_downstream_checkpoint_hash") or "") == checkpoint_hash, "readiness checkpoint hash mismatch")
+    _require(
+        not set(readiness_audit.get("paper_metrics_excluded_from_readiness") or []).isdisjoint({"BLEU", "ROUGE", "METEOR"}),
+        "readiness audit must explicitly exclude paper metrics",
+    )
     source_table = _load_json(source_table_path, field="source_table")
     _require(isinstance(source_table.get("records"), list), "source_table.records must be a list")
     resolved_config = _load_json(resolved_config_path, field="resolved_config")
@@ -497,7 +498,7 @@ def _validate_step3_step4_ready(
         status_path=status_path,
         selected_checkpoint=checkpoint,
         selected_checkpoint_hash=checkpoint_hash,
-        eval_handoff=eval_handoff_path,
+        readiness_audit=readiness_audit_path,
         run_summary=run_summary_path,
         checkpoint_lineage=checkpoint_lineage_path,
         source_table=source_table_path,
@@ -507,9 +508,9 @@ def _validate_step3_step4_ready(
         diagnostics={
             "lineage": lineage_diag,
             "quality_audit_diagnostic": {
-                "path": payload.get("quality_audit"),
-                "status": payload.get("quality_audit_status"),
-                "downstream_ready": payload.get("quality_audit_downstream_ready"),
+                "path": payload.get("readiness_audit"),
+                "status": readiness_audit.get("readiness_status"),
+                "downstream_ready": readiness_audit.get("downstream_ready"),
                 "ignored_for_final_truth": True,
             },
         },

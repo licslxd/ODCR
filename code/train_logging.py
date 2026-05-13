@@ -808,6 +808,10 @@ _EVAL_REGISTRY_CSV_FIELDS: Tuple[str, ...] = (
     "run_id",
     "task_idx",
     "pipeline",
+    "method",
+    "method_name",
+    "experiment_profile",
+    "ablation_profile",
     "domain_from",
     "domain_to",
     "log_file",
@@ -1251,11 +1255,17 @@ def append_eval_run_summaries(
     ts = start_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     desc_one_line = (task_description or "").replace("\n", " ").strip()
     dc = decode_cfg or {}
+    experiment_profile = str(dc.get("experiment_profile") or "csb_odcr_full")
+    ablation_profile = str(dc.get("ablation_profile") or experiment_profile)
     row: Dict[str, Any] = {
         "ts": ts,
         "run_id": run_id or "",
         "task_idx": task_idx,
         "pipeline": pipeline,
+        "method": "CSB-ODCR",
+        "method_name": "CSB-ODCR",
+        "experiment_profile": experiment_profile,
+        "ablation_profile": ablation_profile,
         "domain_from": domain_from,
         "domain_to": domain_to,
         "log_file": os.path.abspath(os.path.expanduser(log_file)) if log_file else "",

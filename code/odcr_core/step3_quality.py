@@ -25,11 +25,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from odcr_core.file_atomic import atomic_write_json
 from odcr_core.training_checkpoint import checkpoint_file_sha256, file_fingerprint, stable_hash
-from odcr_core.step3_eval_handoff import Step3EvalHandoffError, quality_audit_from_eval_handoff
-
-
 STEP3_QUALITY_GATE_VERSION = "odcr_step3_quality_gate/1"
 STEP3_QUALITY_AUDIT_SCHEMA_VERSION = "odcr_step3_quality_audit/1"
+STEP3_UPSTREAM_READINESS_GATE_VERSION = "odcr_step3_upstream_readiness_gate/1"
+STEP3_READINESS_AUDIT_SCHEMA_VERSION = "odcr_step3_readiness_audit/1"
 STEP3_CHECKPOINT_POLICY_VERSION = "odcr_step3_checkpoint_policy/1"
 STEP3_RUNTIME_EVIDENCE_SCHEMA_VERSION = "odcr_step3_runtime_evidence/1"
 STEP3_DIAGNOSTIC_PROTOCOL_VERSION = "odcr_step3_diagnostic_protocol/1"
@@ -407,6 +406,209 @@ def build_step3_quality_audit(
     state = root / "state"
     model = root / "model"
     thresholds = dict(thresholds or {})
+    reasons: list[str] = []
+    warnings: list[str] = []
+
+    summary = load_json_object(meta / "run_summary.json", required=False)
+    rows = read_epoch_summary(meta / "epoch_summary.csv")
+    best_epoch, best_metric = _best_epoch(rows)
+    best_event = load_json_object(state / "best_event.json", required=False)
+    best_observed_event = best_event.get("best_observed_event") if isinstance(best_event.get("best_observed_event"), Mapping) else {}
+    legacy_best_epoch = best_event.get("epoch")
+    selected_epoch = best_observed_event.get("epoch") or legacy_best_epoch
+
+    if best_epoch is None:
+        reasons.append("best_observed_event_missing")
+    if selected_epoch is not None and best_epoch is not None and int(selected_epoch) != int(best_epoch):
+        reasons.append("best_checkpoint_not_global_best")
+    if not (model / "best_observed.pth").is_file() and best_epoch is not None:
+        if not (model / "best.pth").is_file() or int(selected_epoch or -1) != int(best_epoch):
+            reasons.append("global_best_checkpoint_missing")
+
+    evidence_paths = {
+        "run_summary": meta / "run_summary.json",
+        "source_table": meta / "source_table.json",
+        "resolved_config": meta / "resolved_config.json",
+        "metrics_jsonl": meta / "metrics.jsonl",
+        "loss_breakdown_jsonl": meta / "loss_breakdown.jsonl",
+        "timing_profile_jsonl": meta / "timing_profile.jsonl",
+        "gpu_profile_jsonl": meta / "gpu_profile.jsonl",
+        "best_event": state / "best_event.json",
+    }
+    for key, path in evidence_paths.items():
+        if key in {"metrics_jsonl", "loss_breakdown_jsonl", "timing_profile_jsonl", "gpu_profile_jsonl"}:
+            if not path.is_file() or path.stat().st_size <= 0:
+                reasons.append(f"{key}_missing")
+        elif not path.is_file():
+            reasons.append(f"{key}_missing")
+
+    grad_inf_count = int(_count_full_log_grad_inf(meta / "full.log"))
+    if grad_inf_count > 0:
+        reasons.append("nonfinite_gradient_events_present")
+
+    bad_status_markers = (
+        "oom",
+        "out_of_memory",
+        "nonfinite",
+        "high_grad_norm_abort",
+        "high gradient norm gate aborted",
+    )
+    full_log_text = ""
+    full_log = meta / "full.log"
+    if full_log.is_file():
+        full_log_text = full_log.read_text(encoding="utf-8", errors="ignore").lower()
+        for marker in bad_status_markers:
+            if marker in full_log_text:
+                reasons.append(f"run_health_{marker}_present")
+
+    status = str(summary.get("status") or "").lower()
+    train_status = str(summary.get("train_status") or status).lower()
+    validation_status = str(summary.get("validation_status") or "ok").lower()
+    if status and status not in {"ok", "completed", "success", "step4_ready"}:
+        reasons.append("run_status_not_ok")
+    if train_status and train_status not in {"ok", "completed", "success"}:
+        reasons.append("train_status_not_ok")
+    if validation_status and validation_status not in {"ok", "completed", "success", "not_applicable"}:
+        reasons.append("validation_status_not_ok")
+
+    valid_loss_values = [
+        float(row.get("valid_loss"))
+        for row in rows
+        if _is_finite_number(row.get("valid_loss"))
+    ]
+    if not valid_loss_values:
+        reasons.append("valid_loss_missing")
+    elif not all(math.isfinite(value) for value in valid_loss_values):
+        reasons.append("valid_loss_nonfinite")
+
+    selected_checkpoint_path = (model / "best_observed.pth") if (model / "best_observed.pth").is_file() else (model / "best.pth")
+    selected_checkpoint = str(selected_checkpoint_path)
+    selected_hash = checkpoint_file_sha256(selected_checkpoint_path) if selected_checkpoint_path.is_file() else ""
+    if not selected_checkpoint_path.is_file():
+        reasons.append("selected_downstream_checkpoint_missing")
+    if not selected_hash:
+        reasons.append("selected_downstream_checkpoint_hash_missing")
+
+    csb_contract_hash_value = str(summary.get("csb_contract_hash") or "")
+    csb_contract = summary.get("csb_contract") if isinstance(summary.get("csb_contract"), Mapping) else {}
+    csb_fields = csb_contract.get("required_tensor_fields") or (summary.get("csb_packet") or {}).get("tensor_fields") or []
+    required_z = ("z_content", "z_style", "z_domain", "z_uncertainty")
+    missing_z = [field for field in required_z if field not in csb_fields]
+    if not csb_contract_hash_value:
+        reasons.append("csb_contract_hash_missing")
+    if missing_z:
+        reasons.append("csb_contract_z_fields_missing")
+
+    checkpoint_lineage_candidates = [
+        Path(str(selected_checkpoint_path) + ".lineage.json"),
+        state / "checkpoint_lineage.json",
+        state / "best_observed.lineage.json",
+    ]
+    checkpoint_lineage_path = next((path for path in checkpoint_lineage_candidates if path.is_file()), None)
+    if checkpoint_lineage_path is None:
+        reasons.append("checkpoint_lineage_missing")
+
+    source_table_hash = _optional_file_hash(meta / "source_table.json")
+    resolved_config_hash = _optional_file_hash(meta / "resolved_config.json")
+    if not source_table_hash:
+        reasons.append("source_table_hash_missing")
+    if not resolved_config_hash:
+        reasons.append("resolved_config_hash_missing")
+
+    readiness_status = "pass" if not reasons else "blocked"
+    downstream_ready = readiness_status == "pass"
+    readiness_audit = {
+        "schema_version": STEP3_READINESS_AUDIT_SCHEMA_VERSION,
+        "quality_gate_version": STEP3_UPSTREAM_READINESS_GATE_VERSION,
+        "readiness_gate": "step3_upstream_readiness_gate",
+        "run_root": str(root),
+        "status": status or "unknown",
+        "quality_status": readiness_status,
+        "readiness_status": readiness_status,
+        "downstream_ready": downstream_ready,
+        "stage_status": "step4_ready" if downstream_ready else "not_ready",
+        "ready_for": ["step4"] if downstream_ready else [],
+        "quality_block_reasons": sorted(set(reasons)),
+        "readiness_block_reasons": sorted(set(reasons)),
+        "quality_warnings": sorted(set(warnings)),
+        "readiness_warnings": sorted(set(warnings)),
+        "paper_metrics_excluded_from_readiness": ["BLEU", "ROUGE", "DIST", "METEOR", "paper_target_only_eval"],
+        "run_health": {
+            "status": status or "unknown",
+            "train_status": train_status or "unknown",
+            "validation_status": validation_status or "unknown",
+            "no_oom": not any(reason.startswith("run_health_oom") or reason.startswith("run_health_out_of_memory") for reason in reasons),
+            "no_nonfinite_abort": not any("nonfinite" in reason for reason in reasons),
+            "no_high_grad_abort": not any("high_grad" in reason for reason in reasons),
+            "finite_grad": grad_inf_count == 0,
+        },
+        "checkpoint_health": {
+            "best_observed_exists": (model / "best_observed.pth").is_file(),
+            "selected_downstream_checkpoint_exists": selected_checkpoint_path.is_file(),
+            "checkpoint_lineage_complete": checkpoint_lineage_path is not None,
+            "resolved_config_hash": resolved_config_hash,
+            "source_table_hash": source_table_hash,
+            "csb_contract_hash": csb_contract_hash_value,
+        },
+        "scorer_sanity": {
+            "valid_loss_finite": bool(valid_loss_values and all(math.isfinite(value) for value in valid_loss_values)),
+            "best_valid_loss": best_metric,
+            "mae_rmse_are_rating_sanity_only": True,
+        },
+        "csb_contract_health": {
+            "required_z_fields": list(required_z),
+            "missing_z_fields": missing_z,
+            "csb_contract_hash_present": bool(csb_contract_hash_value),
+            "sidecar_only": True,
+        },
+        "handoff_health": {
+            "stage_status": "step4_ready" if downstream_ready else "not_ready",
+            "downstream_ready": downstream_ready,
+            "step4_consumability_required": True,
+        },
+        "quality_gate_inputs": {
+            "best_epoch_from_epoch_summary": best_epoch,
+            "best_metric_from_epoch_summary": best_metric,
+            "selected_best_epoch": selected_epoch,
+            "grad_inf_count": grad_inf_count,
+            "metrics_rows": _count_jsonl(evidence_paths["metrics_jsonl"]),
+            "timing_rows": _count_jsonl(evidence_paths["timing_profile_jsonl"]),
+            "gpu_rows": _count_jsonl(evidence_paths["gpu_profile_jsonl"]),
+        },
+        "selected_downstream_checkpoint": selected_checkpoint,
+        "selected_downstream_checkpoint_hash": selected_hash,
+        "selected_downstream_checkpoint_scope": "best_observed",
+        "selected_downstream_checkpoint_epoch": best_epoch,
+        "selected_downstream_checkpoint_metric": best_metric,
+        "evidence_levels": {
+            "code_present": True,
+            "active_path": bool(best_event or summary),
+            "runtime_verified": False,
+            "formal_verified": False,
+            "downstream_eligible": downstream_ready,
+        },
+        "generated_at_utc": utc_now(),
+    }
+    return readiness_audit
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return False
+
+
+def _legacy_build_step3_quality_audit(
+    run_root: str | Path,
+    *,
+    thresholds: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = Path(run_root).expanduser().resolve()
+    meta = root / "meta"
+    state = root / "state"
+    model = root / "model"
+    thresholds = dict(thresholds or {})
     grad_inf_threshold = int(thresholds.get("grad_inf_count_block_threshold", 0))
     severe_deterioration_ratio = float(thresholds.get("valid_loss_deterioration_ratio_block_threshold", 0.25))
     reasons: list[str] = []
@@ -508,13 +710,18 @@ def build_step3_quality_audit(
 
 
 def write_step3_quality_audit(run_root: str | Path, audit: Mapping[str, Any]) -> Path:
-    path = Path(run_root).expanduser().resolve() / "meta" / "quality_audit.json"
+    filename = "readiness_audit.json" if str(audit.get("schema_version") or "") == STEP3_READINESS_AUDIT_SCHEMA_VERSION else "quality_audit.json"
+    path = Path(run_root).expanduser().resolve() / "meta" / filename
     atomic_write_json(path, dict(audit))
     return path
 
 
 def load_step3_quality_audit(run_root: str | Path) -> dict[str, Any]:
-    return load_json_object(Path(run_root).expanduser().resolve() / "meta" / "quality_audit.json", required=False)
+    root = Path(run_root).expanduser().resolve()
+    readiness = load_json_object(root / "meta" / "readiness_audit.json", required=False)
+    if readiness:
+        return readiness
+    return load_json_object(root / "meta" / "quality_audit.json", required=False)
 
 
 def validate_step3_downstream_quality_gate(
@@ -528,21 +735,15 @@ def validate_step3_downstream_quality_gate(
     audit = load_step3_quality_audit(root)
     if not audit:
         if missing_policy == "warning":
-            raise Step3QualityGateError(f"Step3 quality audit sidecar missing: {root / 'meta' / 'quality_audit.json'}")
-        try:
-            audit = quality_audit_from_eval_handoff(root)
-        except Step3EvalHandoffError as handoff_exc:
-            raise Step3QualityGateError(f"Step3 quality audit sidecar missing; downstream is blocked: {root}") from handoff_exc
+            raise Step3QualityGateError(f"Step3 readiness audit sidecar missing: {root / 'meta' / 'readiness_audit.json'}")
+        raise Step3QualityGateError(f"Step3 readiness audit sidecar missing; downstream is blocked: {root}")
     if str(audit.get("quality_status")) != "pass" or audit.get("downstream_ready") is not True:
-        try:
-            audit = quality_audit_from_eval_handoff(root)
-        except Step3EvalHandoffError as handoff_exc:
-            reasons = audit.get("quality_block_reasons") or []
-            raise Step3QualityGateError(
-                "Step3 downstream quality gate blocked run: "
-                f"quality_status={audit.get('quality_status')!r} downstream_ready={audit.get('downstream_ready')!r} "
-                f"reasons={reasons}"
-            ) from handoff_exc
+        reasons = audit.get("readiness_block_reasons") or audit.get("quality_block_reasons") or []
+        raise Step3QualityGateError(
+            "Step3 upstream readiness gate blocked run: "
+            f"readiness_status={audit.get('readiness_status') or audit.get('quality_status')!r} "
+            f"downstream_ready={audit.get('downstream_ready')!r} reasons={reasons}"
+        )
     ckpt = Path(selected_checkpoint or audit.get("selected_downstream_checkpoint") or "").expanduser()
     if not ckpt.is_absolute():
         ckpt = (root / ckpt).resolve()
@@ -571,9 +772,15 @@ def _count_full_log_grad_inf(path: Path) -> int:
 @dataclass(frozen=True)
 class GradInspection:
     grad_finite: bool
+    grad_tensor_finite: bool
+    grad_norm_finite: bool
     nonfinite_param_count: int
     nonfinite_param_topk: list[dict[str, Any]]
     nonfinite_param_group_topk: list[dict[str, Any]]
+    topk_grad_norm_params: list[dict[str, Any]]
+    topk_nonfinite_params: list[dict[str, Any]]
+    first_bad_param_name: str
+    first_bad_param_reason: str
     grad_norm_pre_clip: float
 
 
@@ -586,8 +793,11 @@ def inspect_gradients(
     import torch
 
     nonfinite: list[tuple[str, int, float]] = []
+    finite_norms: list[tuple[str, float, float]] = []
     group_counter: Counter[str] = Counter()
     norms: list[Any] = []
+    first_bad_name = ""
+    first_bad_reason = ""
     for name, param in named_parameters:
         grad = getattr(param, "grad", None)
         if grad is None or getattr(grad, "is_sparse", False):
@@ -602,9 +812,20 @@ def inspect_gradients(
             except Exception:
                 max_abs = math.inf
             nonfinite.append((str(name), bad_count, max_abs))
+            if not first_bad_name:
+                first_bad_name = str(name)
+                first_bad_reason = "raw_grad_tensor_nonfinite"
             group_counter[_param_group_name(str(name))] += bad_count
         try:
-            norms.append(torch.linalg.vector_norm(detached.float(), ord=2))
+            param_norm_t = torch.linalg.vector_norm(detached.float(), ord=2)
+            norms.append(param_norm_t)
+            param_norm = float(param_norm_t.item())
+            try:
+                max_abs_finite = float(torch.nan_to_num(detached.float().abs(), nan=0.0, posinf=0.0, neginf=0.0).max().item())
+            except Exception:
+                max_abs_finite = math.inf
+            if math.isfinite(param_norm):
+                finite_norms.append((str(name), param_norm, max_abs_finite))
         except Exception:
             pass
     if norms:
@@ -615,17 +836,33 @@ def inspect_gradients(
     else:
         total_norm = 0.0
     nonfinite.sort(key=lambda item: (item[1], item[2]), reverse=True)
+    finite_norms.sort(key=lambda item: item[1], reverse=True)
+    grad_tensor_finite = not nonfinite
+    grad_norm_finite = math.isfinite(total_norm)
+    if grad_tensor_finite and not grad_norm_finite and not first_bad_name:
+        first_bad_name = finite_norms[0][0] if finite_norms else "__total_grad_norm__"
+        first_bad_reason = "nonfinite_total_grad_norm"
+    nonfinite_topk = [
+        {"name": name, "nonfinite_count": count, "max_abs": max_abs}
+        for name, count, max_abs in nonfinite[: max(0, int(topk))]
+    ]
     return GradInspection(
-        grad_finite=not nonfinite and math.isfinite(total_norm),
+        grad_finite=grad_tensor_finite and grad_norm_finite,
+        grad_tensor_finite=grad_tensor_finite,
+        grad_norm_finite=grad_norm_finite,
         nonfinite_param_count=sum(item[1] for item in nonfinite),
-        nonfinite_param_topk=[
-            {"name": name, "nonfinite_count": count, "max_abs": max_abs}
-            for name, count, max_abs in nonfinite[: max(0, int(topk))]
-        ],
+        nonfinite_param_topk=nonfinite_topk,
         nonfinite_param_group_topk=[
             {"group": name, "nonfinite_count": count}
             for name, count in group_counter.most_common(max(0, int(topk)))
         ],
+        topk_grad_norm_params=[
+            {"name": name, "grad_norm": norm, "max_abs": max_abs}
+            for name, norm, max_abs in finite_norms[: max(0, int(topk))]
+        ],
+        topk_nonfinite_params=nonfinite_topk,
+        first_bad_param_name=first_bad_name,
+        first_bad_param_reason=first_bad_reason,
         grad_norm_pre_clip=total_norm,
     )
 
@@ -654,6 +891,52 @@ def sync_grad_finite_decision(local_finite: bool, *, device: Any, world_size: in
             raise RuntimeError("Step3 grad finite sync requested before torch.distributed init.")
         dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(int(flag.item()))
+
+
+def sync_grad_gate_diagnostics(
+    *,
+    local_tensor_finite: bool,
+    local_norm_finite: bool,
+    local_high_grad_skip: bool,
+    local_high_grad_abort: bool,
+    device: Any,
+    world_size: int,
+    rank: int = 0,
+) -> dict[str, Any]:
+    import torch
+    import torch.distributed as dist
+
+    finite_flags = torch.tensor(
+        [1 if local_tensor_finite else 0, 1 if local_norm_finite else 0],
+        device=device,
+        dtype=torch.int32,
+    )
+    high_flags = torch.tensor(
+        [1 if local_high_grad_skip else 0, 1 if local_high_grad_abort else 0],
+        device=device,
+        dtype=torch.int32,
+    )
+    offender_rank = torch.tensor(
+        [int(rank) if (not local_tensor_finite or not local_norm_finite or local_high_grad_skip or local_high_grad_abort) else 2**30],
+        device=device,
+        dtype=torch.int32,
+    )
+    if int(world_size) > 1:
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("Step3 grad gate diagnostic sync requested before torch.distributed init.")
+        dist.all_reduce(finite_flags, op=dist.ReduceOp.MIN)
+        dist.all_reduce(high_flags, op=dist.ReduceOp.MAX)
+        dist.all_reduce(offender_rank, op=dist.ReduceOp.MIN)
+    offender = int(offender_rank.item())
+    return {
+        "rank_local_grad_tensor_finite": bool(local_tensor_finite),
+        "rank_local_grad_norm_finite": bool(local_norm_finite),
+        "rank_global_grad_finite": bool(int(finite_flags[0].item())),
+        "rank_global_grad_norm_finite": bool(int(finite_flags[1].item())),
+        "rank_global_high_grad_skip": bool(int(high_flags[0].item())),
+        "rank_global_high_grad_abort": bool(int(high_flags[1].item())),
+        "offender_rank": None if offender >= 2**30 else offender,
+    }
 
 
 def timing_row_with_closure(

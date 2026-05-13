@@ -35,6 +35,10 @@ _ERROR_LINE_TOKENS = (
     "valueerror",
     "filenotfounderror",
     "cuda out of memory",
+    "nonfinite gradient gate",
+    "high gradient norm gate",
+    "grad finite gate",
+    "continuous skipped steps",
     "warning",
     "warn",
 )
@@ -106,7 +110,17 @@ def _odcr_layout_env(cfg: ResolvedConfig) -> dict[str, str]:
         "ODCR_RESOLVED_STEP5_TEXT_MODEL": str(Path(cfg.step5_text_model).resolve()),
         "ODCR_RESOLVED_SENTENCE_EMBED_MODEL": str(Path(cfg.sentence_embed_model).resolve()),
         "ODCR_RESOLVED_EMBED_DIM": str(int(cfg.embed_dim)),
+        "ODCR_METHOD_NAME": "CSB-ODCR",
     }
+    try:
+        import json
+
+        profile = json.loads(str(getattr(cfg, "experiment_profile_config_json", "") or "{}"))
+        if isinstance(profile, dict) and profile:
+            out["ODCR_EXPERIMENT_PROFILE"] = str(profile.get("name") or "")
+            out["ODCR_ABLATION_PROFILE"] = str(profile.get("ablation_profile") or "")
+    except Exception:
+        pass
     _tp = getattr(cfg, "effective_training_payload_json", "") or ""
     if _tp.strip():
         out["ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON"] = _tp
@@ -570,9 +584,10 @@ def _torchrun_hardware_env(cfg: ResolvedConfig) -> dict[str, str]:
     except json.JSONDecodeError:
         _le = {}
     if isinstance(_le, dict):
-        cvd = _le.get("CUDA_VISIBLE_DEVICES")
-        if cvd is not None and str(cvd).strip() != "":
-            out["CUDA_VISIBLE_DEVICES"] = str(cvd).strip()
+        for env_name in ("CUDA_VISIBLE_DEVICES", "PYTORCH_CUDA_ALLOC_CONF"):
+            value = _le.get(env_name)
+            if value is not None and str(value).strip() != "":
+                out[env_name] = str(value).strip()
     return out
 
 

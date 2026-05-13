@@ -11,39 +11,42 @@ sys.path.insert(0, str(REPO_ROOT / "code" / "tools"))
 import odcr_tmux_gpu_bridge as bridge  # noqa: E402
 
 
-class GpuBridgeNoWhitelistHardBlockerTest(unittest.TestCase):
-    def test_mode_specs_whitelist_hard_blocker_absent(self) -> None:
+class GpuBridgeRepoCommandAllowlistTest(unittest.TestCase):
+    def test_repo_command_modes_are_metadata_registered(self) -> None:
         source = Path(bridge.__file__).read_text(encoding="utf-8")
         self.assertNotIn("MODE_SPECS", source)
         for mode in ("repo-command", "repo-script", "repo-module", "command-file"):
             self.assertIn(mode, bridge.OPERATION_SPECS)
+        from odcr_core.aux.runtime.stage_dispatch import REPO_COMMAND_REGISTRY
 
-    def test_repo_local_module_and_script_allowed(self) -> None:
+        self.assertIn("step3_bounded_probe", REPO_COMMAND_REGISTRY)
+        self.assertIn("step4_bounded_preflight", REPO_COMMAND_REGISTRY)
+
+    def test_unregistered_repo_local_module_and_script_denied(self) -> None:
         output_dir = "AI_analysis/06_probe_evidence/test_gpu_bridge_no_whitelist"
-        module_argv = bridge.runtime_command_argv(
-            bridge.BridgeOptions(
-                mode="repo-module",
-                module_name="tools.odcr_step3_performance_probe",
-                command_argv=("--help",),
-                output_dir=output_dir,
-            ),
-            "bridge_test_module",
-        )
-        self.assertIn("-m", module_argv)
-        self.assertIn("tools.odcr_step3_performance_probe", module_argv)
+        with self.assertRaises(bridge.BridgeError):
+            bridge.runtime_command_argv(
+                bridge.BridgeOptions(
+                    mode="repo-module",
+                    module_name="tools.odcr_step3_performance_probe",
+                    command_argv=("--help",),
+                    output_dir=output_dir,
+                ),
+                "bridge_test_module",
+            )
 
-        script_argv = bridge.runtime_command_argv(
-            bridge.BridgeOptions(
-                mode="repo-script",
-                script_path="code/tools/odcr_step3_performance_probe.py",
-                command_argv=("--help",),
-                output_dir=output_dir,
-            ),
-            "bridge_test_script",
-        )
-        self.assertIn("code/tools/odcr_step3_performance_probe.py", script_argv)
+        with self.assertRaises(bridge.BridgeError):
+            bridge.runtime_command_argv(
+                bridge.BridgeOptions(
+                    mode="repo-script",
+                    script_path="code/tools/odcr_step3_performance_probe.py",
+                    command_argv=("--help",),
+                    output_dir=output_dir,
+                ),
+                "bridge_test_script",
+            )
 
-    def test_mode_mismatch_no_longer_blocks_repo_command(self) -> None:
+    def test_registered_repo_command_allows_exact_probe_help(self) -> None:
         argv = bridge.runtime_command_argv(
             bridge.BridgeOptions(
                 mode="repo-command",

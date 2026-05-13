@@ -40,9 +40,12 @@ STEP3_RUNTIME_PROBE_TYPES: tuple[str, ...] = (
     "prefetch-ab",
     "grad-monitor-window",
     "memory-phase-window",
+    "epoch-boundary-memory",
+    "epoch2-numerical-stability",
     "ddp-gather-sync-window",
     "quality-checkpoint-window",
     "batch-ladder-window",
+    "sidecar-gradient-firewall",
 )
 
 STATE_FIELDS: tuple[str, ...] = (
@@ -62,6 +65,8 @@ STATE_FIELDS: tuple[str, ...] = (
     "prefetch_rows_emitted",
     "grad_rows_emitted",
     "ddp_rows_emitted",
+    "loss_rows_emitted",
+    "csb_rows_emitted",
     "runtime_verified",
     "evidence_complete",
     "formal_namespace_polluted",
@@ -150,6 +155,23 @@ GRAD_REQUIRED_FIELDS: tuple[str, ...] = (
     "grad_finite",
     "grad_norm_pre_clip",
     "grad_norm_post_clip",
+    "pre_clip_grad_norm",
+    "post_clip_grad_norm",
+    "grad_norm_isfinite",
+    "grad_norm_was_clipped",
+    "rank_local_grad_tensor_finite",
+    "rank_local_grad_norm_finite",
+    "rank_global_grad_finite",
+    "rank_global_grad_norm_finite",
+    "topk_grad_norm_params",
+    "topk_nonfinite_params",
+    "high_grad_skip_count",
+    "nonfinite_skip_count",
+    "current_lr",
+    "optimizer_step_attempt_slot",
+    "physical_batch_index",
+    "successful_global_step",
+    "warmup_multipliers",
     "grad_check_ms",
     "grad_norm_compute_ms",
     "grad_clip_ms",
@@ -159,6 +181,10 @@ GRAD_REQUIRED_FIELDS: tuple[str, ...] = (
     "skipped_step_count",
     "nonfinite_param_count",
     "nonfinite_param_topk",
+    "primary_grad_param_count",
+    "sidecar_grad_param_count",
+    "primary_grad_from_sidecar_max_abs",
+    "sidecar_loss_updates_sidecar",
 )
 
 DDP_REQUIRED_FIELDS: tuple[str, ...] = (
@@ -178,6 +204,48 @@ DDP_REQUIRED_FIELDS: tuple[str, ...] = (
     "compact_gather_only",
 )
 
+LOSS_REQUIRED_FIELDS: tuple[str, ...] = (
+    "validation_run_id",
+    "task_id",
+    "profile_id",
+    "probe_type",
+    "rank",
+    "world_size",
+    "global_step",
+    "total_loss",
+    "total_loss_finite",
+    "all_components_finite",
+    "L_rating_shared",
+    "L_light_explainer",
+    "primary_loss",
+    "sidecar_loss",
+    "gradient_firewall",
+    "L_csb_ddp_graph_anchor_zero",
+    "csb_conflict_routing_present",
+)
+
+CSB_REQUIRED_FIELDS: tuple[str, ...] = (
+    "validation_run_id",
+    "task_id",
+    "profile_id",
+    "probe_type",
+    "rank",
+    "world_size",
+    "global_step",
+    "csb_contract_hash",
+    "csb_schema_version",
+    "csb_packet_present",
+    "csb_diagnostics_present",
+    "z_content_shape",
+    "z_style_shape",
+    "z_domain_shape",
+    "z_uncertainty_shape",
+    "controlled_injection_enabled",
+    "light_explainer_step3_loss",
+    "gradient_firewall",
+    "csb_conflict_routing_present",
+)
+
 MEMORY_REQUIRED_PHASES: tuple[str, ...] = (
     "after_batch_cpu",
     "after_h2d",
@@ -187,6 +255,15 @@ MEMORY_REQUIRED_PHASES: tuple[str, ...] = (
     "after_backward",
     "after_grad_norm",
     "after_optimizer",
+)
+
+EPOCH_BOUNDARY_MEMORY_REQUIRED_PHASES: tuple[str, ...] = (
+    "before_validation",
+    "after_validation",
+    "after_checkpoint_save",
+    "after_epoch_boundary_cleanup",
+    "before_next_backward",
+    "after_next_backward",
 )
 
 
@@ -402,6 +479,8 @@ class Step3RuntimeEvidenceSink:
         self.prefetch_rows: list[dict[str, Any]] = []
         self.grad_rows: list[dict[str, Any]] = []
         self.ddp_rows: list[dict[str, Any]] = []
+        self.loss_rows: list[dict[str, Any]] = []
+        self.csb_rows: list[dict[str, Any]] = []
         self.rank_results: list[dict[str, Any]] = []
 
     def add_rank_result(self, result: Mapping[str, Any]) -> None:
@@ -412,6 +491,8 @@ class Step3RuntimeEvidenceSink:
         self.prefetch_rows.extend(dict(row) for row in item.get("prefetch_rows", []) or [])
         self.grad_rows.extend(dict(row) for row in item.get("grad_rows", []) or [])
         self.ddp_rows.extend(dict(row) for row in item.get("ddp_rows", []) or [])
+        self.loss_rows.extend(dict(row) for row in item.get("loss_rows", []) or [])
+        self.csb_rows.extend(dict(row) for row in item.get("csb_rows", []) or [])
 
     def _required_complete(self, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> tuple[bool, list[str]]:
         if not rows:
@@ -446,14 +527,42 @@ class Step3RuntimeEvidenceSink:
             ("prefetch", self.prefetch_rows, PREFETCH_REQUIRED_FIELDS),
             ("grad", self.grad_rows, GRAD_REQUIRED_FIELDS),
             ("ddp", self.ddp_rows, DDP_REQUIRED_FIELDS),
+            ("loss", self.loss_rows, LOSS_REQUIRED_FIELDS),
+            ("csb", self.csb_rows, CSB_REQUIRED_FIELDS),
         ):
             ok, row_findings = self._required_complete(rows, fields)
             if not ok:
                 findings.append(f"{label} evidence incomplete: {'; '.join(row_findings)}")
         phases = {str(row.get("phase")) for row in self.memory_rows}
-        missing_phases = [phase for phase in MEMORY_REQUIRED_PHASES if phase not in phases]
+        required_phases = list(MEMORY_REQUIRED_PHASES)
+        if self.request.probe_type == "epoch-boundary-memory":
+            required_phases.extend(EPOCH_BOUNDARY_MEMORY_REQUIRED_PHASES)
+        missing_phases = [phase for phase in required_phases if phase not in phases]
         if missing_phases:
             findings.append(f"memory required phases missing: {missing_phases}")
+        if self.request.probe_type == "epoch2-numerical-stability":
+            pre_clip_values = [
+                float(row.get("pre_clip_grad_norm", row.get("grad_norm_pre_clip", 0.0)) or 0.0)
+                for row in self.grad_rows
+            ]
+            skip_thresholds = [
+                float(row.get("high_grad_norm_skip_threshold", math.inf) or math.inf)
+                for row in self.grad_rows
+            ]
+            high_skip_count = sum(int(row.get("high_grad_skip_count", 0) or 0) for row in self.grad_rows)
+            nonfinite_skip_count = sum(int(row.get("nonfinite_skip_count", 0) or 0) for row in self.grad_rows)
+            if any(not math.isfinite(value) for value in pre_clip_values):
+                findings.append("epoch2 numerical probe observed nonfinite pre_clip_grad_norm")
+            if any(value > threshold for value, threshold in zip(pre_clip_values, skip_thresholds)):
+                findings.append("epoch2 numerical probe exceeded high_grad_norm_skip_threshold")
+            if high_skip_count:
+                findings.append(f"epoch2 numerical probe high_grad_skip_count={high_skip_count}")
+            if nonfinite_skip_count:
+                findings.append(f"epoch2 numerical probe nonfinite_skip_count={nonfinite_skip_count}")
+            if not all(bool(row.get("rank_global_grad_finite")) and bool(row.get("rank_global_grad_norm_finite")) for row in self.grad_rows):
+                findings.append("epoch2 numerical probe rank-wise grad finite flags were inconsistent")
+            if not all(bool(row.get("total_loss_finite")) and bool(row.get("all_components_finite")) for row in self.loss_rows):
+                findings.append("epoch2 numerical probe observed nonfinite loss component")
         if bool(state.get("formal_namespace_polluted")):
             findings.append("formal namespace polluted")
         for field_name in (
@@ -481,7 +590,12 @@ class Step3RuntimeEvidenceSink:
             "memory_phase_summary_jsonl": self.evidence_dir / "memory_phase_summary.jsonl",
             "prefetch_overlap_summary_json": self.evidence_dir / "prefetch_overlap_summary.json",
             "grad_monitor_validation_json": self.evidence_dir / "grad_monitor_validation.json",
+            "grad_norm_time_series_jsonl": self.evidence_dir / "grad_norm_time_series.jsonl",
             "ddp_gather_sync_summary_json": self.evidence_dir / "ddp_gather_sync_summary.json",
+            "loss_component_summary_json": self.evidence_dir / "loss_component_summary.json",
+            "loss_component_rows_jsonl": self.evidence_dir / "loss_component_rows.jsonl",
+            "csb_forward_diagnostics_json": self.evidence_dir / "csb_forward_diagnostics.json",
+            "csb_forward_diagnostics_rows_jsonl": self.evidence_dir / "csb_forward_diagnostics_rows.jsonl",
             "run_summary_validation_json": self.evidence_dir / "run_summary_validation.json",
             "report_json": self.evidence_dir / "report.json",
             "report_md": self.evidence_dir / "report.md",
@@ -491,8 +605,13 @@ class Step3RuntimeEvidenceSink:
         _write_csv(paths["memory_phase_summary_csv"], self.memory_rows, MEMORY_REQUIRED_FIELDS)
         _append_jsonl(paths["memory_phase_summary_jsonl"], self.memory_rows)
         write_json(paths["prefetch_overlap_summary_json"], summarize_prefetch_rows(self.prefetch_rows, report=report))
+        _append_jsonl(paths["grad_norm_time_series_jsonl"], self.grad_rows)
         write_json(paths["grad_monitor_validation_json"], summarize_grad_rows(self.grad_rows, report=report))
         write_json(paths["ddp_gather_sync_summary_json"], summarize_ddp_rows(self.ddp_rows, report=report))
+        _append_jsonl(paths["loss_component_rows_jsonl"], self.loss_rows)
+        _append_jsonl(paths["csb_forward_diagnostics_rows_jsonl"], self.csb_rows)
+        write_json(paths["loss_component_summary_json"], summarize_loss_rows(self.loss_rows, report=report))
+        write_json(paths["csb_forward_diagnostics_json"], summarize_csb_rows(self.csb_rows, report=report))
         write_json(paths["run_summary_validation_json"], dict(report))
         write_json(paths["report_json"], dict(report))
         _write_text(paths["report_md"], markdown_runtime_probe_report(report))
@@ -524,6 +643,10 @@ def summarize_prefetch_rows(rows: Sequence[Mapping[str, Any]], *, report: Mappin
 def summarize_grad_rows(rows: Sequence[Mapping[str, Any]], *, report: Mapping[str, Any]) -> dict[str, Any]:
     finite = [bool(row.get("grad_finite")) for row in rows]
     opt = [bool(row.get("optimizer_step_executed")) for row in rows]
+    pre_clip = [row.get("pre_clip_grad_norm", row.get("grad_norm_pre_clip")) for row in rows]
+    post_clip = [row.get("post_clip_grad_norm", row.get("grad_norm_post_clip")) for row in rows]
+    high_skip_count = sum(int(row.get("high_grad_skip_count", 0) or 0) for row in rows)
+    nonfinite_skip_count = sum(int(row.get("nonfinite_skip_count", 0) or 0) for row in rows)
     return {
         "schema_version": SCHEMA_VERSION,
         "probe_type": report.get("probe_type"),
@@ -532,6 +655,17 @@ def summarize_grad_rows(rows: Sequence[Mapping[str, Any]], *, report: Mapping[st
         "row_count": len(rows),
         "grad_finite_rate": float(sum(1 for item in finite if item) / len(finite)) if finite else None,
         "optimizer_step_executed": all(opt) if opt else None,
+        "pre_clip_grad_norm_max": max((float(v) for v in pre_clip if not _missing(v)), default=None),
+        "post_clip_grad_norm_max": max((float(v) for v in post_clip if not _missing(v)), default=None),
+        "high_grad_skip_count": int(high_skip_count),
+        "nonfinite_skip_count": int(nonfinite_skip_count),
+        "rank_wise_consistency": all(
+            bool(row.get("rank_global_grad_finite")) and bool(row.get("rank_global_grad_norm_finite"))
+            for row in rows
+        )
+        if rows
+        else None,
+        "topk_grad_norm_summary": [row.get("topk_grad_norm_params") for row in rows[:4]],
         "grad_check_ms": _mean([row.get("grad_check_ms") for row in rows]),
         "grad_norm_compute_ms": _mean([row.get("grad_norm_compute_ms") for row in rows]),
         "grad_clip_ms": _mean([row.get("grad_clip_ms") for row in rows]),
@@ -556,11 +690,99 @@ def summarize_ddp_rows(rows: Sequence[Mapping[str, Any]], *, report: Mapping[str
     }
 
 
+def summarize_loss_rows(rows: Sequence[Mapping[str, Any]], *, report: Mapping[str, Any]) -> dict[str, Any]:
+    total_losses = [row.get("total_loss") for row in rows]
+    anchor_zeros = [row.get("L_csb_ddp_graph_anchor_zero") for row in rows]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "probe_type": report.get("probe_type"),
+        "runtime_verified": bool(report.get("runtime_verified")),
+        "evidence_complete": bool(report.get("evidence_complete")),
+        "row_count": len(rows),
+        "total_loss_finite": all(bool(row.get("total_loss_finite")) for row in rows) if rows else None,
+        "all_components_finite": all(bool(row.get("all_components_finite")) for row in rows) if rows else None,
+        "optimizer_loss_mean": _mean(total_losses),
+        "rating_loss_mean": _mean([row.get("L_rating_shared") for row in rows]),
+        "light_explainer_loss_mean": _mean([row.get("L_light_explainer") for row in rows]),
+        "csb_ddp_graph_anchor_zero_max_abs": max(
+            (abs(float(value)) for value in anchor_zeros if not _missing(value)),
+            default=None,
+        ),
+        "csb_conflict_routing_present": any(bool(row.get("csb_conflict_routing_present")) for row in rows),
+        "component_keys": sorted((rows[0].get("component_raw") or {}).keys()) if rows else [],
+        "weighted_component_keys": sorted((rows[0].get("component_weighted") or {}).keys()) if rows else [],
+    }
+
+
+def summarize_csb_rows(rows: Sequence[Mapping[str, Any]], *, report: Mapping[str, Any]) -> dict[str, Any]:
+    required_fields = ("z_content_shape", "z_style_shape", "z_domain_shape", "z_uncertainty_shape")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "probe_type": report.get("probe_type"),
+        "runtime_verified": bool(report.get("runtime_verified")),
+        "evidence_complete": bool(report.get("evidence_complete")),
+        "row_count": len(rows),
+        "required_tensor_fields_present": all(
+            all(bool(row.get(field)) for field in required_fields) for row in rows
+        )
+        if rows
+        else None,
+        "csb_packet_present": all(bool(row.get("csb_packet_present")) for row in rows) if rows else None,
+        "csb_diagnostics_present": all(bool(row.get("csb_diagnostics_present")) for row in rows) if rows else None,
+        "csb_contract_hashes": sorted({str(row.get("csb_contract_hash") or "") for row in rows if row.get("csb_contract_hash")}),
+        "csb_schema_versions": sorted({str(row.get("csb_schema_version") or "") for row in rows if row.get("csb_schema_version")}),
+        "controlled_injection_enabled": any(bool(row.get("controlled_injection_enabled")) for row in rows),
+        "csb_conflict_routing_present": any(bool(row.get("csb_conflict_routing_present")) for row in rows),
+        "example_shapes": {
+            field: rows[0].get(field)
+            for field in required_fields
+        }
+        if rows
+        else {},
+        "example_csb_packet": rows[0].get("csb_packet") if rows else {},
+        "example_csb_diagnostics": rows[0].get("csb_diagnostics") if rows else {},
+        "example_csb_conflict_routing": rows[0].get("csb_conflict_routing") if rows else {},
+    }
+
+
 def _mean(values: Sequence[Any]) -> float | None:
     clean = [float(value) for value in values if not _missing(value) and math.isfinite(float(value))]
     if not clean:
         return None
     return float(sum(clean) / len(clean))
+
+
+def _memory_peak_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    def max_float(key: str) -> float:
+        values: list[float] = []
+        for row in rows:
+            try:
+                values.append(float(row.get(key) or 0.0))
+            except (TypeError, ValueError):
+                continue
+        return round(max(values), 6) if values else 0.0
+
+    def max_int(key: str) -> int:
+        values: list[int] = []
+        for row in rows:
+            try:
+                values.append(int(row.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+        return max(values) if values else 0
+
+    return {
+        "allocated_gib": max_float("allocated_gib"),
+        "reserved_gib": max_float("reserved_gib"),
+        "max_allocated_gib": max_float("max_allocated_gib"),
+        "max_reserved_gib": max_float("max_reserved_gib"),
+        "reserved_minus_allocated_gib": max_float("reserved_minus_allocated_gib"),
+        "inactive_split_gib": max_float("inactive_split_gib"),
+        "non_releasable_gib": max_float("non_releasable_gib"),
+        "cuda_malloc_retry_count": max_int("cuda_malloc_retry_count"),
+        "cuda_oom_count": max_int("cuda_oom_count"),
+        "phases": sorted({str(row.get("phase")) for row in rows if str(row.get("phase") or "").strip()}),
+    }
 
 
 def _memory_row_from_torch(
@@ -594,6 +816,24 @@ def _memory_row_from_torch(
         }
     )
     return row
+
+
+def _memory_row_from_cleanup(
+    row: Mapping[str, Any],
+    *,
+    world_size: int,
+    request: Step3ValidationWindowRequest,
+) -> dict[str, Any]:
+    out = dict(row)
+    out.update(
+        {
+            "validation_run_id": request.run_id,
+            "task_id": int(request.task_id),
+            "probe_type": request.probe_type,
+            "world_size": int(world_size),
+        }
+    )
+    return out
 
 
 def _tensor_shape_bytes(value: Any) -> tuple[list[int], int] | None:
@@ -635,6 +875,51 @@ def _gather_shapes_and_bytes(batch: Any) -> tuple[dict[str, list[int]], int]:
         shapes[name] = shape
         total += size
     return shapes, total
+
+
+def _tensor_shape(value: Any) -> list[int]:
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            return [int(dim) for dim in value.shape]
+    except Exception:
+        return []
+    return []
+
+
+def _finite_float(value: Any) -> float:
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            raw = float(value.detach().float().item())
+        else:
+            raw = float(value)
+    except Exception:
+        return float("nan")
+    return raw if math.isfinite(raw) else float("nan")
+
+
+def _jsonable_probe_value(value: Any) -> Any:
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                return _finite_float(value)
+            return _tensor_shape(value)
+    except Exception:
+        pass
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable_probe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_probe_value(v) for v in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return str(value)
 
 
 def _timing_ms(timing: Mapping[str, Any], *names: str) -> float:
@@ -684,6 +969,8 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
     prefetch_rows: list[dict[str, Any]] = []
     grad_rows: list[dict[str, Any]] = []
     ddp_rows: list[dict[str, Any]] = []
+    loss_rows: list[dict[str, Any]] = []
+    csb_rows: list[dict[str, Any]] = []
     try:
         if not torch.cuda.is_available() or int(torch.cuda.device_count()) < world_size:
             raise RuntimeError(
@@ -755,7 +1042,7 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                 early_stop_patience=None,
                 bleu4_max_samples=None,
             )
-            final_cfg, train_dataloader, _valid_dataloader, model, sampler = s3.build_config_and_data_ddp(
+            final_cfg, train_dataloader, valid_dataloader, model, sampler = s3.build_config_and_data_ddp(
                 args,
                 rank=rank,
                 world_size=world_size,
@@ -778,8 +1065,38 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
         underlying = s3.get_underlying_model(model)
         structured_weights = s3.step3_structured_loss_weights_from_config(final_cfg)
         loss_semantics = s3.step3_loss_semantics_from_config(final_cfg)
+        grad_finite_cfg = json.loads(str(getattr(final_cfg, "grad_finite_config_json", "") or "{}"))
         s3.apply_step3_precision_backend(final_cfg)
         optimizer = s3.build_step3_optimizer(model, final_cfg)
+        scheduler_cfg = json.loads(str(getattr(final_cfg, "scheduler_config_json", "") or "{}"))
+        scheduler_name = str(scheduler_cfg.get("name") or getattr(final_cfg, "lr_scheduler", "") or "warmup_cosine")
+        sched = None
+        probe_scheduler_slot_offset = 0
+        if scheduler_name in {"warmup_cosine", "safe_damping_v2"}:
+            n_steps_for_schedule = max(1, len(train_dataloader))
+            total_steps_for_schedule = max(1, int(getattr(final_cfg, "epochs", 1) or 1) * n_steps_for_schedule)
+            warmup_steps_resolved, _warmup_ratio_logged = s3.resolve_warmup_steps(
+                total_steps_for_schedule,
+                n_steps_for_schedule,
+                explicit_steps=getattr(final_cfg, "odcr_warmup_steps", None),
+                explicit_ratio=getattr(final_cfg, "odcr_warmup_ratio", None),
+                warmup_epochs_fallback=float(getattr(final_cfg, "warmup_epochs", 0.0) or 0.0),
+            )
+            lr_lambda = s3.warmup_cosine_multiplier_lambda(
+                int(warmup_steps_resolved),
+                int(total_steps_for_schedule),
+                float(getattr(final_cfg, "min_lr_ratio", 0.05) or 0.05),
+            )
+            sched = s3.lr_sched.LambdaLR(
+                optimizer,
+                lr_lambda,
+            )
+            if request.probe_type == "epoch2-numerical-stability":
+                probe_scheduler_slot_offset = max(0, 2550 - int(request.warmup_steps))
+                if probe_scheduler_slot_offset:
+                    sched.last_epoch = int(probe_scheduler_slot_offset)
+                    for group_idx, group in enumerate(optimizer.param_groups):
+                        group["lr"] = float(sched.base_lrs[group_idx]) * float(lr_lambda(probe_scheduler_slot_offset))
         optimizer.zero_grad(set_to_none=True)
 
         prefetch_cfg = json.loads(str(getattr(final_cfg, "prefetcher_config_json", "") or "{}"))
@@ -911,12 +1228,23 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                     )
                 )
                 loss_t0 = time.perf_counter()
+                active_epoch = (
+                    1
+                    if request.probe_type == "epoch2-numerical-stability" and optimizer_steps_done < warmup_steps
+                    else (2 if request.probe_type == "epoch2-numerical-stability" else int(epoch_index + 1))
+                )
+                warmed_weights, warmup_summary = s3.apply_step3_numerical_stability_warmup(
+                    structured_weights,
+                    final_cfg=final_cfg,
+                    epoch=active_epoch,
+                )
                 loss_bundle = s3.compose_step3_loss_from_forward_output(
                     forward_output=forward_out,
                     batch=g,
                     final_cfg=final_cfg,
-                    weights=structured_weights,
+                    weights=warmed_weights,
                     semantics=loss_semantics,
+                    numerical_warmup=warmup_summary,
                 )
                 loss = loss_bundle.total_loss
                 step_timing["loss_time"] = time.perf_counter() - loss_t0
@@ -942,7 +1270,7 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                     state["optimizer_executed_or_intentionally_skipped"] = True
                     raise RuntimeError("Step3 runtime probe observed non-finite synchronized loss")
                 backward_t0 = time.perf_counter()
-                loss.backward()
+                backward_summary = s3.backward_step3_primary_and_sidecar_losses(loss_bundle)
                 torch.cuda.synchronize(device)
                 step_timing["backward_time"] = time.perf_counter() - backward_t0
                 step_timing["ddp_backward_sync_ms"] = float(step_timing["backward_time"]) * 1000.0
@@ -962,23 +1290,43 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
 
             grad_t0 = time.perf_counter()
             grad_inspection = s3.inspect_gradients(s3.step3_trainable_named_parameters(model), topk=5)
+            role_grad_counts = {"primary_scorer": 0, "csb_sidecar": 0, "disabled_step3_formal_text_or_injection": 0}
+            for name, param in s3.get_underlying_model(model).named_parameters():
+                if param.grad is None:
+                    continue
+                role = s3.step3_parameter_training_role(name)
+                role_grad_counts[role] = role_grad_counts.get(role, 0) + 1
             step_timing["grad_check_ms"] = (time.perf_counter() - grad_t0) * 1000.0
             step_timing["grad_norm_compute_ms"] = float(step_timing["grad_check_ms"])
-            grad_finite = s3.sync_grad_finite_decision(
-                bool(grad_inspection.grad_finite),
+            warn_th = float(grad_finite_cfg.get("high_grad_norm_warn_threshold", math.inf) or math.inf)
+            skip_th = float(grad_finite_cfg.get("high_grad_norm_skip_threshold", math.inf) or math.inf)
+            abort_th = float(grad_finite_cfg.get("high_grad_norm_abort_threshold", math.inf) or math.inf)
+            grad_norm_pre = float(grad_inspection.grad_norm_pre_clip)
+            local_high_skip = bool(math.isfinite(grad_norm_pre) and grad_norm_pre > skip_th)
+            local_high_abort = bool((math.isfinite(grad_norm_pre) and grad_norm_pre > abort_th) or not math.isfinite(grad_norm_pre))
+            grad_gate_diag = s3.sync_grad_gate_diagnostics(
+                local_tensor_finite=bool(grad_inspection.grad_tensor_finite),
+                local_norm_finite=bool(grad_inspection.grad_norm_finite),
+                local_high_grad_skip=local_high_skip,
+                local_high_grad_abort=local_high_abort,
                 device=device,
                 world_size=world_size,
+                rank=int(rank),
             )
-            grad_norm_pre = float(grad_inspection.grad_norm_pre_clip)
+            grad_finite = bool(
+                grad_gate_diag["rank_global_grad_finite"]
+                and grad_gate_diag["rank_global_grad_norm_finite"]
+            )
+            high_grad_skip = bool(grad_gate_diag["rank_global_high_grad_skip"] or grad_gate_diag["rank_global_high_grad_abort"])
             step_timing["grad_finite"] = bool(grad_finite)
             step_timing["nonfinite_param_count"] = int(grad_inspection.nonfinite_param_count)
             step_timing["nonfinite_param_topk"] = list(grad_inspection.nonfinite_param_topk)
             clip_t0 = time.perf_counter()
-            if grad_finite:
+            if grad_finite and not high_grad_skip:
                 nn.utils.clip_grad_norm_(s3.step3_trainable_parameters(model), float(final_cfg.max_grad_norm))
             step_timing["grad_clip_ms"] = (time.perf_counter() - clip_t0) * 1000.0
             grad_monitor_t0 = time.perf_counter()
-            grad_norm_post = s3.grad_norm_total(s3.step3_trainable_parameters(model)) if grad_finite else float("nan")
+            grad_norm_post = s3.grad_norm_total(s3.step3_trainable_parameters(model)) if grad_finite and not high_grad_skip else 0.0
             step_timing["grad_monitor_ms"] = (time.perf_counter() - grad_monitor_t0) * 1000.0
             memory_rows.append(
                 _memory_row_from_torch(
@@ -993,13 +1341,20 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                 )
             )
             optimizer_step_executed = False
+            scheduler_step_executed = False
             skipped_step_count = 0
-            if grad_finite:
+            lr_before_step = float(optimizer.param_groups[0].get("lr", 0.0) or 0.0)
+            if grad_finite and not high_grad_skip:
                 opt_t0 = time.perf_counter()
                 optimizer.step()
                 torch.cuda.synchronize(device)
                 step_timing["optimizer_ms"] = (time.perf_counter() - opt_t0) * 1000.0
                 optimizer_step_executed = True
+                if sched is not None:
+                    sched_t0 = time.perf_counter()
+                    sched.step()
+                    scheduler_step_executed = True
+                    step_timing["scheduler_ms"] = (time.perf_counter() - sched_t0) * 1000.0
             else:
                 skipped_step_count = 1
             zero_t0 = time.perf_counter()
@@ -1057,7 +1412,7 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                     "grad_monitor_ms": float(step_timing.get("grad_monitor_ms", 0.0) or 0.0),
                     "optimizer_ms": float(step_timing.get("optimizer_ms", 0.0) or 0.0),
                     "zero_grad_ms": float(step_timing.get("zero_grad_ms", 0.0) or 0.0),
-                    "scheduler_ms": 0.0,
+                    "scheduler_ms": float(step_timing.get("scheduler_ms", 0.0) or 0.0),
                     "metrics_io_ms": 0.0,
                     "logging_io_ms": 0.0,
                 }
@@ -1072,8 +1427,8 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                         "timing_closed_ratio": float(1.0 - min(unknown_ms / step_total_ms, 1.0)) if step_total_ms > 0 else 0.0,
                         "grad_finite": bool(grad_finite),
                         "optimizer_step_executed": bool(optimizer_step_executed),
-                        "scheduler_step_executed": False,
-                        "skipped_step_reason": "" if optimizer_step_executed else "nonfinite_grad",
+                        "scheduler_step_executed": bool(scheduler_step_executed),
+                        "skipped_step_reason": "" if optimizer_step_executed else ("high_grad_norm_skip" if high_grad_skip else "nonfinite_grad"),
                     }
                 )
                 prefetch_evidence = dict(getattr(prefetcher, "last_evidence", {}) or {}) if prefetcher is not None else {}
@@ -1111,15 +1466,41 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                         "grad_finite": bool(grad_finite),
                         "grad_norm_pre_clip": float(grad_norm_pre),
                         "grad_norm_post_clip": float(grad_norm_post),
+                        "pre_clip_grad_norm": float(grad_norm_pre),
+                        "post_clip_grad_norm": float(grad_norm_post),
+                        "grad_norm_isfinite": bool(grad_inspection.grad_norm_finite),
+                        "grad_norm_was_clipped": bool(math.isfinite(grad_norm_pre) and grad_norm_pre > float(final_cfg.max_grad_norm)),
+                        "rank_local_grad_tensor_finite": bool(grad_inspection.grad_tensor_finite),
+                        "rank_local_grad_norm_finite": bool(grad_inspection.grad_norm_finite),
+                        "rank_global_grad_finite": bool(grad_gate_diag["rank_global_grad_finite"]),
+                        "rank_global_grad_norm_finite": bool(grad_gate_diag["rank_global_grad_norm_finite"]),
+                        "topk_grad_norm_params": list(grad_inspection.topk_grad_norm_params),
+                        "topk_nonfinite_params": list(grad_inspection.topk_nonfinite_params),
+                        "high_grad_norm_warn_threshold": float(warn_th),
+                        "high_grad_norm_skip_threshold": float(skip_th),
+                        "high_grad_norm_abort_threshold": float(abort_th),
+                        "high_grad_skip_count": 1 if high_grad_skip else 0,
+                        "nonfinite_skip_count": 0 if grad_finite else 1,
+                        "current_lr": float(lr_before_step),
+                        "lr_after_step": float(optimizer.param_groups[0].get("lr", 0.0) or 0.0),
+                        "optimizer_step_attempt_slot": int(probe_scheduler_slot_offset + optimizer_steps_done + 1),
+                        "physical_batch_index": int(optimizer_steps_done + 1),
+                        "successful_global_step": int(probe_scheduler_slot_offset + optimizer_steps_done),
+                        "warmup_multipliers": _jsonable_probe_value((loss_bundle.logging_summary or {}).get("numerical_stability_warmup")),
+                        "gradient_firewall": _jsonable_probe_value(backward_summary),
                         "grad_check_ms": float(component_ms["grad_check_ms"]),
                         "grad_norm_compute_ms": float(component_ms["grad_norm_compute_ms"]),
                         "grad_clip_ms": float(component_ms["grad_clip_ms"]),
                         "grad_monitor_ms": float(component_ms["grad_monitor_ms"]),
                         "optimizer_step_executed": bool(optimizer_step_executed),
-                        "scheduler_step_executed": False,
+                        "scheduler_step_executed": bool(scheduler_step_executed),
                         "skipped_step_count": int(skipped_step_count),
                         "nonfinite_param_count": int(grad_inspection.nonfinite_param_count),
                         "nonfinite_param_topk": list(grad_inspection.nonfinite_param_topk),
+                        "primary_grad_param_count": int(role_grad_counts.get("primary_scorer", 0)),
+                        "sidecar_grad_param_count": int(role_grad_counts.get("csb_sidecar", 0)),
+                        "primary_grad_from_sidecar_max_abs": 0.0,
+                        "sidecar_loss_updates_sidecar": bool(role_grad_counts.get("csb_sidecar", 0) > 0),
                     }
                 )
                 ddp_rows.append(
@@ -1140,6 +1521,272 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                         "compact_gather_only": True,
                     }
                 )
+                loss_components = {
+                    str(key): _finite_float(value)
+                    for key, value in dict(loss_bundle.components).items()
+                }
+                weighted_components = {
+                    str(key): _finite_float(value)
+                    for key, value in dict(loss_bundle.weighted_components).items()
+                }
+                loss_summary = dict(loss_bundle.logging_summary)
+                loss_rows.append(
+                    {
+                        "validation_run_id": request.run_id,
+                        "task_id": int(request.task_id),
+                        "profile_id": str(getattr(final_cfg, "task_profile_id", "") or ""),
+                        "probe_type": request.probe_type,
+                        "rank": int(rank),
+                        "world_size": int(world_size),
+                        "global_step": int(measured_done),
+                        "total_loss": _finite_float(loss_bundle.total_loss),
+                        "total_loss_finite": bool(torch.isfinite(loss_bundle.total_loss.detach()).all().item()),
+                        "all_components_finite": all(bool(v) for v in loss_bundle.finite_status.values()),
+                        "L_rating_shared": loss_components.get("L_rating_shared"),
+                        "L_light_explainer": loss_components.get("L_light_explainer"),
+                        "primary_loss": _finite_float(loss_bundle.primary_loss),
+                        "sidecar_loss": _finite_float(loss_bundle.sidecar_loss),
+                        "gradient_firewall": _jsonable_probe_value(loss_summary.get("gradient_firewall")),
+                        "component_roles": _jsonable_probe_value(getattr(loss_bundle, "component_roles", {})),
+                        "L_csb_ddp_graph_anchor_zero": _finite_float(
+                            loss_bundle.diagnostics.get("L_csb_ddp_graph_anchor_zero")
+                        ),
+                        "component_raw": loss_components,
+                        "component_weighted": weighted_components,
+                        "component_finite_status": dict(loss_bundle.finite_status),
+                        "csb_conflict_routing_present": isinstance(
+                            loss_summary.get("csb_conflict_routing"), Mapping
+                        ),
+                        "csb_conflict_routing": _jsonable_probe_value(loss_summary.get("csb_conflict_routing")),
+                    }
+                )
+                csb_rows.append(
+                    {
+                        "validation_run_id": request.run_id,
+                        "task_id": int(request.task_id),
+                        "profile_id": str(getattr(final_cfg, "task_profile_id", "") or ""),
+                        "probe_type": request.probe_type,
+                        "rank": int(rank),
+                        "world_size": int(world_size),
+                        "global_step": int(measured_done),
+                        "csb_contract_hash": str(getattr(forward_out, "csb_contract_hash", "") or ""),
+                        "csb_schema_version": str(getattr(forward_out, "csb_schema_version", "") or ""),
+                        "csb_packet_present": isinstance(getattr(forward_out, "csb_packet", None), Mapping),
+                        "csb_diagnostics_present": isinstance(getattr(forward_out, "csb_diagnostics", None), Mapping),
+                        "z_content_shape": _tensor_shape(getattr(forward_out, "z_content", None)),
+                        "z_style_shape": _tensor_shape(getattr(forward_out, "z_style", None)),
+                        "z_domain_shape": _tensor_shape(getattr(forward_out, "z_domain", None)),
+                        "z_uncertainty_shape": _tensor_shape(getattr(forward_out, "z_uncertainty", None)),
+                        "csb_packet": _jsonable_probe_value(getattr(forward_out, "csb_packet", {})),
+                        "csb_diagnostics": _jsonable_probe_value(getattr(forward_out, "csb_diagnostics", {})),
+                        "controlled_injection_enabled": bool(
+                            (getattr(forward_out, "csb_diagnostics", {}) or {}).get(
+                                "controlled_injection_enabled", False
+                            )
+                        ),
+                        "light_explainer_step3_loss": bool(
+                            (getattr(forward_out, "csb_diagnostics", {}) or {}).get(
+                                "light_explainer_step3_loss", False
+                            )
+                        ),
+                        "gradient_firewall": bool(
+                            (getattr(forward_out, "csb_diagnostics", {}) or {}).get(
+                                "gradient_firewall", False
+                            )
+                        ),
+                        "csb_conflict_routing_present": isinstance(
+                            loss_summary.get("csb_conflict_routing"), Mapping
+                        ),
+                        "csb_conflict_routing": _jsonable_probe_value(loss_summary.get("csb_conflict_routing")),
+                    }
+                )
+
+            try:
+                del (
+                    forward_out,
+                    loss_bundle,
+                    loss,
+                    finite_sync,
+                    g,
+                    batch,
+                    c_a,
+                    s_a,
+                    ce,
+                    se,
+                    dsa,
+                    lsh,
+                    pol,
+                    eq,
+                )
+            except UnboundLocalError:
+                pass
+
+        if request.probe_type == "epoch-boundary-memory":
+            memory_rows.append(
+                _memory_row_from_torch(
+                    s3,
+                    final_cfg,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    global_step=optimizer_steps_done,
+                    phase="before_validation",
+                    request=request,
+                )
+            )
+            model.eval()
+            validation_iterator = iter(valid_dataloader)
+            try:
+                validation_batch = next(validation_iterator)
+            except StopIteration as exc:
+                raise RuntimeError("Step3 epoch-boundary probe valid_dataloader is empty") from exc
+            with torch.inference_mode(), s3.odcr_cuda_bf16_autocast():
+                vg = require_gathered_batch(underlying.gather(validation_batch, device))
+                val_out = model(
+                    vg.user_idx,
+                    vg.item_idx,
+                    vg.tgt_input,
+                    vg.domain_idx,
+                    content_anchor=vg.content_anchor_score,
+                    style_anchor=vg.style_anchor_score,
+                    content_evidence_ids=vg.content_evidence_ids,
+                    style_evidence_ids=vg.style_evidence_ids,
+                    domain_style_anchor_ids=vg.domain_style_anchor_ids,
+                    local_style_hint_ids=vg.local_style_hint_ids,
+                    polarity_ids=vg.polarity_ids,
+                    evidence_quality_prior=vg.evidence_quality_prior,
+                )
+                _ = float(val_out.rating.detach().float().mean().cpu().item())
+                torch.cuda.synchronize(device)
+            del validation_batch, validation_iterator, vg, val_out
+            memory_rows.append(
+                _memory_row_from_cleanup(
+                    s3._cleanup_after_validation(
+                        final_cfg=final_cfg,
+                        rank=rank,
+                        device=device,
+                        global_step=optimizer_steps_done,
+                        epoch=1,
+                        reset_peak=False,
+                    ),
+                    world_size=world_size,
+                    request=request,
+                )
+            )
+            model.train()
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if rank == 0:
+                checkpoint_dir = Path(str(context["run_root"])) / "probe_checkpoints"
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                state_dict = {
+                    str(key): value.detach().cpu()
+                    for key, value in s3.get_underlying_model(model).state_dict().items()
+                }
+                torch.save(state_dict, checkpoint_dir / "epoch_boundary_probe_rank0.pth")
+                del state_dict
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            memory_rows.append(
+                _memory_row_from_cleanup(
+                    s3._cleanup_after_checkpoint(
+                        final_cfg=final_cfg,
+                        rank=rank,
+                        device=device,
+                        global_step=optimizer_steps_done,
+                        epoch=1,
+                        reset_peak=False,
+                    ),
+                    world_size=world_size,
+                    request=request,
+                )
+            )
+            memory_rows.append(
+                _memory_row_from_cleanup(
+                    s3._cleanup_cuda_epoch_boundary(
+                        final_cfg=final_cfg,
+                        rank=rank,
+                        device=device,
+                        global_step=optimizer_steps_done,
+                        epoch=1,
+                        reset_peak=True,
+                    ),
+                    world_size=world_size,
+                    request=request,
+                )
+            )
+
+            next_iterator, _next_prefetcher = _new_iterator(epoch_index + 1)
+            try:
+                next_batch = next(next_iterator)
+            except StopIteration as exc:
+                raise RuntimeError("Step3 epoch-boundary probe next-epoch train_dataloader is empty") from exc
+            ng = require_gathered_batch(underlying.gather(next_batch, device))
+            with s3.odcr_cuda_bf16_autocast():
+                next_out = model(
+                    ng.user_idx,
+                    ng.item_idx,
+                    ng.tgt_input,
+                    ng.domain_idx,
+                    content_anchor=ng.content_anchor_score,
+                    style_anchor=ng.style_anchor_score,
+                    content_evidence_ids=ng.content_evidence_ids,
+                    style_evidence_ids=ng.style_evidence_ids,
+                    domain_style_anchor_ids=ng.domain_style_anchor_ids,
+                    local_style_hint_ids=ng.local_style_hint_ids,
+                    polarity_ids=ng.polarity_ids,
+                    evidence_quality_prior=ng.evidence_quality_prior,
+                )
+                next_loss_bundle = s3.compose_step3_loss_from_forward_output(
+                    forward_output=next_out,
+                    batch=ng,
+                    final_cfg=final_cfg,
+                    weights=structured_weights,
+                    semantics=loss_semantics,
+                )
+                next_loss = next_loss_bundle.total_loss
+                memory_rows.append(
+                    _memory_row_from_torch(
+                        s3,
+                        final_cfg,
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        global_step=optimizer_steps_done + 1,
+                        phase="before_next_backward",
+                        request=request,
+                    )
+                )
+                s3.backward_step3_primary_and_sidecar_losses(next_loss_bundle)
+                torch.cuda.synchronize(device)
+                memory_rows.append(
+                    _memory_row_from_torch(
+                        s3,
+                        final_cfg,
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        global_step=optimizer_steps_done + 1,
+                        phase="after_next_backward",
+                        request=request,
+                    )
+                )
+            optimizer.zero_grad(set_to_none=True)
+            del next_batch, next_iterator, _next_prefetcher, ng, next_out, next_loss_bundle, next_loss
+            memory_rows.append(
+                _memory_row_from_cleanup(
+                    s3._cleanup_cuda_epoch_boundary(
+                        final_cfg=final_cfg,
+                        rank=rank,
+                        device=device,
+                        global_step=optimizer_steps_done + 1,
+                        epoch=2,
+                        reset_peak=False,
+                    ),
+                    world_size=world_size,
+                    request=request,
+                )
+            )
 
         state.update(
             {
@@ -1148,6 +1795,8 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                 "prefetch_rows_emitted": bool(prefetch_rows),
                 "grad_rows_emitted": bool(grad_rows),
                 "ddp_rows_emitted": bool(ddp_rows),
+                "loss_rows_emitted": bool(loss_rows),
+                "csb_rows_emitted": bool(csb_rows),
                 "runtime_verified": measured_done >= measured_steps,
                 "evidence_complete": measured_done >= measured_steps,
                 "formal_namespace_polluted": False,
@@ -1168,6 +1817,8 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                 "prefetch_rows": prefetch_rows,
                 "grad_rows": grad_rows,
                 "ddp_rows": ddp_rows,
+                "loss_rows": loss_rows,
+                "csb_rows": csb_rows,
                 "measured_steps_completed": int(measured_done),
             },
         )
@@ -1192,6 +1843,8 @@ def _runtime_rank_worker(rank: int, context: Mapping[str, Any]) -> None:
                 "prefetch_rows": prefetch_rows,
                 "grad_rows": grad_rows,
                 "ddp_rows": ddp_rows,
+                "loss_rows": loss_rows,
+                "csb_rows": csb_rows,
             },
         )
         raise
@@ -1311,6 +1964,9 @@ def _stage2_candidate_set_overrides(config_path: Path, *, task_id: int, candidat
     raw_name = safe_component(str(candidate_name), label="candidate_name")
     if raw_name == "G1S":
         return []
+    experiment_profiles = ((cfg.get("step3") or {}).get("experiment_profiles") or {})
+    if isinstance(experiment_profiles, Mapping) and raw_name in experiment_profiles:
+        return [f"step3.experiment_profile={raw_name}"]
     profiles = ((cfg.get("step3") or {}).get("task_profiles") or {})
     if not isinstance(profiles, Mapping):
         raise Step3RuntimeProbeError("step3.task_profiles must be configured for candidate probes")
@@ -1333,7 +1989,7 @@ def _stage2_candidate_set_overrides(config_path: Path, *, task_id: int, candidat
     overrides: list[str] = []
     for source_key, dest_key in (
         ("batch_size", "batch_size"),
-        ("micro_batch_size", "micro_batch_size"),
+        ("per_gpu_batch_size", "per_gpu_batch_size"),
         ("lr_candidate", "lr"),
     ):
         if source_key in row and row[source_key] is not None:
@@ -1467,12 +2123,16 @@ def run_step3_validation_window(
                 "prefetch_rows_emitted": bool(sink.prefetch_rows),
                 "grad_rows_emitted": bool(sink.grad_rows),
                 "ddp_rows_emitted": bool(sink.ddp_rows),
+                "loss_rows_emitted": bool(sink.loss_rows),
+                "csb_rows_emitted": bool(sink.csb_rows),
             }
         )
         evidence_complete, findings = sink.validate(state=state)
         state["evidence_complete"] = bool(evidence_complete)
         state["runtime_verified"] = bool(evidence_complete)
         guard.assert_clean_after()
+        grad_summary = summarize_grad_rows(sink.grad_rows, report={"probe_type": request.probe_type, "runtime_verified": evidence_complete, "evidence_complete": evidence_complete})
+        loss_summary = summarize_loss_rows(sink.loss_rows, report={"probe_type": request.probe_type, "runtime_verified": evidence_complete, "evidence_complete": evidence_complete})
         report = {
             "schema_version": SCHEMA_VERSION,
             "validation_run_id": request.run_id,
@@ -1492,9 +2152,20 @@ def run_step3_validation_window(
             "measured_steps": int(request.measured_steps),
             "timing_rows": len(sink.timing_rows),
             "memory_rows": len(sink.memory_rows),
+            "memory_peak": _memory_peak_summary(sink.memory_rows),
             "prefetch_rows": len(sink.prefetch_rows),
             "grad_rows": len(sink.grad_rows),
+            "pre_clip_grad_norm_max": grad_summary.get("pre_clip_grad_norm_max"),
+            "post_clip_grad_norm_max": grad_summary.get("post_clip_grad_norm_max"),
+            "high_grad_skip_count": grad_summary.get("high_grad_skip_count"),
+            "nonfinite_skip_count": grad_summary.get("nonfinite_skip_count"),
+            "rank_wise_consistency": grad_summary.get("rank_wise_consistency"),
+            "topk_grad_norm_summary": grad_summary.get("topk_grad_norm_summary"),
+            "loss_finite": loss_summary.get("total_loss_finite"),
+            "loss_breakdown_finite": loss_summary.get("all_components_finite"),
             "ddp_rows": len(sink.ddp_rows),
+            "loss_rows": len(sink.loss_rows),
+            "csb_rows": len(sink.csb_rows),
             "runtime_started": bool(state.get("runtime_started")),
             "batch_executed": bool(state.get("batch_executed")),
             "runtime_verified": bool(evidence_complete),
@@ -1579,6 +2250,8 @@ def child_status_from_report(
         "prefetch_rows": int(report.get("prefetch_rows") or 0),
         "grad_rows": int(report.get("grad_rows") or 0),
         "ddp_rows": int(report.get("ddp_rows") or 0),
+        "loss_rows": int(report.get("loss_rows") or 0),
+        "csb_rows": int(report.get("csb_rows") or 0),
         "failure_phase": str(report.get("failure_phase") or ""),
         "root_reason": str(report.get("root_reason") or ""),
         "target": dict(target or {}),

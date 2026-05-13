@@ -104,7 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_name=getattr(args, "candidate_name", None),
             warmup_steps=int(args.warmup_steps),
             measured_steps=int(args.measured_steps),
-            max_wall_seconds=max(20, min(int(args.max_seconds), 170)),
+            max_wall_seconds=max(20, min(int(args.max_seconds), 900)),
             repo_root=REPO_ROOT,
             bridge_dispatched=True,
         )
@@ -117,7 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_name=getattr(args, "candidate_name", None),
             warmup_steps=int(args.warmup_steps),
             measured_steps=int(args.measured_steps),
-            max_wall_seconds=max(20, min(int(args.max_seconds), 170)),
+            max_wall_seconds=max(20, min(int(args.max_seconds), 900)),
             bridge_dispatched=True,
         )
         guard = Step3ValidationNamespaceGuard(REPO_ROOT, int(args.task), str(args.slug), run_id)

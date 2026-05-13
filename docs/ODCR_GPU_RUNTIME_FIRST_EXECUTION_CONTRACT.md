@@ -4,20 +4,19 @@
 
 GPU use is allowed by default for Codex repo-local validation, probe, and
 bounded runtime when the current tmux pane is user-created, already-entered,
-uniquely validated, and exposes real-time CUDA. This contract deletes the old
-GPU whitelist hard blocker and the post-edit full pre-GPU gate.
+uniquely validated, and exposes real-time CUDA. This contract replaces the old
+GPU whitelist hard blocker with the `./odcr runtime` stage-dispatch allowlist
+and deletes the post-edit full pre-GPU gate.
 
 ## Runtime-First Rule
 
-There is no GPU whitelist hard blocker and no closed-choice-only runtime
-restriction. The tmux bridge may execute repo-local Python modules, repo-local
-scripts, generated command files under validation directories, and direct
-repo-local commands. The bridge still sends one generated command file to the
-validated pane; arbitrary send-keys remain forbidden.
+There is no arbitrary repo-command shell dispatch. The tmux bridge may execute
+only registered stage-dispatch commands and generated command files under
+validation directories. The bridge still sends one generated command file to
+the validated pane; arbitrary send-keys remain forbidden.
 
-No GPU whitelist hard blocker is allowed in the active execution path; formal
-full train still requires user confirmation; runtime evidence takes priority
-over static full-suite instability.
+formal full train still requires user confirmation. runtime evidence takes
+priority over static full-suite instability.
 
 post-edit full is not a GPU prerequisite. The GPU preflight is fast sanity:
 

@@ -172,16 +172,6 @@ def require_sentence_embed_model_dir() -> str:
     return p
 
 
-def get_t5_small_dir() -> str:
-    """历史名：与 :func:`get_step5_text_model_dir` 相同（当前主线为 flan-t5-xl 目录）。"""
-    return get_step5_text_model_dir()
-
-
-def get_mpnet_dir() -> str:
-    """历史名：与 :func:`get_sentence_embed_model_dir` 相同（当前主线为 BGE-large）。"""
-    return get_sentence_embed_model_dir()
-
-
 def get_meteor_cache_dir() -> str:
     """METEOR/evaluate 本地缓存目录；默认 ``<repo>/artifacts/models/evaluate_meteor``。"""
     return os.path.join(get_models_dir(), "evaluate_meteor")
@@ -290,7 +280,3 @@ def get_t5_tokenizer_path():
     """T5 tokenizer 本地路径（与 Step5 文本模型目录一致）。"""
     return get_step5_text_model_dir()
 
-
-def get_mpnet_path():
-    """句向量模型本地路径（与 ODCR_SENTENCE_EMBED_MODEL 一致）。"""
-    return get_sentence_embed_model_dir()

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from odcr_core import path_layout, run_naming
+from odcr_core.csb_contract import CSB_ODCR_METHOD_NAME
 from odcr_core.file_atomic import atomic_write_json
 from odcr_core.index_contract import ODCR_ROUTING_TRAIN_CSV
 from odcr_core.step4_export_validator import (
@@ -45,7 +46,7 @@ BAD_FINAL_STATUSES = {
     "not_ready",
 }
 
-OK_RUN_SUMMARY_STATUSES = {"ok", "completed", "success", "completed_with_eval_handoff", "eval_handoff_accepted"}
+OK_RUN_SUMMARY_STATUSES = {"ok", "completed", "success", "step4_ready"}
 BAD_RUN_SUMMARY_STATUSES = {"failed", "running", "partial", "interrupted"}
 
 
@@ -186,9 +187,9 @@ def _checkpoint_valid(stage: str, checkpoint: Path | None) -> tuple[bool, str | 
     return True, None, lineage
 
 
-def _selected_step3_checkpoint(repo_root: Path, run_root: Path, run_summary: Mapping[str, Any], handoff: Mapping[str, Any]) -> Path | None:
+def _selected_step3_checkpoint(repo_root: Path, run_root: Path, run_summary: Mapping[str, Any], readiness_audit: Mapping[str, Any]) -> Path | None:
     for raw in (
-        handoff.get("checkpoint_path"),
+        readiness_audit.get("selected_downstream_checkpoint"),
         run_summary.get("selected_downstream_checkpoint"),
         run_summary.get("selected_checkpoint"),
         run_root / "model" / "best_observed.pth",
@@ -206,25 +207,23 @@ def _step3_status(
     run_root: Path,
     run_summary: Mapping[str, Any],
     quality_audit: Mapping[str, Any],
-    eval_handoff: Mapping[str, Any],
 ) -> dict[str, Any]:
     summary_status = str(run_summary.get("status") or "").strip().lower()
-    handoff_ready = (
-        str(eval_handoff.get("schema_version") or "") == "odcr_step3_eval_handoff/1"
-        and str(eval_handoff.get("train_status") or "") == "completed"
-        and str(eval_handoff.get("paper_eval_status") or "") == "completed"
-        and str(eval_handoff.get("paper_eval_protocol") or "") == "paper_target_only_eval"
-        and bool(eval_handoff.get("old_failure_history_preserved")) is True
+    readiness_ready = (
+        str(quality_audit.get("schema_version") or "") == "odcr_step3_readiness_audit/1"
+        and str(quality_audit.get("readiness_gate") or "") == "step3_upstream_readiness_gate"
+        and str(quality_audit.get("readiness_status") or quality_audit.get("quality_status") or "") == "pass"
+        and quality_audit.get("downstream_ready") is True
     )
-    checkpoint = _selected_step3_checkpoint(repo_root, run_root, run_summary, eval_handoff)
+    checkpoint = _selected_step3_checkpoint(repo_root, run_root, run_summary, quality_audit)
     checkpoint_ok, checkpoint_error, checkpoint_lineage = _checkpoint_valid("step3", checkpoint)
-    if handoff_ready:
-        final_status = "completed_with_eval_handoff"
+    if readiness_ready:
+        final_status = "step4_ready"
         downstream_ready = checkpoint_ok
         ready_for = ["step4"] if downstream_ready else []
-        status_source = "eval_handoff"
+        status_source = "step3_upstream_readiness_gate"
         reasons = [] if checkpoint_ok else [checkpoint_error or "checkpoint_not_valid"]
-        supersedes = ["quality_audit.json", "post_train_eval_failed_status"]
+        supersedes = ["paper_eval_handoff_gate", "post_train_paper_metric_status"]
     elif quality_audit and (
         str(quality_audit.get("quality_status") or "").strip().lower() == "blocked"
         or quality_audit.get("downstream_ready") is False
@@ -269,7 +268,7 @@ def _step3_status(
         "checkpoint_lineage": _repo_relative(repo_root, _checkpoint_lineage_path(run_root, checkpoint)),
         "checkpoint_lineage_schema": checkpoint_lineage.get("sidecar_schema_version") if checkpoint_lineage else None,
         "supersedes": supersedes,
-        "failure_history_preserved": bool(run_summary.get("failure_history")) or bool(eval_handoff.get("old_failure_history_preserved")),
+        "failure_history_preserved": bool(run_summary.get("failure_history")) or readiness_ready,
         "do_not_use_quality_audit_as_final_truth": True,
         "quality_audit_status": quality_audit.get("quality_status") if quality_audit else None,
         "quality_audit_downstream_ready": quality_audit.get("downstream_ready") if quality_audit else None,
@@ -363,7 +362,9 @@ def build_stage_status(
     summary_path = meta / "run_summary.json"
     run_summary = _load_json(summary_path, required=False)
     quality_audit = _load_json(meta / "quality_audit.json", required=False)
-    eval_handoff = _load_json(meta / "eval_handoff.json", required=False)
+    readiness_audit = _load_json(meta / "readiness_audit.json", required=False)
+    if readiness_audit:
+        quality_audit = readiness_audit
     if not run_root.is_dir():
         stage_payload = {
             "final_status": "missing_run_dir",
@@ -383,7 +384,6 @@ def build_stage_status(
             run_root=run_root,
             run_summary=run_summary,
             quality_audit=quality_audit,
-            eval_handoff=eval_handoff,
         )
     elif stage_name == "step4":
         stage_payload = _step4_status(repo_root=root, run_root=run_root, run_summary=run_summary)
@@ -409,7 +409,7 @@ def build_stage_status(
     now = _utc_now()
     required_artifacts = ["run_summary", "source_table", "resolved_config"]
     if stage_name == "step3":
-        required_artifacts.extend(["eval_handoff", "selected_checkpoint", "checkpoint_lineage"])
+        required_artifacts.extend(["readiness_audit", "selected_checkpoint", "checkpoint_lineage"])
     elif stage_name == "step4":
         required_artifacts.extend(["selected_export", "export_manifest", "index_contract"])
     elif stage_name == "step5":
@@ -425,6 +425,10 @@ def build_stage_status(
         "task_id": int(task),
         "run_id": rid,
         "run_dir": _repo_relative(root, run_root),
+        "method_name": str(run_summary.get("method_name") or CSB_ODCR_METHOD_NAME),
+        "method": run_summary.get("method") if isinstance(run_summary.get("method"), Mapping) else {"method_name": CSB_ODCR_METHOD_NAME},
+        "csb_contract_hash": str(run_summary.get("csb_contract_hash") or ""),
+        "csb_contract": run_summary.get("csb_contract") if isinstance(run_summary.get("csb_contract"), Mapping) else None,
         "final_status": stage_payload["final_status"],
         "downstream_ready": bool(stage_payload["downstream_ready"]),
         "ready_for": list(stage_payload["ready_for"]),
@@ -434,7 +438,7 @@ def build_stage_status(
         "export_manifest": stage_payload.get("export_manifest"),
         "index_contract": stage_payload.get("index_contract"),
         "export_readiness": stage_payload.get("export_readiness"),
-        "eval_handoff": _repo_relative(root, meta / "eval_handoff.json") if (meta / "eval_handoff.json").is_file() else None,
+        "readiness_audit": _repo_relative(root, meta / "readiness_audit.json") if (meta / "readiness_audit.json").is_file() else None,
         "run_summary": _repo_relative(root, summary_path) if summary_path.is_file() else None,
         "checkpoint_lineage": stage_payload.get("checkpoint_lineage"),
         "source_table": _repo_relative(root, source_table) if source_table.is_file() else None,
@@ -450,7 +454,7 @@ def build_stage_status(
         "quality_audit_downstream_ready": stage_payload.get("quality_audit_downstream_ready"),
         "artifacts": {
             "run_summary": _artifact_status(root, _repo_relative(root, summary_path)),
-            "eval_handoff": _artifact_status(root, _repo_relative(root, meta / "eval_handoff.json")) if stage_name == "step3" else None,
+            "readiness_audit": _artifact_status(root, _repo_relative(root, meta / "readiness_audit.json")) if stage_name == "step3" else None,
             "selected_checkpoint": _artifact_status(root, stage_payload.get("selected_checkpoint")),
             "selected_export": _artifact_status(root, stage_payload.get("selected_export")),
             "export_manifest": _artifact_status(root, stage_payload.get("export_manifest")),
@@ -516,11 +520,11 @@ def write_quality_audit_superseded_sidecar(*, repo_root: str | Path, stage_statu
         "schema_version": QUALITY_AUDIT_SUPERSEDED_SCHEMA_VERSION,
         "generated_at_utc": _utc_now(),
         "superseded_by": [
-            _repo_relative(root, meta / "eval_handoff.json"),
+            _repo_relative(root, meta / "readiness_audit.json"),
             _repo_relative(root, meta / "stage_status.json"),
         ],
         "do_not_use_for_downstream_gate": True,
-        "reason": "post-train eval failed but later full paper eval accepted through eval_handoff; stage_status is the final downstream truth",
+        "reason": "Step3 upstream readiness gate supersedes diagnostic quality_audit; stage_status is the final downstream truth",
         "original_quality_audit_preserved": True,
         "original_quality_audit": _repo_relative(root, audit),
         "original_quality_audit_hash": _file_sha256(audit),

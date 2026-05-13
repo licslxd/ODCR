@@ -50,6 +50,7 @@ from odcr_core.index_contract import (
     resolve_index_contract_path,
     validate_first_batch_indices,
     validate_index_contract_against_profiles,
+    validate_csb_step4_gate,
     validate_split_indices,
     validate_step4_export_lineage,
     write_index_contract_audit,
@@ -349,6 +350,8 @@ def _build_step5_checkpoint_lineage(final_cfg: FinalTrainingConfig, model: nn.Mo
         "compat_schema_version": STEP5_CHECKPOINT_COMPAT_SCHEMA_VERSION,
         "train_schema_version": STEP5_TRAIN_SCHEMA_VERSION,
         "step4_export_lineage_hash": str(step4_lineage["lineage_hash"]),
+        "csb_contract_hash": str(step4_lineage.get("csb_contract_hash") or ""),
+        "csb_contract": dict(step4_lineage.get("csb_contract") or {}),
         "step5_config_hashes": _step5_config_hashes(final_cfg),
         "one_control_resolved_config_hash": current_one_control_resolved_config_hash(
             extra={"stage": "step5", "task_idx": int(final_cfg.task_idx)}
@@ -3324,8 +3327,7 @@ def trainModel_ddp(
             save_reason = ""
             if str(checkpoint_metric).strip().lower() in ("valid_loss", "loss") and rank == 0:
                 if ckpt_mode == "valid_loss_only":
-                    do_save = current_valid_loss <= prev_valid_loss
-                    save_reason = "valid_loss_not_worse_than_prev_epoch"
+                    raise RuntimeError("valid_loss_only checkpoint selection is retired; use guarded_composite.")
                 elif ckpt_mode == "guarded_composite":
                     best_vl_gate_ref = float(best_vl_ever)
                     rel_tol = float(final_cfg.checkpoint_guard_valid_loss_rel_tol)
@@ -5558,6 +5560,7 @@ def build_odcr_ddp_artefacts(
         auxiliary_domain=str(args.auxiliary),
         target_domain=str(args.target),
     )
+    _step5_csb_gate = validate_csb_step4_gate(index_contract)
     nuser = int(index_contract["nuser_global"])
     nitem = int(index_contract["nitem_global"])
     _prof_dc, _prof_ds, _prof_uc, _prof_us, _prof_ic, _prof_is, _prof_meta = _load_odcr_profile_tensors_from_contract(
@@ -5591,6 +5594,7 @@ def build_odcr_ddp_artefacts(
         )
     resolved = replace(resolved, emsize=_prof_dim)
     setattr(args, "_odcr_index_contract", index_contract)
+    setattr(args, "_csb_step5_gate", _step5_csb_gate)
     setattr(args, "_odcr_profile_meta", _prof_meta)
 
     train_df = pd.read_csv(train_path)

@@ -101,7 +101,7 @@ class Step3NoAccumGatherMemoryTest(unittest.TestCase):
                     "activation_checkpointing": {
                         "enabled": True,
                         "policy": "selective",
-                        "modules": ["odcr_disentangler"],
+                        "modules": ["csb_odcr_bottleneck"],
                     },
                     "profile_buffer_policy": "cpu_pinned_batch_gather",
                 },

@@ -89,6 +89,7 @@ def _minimal_final_cfg(*, full_bleu_decode_strategy: str = "greedy") -> FinalTra
         checkpoint_policy_config_json="{}",
         quality_gate_config_json="{}",
         grad_finite_config_json="{}",
+        numerical_stability_config_json="{}",
         diagnostic_eval_config_json="{}",
         cross_rank_structured_gather_config_json="{}",
         memory_config_json="{}",

@@ -19,6 +19,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from odcr_core.config_resolver import OneControlConfigError, _latest_run
+from odcr_core.csb_contract import csb_contract_hash, default_csb_contract_payload, method_payload
 from odcr_core.training_checkpoint import (
     STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
     checkpoint_file_sha256,
@@ -31,17 +32,23 @@ class LatestRunResolutionTest(unittest.TestCase):
         meta = repo / "runs" / stage / f"task{task_id}" / run_id / "meta"
         meta.mkdir(parents=True, exist_ok=True)
         summary = meta / "run_summary.json"
+        csb_contract = default_csb_contract_payload()
+        csb_contract["contract_hash"] = csb_contract_hash(csb_contract)
         summary.write_text(
             json.dumps(
                 {
                     "run_id": run_id,
                     "stage": stage,
                     "task_id": task_id,
+                    "method_name": "CSB-ODCR",
+                    "method": method_payload(),
+                    "csb_contract": csb_contract,
+                    "csb_contract_hash": csb_contract["contract_hash"],
                     "source_domain": "AM_Movies" if task_id == 4 else "AM_CDs",
                     "target_domain": "AM_CDs" if task_id == 4 else "AM_Movies",
-                    "status": "completed_with_eval_handoff",
+                    "status": "step4_ready",
                     "train_status": "completed",
-                    "paper_eval_status": "completed",
+                    "paper_eval_status": "not_applicable",
                     "downstream_ready": True,
                     "selected_checkpoint": f"runs/{stage}/task{task_id}/{run_id}/model/best.pth",
                     "selected_checkpoint_hash": "",
@@ -71,37 +78,29 @@ class LatestRunResolutionTest(unittest.TestCase):
                 "replaced_previous": False,
             },
         )
-        quality = ckpt.parents[1] / "meta" / "quality_audit.json"
-        quality.parent.mkdir(parents=True, exist_ok=True)
-        quality.write_text(
+        readiness = ckpt.parents[1] / "meta" / "readiness_audit.json"
+        readiness.parent.mkdir(parents=True, exist_ok=True)
+        readiness.write_text(
             json.dumps(
                 {
-                    "schema_version": "odcr_step3_quality_audit/1",
+                    "schema_version": "odcr_step3_readiness_audit/1",
+                    "readiness_gate": "step3_upstream_readiness_gate",
+                    "readiness_status": "pass",
                     "quality_status": "pass",
                     "downstream_ready": True,
-                    "quality_block_reasons": [],
+                    "ready_for": ["step4"],
+                    "paper_metrics_excluded_from_readiness": ["BLEU", "ROUGE", "DIST", "METEOR"],
                     "selected_downstream_checkpoint": str(ckpt),
                     "selected_downstream_checkpoint_hash": checkpoint_file_sha256(ckpt),
                     "selected_downstream_checkpoint_scope": "best_observed",
                     "selected_downstream_checkpoint_epoch": 1,
                     "selected_downstream_checkpoint_metric": 1.0,
-                }
-            ),
-            encoding="utf-8",
-        )
-        handoff = ckpt.parents[1] / "meta" / "eval_handoff.json"
-        handoff.write_text(
-            json.dumps(
-                {
-                    "schema_version": "odcr_step3_eval_handoff/1",
-                    "task_id": task_id,
-                    "run_id": run_id,
-                    "checkpoint_path": str(ckpt),
-                    "checkpoint_hash": checkpoint_file_sha256(ckpt),
-                    "train_status": "completed",
-                    "paper_eval_status": "completed",
-                    "paper_eval_protocol": "paper_target_only_eval",
-                    "old_failure_history_preserved": True,
+                    "csb_contract_health": {
+                        "required_z_fields": ["z_content", "z_style", "z_domain", "z_uncertainty"],
+                        "missing_z_fields": [],
+                        "csb_contract_hash_present": True,
+                        "sidecar_only": True,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -237,15 +236,17 @@ class LatestRunResolutionTest(unittest.TestCase):
             ckpt = repo / "runs" / "step3" / "task4" / "1" / "model" / "best.pth"
             ckpt.parent.mkdir(parents=True, exist_ok=True)
             ckpt.write_bytes(b"dummy-checkpoint")
-            quality = repo / "runs" / "step3" / "task4" / "1" / "meta" / "quality_audit.json"
-            quality.parent.mkdir(parents=True, exist_ok=True)
-            quality.write_text(
+            readiness = repo / "runs" / "step3" / "task4" / "1" / "meta" / "readiness_audit.json"
+            readiness.parent.mkdir(parents=True, exist_ok=True)
+            readiness.write_text(
                 json.dumps(
                     {
-                        "schema_version": "odcr_step3_quality_audit/1",
+                        "schema_version": "odcr_step3_readiness_audit/1",
+                        "readiness_gate": "step3_upstream_readiness_gate",
+                        "readiness_status": "pass",
                         "quality_status": "pass",
                         "downstream_ready": True,
-                        "quality_block_reasons": [],
+                        "paper_metrics_excluded_from_readiness": ["BLEU", "ROUGE", "METEOR"],
                         "selected_downstream_checkpoint": str(ckpt),
                     }
                 ),

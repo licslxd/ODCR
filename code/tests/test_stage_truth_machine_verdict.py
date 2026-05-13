@@ -28,7 +28,7 @@ def _passing_fields() -> dict:
         "manual_alias_parity_passed": True,
         "promotion_malformed_target_rejected": True,
         "resolver_recomputes_checkpoint_hash": True,
-        "resolver_validates_eval_handoff": True,
+        "resolver_validates_readiness_audit": True,
         "resolver_validates_lineage": True,
         "resolver_validates_source_table": True,
         "formal_namespace_pollution_check_passed": True,

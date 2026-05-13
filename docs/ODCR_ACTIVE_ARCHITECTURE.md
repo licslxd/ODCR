@@ -1,7 +1,15 @@
 # ODCR Active Architecture
 
-This document records the current active ODCR mainline only. Historical
-material belongs in history notes or archive directories, not here.
+This document records the current active ODCR project mainline only. The
+paper-facing active method is now **CSB-ODCR: Causal Structure Bottleneck for
+Orthogonal Disentangled Counterfactual Recommendation**. Historical material
+belongs in history notes or archive directories, not here.
+
+Detailed CSB-ODCR architecture and handoff contracts live in:
+
+- `docs/CSB_ODCR_ACTIVE_ARCHITECTURE.md`
+- `docs/CSB_ODCR_CROSS_STAGE_CONTRACT.md`
+- `docs/CSB_ODCR_EXPERIMENTS_AND_ABLATIONS.md`
 
 ## Active Entrypoints
 
@@ -26,6 +34,14 @@ The resolver owns the resolved payload, source table, child-process transport,
 run metadata, and semantic fingerprints. New public control values must be
 visible in the YAML, schema, resolver, `./odcr show`, `./odcr doctor`, tests,
 and the static guardrail.
+
+The active method/model family surface is One-Control:
+
+- `project.method_name: CSB-ODCR`
+- `project.method_family: csb_odcr`
+- `step3.method`
+- `step3.experiment_profile`
+- `step3.csb_odcr`
 
 Global roots, model paths, and embedding dimension are One-Control values:
 
@@ -150,9 +166,9 @@ kill, or switch tmux sessions. Codex does not manage GPU allocation.
 GPU use is allowed by default for repo-local validation, probe, and bounded
 runtime once the current pane is a user-created, already-entered, uniquely
 validated GPU pane. The controlled tmux GPU bridge,
-`python code/tools/odcr_tmux_gpu_bridge.py`, may send one bridge-generated
-command file to that pane. It is not arbitrary send-keys, and it is no longer
-limited by a GPU whitelist hard blocker. Bridge output stays under
+`./odcr runtime bridge ...`, may send one bridge-generated command file to that
+pane through `code/odcr_core/aux/runtime`. It is not arbitrary send-keys, and
+it is gated by the stage-dispatch allowlist. Bridge output stays under
 `AI_analysis/06_probe_evidence` or `runs/step3_validation` by default. The
 formal namespace guard remains mandatory: validation must not write formal
 latest pointers, formal checkpoints, Step4/Step5/eval/rerank outputs, or paper
@@ -202,14 +218,11 @@ Inactive Step3 semantics:
 
 Step3 downstream handoff requires the active `latest.json` pointer to select a
 run whose `meta/stage_status.json` is downstream-ready and ready for Step4.
-`quality_audit.json` is a training diagnostic only. A completed training run
-whose post-train eval failed may become eligible only through an accepted
-`meta/eval_handoff.json` sidecar produced by `./odcr step3 --accept-eval-only`
-after full `paper_target_only_eval` valid/test evidence passes protocol,
-sample-integrity, registry, and checkpoint-hash checks. The accepted final
-status is `completed_with_eval_handoff`; the old failed state remains in
-`failure_history`, and `downstream_ready=true` means ready for Step4
-preparation, not a completed Step4/Step5 pipeline.
+`quality_audit.json` is diagnostic only. Active Step3 eligibility now comes
+from `meta/readiness_audit.json` with `readiness_gate=step3_upstream_readiness_gate`
+and `final_status=step4_ready`. `BLEU`, `ROUGE`, `DIST`, `METEOR`, and
+`paper_target_only_eval` are excluded from Step3 readiness; paper metrics are
+owned by the later Step3 -> Step4 -> Step5 -> eval/rerank chain.
 
 ## Active Step4
 

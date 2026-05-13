@@ -98,7 +98,7 @@ def _legacy_checkpoint_findings(ckpt_path: Path) -> list[str]:
             f"   - checkpoint: {ckpt_path}\n"
             f"   - 命中的旧 key: {legacy_hits}\n"
             f"   - 前若干 key: {keys[:12]}\n"
-            "   - 原因: 旧 3-tensor profile 与当前 physical_separate / odcr_index_contract/2.2 主线不兼容。\n"
+            "   - 原因: 旧 3-tensor profile 与当前 physical_separate / csb_odcr_index_contract/3.0 主线不兼容。\n"
             "   - 下一步: 先生成当前 ODCR 主线的 Step3 checkpoint，再重试 Step4。"
         )
     return findings

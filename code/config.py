@@ -325,11 +325,13 @@ def parse_full_bleu_decode_strategy(v: Any, *, ctx: str = "full_bleu_decode_stra
 
 
 def parse_checkpoint_selection_mode(v: Any, *, ctx: str = "checkpoint_selection_mode") -> str:
-    """canonical best.pth：guarded_composite=valid_loss 门槛 + 主口径文本复合 tie-break；valid_loss_only=仅逐 epoch 未变差。"""
+    """canonical downstream checkpoint mode: guarded composite only."""
     s = str(v).strip().lower()
-    if s in ("guarded_composite", "valid_loss_only"):
+    if s == "guarded_composite":
         return s
-    raise ValueError(f"{ctx} 须为 guarded_composite 或 valid_loss_only，当前为 {v!r}")
+    if s == "valid_loss_only":
+        raise ValueError(f"{ctx}=valid_loss_only is retired; use guarded_composite.")
+    raise ValueError(f"{ctx} 须为 guarded_composite，当前为 {v!r}")
 
 
 def parse_train_mode(v: Any, *, ctx: str = "train_mode") -> str:
@@ -586,9 +588,6 @@ _TRAINING_PRESET_ALLOWED_KEYS: FrozenSet[str] = frozenset(
         "decode_backend",
         "decode_backend_fallback_policy",
         "train_time_eval_decode_backend",
-        "adversarial_start_epoch",
-        "adversarial_warmup_epochs",
-        "adversarial_coef_target",
         "ddp_find_unused_parameters",
         "step5_strict_index_batches",
         # Step5：可与 decode 预设对齐的生成/解释支路标量（可选写入 training 行以按 task 覆盖）
@@ -624,8 +623,6 @@ _TRAINING_PRESET_INT_KEYS: FrozenSet[str] = frozenset(
         "batch_diversity_warmup_epochs",
         "batch_diversity_ramp_epochs",
         "batch_diversity_min_valid_tokens",
-        "adversarial_start_epoch",
-        "adversarial_warmup_epochs",
         "decode_top_k",
         "max_explanation_length",
         "prefix_greedy_steps",
@@ -663,7 +660,6 @@ _TRAINING_PRESET_FLOAT_KEYS: FrozenSet[str] = frozenset(
         "checkpoint_composite_w_dist2",
         "checkpoint_composite_w_dirty",
         "ema_decay",
-        "adversarial_coef_target",
         "gap_threshold",
         "generate_temperature",
         "label_smoothing",
@@ -1358,6 +1354,7 @@ class FinalTrainingConfig:
     checkpoint_policy_config_json: str
     quality_gate_config_json: str
     grad_finite_config_json: str
+    numerical_stability_config_json: str
     diagnostic_eval_config_json: str
     cross_rank_structured_gather_config_json: str
     memory_config_json: str
@@ -1456,6 +1453,18 @@ class FinalTrainingConfig:
     # Step5A/Step5B：LCI 与 FCA 权重来自 step5.lci / step5.fca。
     step5_lci_weight: float = 0.12
     step5_fca_weight: float = 0.08
+    method_name: str = "CSB-ODCR"
+    method_full_name: str = "CSB-ODCR: Causal Structure Bottleneck for Orthogonal Disentangled Counterfactual Recommendation"
+    method_family: str = "csb_odcr"
+    experiment_profile: str = "csb_odcr_sidecar_stable"
+    ablation_profile: str = "csb_odcr_sidecar_stable"
+    method_config_json: str = ""
+    experiment_profile_config_json: str = ""
+    experiment_profiles_config_json: str = ""
+    csb_odcr_config_json: str = ""
+    csb_contract_config_json: str = ""
+    csb_conflict_routing_config_json: str = ""
+    controlled_injection_config_json: str = ""
     step5_innovation_config_json: str = ""
     step3_structured_loss_weights_json: str = ""
     step3_loss_semantics_json: str = ""
@@ -2040,8 +2049,20 @@ def build_resolved_training_config(
 
     step3_structured_loss_weights_json_v = ""
     step3_loss_semantics_json_v = ""
+    method_config_json_v = json.dumps(_payload.get("method") or {}, ensure_ascii=False, sort_keys=True)
+    experiment_profile_config_json_v = json.dumps(_payload.get("experiment_profile") or {}, ensure_ascii=False, sort_keys=True)
+    experiment_profiles_config_json_v = json.dumps(_payload.get("experiment_profiles") or {}, ensure_ascii=False, sort_keys=True)
+    csb_odcr_config_json_v = json.dumps(_payload.get("step3_csb_odcr") or {}, ensure_ascii=False, sort_keys=True)
+    csb_contract_config_json_v = json.dumps((_payload.get("step3_csb_odcr") or {}).get("contract") or {}, ensure_ascii=False, sort_keys=True)
+    csb_conflict_routing_config_json_v = json.dumps((_payload.get("step3_csb_odcr") or {}).get("conflict_routing") or {}, ensure_ascii=False, sort_keys=True)
+    controlled_injection_config_json_v = json.dumps((_payload.get("step3_csb_odcr") or {}).get("controlled_injection") or {}, ensure_ascii=False, sort_keys=True)
+    method_obj_v = _payload.get("method") if isinstance(_payload.get("method"), dict) else {}
+    experiment_obj_v = _payload.get("experiment_profile") if isinstance(_payload.get("experiment_profile"), dict) else {}
     src["step3_structured_losses"] = "inactive"
     src["step3_loss_semantics"] = "inactive"
+    src["method_name"] = "project.method_name"
+    src["experiment_profile"] = "step3.experiment_profile"
+    src["step3_csb_odcr"] = "step3.csb_odcr"
     if preset_nm == "step3":
         st3_losses = _payload.get("step3_structured_losses")
         if not isinstance(st3_losses, dict):
@@ -2398,6 +2419,7 @@ def build_resolved_training_config(
     checkpoint_policy_config_v = _payload_obj("step3_checkpoint_policy")
     quality_gate_config_v = _payload_obj("step3_quality_gate")
     grad_finite_config_v = _payload_obj("step3_grad_finite")
+    numerical_stability_config_v = _payload_obj("step3_numerical_stability")
     diagnostic_eval_config_v = _payload_obj("step3_diagnostic_eval")
     cross_rank_structured_gather_config_v = _payload_obj("step3_cross_rank_structured_gather")
     memory_config_v = _payload_obj("step3_memory")
@@ -2527,6 +2549,7 @@ def build_resolved_training_config(
         checkpoint_policy_config_json=json.dumps(checkpoint_policy_config_v, ensure_ascii=False, sort_keys=True),
         quality_gate_config_json=json.dumps(quality_gate_config_v, ensure_ascii=False, sort_keys=True),
         grad_finite_config_json=json.dumps(grad_finite_config_v, ensure_ascii=False, sort_keys=True),
+        numerical_stability_config_json=json.dumps(numerical_stability_config_v, ensure_ascii=False, sort_keys=True),
         diagnostic_eval_config_json=json.dumps(diagnostic_eval_config_v, ensure_ascii=False, sort_keys=True),
         cross_rank_structured_gather_config_json=json.dumps(cross_rank_structured_gather_config_v, ensure_ascii=False, sort_keys=True),
         memory_config_json=json.dumps(memory_config_v, ensure_ascii=False, sort_keys=True),
@@ -2584,6 +2607,21 @@ def build_resolved_training_config(
         lambda_ortho_step5=float(lambda_ortho_step5_v),
         step5_lci_weight=float(step5_lci_weight_v),
         step5_fca_weight=float(step5_fca_weight_v),
+        method_name=str(method_obj_v.get("method_name") or "CSB-ODCR"),
+        method_full_name=str(
+            method_obj_v.get("method_full_name")
+            or "CSB-ODCR: Causal Structure Bottleneck for Orthogonal Disentangled Counterfactual Recommendation"
+        ),
+        method_family=str(method_obj_v.get("method_family") or "csb_odcr"),
+        experiment_profile=str(experiment_obj_v.get("name") or _payload.get("ablation_profile") or "csb_odcr_sidecar_stable"),
+        ablation_profile=str(experiment_obj_v.get("name") or _payload.get("ablation_profile") or "csb_odcr_sidecar_stable"),
+        method_config_json=str(method_config_json_v),
+        experiment_profile_config_json=str(experiment_profile_config_json_v),
+        experiment_profiles_config_json=str(experiment_profiles_config_json_v),
+        csb_odcr_config_json=str(csb_odcr_config_json_v),
+        csb_contract_config_json=str(csb_contract_config_json_v),
+        csb_conflict_routing_config_json=str(csb_conflict_routing_config_json_v),
+        controlled_injection_config_json=str(controlled_injection_config_json_v),
         step5_innovation_config_json=str(step5_innovation_config_json_v),
         step3_structured_loss_weights_json=str(step3_structured_loss_weights_json_v),
         step3_loss_semantics_json=str(step3_loss_semantics_json_v),

@@ -42,6 +42,10 @@ from paths_config import (
 from perf_monitor import PerfMonitor
 from train_diagnostics import odcr_cuda_bf16_autocast
 from odcr_core.gather_schema import require_gathered_batch
+from odcr_core.csb_contract import (
+    CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+    csb_contract_hash,
+)
 from odcr_core.index_contract import (
     INDEX_CONTRACT_FILENAME,
     ODCR_ROUTING_TRAIN_CSV,
@@ -153,6 +157,21 @@ def _validate_step3_checkpoint_lineage_for_step4(
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
     payload = current_effective_payload(required=True)
+    csb_cfg = payload.get("step3_csb_odcr")
+    if not isinstance(csb_cfg, Mapping):
+        raise CheckpointLineageError("Step4 requires resolved step3_csb_odcr; missing CSB fallback is forbidden.")
+    csb_contract = csb_cfg.get("contract")
+    if not isinstance(csb_contract, Mapping):
+        raise CheckpointLineageError("Step4 requires resolved step3.csb_odcr.contract; missing CSB fallback is forbidden.")
+    csb_contract = dict(csb_contract)
+    stored_csb_hash = str(csb_contract.get("contract_hash") or "").strip()
+    if not stored_csb_hash:
+        raise CheckpointLineageError("Step4 requires step3.csb_odcr.contract.contract_hash.")
+    computed_csb_hash = csb_contract_hash(csb_contract)
+    if stored_csb_hash != computed_csb_hash:
+        raise CheckpointLineageError(
+            f"Step4 CSB contract hash mismatch: stored={stored_csb_hash} computed={computed_csb_hash}."
+        )
     train_path = os.path.join(get_merged_data_dir(), str(task_idx), "aug_train.csv")
     valid_path = os.path.join(get_merged_data_dir(), str(task_idx), "aug_valid.csv")
     data_fps = {
@@ -219,10 +238,13 @@ def _validate_step3_checkpoint_lineage_for_step4(
         "source_table_compatibility": source_table_compatibility,
         "embed_dim": int(get_odcr_embed_dim()),
         "model_architecture_config_hash": stable_hash(current_arch),
+        "csb_contract": csb_contract,
+        "csb_contract_hash": stored_csb_hash,
         "representation_output_contract_hash": stable_hash(
             {
-                "Step3ForwardOutput": "odcr_step3_forward_output/structured_shared_specific_v1",
-                "Step3LossBundle": "odcr_step3_loss_bundle/structured_shared_specific_v1",
+                "Step3ForwardOutput": CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+                "Step3LossBundle": "csb_odcr_step3_loss_bundle/1",
+                "CSBPacket": csb_contract,
             }
         ),
         "structured_losses_hash": stable_hash(payload.get("step3_structured_losses") or {}),
@@ -243,6 +265,7 @@ def _validate_step3_checkpoint_lineage_for_step4(
         "resolved_config_compatibility_hash": stable_hash(resolved_compatibility),
         "source_table_compatibility_hash": stable_hash(source_table_compatibility),
         "semantic_model_compat_hash": stable_hash(semantic_model_payload),
+        "csb_contract_hash": stored_csb_hash,
         "data_contract_hash": stable_hash(data_contract_payload),
         "artifact_lineage_hash": stable_hash(artifact_lineage_payload),
         **_step3_preprocess_lineage_expected_for_step4(upstream_evidence),
@@ -1533,9 +1556,11 @@ def _run_one_task(
                 "step3_checkpoint_path": os.path.abspath(str(config.get("save_file"))),
                 "step3_checkpoint_hash": _step4_file_sha256(str(config.get("save_file"))),
                 "step3_checkpoint_lineage_hash": str(step3_lineage["lineage_hash"]),
+                "step3_csb_contract_hash": str(step3_lineage.get("csb_contract_hash") or ""),
                 "step3_stage_status_hash": _step4_upstream_artifact_hash("status_path") or _step4_upstream_artifact_hash("stage_status"),
-                "step3_eval_handoff_hash": _step4_upstream_artifact_hash("eval_handoff"),
+                "step3_readiness_audit_hash": _step4_upstream_artifact_hash("readiness_audit"),
             },
+            csb_contract=step3_lineage.get("csb_contract"),
         )
         _ic["step4_export_lineage"] = _step4_export_lineage
         _ic_path = os.path.join(_task_ckpt_dir, INDEX_CONTRACT_FILENAME)

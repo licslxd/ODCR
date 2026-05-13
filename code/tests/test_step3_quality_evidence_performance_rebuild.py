@@ -87,22 +87,25 @@ class Step3QualityEvidencePerformanceRebuildTests(unittest.TestCase):
         self.assertTrue(sidecar["checkpoint_file_hash"])
         self.assertEqual(sidecar["selection_direction"], "min")
 
-    def test_quality_gate_blocks_blocked_latest_before_checkpoint_load(self) -> None:
+    def test_readiness_gate_blocks_blocked_latest_before_checkpoint_load(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
             meta = run / "meta"
             meta.mkdir(parents=True)
-            (meta / "quality_audit.json").write_text(
+            (meta / "readiness_audit.json").write_text(
                 json.dumps(
                     {
+                        "schema_version": "odcr_step3_readiness_audit/1",
+                        "readiness_gate": "step3_upstream_readiness_gate",
+                        "readiness_status": "blocked",
                         "quality_status": "blocked",
                         "downstream_ready": False,
-                        "quality_block_reasons": ["best_checkpoint_not_global_best"],
+                        "readiness_block_reasons": ["best_checkpoint_not_global_best"],
                     }
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(Step3QualityGateError, "quality gate blocked"):
+            with self.assertRaisesRegex(Step3QualityGateError, "upstream readiness gate blocked"):
                 validate_step3_downstream_quality_gate(run)
 
     def test_nonfinite_grad_is_detected_for_optimizer_skip_policy(self) -> None:

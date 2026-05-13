@@ -31,6 +31,7 @@ from odcr_core.index_contract import (  # noqa: E402
     validate_split_indices,
     write_index_contract,
 )
+from odcr_core.csb_contract import default_csb_contract_payload  # noqa: E402
 from odcr_core.training_checkpoint import CheckpointLineageError  # noqa: E402
 from executors.step5_engine import _rerank_eval_cli_resolved, _step5_collate_dynamic  # noqa: E402
 from functools import partial  # noqa: E402
@@ -99,7 +100,7 @@ class TestIndexContract(unittest.TestCase):
         self.assertEqual(c["profile_assets"]["kind"], "odcr_dual_channel")
         self.assertEqual(c["profile_assets"].get("consumption"), "physical_separate")
         self.assertEqual(int(c["embed_dim"]), 1024)
-        self.assertEqual(c.get("schema_version"), "odcr_index_contract/2.2")
+        self.assertEqual(c.get("schema_version"), "csb_odcr_index_contract/3.0")
         bb = c.get("backbones") or {}
         se = bb.get("sentence_embed") or {}
         self.assertEqual(int(se.get("hidden_size")), int(c["embed_dim"]))
@@ -107,7 +108,9 @@ class TestIndexContract(unittest.TestCase):
         self.assertIn("local_dir", se)
         self.assertIn("model_id", se)
         s4 = c.get("step4_export_contract") or {}
-        self.assertEqual(s4.get("schema_version"), "odcr_step4_rcr_export/1.0")
+        self.assertEqual(s4.get("schema_version"), "csb_odcr_step4_rcr_export/1.0")
+        self.assertEqual(s4.get("method_name"), "CSB-ODCR")
+        self.assertIn("csb_contract_hash", s4)
         self.assertIn("content_retention_score", s4.get("required_columns", []))
         self.assertIn("preprocess_route_scorer_prior", s4.get("prior_columns", []))
         self.assertIn("preprocess_route_explainer_prior", s4.get("prior_columns", []))
@@ -137,6 +140,7 @@ class TestIndexContract(unittest.TestCase):
             target_domain="AM_Electronics",
             step3_checkpoint_lineage_hash="abc123",
             step4_rcr_config=rcr_cfg,
+            csb_contract=default_csb_contract_payload(),
         )
         contract = {"step4_export_lineage": lineage}
         self.assertEqual(

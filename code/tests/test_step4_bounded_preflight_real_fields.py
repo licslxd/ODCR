@@ -26,7 +26,7 @@ class Step4BoundedPreflightRealFieldsTest(unittest.TestCase):
         ):
             self.assertIn(name, src)
         self.assertIn("uses_real_task_data", src)
-        self.assertIn("uses_real_run2_checkpoint", src)
+        self.assertIn("uses_selected_step3_checkpoint", src)
         self.assertIn("sample_weight_hint", src)
         self.assertIn("confidence_bucket_distribution", src)
         self.assertIn("gpu-shard", src)

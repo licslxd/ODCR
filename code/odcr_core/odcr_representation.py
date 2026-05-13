@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 import torch
 from torch import nn
 
+from odcr_core.csb_contract import (
+    CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+    CSB_PACKET_SCHEMA_VERSION,
+    build_csb_packet_summary,
+    csb_contract_hash,
+)
+
 
 @dataclass
-class ODCRLatentBundle:
+class CSBODCRLatentBundle:
     shared: torch.Tensor
     specific: torch.Tensor
     specific_core: torch.Tensor
@@ -27,14 +35,22 @@ class ODCRLatentBundle:
     polarity_target: torch.Tensor
     anchor_pred_content: torch.Tensor
     anchor_pred_style: torch.Tensor
+    z_content: torch.Tensor
+    z_style: torch.Tensor
+    z_domain: torch.Tensor
+    z_uncertainty: torch.Tensor
+    csb_packet: dict[str, Any]
+    csb_diagnostics: dict[str, Any]
+    csb_schema_version: str
+    csb_contract_hash: str
 
     @property
     def shared_latent(self) -> torch.Tensor:
-        return self.shared
+        return self.z_content
 
     @property
     def specific_latent(self) -> torch.Tensor:
-        return self.specific
+        return self.z_style
 
 
 def _mlp(width: int, dropout: float) -> nn.Sequential:
@@ -46,12 +62,14 @@ def _mlp(width: int, dropout: float) -> nn.Sequential:
     )
 
 
-class ODCRDisentangler(nn.Module):
+class CSBODCRBottleneck(nn.Module):
     """
-    Step3 主解耦器：
-    - shared 只接 content-guided source
-    - specific 只接 style-guided source
-    - specific = domain-global style prototype + local residual
+    CSB-ODCR Step3 causal structure bottleneck:
+    - primary shared/specific streams remain the rating-clean backbone inputs
+    - z_content/z_style/z_domain/z_uncertainty are CSB branch variables
+    - CSB branch projections are fed by stop-gradient primary seeds so EASD,
+      HSS, and geometry train the bottleneck first instead of hard-pulling the
+      primary rating path.
     """
 
     def __init__(self, hidden_size: int, proj_size: int | None = None, dropout: float = 0.1, num_domains: int = 2):
@@ -81,16 +99,37 @@ class ODCRDisentangler(nn.Module):
         self.shared_proto_norm = nn.LayerNorm(self.hidden_size)
         self.shared_projector = nn.Sequential(nn.Linear(self.hidden_size, p), nn.ReLU(), nn.Linear(p, p))
         self.specific_projector = nn.Sequential(nn.Linear(self.hidden_size, p), nn.ReLU(), nn.Linear(p, p))
+        self.csb_content_head = _mlp(self.hidden_size, dropout)
+        self.csb_style_head = _mlp(self.hidden_size, dropout)
+        self.csb_domain_head = _mlp(self.hidden_size, dropout)
+        self.csb_uncertainty_head = _mlp(self.hidden_size, dropout)
+        self.csb_content_norm = nn.LayerNorm(self.hidden_size)
+        self.csb_style_norm = nn.LayerNorm(self.hidden_size)
+        self.csb_domain_norm = nn.LayerNorm(self.hidden_size)
+        self.csb_uncertainty_norm = nn.LayerNorm(self.hidden_size)
         self.domain_style_proto = nn.Embedding(self.num_domains, self.hidden_size)
         self.shared_global_proto = nn.Parameter(torch.empty(1, self.hidden_size))
         self.gate_wc = nn.Parameter(torch.tensor(1.25))
         self.gate_ws = nn.Parameter(torch.tensor(1.25))
         self.anchor_head_content = nn.Linear(p, 1)
         self.anchor_head_style = nn.Linear(p, 1)
+        self.csb_contract_payload: dict[str, Any] | None = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.uniform_(self.shared_global_proto, -0.08, 0.08)
+
+    def set_csb_contract_payload(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or not payload:
+            raise ValueError("CSBODCRBottleneck requires resolved CSB contract payload.")
+        contract = dict(payload)
+        stored_hash = str(contract.get("contract_hash") or "").strip()
+        if not stored_hash:
+            raise ValueError("CSBODCRBottleneck requires CSB contract_hash.")
+        computed_hash = csb_contract_hash(contract)
+        if stored_hash != computed_hash:
+            raise ValueError(f"CSB contract hash mismatch: stored={stored_hash} computed={computed_hash}.")
+        self.csb_contract_payload = contract
 
     def forward(
         self,
@@ -105,7 +144,7 @@ class ODCRDisentangler(nn.Module):
         polarity_guide: torch.Tensor,
         content_anchor_score: torch.Tensor,
         style_anchor_score: torch.Tensor,
-    ) -> ODCRLatentBundle:
+    ) -> CSBODCRLatentBundle:
         d = domain_idx.long().view(-1).clamp(0, self.num_domains - 1)
         content_target = self.content_target_norm(self.content_target_proj(content_guide))
         style_target = self.style_target_norm(self.style_target_proj(style_guide))
@@ -150,12 +189,53 @@ class ODCRDisentangler(nn.Module):
             + 0.10 * polarity_target
         )
 
-        shared_proj = self.shared_projector(shared)
-        specific_proj = self.specific_projector(specific)
+        shared_stop = shared.detach()
+        specific_stop = specific.detach()
+        content_stop = content_target.detach()
+        style_stop = style_target.detach()
+        domain_stop = domain_style_target.detach()
+        local_stop = local_style_target.detach()
+        reliability = ((ca + sa) * 0.5).clamp(0.0, 1.0)
+        uncertainty = (1.0 - reliability).clamp(0.0, 1.0)
+
+        z_content = self.csb_content_norm(self.csb_content_head(shared_stop + 0.35 * content_stop))
+        z_style = self.csb_style_norm(self.csb_style_head(specific_stop + 0.35 * style_stop + 0.15 * local_stop))
+        z_domain = self.csb_domain_norm(
+            self.csb_domain_head(domain_vec.detach() + 0.35 * domain_stop + 0.15 * style_stop)
+        )
+        z_uncertainty = self.csb_uncertainty_norm(
+            self.csb_uncertainty_head(
+                uncertainty * (shared_stop + specific_stop)
+                + (1.0 - uncertainty) * (content_stop + style_stop) * 0.5
+            )
+        )
+
+        shared_proj = self.shared_projector(z_content)
+        specific_proj = self.specific_projector(z_style)
         pred_c = torch.sigmoid(self.anchor_head_content(shared_proj)).squeeze(-1)
         pred_s = torch.sigmoid(self.anchor_head_style(specific_proj)).squeeze(-1)
         shared_prototype = self.shared_proto_norm(self.shared_global_proto).expand(shared.size(0), -1)
-        return ODCRLatentBundle(
+        if self.csb_contract_payload is None:
+            raise RuntimeError("CSBODCRBottleneck forward requires resolved CSB contract payload.")
+        contract_payload = dict(self.csb_contract_payload)
+        contract_hash = csb_contract_hash(contract_payload)
+        csb_diagnostics = {
+            "schema_version": "csb_odcr_step3_diagnostics/1",
+            "content_anchor_source": "preprocess_content_anchor_score",
+            "style_anchor_source": "preprocess_style_anchor_score",
+            "uncertainty_source": "1 - mean(content_anchor_score, style_anchor_score)",
+            "primary_to_csb_boundary": "stop_gradient_primary_seed_to_csb_heads",
+            "packet_schema_version": CSB_PACKET_SCHEMA_VERSION,
+        }
+        csb_packet = build_csb_packet_summary(
+            z_content=z_content,
+            z_style=z_style,
+            z_domain=z_domain,
+            z_uncertainty=z_uncertainty,
+            diagnostics=csb_diagnostics,
+            contract_payload=contract_payload,
+        )
+        return CSBODCRLatentBundle(
             shared=shared,
             specific=specific,
             specific_core=specific_core,
@@ -172,4 +252,12 @@ class ODCRDisentangler(nn.Module):
             polarity_target=polarity_target,
             anchor_pred_content=pred_c,
             anchor_pred_style=pred_s,
+            z_content=z_content,
+            z_style=z_style,
+            z_domain=z_domain,
+            z_uncertainty=z_uncertainty,
+            csb_packet=csb_packet,
+            csb_diagnostics=csb_diagnostics,
+            csb_schema_version=CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+            csb_contract_hash=contract_hash,
         )

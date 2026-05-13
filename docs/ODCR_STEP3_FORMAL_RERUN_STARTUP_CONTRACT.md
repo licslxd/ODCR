@@ -1,21 +1,14 @@
-# [SUPERSEDED / HISTORICAL ONLY]
-
-This startup contract records the pre-handoff state before task2 run2 was
-accepted through eval handoff. It is not live project truth. Use
-`docs/CURRENT_PROJECT_STATE.md` and the stage status/latest resolver.
-
-# ODCR Step3 Formal Rerun Startup Contract
+# CSB-ODCR Step3 Formal Rerun Startup Contract
 
 This contract is the startup gate for the next task2 Step3 formal rerun.
 
 ## Current Formal Run State
 
-- Step3 task2 run1 is quality-blocked and must not be used downstream.
-- Step3 task2 run2 failed during checkpoint event/lineage writing:
-  `checkpoint_event_from_sidecar` was called without explicit
-  `reason` and `replaced_previous`.
-- Run2 remains preserved as failed evidence. It must not be marked successful
-  or consumed by Step4, Step5, eval, or rerank.
+- Deleted or archived historical runs are not part of the active startup path.
+- A fresh CSB-native Step3 task2 run must start from the One-Control resolver,
+  not from historical latest pointers or checkpoint compatibility paths.
+- Failed, partial, or non-evaluated historical runs must not be marked
+  successful or consumed by Step4, Step5, eval, or rerank.
 
 ## Formal Profile Binding
 
@@ -65,6 +58,6 @@ or formal checkpoints.
 
 ## Handoff Rule
 
-Do not use run1 or run2 downstream. The next formal rerun must use a new run id,
-must resolve to `task2_strong_forward_g1s`, and must pass cache-check and
-checkpoint-write preflight before launch.
+Do not use historical downstream evidence. The next formal rerun must use a
+fresh run id, must resolve to `task2_strong_forward_g1s`, and must pass
+cache-check and checkpoint-write preflight before launch.

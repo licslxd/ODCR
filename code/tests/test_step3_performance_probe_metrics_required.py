@@ -51,8 +51,9 @@ class Step3PerformanceProbeMetricsRequiredTest(unittest.TestCase):
         self.assertTrue(any("prefetch" in item for item in findings))
         self.assertTrue(any("grad" in item for item in findings))
         self.assertTrue(any("ddp" in item.lower() for item in findings))
+        self.assertTrue(any("loss" in item.lower() for item in findings))
+        self.assertTrue(any("csb" in item.lower() for item in findings))
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

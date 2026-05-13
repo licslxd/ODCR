@@ -28,6 +28,9 @@ classification and impact rows before asking Codex to edit files.
   channels.
 - Do not reconnect retired logic, aliases, archived presets, old fields, or old
   checkpoints as silent fallback paths.
+- Shared Codex workflow, tmux/GPU bridge, command-template, and stage-prompt
+  constraints live in `code/odcr_core/aux/templates/`; mirror those templates
+  instead of inventing per-request runtime rules.
 - Do not run preprocess, training, Step4, Step5, eval, or rerank unless this
   request explicitly allows that run.
 - Do not treat tmux itself as a GPU. The user creates or enters the admin-side
@@ -39,9 +42,9 @@ classification and impact rows before asking Codex to edit files.
 - GPU use is allowed by default for repo-local validation, probe, and bounded
   runtime when the current pane is a user-created, already-entered, uniquely
   validated GPU pane.
-- The controlled tmux GPU bridge `python code/tools/odcr_tmux_gpu_bridge.py`
-  may send exactly one bridge-generated command file to that pane. This is not
-  arbitrary send-keys and is no longer limited by a GPU whitelist hard blocker.
+- The controlled tmux GPU bridge `./odcr runtime bridge ...` may send exactly
+  one bridge-generated command file to that pane. This is not arbitrary
+  send-keys and is gated by the stage-dispatch allowlist.
 - Controlled bridge outputs must stay under `AI_analysis/06_probe_evidence` or
   `runs/step3_validation` unless a future request explicitly confirms a formal
   run. The formal namespace guard remains mandatory.
@@ -103,7 +106,7 @@ preprocess_b, preprocess_c, BGE-large, or embedding/domain probes.
 | Admin tmux command | `tmux -L odcr_gpu new-session -A -s odcr` |
 | User GPU-node entry | User manually runs `odcr-enter-gpu <JOBID>` inside the same tmux |
 | Codex forbidden GPU-management commands | Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create, kill, or switch tmux |
-| Controlled bridge exception | `python code/tools/odcr_tmux_gpu_bridge.py`; user-created, already-entered, uniquely validated GPU pane; repo-local validation/probe/bounded runtime command files; not arbitrary send-keys |
+| Controlled bridge exception | `./odcr runtime bridge ...`; user-created, already-entered, uniquely validated GPU pane; registered validation/probe/bounded runtime command files only; not arbitrary send-keys |
 | Bridge output/timeout | `AI_analysis/06_probe_evidence` or `runs/step3_validation` by default; formal namespace guard required |
 | CUDA evidence source | Current tmux session real-time CUDA only; not admin shell or old probe output |
 | If CUDA is unavailable | Fail fast and ask the user to manually enter the GPU node in the same tmux, then rerun probe |

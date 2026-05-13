@@ -23,6 +23,12 @@ from executors.step3_train_core import (  # noqa: E402
     summarize_step3_profile_buffers,
     validate_step3_graph_safety_preflight,
 )
+from odcr_core.csb_contract import (  # noqa: E402
+    CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+    csb_contract_hash,
+    default_csb_contract_payload,
+    validate_csb_forward_output_schema,
+)
 from odcr_core.odcr_losses import (  # noqa: E402
     build_orthogonal_losses,
     shared_invariance_loss,
@@ -69,6 +75,22 @@ class _Cfg:
         },
         sort_keys=True,
     )
+    csb_odcr_config_json = json.dumps(
+        {
+            "enabled": True,
+            "controlled_injection": {"enabled": True, "gate_init": 0.35, "rating_safe_injection": True},
+            "conflict_routing": {
+                "enabled": True,
+                "mode": "rating_anchor_projection",
+                "rating_anchor": "L_rating_shared",
+                "explanation_anchor": "L_light_explainer",
+                "diversity_guard": ["DIST-1", "DIST-2"],
+                "aux_soft_cap": 0.75,
+                "dynamic_downweight": True,
+            },
+        },
+        sort_keys=True,
+    )
 
 
 class _Batch:
@@ -84,7 +106,7 @@ def _build_model() -> Model:
     ist = torch.randn(nitem, d)
     dc = torch.randn(2, d)
     ds = torch.randn(2, d)
-    return Model(
+    model = Model(
         nuser=nuser,
         nitem=nitem,
         ntoken=ntoken,
@@ -100,6 +122,10 @@ def _build_model() -> Model:
         domain_content_profiles=dc,
         domain_style_profiles=ds,
     )
+    contract = default_csb_contract_payload()
+    contract["contract_hash"] = csb_contract_hash(contract)
+    model.csb_odcr_bottleneck.set_csb_contract_payload(contract)
+    return model
 
 
 def _synthetic_forward_batch(model: Model) -> tuple[Step3ForwardOutput, _Batch]:
@@ -186,11 +212,18 @@ class TestStep3StructuredStability(unittest.TestCase):
             evidence_quality_prior=torch.rand(bsz),
         )
         self.assertIsInstance(out, Step3ForwardOutput)
+        validate_csb_forward_output_schema(out)
+        self.assertEqual(out.csb_schema_version, CSB_FORWARD_OUTPUT_SCHEMA_VERSION)
+        for key in ("z_content", "z_style", "z_domain", "z_uncertainty"):
+            self.assertIn(key, out.structured_loss_inputs)
+            self.assertEqual(tuple(getattr(out, key).shape), (bsz, model.emsize))
+        self.assertEqual(out.csb_packet["method_name"], "CSB-ODCR")
+        self.assertFalse(out.csb_diagnostics["controlled_injection_enabled"])
         for key in ("shared_prototype", "domain_style_proto", "shared_latent", "specific_latent"):
             self.assertIn(key, out.structured_loss_inputs)
             self.assertTrue(out.structured_loss_inputs[key].requires_grad)
-        self.assertIsNotNone(model.last_odcr_latents)
-        self.assertFalse(model.last_odcr_latents.shared_prototype.requires_grad)
+        self.assertIsNotNone(model.last_csb_latents)
+        self.assertFalse(model.last_csb_latents.shared_prototype.requires_grad)
         self.assertFalse(model.last_shared_proj.requires_grad)
 
     def test_profile_domain_artifacts_are_frozen_buffers(self) -> None:
@@ -274,9 +307,13 @@ class TestStep3StructuredStability(unittest.TestCase):
         out, batch = _synthetic_forward_batch(model)
         base = compose_step3_loss_from_forward_output(forward_output=out, batch=batch, final_cfg=_Cfg())
         changed = compose_step3_loss_from_forward_output(forward_output=out, batch=batch, final_cfg=_CfgChanged())
+        self.assertAlmostEqual(float((changed.total_loss - base.total_loss).detach().item()), 0.0, places=6)
         self.assertAlmostEqual(
-            float((changed.total_loss - base.total_loss).detach().item()),
-            float((0.50 - 0.12) * base.components["L_content_alignment"].detach().item()),
+            float((changed.sidecar_loss - base.sidecar_loss).detach().item()),
+            float(
+                (changed.weights["L_content_alignment"] - base.weights["L_content_alignment"])
+                * base.components["L_content_alignment"].detach().item()
+            ),
             places=6,
         )
 
@@ -297,6 +334,24 @@ class TestStep3StructuredStability(unittest.TestCase):
         self.assertGreater(stats["specific_std_mean"], 0.4)
         self.assertTrue(all(math.isfinite(v) for v in grad_norms))
         self.assertLess(max(grad_norms), 10.0)
+
+    def test_csb_specific_branch_is_sidecar_loss_only(self) -> None:
+        model = _build_model()
+        out, batch = _synthetic_forward_batch(model)
+        bundle = compose_step3_loss_from_forward_output(forward_output=out, batch=batch, final_cfg=_Cfg())
+        bundle.sidecar_loss.backward()
+
+        params = dict(model.named_parameters())
+        for name in (
+            "csb_odcr_bottleneck.csb_content_head.0.weight",
+            "csb_odcr_bottleneck.csb_style_head.0.weight",
+            "csb_odcr_bottleneck.shared_projector.0.weight",
+            "csb_odcr_bottleneck.anchor_head_content.weight",
+        ):
+            with self.subTest(name=name):
+                grad = params[name].grad
+                self.assertIsNotNone(grad)
+                self.assertTrue(torch.isfinite(grad).all().item())
 
     def test_variance_floor_penalizes_collapsed_latents(self) -> None:
         shared = torch.zeros(4, 8)

@@ -211,15 +211,24 @@ class ResolvedConfig:
     checkpoint_policy_config_json: str
     quality_gate_config_json: str
     grad_finite_config_json: str
+    numerical_stability_config_json: str
     diagnostic_eval_config_json: str
     cross_rank_structured_gather_config_json: str
     memory_config_json: str
+    allocator_config_json: str
     timing_config_json: str
     performance_candidates_config_json: str
     cache_policy_config_json: str
     objective_drift_config_json: str
     recovery_config_json: str
     phase_loss_schedule_config_json: str
+    method_config_json: str
+    experiment_profile_config_json: str
+    experiment_profiles_config_json: str
+    csb_odcr_config_json: str
+    csb_contract_config_json: str
+    csb_conflict_routing_config_json: str
+    controlled_injection_config_json: str
     conflict_aware_config_json: str
     loss_gradient_conflict_probe_config_json: str
     adapter_gating_config_json: str

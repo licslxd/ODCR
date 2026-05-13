@@ -1,5 +1,8 @@
 project:
-  name: ODCR
+  name: CSB-ODCR
+  method_name: CSB-ODCR
+  method_full_name: "CSB-ODCR: Causal Structure Bottleneck for Orthogonal Disentangled Counterfactual Recommendation"
+  method_family: csb_odcr
   default_task: 2
   seed: 3407
   run_root: runs
@@ -129,6 +132,179 @@ preprocess:
     skip_completed: true
 
 step3:
+  method:
+    name: CSB-ODCR
+    full_name: "CSB-ODCR: Causal Structure Bottleneck for Orthogonal Disentangled Counterfactual Recommendation"
+    family: csb_odcr
+    model_family: csb_odcr
+    display_name: CSB-ODCR
+  experiment_profile: csb_odcr_sidecar_stable
+  experiment_profiles:
+    csb_odcr_sidecar_stable:
+      ablation_profile: csb_odcr_sidecar_stable
+      candidate_role: G1S-sidecar-stable
+      safe_profile: true
+      recommended_next_full: true
+      primary_training: rating_only
+      csb_mode: sidecar
+      gradient_firewall: true
+      controlled_injection_formal_train: false
+      light_explainer_step3_loss: false
+      conflict_routing_step3_primary: false
+      csb_rating_safe_adapter_train: false
+      paper_metric_gate: false
+      csb_enabled: true
+      controlled_injection_enabled: false
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: false
+      formal_allowed: true
+      description: contract-first primary rating scorer with detached CSB sidecar Z export
+      scheduler:
+        warmup_ratio: 0.10
+      train:
+        batch_size: 1408
+        per_gpu_batch_size: 704
+        lr: 7.0e-4
+        max_grad_norm: 0.5
+        max_epochs: 40
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+    csb_odcr_full:
+      ablation_profile: csb_odcr_full
+      csb_enabled: true
+      controlled_injection_enabled: true
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: true
+      formal_allowed: false
+      description: full CSB-ODCR
+    csb_odcr_full_safe:
+      ablation_profile: csb_odcr_full
+      candidate_role: G1S-safe
+      safe_profile: true
+      recommended_next_full: false
+      deprecated: true
+      blocked_reason: superseded_by_csb_odcr_sidecar_stable
+      csb_enabled: true
+      controlled_injection_enabled: true
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: true
+      formal_allowed: false
+      description: full CSB-ODCR with epoch-boundary OOM recovery batch headroom
+      scheduler:
+        warmup_ratio: 0.10
+      train:
+        batch_size: 1408
+        per_gpu_batch_size: 704
+        lr: 7.0e-4
+        max_grad_norm: 0.5
+        max_epochs: 40
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+    csb_odcr_full_safe640:
+      ablation_profile: csb_odcr_full
+      candidate_role: G1S-safe640
+      safe_profile: true
+      fallback_only: true
+      not_default: true
+      csb_enabled: true
+      controlled_injection_enabled: true
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: true
+      formal_allowed: false
+      description: fallback-only full CSB-ODCR profile if 704 epoch-boundary probe fails
+      train:
+        batch_size: 1280
+        per_gpu_batch_size: 640
+        lr: 7.0e-4
+        max_grad_norm: 0.5
+        max_epochs: 40
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+    csb_odcr_wo_csb:
+      ablation_profile: csb_odcr_wo_csb
+      csb_enabled: false
+      controlled_injection_enabled: false
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: false
+      formal_allowed: false
+      description: ablate causal structure bottleneck signals
+    csb_odcr_wo_controlled_injection:
+      ablation_profile: csb_odcr_wo_controlled_injection
+      csb_enabled: true
+      controlled_injection_enabled: false
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: true
+      formal_allowed: false
+      description: ablate structural prefix and gated adapter injection
+    csb_odcr_wo_rcr_uci:
+      ablation_profile: csb_odcr_wo_rcr_uci
+      csb_enabled: true
+      controlled_injection_enabled: true
+      rcr_uci_enabled: false
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: true
+      formal_allowed: false
+      description: ablate downstream reliability routing and uncertainty calibration
+    csb_odcr_wo_ccv_fca_diversity:
+      ablation_profile: csb_odcr_wo_ccv_fca_diversity
+      csb_enabled: true
+      controlled_injection_enabled: true
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: false
+      conflict_routing_enabled: true
+      formal_allowed: false
+      description: ablate downstream control and diversity mechanisms
+    csb_odcr_wo_conflict_routing:
+      ablation_profile: csb_odcr_wo_conflict_routing
+      csb_enabled: true
+      controlled_injection_enabled: true
+      rcr_uci_enabled: true
+      ccv_fca_diversity_enabled: true
+      conflict_routing_enabled: false
+      formal_allowed: false
+      description: ablate rating-anchor auxiliary conflict routing
+  csb_odcr:
+    enabled: true
+    contract:
+      schema_version: csb_odcr_csb_packet/1
+      cross_stage_contract_version: csb_odcr_cross_stage_contract/1
+      required_tensor_fields: [z_content, z_style, z_domain, z_uncertainty]
+    bottleneck:
+      structure_branch_stop_gradient: true
+    controlled_injection:
+      enabled: false
+      mode: structural_prefix
+      structural_prefix_tokens: 4
+      gate_init: 0.35
+      rating_safe_injection: false
+      rating_allowed_fields: [z_content, z_uncertainty]
+      explainer_allowed_fields: [z_content, z_style, z_domain, z_uncertainty]
+    conflict_routing:
+      enabled: false
+      mode: csb_branch_only
+      rating_anchor: L_rating_shared
+      explanation_anchor: L_light_explainer
+      diversity_guard: [DIST-1, DIST-2]
+      aux_soft_cap: 0.75
+      projection_threshold: -0.05
+      dynamic_downweight: true
+      formal_allowed: false
+      ddp_graph_safe_zero_required: true
   ddp:
     find_unused_parameters: false
     static_graph: false
@@ -163,7 +339,7 @@ step3:
     polarity_alignment_weight: 0.05
     residual_specific_weight: 0.025
     prototype_separation_weight: 0.04
-    light_explainer_weight: 0.03
+    light_explainer_weight: 0.0
   scenario_profiles:
     legacy_scenario:
       tokenizer:
@@ -467,33 +643,33 @@ step3:
     enabled: true
     transition: epoch_or_objective_drift
     phases:
-      - name: alignment_warmup
+      - name: primary_fit
         start_epoch: 1
         end_epoch: 2
         loss_multipliers:
+          L_rating_shared: 1.0
           L_content_alignment: 1.0
           L_style_alignment: 1.0
           L_shared_proto: 1.0
           L_domain_style_alignment: 0.9
           L_specific_separation: 0.6
           L_variance: 0.7
-          L_light_explainer: 0.8
-      - name: task_refinement
+      - name: csb_sidecar_alignment
         start_epoch: 3
         end_epoch: 24
         loss_multipliers:
           L_rating_shared: 1.0
-          L_light_explainer: 1.2
           L_content_alignment: 0.55
           L_style_alignment: 0.55
           L_specific_separation: 0.35
           L_variance: 0.45
           L_domain_style_alignment: 0.45
           L_prototype_separation: 0.5
-      - name: light_regularization
+      - name: recovery_pareto_candidate
         start_epoch: 25
         end_epoch: null
         loss_multipliers:
+          L_rating_shared: 1.0
           L_content_alignment: 0.35
           L_style_alignment: 0.35
           L_specific_separation: 0.25
@@ -501,7 +677,6 @@ step3:
           L_orthogonal: 0.50
           L_domain_style_alignment: 0.30
           L_prototype_separation: 0.35
-          L_light_explainer: 1.1
   conflict_aware:
     enabled: false
     mode: "off"
@@ -527,10 +702,10 @@ step3:
     style_content_residual_gate: off
     checkpoint_compatibility: disabled_no_state_change
   paper_candidate_selection:
-    enabled: true
+    enabled: false
     eval_protocol: paper_target_only_eval
     bounded_eval_required: true
-    candidate_pool: [best_observed, best_after_min_epochs, top_k_valid_loss, milestone, recovery, ema, checkpoint_average]
+    candidate_pool: [best_observed, best_after_min_epochs, top_k_valid_loss, milestone, recovery, csb_stable, csb_control, ema, checkpoint_average]
     no_paper_eval_no_selection: true
     scorer_explainer_split: true
     rating_guard:
@@ -551,12 +726,14 @@ step3:
     outputs:
       paper_candidate_selection: paper_candidate_selection.json
       candidate_eval_registry: candidate_eval_registry.jsonl
+      csb_control_checkpoint: csb_control_checkpoint.json
+      route_calibration_source: route_calibration_source.json
   checkpoint_averaging:
     enabled: false
     candidate_only: true
     never_overwrite_best_observed: true
     requires_lineage: true
-    requires_paper_eval_before_downstream: true
+    requires_paper_eval_before_downstream: false
   eval:
     protocol: minimal_eval
     split: valid
@@ -628,9 +805,39 @@ step3:
     skip_optimizer_on_nonfinite: true
     scheduler_step_on_skipped_optimizer: false
     continuous_nonfinite_abort_threshold: 3
+    high_grad_norm_warn_threshold: 100.0
+    high_grad_norm_skip_threshold: 10000.0
+    high_grad_norm_abort_threshold: 100000000.0
+    continuous_high_grad_abort_threshold: 3
     monitor_interval_steps: 50
     anomaly_topk: 5
     full_scan_on_anomaly: true
+  numerical_stability:
+    enabled: true
+    auxiliary_warmup:
+      enabled: true
+      schedule:
+        epoch1: 0.5
+        epoch2: 0.75
+        epoch3_plus: 1.0
+    light_explainer_warmup:
+      enabled: false
+      schedule:
+        epoch1: 0.5
+        epoch2: 0.7
+        epoch3_plus: 1.0
+    conflict_routing_warmup:
+      enabled: false
+      schedule:
+        epoch1: 0.3
+        epoch2: 0.6
+        epoch3_plus: 1.0
+    controlled_injection_warmup:
+      enabled: false
+      schedule:
+        epoch1: 0.5
+        epoch2: 0.75
+        epoch3_plus: 1.0
   diagnostic_eval:
     sample_schema_version: odcr_step3_diagnostic_sample/1
     collapse_schema_version: odcr_step3_collapse_stats/1
@@ -674,7 +881,7 @@ step3:
       enabled: false
       policy: selective
       modules:
-        - odcr_disentangler
+        - csb_odcr_bottleneck
         - structured_projector
         - representation_mlps
     profile_buffer_policy: gpu_resident
@@ -691,10 +898,20 @@ step3:
         - after_backward
         - after_grad_norm
         - after_optimizer
+        - before_validation
         - after_validation
         - after_eval_decode
         - after_checkpoint_save
         - after_epoch_boundary
+        - after_epoch_boundary_cleanup
+        - before_next_backward
+        - after_next_backward
+    allocator:
+      enabled: true
+      expandable_segments: true
+      cuda_alloc_conf: "expandable_segments:True"
+      applies_to: [step3]
+      source: step3.memory.allocator
     allocator_candidates:
       expandable_segments: false
       max_split_size_mb: null
@@ -752,6 +969,26 @@ step3:
       g2_direct_formal: true
       retired_optimizer_delay_training: true
     batch_ladder:
+      G1S-safe:
+        batch_size: 1408
+        per_gpu_batch_size: 704
+        ddp_world_size: 2
+        lr_candidate: 7.0e-4
+        warmup_ratio_min: 0.03
+        warmup_ratio_max: 0.06
+        formal_allowed: false
+        probe_only: true
+        experiment_profile: csb_odcr_full_safe
+      fallback_safe640:
+        batch_size: 1280
+        per_gpu_batch_size: 640
+        ddp_world_size: 2
+        lr_candidate: 7.0e-4
+        formal_allowed: false
+        probe_only: true
+        fallback_only: true
+        not_default: true
+        experiment_profile: csb_odcr_full_safe640
       G1S:
         batch_size: 1536
         per_gpu_batch_size: 768
@@ -904,6 +1141,13 @@ step4:
         - confidence_bucket
         - preprocess_route_scorer_prior
         - preprocess_route_explainer_prior
+    csb_contract:
+      required: true
+      schema_version: csb_odcr_csb_packet/1
+      cross_stage_contract_version: csb_odcr_cross_stage_contract/1
+      required_tensor_fields: [z_content, z_style, z_domain, z_uncertainty]
+      diagnostics_required: true
+      old_scalar_only_formal_allowed: false
   keep_fields:
     - odcr_routing_train.csv
     - index_contract.json
@@ -972,6 +1216,9 @@ step5:
       - route_explainer
       - route_scorer
       - sample_weight_hint
+      - csb_control_packet
+      - csb_contract_hash
+      - diversity_guard_status
     uncertainty_tone_control: true
     route_conditioning: true
     numeric_control_weight: 1.0
@@ -980,6 +1227,13 @@ step5:
     soft_prompt_len: 16
     numeric_control_dim: 13
     control_adapter_input_blocks: 6
+    csb_control_packet:
+      required: true
+      schema_version: csb_odcr_csb_packet/1
+      contract_hash_required: true
+      scorer_clean_fields: [z_content, z_uncertainty]
+      explainer_rich_fields: [z_content, z_style, z_domain, z_uncertainty]
+      diversity_guard_required: true
     native_lora:
       enabled: true
       r: 16
@@ -1010,7 +1264,7 @@ step5:
       full_bleu_eval: {mode: off}
       full_bleu_decode_strategy: inherit
       checkpoint_metric: valid_loss
-      checkpoint_selection_mode: valid_loss_only
+      checkpoint_selection_mode: guarded_composite
       min_lr_ratio: 0.1
       lambda_ortho: 0.2
       lambda_ortho_xcov: 1.0

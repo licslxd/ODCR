@@ -32,7 +32,7 @@ class TestStep3ShowFormalOnly(unittest.TestCase):
         out = _run_odcr("show", "--stage", "step3", "--task", "2")
         payload = _first_json_object(out)
         text = json.dumps(payload, ensure_ascii=False)
-        self.assertEqual(payload["train"]["candidate"], "G1S")
+        self.assertEqual(payload["train"]["candidate"], "G1S-sidecar-stable")
         self.assertEqual(payload["task"]["task_profile_id"], "task2_strong_forward_g1s")
         self.assertNotIn("step3_backup_profiles", payload)
         self.assertNotIn("step3_exploration_profiles", payload)
@@ -54,7 +54,7 @@ class TestStep3ShowFormalOnly(unittest.TestCase):
         out = _run_odcr("step3", "--task", "2", "--dry-run")
         payload = _first_json_object(out)
         text = json.dumps(payload, ensure_ascii=False)
-        self.assertEqual(payload["train"]["candidate"], "G1S")
+        self.assertEqual(payload["train"]["candidate"], "G1S-sidecar-stable")
         self.assertNotIn("task2_g0_backup", text)
         self.assertNotIn("task2_g2_effective_pool_2048", text)
 

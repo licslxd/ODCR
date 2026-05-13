@@ -40,6 +40,9 @@ class Step3V3RecoveryConflictPaperSelectionTest(unittest.TestCase):
     def test_formal_default_is_pure_warmup_cosine_and_no_hidden_damping(self) -> None:
         cfg, _sources, snapshot = _resolve_step3()
         payload = json.loads(cfg.effective_training_payload_json)
+        self.assertEqual(payload["method"]["method_name"], "CSB-ODCR")
+        self.assertIn("step3_csb_odcr", payload)
+        self.assertFalse(payload["step3_csb_odcr"]["conflict_routing"]["enabled"])
         scheduler = payload["step3_scheduler"]
         self.assertEqual(scheduler["name"], "warmup_cosine")
         self.assertFalse(scheduler["damping_enabled"])
@@ -97,12 +100,12 @@ class Step3V3RecoveryConflictPaperSelectionTest(unittest.TestCase):
         _cfg, _sources, snapshot = _resolve_step3()
         schedule = snapshot["step3_phase_loss_schedule"]
         phase = resolve_phase_for_epoch(epoch=30, config=schedule)
-        self.assertEqual(phase["phase"], "light_regularization")
+        self.assertEqual(phase["phase"], "recovery_pareto_candidate")
         weights = {"L_specific_separation": 0.16, "L_variance": 0.10, "L_light_explainer": 0.03}
         adjusted = apply_loss_multipliers(weights, phase["loss_multipliers"])
         self.assertLess(adjusted["L_specific_separation"], weights["L_specific_separation"])
         self.assertLess(adjusted["L_variance"], weights["L_variance"])
-        self.assertGreater(adjusted["L_light_explainer"], weights["L_light_explainer"])
+        self.assertEqual(adjusted["L_light_explainer"], weights["L_light_explainer"])
 
     def test_loss_group_mapping_covers_active_components_and_schema(self) -> None:
         payload = validate_loss_group_mapping(STEP3_TOTAL_LOSS_COMPONENTS)
@@ -141,8 +144,10 @@ class Step3V3RecoveryConflictPaperSelectionTest(unittest.TestCase):
             },
         }
         selection = select_paper_aware_candidates([collapsed, diverse])
+        self.assertEqual(selection["method_name"], "CSB-ODCR")
         self.assertEqual(selection["scorer_downstream_checkpoint"]["checkpoint"], "best_observed.pth")
         self.assertEqual(selection["explainer_downstream_checkpoint"]["checkpoint"], "recovery.pth")
+        self.assertEqual(selection["csb_control_checkpoint"]["checkpoint"], "recovery.pth")
         self.assertTrue(selection["scorer_explainer_can_differ"])
 
     def test_no_paper_eval_means_no_paper_aware_selection(self) -> None:
@@ -156,6 +161,7 @@ class Step3V3RecoveryConflictPaperSelectionTest(unittest.TestCase):
         self.assertFalse(snapshot["step3_adapter_gating"]["formal_allowed"])
         self.assertEqual(snapshot["step3_conflict_aware"]["mode"], "off")
         self.assertFalse(snapshot["step3_conflict_aware"]["formal_allowed"])
+        self.assertFalse(snapshot["step3_csb_odcr"]["conflict_routing"]["formal_allowed"])
 
 
 if __name__ == "__main__":

@@ -71,7 +71,7 @@ class TestIndexContractDualOnlyReadable(unittest.TestCase):
     def test_schema_version_constant(self) -> None:
         from odcr_core import index_contract as ic
 
-        self.assertEqual(ic.INDEX_CONTRACT_SCHEMA_VERSION, "odcr_index_contract/2.2")
+        self.assertEqual(ic.INDEX_CONTRACT_SCHEMA_VERSION, "csb_odcr_index_contract/3.0")
 
 
 if __name__ == "__main__":

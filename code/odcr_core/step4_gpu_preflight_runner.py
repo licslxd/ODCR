@@ -551,19 +551,24 @@ def _run_rank(payload: dict[str, Any]) -> None:
         "required_fields": required_fields,
     })
     ckpt_fp = file_fingerprint(checkpoint_path)
+    step3_lineage = _load_json(Path(checkpoint_path + ".lineage.json"))
+    csb_contract = step3_lineage.get("csb_contract")
+    if not isinstance(csb_contract, dict) or not str(step3_lineage.get("csb_contract_hash") or csb_contract.get("contract_hash") or "").strip():
+        raise RuntimeError(f"Step3 checkpoint lineage missing CSB contract/hash: {checkpoint_path}.lineage.json")
     lineage = build_step4_export_lineage(
         task_id=int(payload["task"]),
         auxiliary_domain=str(payload["source"]),
         target_domain=str(payload["target"]),
-        step3_checkpoint_lineage_hash=str(_load_json(Path(checkpoint_path + ".lineage.json")).get("lineage_hash") or ""),
+        step3_checkpoint_lineage_hash=str(step3_lineage.get("lineage_hash") or ""),
         step4_rcr_config=rcr_config.to_dict(),
         step4_run=str(payload["validation_namespace"]),
         frozen_step3_lineage={
             "upstream_step3_run_id": str(payload.get("step3_run_id") or ""),
             "step3_checkpoint_path": checkpoint_path,
             "step3_checkpoint_hash": str(ckpt_fp.get("sha256") or ""),
-            "step3_checkpoint_lineage_hash": str(_load_json(Path(checkpoint_path + ".lineage.json")).get("lineage_hash") or ""),
+            "step3_checkpoint_lineage_hash": str(step3_lineage.get("lineage_hash") or ""),
         },
+        csb_contract=csb_contract,
     )
     manifest_preview = mark_gpu_shard_forward({
         "schema_version": "odcr_step4_manifest_preview/1",
@@ -647,7 +652,7 @@ def _run_rank(payload: dict[str, Any]) -> None:
         "max_samples": int(payload["max_samples"]),
         "sample_count": int(n_samples),
         "uses_real_task_data": True,
-        "uses_real_run2_checkpoint": str(payload.get("step3_run_id")) == "2",
+        "uses_selected_step3_checkpoint": bool(str(payload.get("step3_run_id") or "").strip()),
         "upstream_step3_run_id": str(payload.get("step3_run_id") or ""),
         "preflight_mode": "gpu-shard",
         "candidate": payload.get("candidate"),

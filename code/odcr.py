@@ -25,6 +25,7 @@ from odcr_core.manifests import (
     build_source_table_snapshot,
     formal_snapshot_view,
 )
+from odcr_core.aux.control import add_runtime_parser, cmd_runtime
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = "configs/odcr.yaml"
@@ -93,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     s3.add_argument("--expect-cache-hit", action="store_true")
     s3.add_argument("--allow-cold-build", action="store_true")
     s3.add_argument("--expect-num-proc", type=int, default=None)
-    s3.add_argument("--accept-eval-only", action="store_true")
+    s3.add_argument("--accept-eval-only", action="store_true", help=argparse.SUPPRESS)
 
     s4 = sub.add_parser("step4", parents=[common])
     s4.add_argument("--task", type=int, required=True)
@@ -137,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sh.add_argument("--task", type=int, default=None)
     sh.add_argument("--profile", dest="eval_profile", default=None)
+
+    add_runtime_parser(sub, common)
 
     sub.add_parser("doctor", parents=[common])
 
@@ -367,26 +370,10 @@ def cmd_stage(args: argparse.Namespace, command: str) -> None:
     if command == "step5" and getattr(args, "from_step4", None) and getattr(args, "from_step4_run", None):
         raise OneControlConfigError("use only one of --from-step4 or --from-step4-run")
     if command == "step3" and bool(getattr(args, "accept_eval_only", False)):
-        run_id = str(getattr(args, "run_id", "") or "").strip()
-        if run_id in {"", "auto"}:
-            raise OneControlConfigError("--accept-eval-only requires an explicit --run-id")
-        from odcr_core.step3_eval_handoff import (
-            Step3EvalHandoffError,
-            accept_step3_eval_handoff,
+        raise OneControlConfigError(
+            "--accept-eval-only is retired: Step3 downstream_ready is decided by "
+            "step3_upstream_readiness_gate, not paper_target_only_eval."
         )
-
-        try:
-            result = accept_step3_eval_handoff(
-                repo_root=REPO_ROOT,
-                task_id=int(args.task),
-                run_id=run_id,
-                dry_run=_dry_run(args),
-                require_test=True,
-            )
-        except Step3EvalHandoffError as exc:
-            raise OneControlConfigError(str(exc)) from exc
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-        return
     resolve_args = args
     if (
         command == "step3"
@@ -527,7 +514,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         try:
             _cfg, _sources, _snapshot = _resolve_for_args(ns, command)
         except OneControlConfigError as exc:
-            if command in {"step5", "eval"}:
+            if command in {"step4", "step5", "eval"}:
                 pending_upstreams.append(f"{command}: {exc}")
                 continue
             raise
@@ -541,8 +528,25 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     if step3_doctor_snapshot:
         hw = step3_doctor_snapshot.get("hardware") or {}
         train = step3_doctor_snapshot.get("train") or {}
+        method = step3_doctor_snapshot.get("method") or {}
+        csb_cfg = step3_doctor_snapshot.get("step3_csb_odcr") or {}
         sources = step3_doctor_snapshot.get("field_sources") or {}
         print("Step3 runtime controls:")
+        print(
+            "  method: "
+            f"{method.get('method_name')} family={method.get('method_family')} "
+            f"(source: {sources.get('method_name')})"
+        )
+        print(
+            "  experiment_profile: "
+            f"{train.get('experiment_profile')} ablation={train.get('ablation_profile')} "
+            f"(source: {sources.get('step3_experiment_profile')})"
+        )
+        print(
+            "  csb_contract_hash: "
+            f"{train.get('csb_contract_hash') or (csb_cfg.get('contract') or {}).get('contract_hash')} "
+            f"(source: {sources.get('step3_csb_contract')})"
+        )
         print(f"  hardware_profile: {hw.get('profile')} (source: {sources.get('hardware')})")
         print(
             "  max_parallel_cpu: "
@@ -590,6 +594,50 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             f"max_grad_norm={train.get('max_grad_norm')} "
             f"valid={step3_doctor_snapshot.get('step3_eval')}"
         )
+        grad_finite_cfg = step3_doctor_snapshot.get("step3_grad_finite") or {}
+        numerical_cfg = step3_doctor_snapshot.get("step3_numerical_stability") or {}
+        print(
+            "  grad_finite_gate: "
+            f"enabled={grad_finite_cfg.get('enabled')} "
+            f"warn={grad_finite_cfg.get('high_grad_norm_warn_threshold')} "
+            f"skip={grad_finite_cfg.get('high_grad_norm_skip_threshold')} "
+            f"abort={grad_finite_cfg.get('high_grad_norm_abort_threshold')} "
+            f"continuous_high_abort={grad_finite_cfg.get('continuous_high_grad_abort_threshold')} "
+            f"(source: {sources.get('step3_grad_finite')})"
+        )
+        print(
+            "  numerical_stability: "
+            f"enabled={numerical_cfg.get('enabled')} "
+            f"aux={((numerical_cfg.get('auxiliary_warmup') or {}).get('schedule') or {})} "
+            f"light={((numerical_cfg.get('light_explainer_warmup') or {}).get('schedule') or {})} "
+            f"conflict={((numerical_cfg.get('conflict_routing_warmup') or {}).get('schedule') or {})} "
+            f"control={((numerical_cfg.get('controlled_injection_warmup') or {}).get('schedule') or {})} "
+            f"(source: {sources.get('step3_numerical_stability')})"
+        )
+        memory_cfg = step3_doctor_snapshot.get("step3_memory") or {}
+        allocator_cfg = memory_cfg.get("allocator") if isinstance(memory_cfg, dict) else {}
+        print(
+            "  allocator: "
+            f"PYTORCH_CUDA_ALLOC_CONF={allocator_cfg.get('cuda_alloc_conf') if isinstance(allocator_cfg, dict) else None} "
+            f"(source: {sources.get('step3_memory_allocator')})"
+        )
+        experiment_profiles = step3_doctor_snapshot.get("experiment_profiles") or {}
+        safe_profile = experiment_profiles.get("csb_odcr_sidecar_stable") if isinstance(experiment_profiles, dict) else {}
+        if isinstance(safe_profile, dict):
+            safe_train = safe_profile.get("train") or {}
+            print(
+                "  safe_profile: "
+                f"csb_odcr_sidecar_stable per_gpu={safe_train.get('per_gpu_batch_size')} "
+                f"global={safe_train.get('batch_size')} "
+                f"candidate={safe_profile.get('candidate_role')}"
+            )
+            print(
+                "  sidecar: "
+                f"primary_training={safe_profile.get('primary_training')} "
+                f"csb_mode={safe_profile.get('csb_mode')} "
+                f"gradient_firewall={safe_profile.get('gradient_firewall')} "
+                f"paper_metric_gate={safe_profile.get('paper_metric_gate')}"
+            )
         print(
             "  h2d: "
             f"pin_memory={hw.get('pin_memory')} persistent_workers={hw.get('persistent_workers')} "
@@ -673,6 +721,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             controls["scheduling_policy"] = pp_cfg.scheduling_policy
         print(f"  preprocess_{letter}: {json.dumps(controls, sort_keys=True)}")
     checks.append("preprocess_b/c CPU tokenizer, prefetch, H2D, and scheduling controls resolve from configs/odcr.yaml")
+    from odcr_core.aux.control.doctor_checks import runtime_doctor_checks
+
+    for runtime_check in runtime_doctor_checks():
+        checks.append(runtime_check)
     retired = REPO_ROOT / "scripts" / "run_stage.sh"
     if retired.exists():
         raise OneControlConfigError("scripts/run_stage.sh must be absent; use ./odcr or python code/odcr.py")
@@ -844,6 +896,8 @@ def main(argv: list[str] | None = None) -> int:
                 _print_source_table_payload(build_formal_source_table_snapshot(snapshot))
         elif args.command == "doctor":
             cmd_doctor(args)
+        elif args.command == "runtime":
+            cmd_runtime(args)
         elif args.command == "promote-upstream":
             cmd_promote_upstream(args)
         elif args.command == "tail":

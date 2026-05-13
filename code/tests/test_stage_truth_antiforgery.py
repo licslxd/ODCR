@@ -31,18 +31,18 @@ class StageTruthAntiForgeryTest(unittest.TestCase):
                     "task_id": 2,
                     "run_id": "3",
                     "run_dir": "runs/step3/task2/3",
-                    "final_status": "completed_with_eval_handoff",
+                    "final_status": "step4_ready",
                     "downstream_ready": True,
                     "ready_for": ["step4"],
                     "artifacts": {},
                 },
             )
-            with self.assertRaisesRegex(UpstreamResolutionError, "stage_status_strict_validation_failed"):
+            with self.assertRaisesRegex(UpstreamResolutionError, "stage_status_strict_validation_failed|csb_contract_gate_failed"):
                 resolve_upstream(repo_root=repo, stage="step3", task=2, from_run="3", consumer_stage="step4")
 
     def test_missing_artifacts_hash_mismatch_and_stale_exists_are_rejected(self) -> None:
         cases = {
-            "missing_eval_handoff": lambda repo, run: (run / "meta" / "eval_handoff.json").unlink(),
+            "missing_readiness_audit": lambda repo, run: (run / "meta" / "readiness_audit.json").unlink(),
             "missing_checkpoint": lambda repo, run: (run / "model" / "best_observed.pth").unlink(),
             "hash_mismatch": lambda repo, run: mutate_status(
                 repo,
@@ -82,18 +82,20 @@ class StageTruthAntiForgeryTest(unittest.TestCase):
             warnings = (res.validation or {}).get("latest_warnings") or []
             self.assertTrue(any("deprecated latest_status" in item for item in warnings))
 
-    def test_alias_parity_rejects_run1_and_accepts_run2(self) -> None:
+    def test_strict_resolver_rejects_ineligible_and_accepts_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            write_step3_fixture(repo, task=2, run_id="1", eligible=False)
-            write_step3_fixture(repo, task=2, run_id="2", active=True, eligible=True)
-            for requested in ("1", "1"):
-                with self.assertRaisesRegex(UpstreamResolutionError, "run1 is not eligible"):
+            blocked = "11"
+            ready = "12"
+            write_step3_fixture(repo, task=2, run_id=blocked, eligible=False)
+            write_step3_fixture(repo, task=2, run_id=ready, active=True, eligible=True)
+            for requested in (blocked, blocked):
+                with self.assertRaisesRegex(UpstreamResolutionError, "not eligible"):
                     resolve_upstream(repo_root=repo, stage="step3", task=2, from_run=requested, consumer_stage="step4")
-            for requested in ("2", "latest"):
+            for requested in (ready, "latest"):
                 self.assertEqual(
                     resolve_upstream(repo_root=repo, stage="step3", task=2, from_run=requested, consumer_stage="step4").run_id,
-                    "2",
+                    ready,
                 )
 
     def test_generic_task_runs_are_not_hardcoded(self) -> None:
@@ -111,7 +113,7 @@ class StageTruthAntiForgeryTest(unittest.TestCase):
             write_step3_fixture(repo, task=2, run_id="2", active=True, eligible=True, quality_downstream_ready=False)
             self.assertEqual(resolve_upstream(repo_root=repo, stage="step3", task=2, consumer_stage="step4").run_id, "2")
             run = write_step3_fixture(repo, task=2, run_id="3", eligible=True, quality_downstream_ready=True)
-            (run / "meta" / "eval_handoff.json").unlink()
+            (run / "meta" / "readiness_audit.json").unlink()
             with self.assertRaisesRegex(UpstreamResolutionError, "stage_status_strict_validation_failed"):
                 resolve_upstream(repo_root=repo, stage="step3", task=2, from_run="3", consumer_stage="step4")
 

@@ -20,6 +20,11 @@ from typing import Iterable, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+CODE_DIR = REPO_ROOT / "code"
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from odcr_core.aux.governance.rule_registry import GUARDRAIL_GROUPS, RULE_GROUP_BY_ID
+
 HOOK_WRAPPER_ABS = "/public/home/zhangliml/lc/ODCR/ODCR-main/.codex/hooks/odcr_post_edit_stop.sh"
 HOOK_STOP_COMMAND = f"/usr/bin/env bash {HOOK_WRAPPER_ABS}"
 D4C_PYTHON_ABS = "/public/home/zhangliml/miniconda3/envs/D4C/bin/python"
@@ -36,71 +41,6 @@ TOP_LEVEL_BLOCKS = (
     "step5",
     "eval",
 )
-
-GUARDRAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "control-plane",
-        ("R002", "R003", "R005", "R006", "R009", "R025", "R026", "R027", "R028"),
-    ),
-    ("data-contract", ("R008", "R024")),
-    ("lineage-cache", ("R031", "R032", "R033", "R034", "R035", "R041")),
-    ("ddp-loss", ("R036", "R037", "R038", "R040")),
-    ("legacy-cleanup", ("R001", "R004", "R095")),
-    (
-        "step3-mainline",
-        (
-            "R010",
-            "R011",
-            "R029",
-            "R097",
-            "R099",
-            "R100",
-            "R101",
-            "R102",
-            "R103",
-            "R104",
-            "R105",
-            "R106",
-            "R107",
-            "R108",
-            "R109",
-            "R110",
-            "R111",
-        ),
-    ),
-    ("stage-truth-upstream", ("R112", "R113")),
-    ("step4-runtime-preflight", ("R114", "R115")),
-    ("step4-evidence-level", ("R116",)),
-    ("no-accum-architecture", ("R117",)),
-    ("step4-rcr", ("R012", "R013", "R014", "R015")),
-    ("step5-innovation", ("R016", "R017", "R018", "R019", "R020", "R021", "R022", "R023", "R030", "R039")),
-    ("code-hygiene", ("R007",)),
-    ("evolution-protocol", ("R042", "R043", "R044", "R045", "R046", "R047", "R048", "R049", "R050", "R096")),
-    ("post-edit-workflow", ("R051", "R052", "R053", "R054", "R055", "R056", "R089")),
-    ("run-summary-logging", ("R057", "R058", "R059", "R090", "R091")),
-    ("p0-cache-hard-gates", ("R092", "R093", "R094", "R098")),
-    ("logging-console-file", ("R060", "R061", "R062")),
-    ("logging-artifact-evolution", ("R068", "R069", "R070", "R071", "R072")),
-    ("logging-directory-boundaries", ("R078", "R079", "R080", "R081", "R082", "R083")),
-    ("logging-old-layout-tail", ("R084", "R085", "R086", "R087", "R088")),
-    (
-        "post-edit-fast-path",
-        (
-            "R063",
-            "R064",
-            "R065",
-            "R066",
-            "R067",
-            "R073",
-            "R074",
-            "R075",
-            "R076",
-            "R077",
-        ),
-    ),
-)
-
-RULE_GROUP_BY_ID = {rule_id: group for group, rule_ids in GUARDRAIL_GROUPS for rule_id in rule_ids}
 
 MAINLINE_FILES = (
     "odcr",
@@ -224,6 +164,7 @@ EVOLUTION_ALLOWED_ARG_DEFAULT_FLAGS = {
 
 EVOLUTION_ALLOWED_ENV_READS = {
     "CUDA_VISIBLE_DEVICES",
+    "LOGNAME",
     "ODCR_CONSOLE_LEVEL",
     "ODCR_CONFIG_FIELD_SOURCES_JSON",
     "ODCR_DAEMON_CHILD",
@@ -246,6 +187,9 @@ EVOLUTION_ALLOWED_ENV_READS = {
     "ODCR_GLOBAL_EVAL_BATCH_SIZE",
     "ODCR_GRAD_TOPK",
     "ODCR_GRAD_WARN_NORM",
+    "ODCR_GPU_TMUX_SOCKET",
+    "ODCR_GPU_TMUX_SOCKET_DIRS",
+    "ODCR_GPU_TMUX_TARGET",
     "ODCR_HARDWARE_PRESET",
     "ODCR_HARDWARE_PROFILE_JSON",
     "ODCR_ITER",
@@ -300,7 +244,12 @@ EVOLUTION_ALLOWED_ENV_READS = {
     "ODCR_UPSTREAM_RESOLUTION_JSON",
     "RANK",
     "RUNNING_CPU_COUNT",
+    "SLURM_JOB_ID",
+    "TMPDIR",
+    "TMUX",
     "TOKENIZERS_PARALLELISM",
+    "USER",
+    "XDG_RUNTIME_DIR",
 }
 
 EVOLUTION_UNUSED_LOSS_ALLOWLIST = {
@@ -2583,7 +2532,6 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
     resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
     cfg_py = _read(repo_root / "code" / "config.py")
     engine = _read(repo_root / "code" / "executors" / "step3_train_core.py")
-    probe = _read(repo_root / "code" / "tools" / "odcr_step3_real_data_probe.py")
     required = {
         "configs/odcr.yaml": (
             "structured_losses:",
@@ -2617,18 +2565,12 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
             "Step3LossBundle",
             "compose_step3_loss_from_forward_output",
         ),
-        "code/tools/odcr_step3_real_data_probe.py": (
-            "compose_step3_loss_from_forward_output",
-            "validate_step3_graph_safety_preflight",
-            "profile_domain_artifacts",
-        ),
     }
     texts = {
         "configs/odcr.yaml": config,
         "code/odcr_core/config_resolver.py": resolver,
         "code/config.py": cfg_py,
         "code/executors/step3_train_core.py": engine,
-        "code/tools/odcr_step3_real_data_probe.py": probe,
     }
     findings: list[Finding] = []
     for rel, terms in required.items():
@@ -2668,12 +2610,6 @@ def _check_step3_structured_losses_one_control(repo_root: Path) -> RuleResult:
             "shared_global_proto",
             "nn.Parameter(user_content_profiles",
             "nn.Parameter(domain_content_profiles",
-        ),
-        "code/tools/odcr_step3_real_data_probe.py": (
-            "underlying.last_odcr_latents",
-            "ddp_model.module",
-            "domain_style_proto.weight",
-            "shared_global_proto",
         ),
     }
     for rel, terms in banned_side_channels.items():
@@ -3974,7 +3910,7 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
         "docs/ODCR_GPU_RUNTIME_FIRST_EXECUTION_CONTRACT.md": (
             "GPU use is allowed by default",
             "repo-local validation, probe, and bounded runtime",
-            "No GPU whitelist hard blocker",
+            "stage-dispatch allowlist",
             "post-edit full is not a GPU prerequisite",
             "fast sanity",
             "formal namespace guard",
@@ -4039,10 +3975,10 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
                         rel,
                         1,
                         match.group(0)[:240],
-                        "Do not imply tmux equals GPU, Codex manages GPU allocation, arbitrary send-keys is allowed, --scope all is permanently banned, or whitelist/post-edit gates are required for GPU.",
+                            "Do not imply tmux equals GPU, Codex manages GPU allocation, arbitrary send-keys is allowed, --scope all is permanently banned, or post-edit gates are required for GPU.",
                     )
                 )
-    bridge = _read(repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py")
+    bridge = _read(repo_root / "code" / "odcr_core" / "aux" / "runtime" / "gpu_bridge.py")
     post_edit = _read(repo_root / "code" / "tools" / "odcr_post_edit_check.py")
     startup = _read(repo_root / "code" / "tools" / "odcr_step3_startup_validation.py")
     bridge_required = (
@@ -4176,8 +4112,8 @@ def _check_gpu_tmux_policy_docs(repo_root: Path) -> RuleResult:
         result.fail("GPU/tmux policy docs are missing required boundaries or contain stale claims.", findings)
     else:
         result.summary = (
-            "GPU/tmux docs require runtime-first repo-local GPU validation, user-managed GPU-node entry, "
-            "current-tmux CUDA probes, AI_analysis output, and formal namespace protection."
+            "GPU/tmux docs require runtime-first registered GPU validation, user-managed GPU-node entry, "
+            "current-tmux CUDA probes, AI_analysis output, stage-dispatch allowlists, and formal namespace protection."
         )
     return result
 
@@ -4208,7 +4144,7 @@ def _check_step3_runtime_probe_truth_contract(repo_root: Path) -> RuleResult:
     result = RuleResult("R110", "Step3 performance probe must require runtime truth evidence")
     files = {
         "code/tools/odcr_step3_performance_probe.py": _read(repo_root / "code" / "tools" / "odcr_step3_performance_probe.py"),
-        "code/tools/odcr_tmux_gpu_bridge.py": _read(repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py"),
+        "code/odcr_core/aux/runtime/gpu_bridge.py": _read(repo_root / "code" / "odcr_core" / "aux" / "runtime" / "gpu_bridge.py"),
         "code/odcr_core/step3_runtime_probe.py": _read(repo_root / "code" / "odcr_core" / "step3_runtime_probe.py"),
         "code/odcr_core/stage2_runtime_first.py": _read(repo_root / "code" / "odcr_core" / "stage2_runtime_first.py"),
         "code/executors/step3_train_core.py": _read(repo_root / "code" / "executors" / "step3_train_core.py"),
@@ -4223,7 +4159,7 @@ def _check_step3_runtime_probe_truth_contract(repo_root: Path) -> RuleResult:
             "evidence_complete",
             "return int(status[\"exit_code\"])",
         ),
-        "code/tools/odcr_tmux_gpu_bridge.py": (
+        "code/odcr_core/aux/runtime/gpu_bridge.py": (
             "bridge_transport_ok",
             "child_process_ok",
             "runtime_probe_ok",
@@ -7663,6 +7599,7 @@ def _check_step3_formal_logging_param_surface(repo_root: Path) -> RuleResult:
     train_logging = _read(repo_root / "code" / "train_logging.py")
     manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
     odcr_py = _read(repo_root / "code" / "odcr.py")
+    runner_text = _read(repo_root / "code" / "odcr_core" / "runners.py")
     step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
 
     checks = {
@@ -8045,7 +7982,7 @@ def _check_step3_quality_evidence_performance_rebuild(repo_root: Path) -> RuleRe
     core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
     quality = _read(repo_root / "code" / "odcr_core" / "step3_quality.py")
     checkpoint = _read(repo_root / "code" / "odcr_core" / "training_checkpoint.py")
-    bridge = _read(repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py")
+    bridge = _read(repo_root / "code" / "odcr_core" / "aux" / "runtime" / "gpu_bridge.py")
     post_edit = _read(repo_root / "code" / "tools" / "odcr_post_edit_check.py")
     docs = _read(repo_root / "docs" / "ODCR_STEP3_QUALITY_EVIDENCE_PERFORMANCE_CONTRACT.md")
     tests = _read(repo_root / "code" / "tests" / "test_step3_quality_evidence_performance_rebuild.py")
@@ -8067,8 +8004,8 @@ def _check_step3_quality_evidence_performance_rebuild(repo_root: Path) -> RuleRe
         ),
         "code/odcr_core/stage_status.py": (
             "do_not_use_quality_audit_as_final_truth",
-            "quality_audit.json.superseded_by.json",
-            "completed_with_eval_handoff",
+            "readiness_audit.json",
+            "step3_upstream_readiness_gate",
         ),
         "code/odcr_core/config_schema.py": (
             "checkpoint_policy_config_json",
@@ -8107,7 +8044,7 @@ def _check_step3_quality_evidence_performance_rebuild(repo_root: Path) -> RuleRe
             "CHECKPOINT_EVENT_LEDGER_SCHEMA_VERSION",
             "never_silently_overwrite_global_best",
         ),
-        "code/tools/odcr_tmux_gpu_bridge.py": (
+        "code/odcr_core/aux/runtime/gpu_bridge.py": (
             "step3-performance-probe",
             "STEP3_PERFORMANCE_PROBE_TYPES",
             "build_step3_performance_probe_script",
@@ -8138,7 +8075,7 @@ def _check_step3_quality_evidence_performance_rebuild(repo_root: Path) -> RuleRe
         "code/odcr_core/step3_quality.py": quality,
         "code/executors/step3_train_core.py": core,
         "code/odcr_core/training_checkpoint.py": checkpoint,
-        "code/tools/odcr_tmux_gpu_bridge.py": bridge,
+        "code/odcr_core/aux/runtime/gpu_bridge.py": bridge,
         "code/tools/odcr_post_edit_check.py": post_edit,
         "docs/ODCR_STEP3_QUALITY_EVIDENCE_PERFORMANCE_CONTRACT.md": docs,
         "code/tests/test_step3_quality_evidence_performance_rebuild.py": tests,
@@ -8266,7 +8203,7 @@ def _check_stage_status_strict_antiforgery_guardrail(repo_root: Path) -> RuleRes
         "hash_mismatch_rejected": "hash mismatch must be rejected",
         "stale_exists_rejected": "stale exists=true must be rejected from disk",
         "promotion_malformed_target_rejected": "promotion dry-run must reject malformed target",
-        "alias_run1_rejected": "manual alias must use the same strict resolver",
+        "blocked_run_rejected": "manual upstream selection must use the same strict resolver",
         "latest_pointer_only_passed": "deprecated latest_status must not be final truth",
     }
     for key, message in required.items():
@@ -8282,7 +8219,7 @@ def _check_stage_status_strict_antiforgery_guardrail(repo_root: Path) -> RuleRes
     if findings:
         result.fail("Stage status anti-forgery negative selftest failed.", findings)
     else:
-        result.summary = "R113 negative cases reject forged status, missing artifacts, hash mismatch, stale exists, malformed promotion, and alias bypass."
+        result.summary = "R113 negative cases reject forged status, missing artifacts, hash mismatch, stale exists, malformed promotion, and blocked-run bypass."
     return result
 
 
@@ -8375,7 +8312,7 @@ def _check_step4_runtime_preflight_twophase_guardrail(repo_root: Path) -> RuleRe
 def _check_gpu_bridge_step4_bounded_preflight_admission(repo_root: Path) -> RuleResult:
     result = RuleResult("R115", "GPU bridge Step4 bounded preflight admission")
     findings: list[Finding] = []
-    bridge_path = repo_root / "code" / "tools" / "odcr_tmux_gpu_bridge.py"
+    bridge_path = repo_root / "code" / "odcr_core" / "aux" / "runtime" / "gpu_bridge.py"
     bridge_text = _read(bridge_path)
     required_terms = (
         "BridgeCommandPolicy",
@@ -8525,7 +8462,7 @@ def _check_step4_evidence_level_antifake_tuning_guardrail(repo_root: Path) -> Ru
             "fake_score_used_for_tuning",
             "candidate_source_is_cpu_preview",
         ),
-        "code/tools/odcr_tmux_gpu_bridge.py": (
+        "code/odcr_core/aux/runtime/gpu_bridge.py": (
             "_step4_runtime_evidence_ok",
             "actual_gpu_forward_executed",
             "actual_model_loaded_on_gpu",
@@ -8674,6 +8611,14 @@ def _check_no_accum_architecture_guardrail(repo_root: Path) -> RuleResult:
     except Exception as exc:
         result.fail("R117 could not read configs/odcr.yaml.", [Finding("configs/odcr.yaml", 1, repr(exc), "Config must be YAML-readable.")])
         return result
+    schema = _read(repo_root / "code" / "odcr_core" / "config_schema.py")
+    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
+    config_py = _read(repo_root / "code" / "config.py")
+    odcr_py = _read(repo_root / "code" / "odcr.py")
+    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
+    step5_engine = _read(repo_root / "code" / "executors" / "step5_engine.py")
+    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
+    runner_text = _read(repo_root / "code" / "odcr_core" / "runners.py")
 
     def _walk_config(value: object, path: str) -> None:
         if isinstance(value, Mapping):
@@ -8722,18 +8667,21 @@ def _check_no_accum_architecture_guardrail(repo_root: Path) -> RuleResult:
                 row = (item.get("train") if block_name == "task_profiles" and isinstance(item, Mapping) else item)
                 world = int((item or {}).get("ddp_world_size") or ddp_world) if isinstance(item, Mapping) else ddp_world
                 _check_train_row(row, f"step3.{block_name}.{name}.train" if block_name == "task_profiles" else f"step3.{block_name}.{name}", world=world)
+    experiment_profiles = step3.get("experiment_profiles") if isinstance(step3, Mapping) else {}
+    if isinstance(experiment_profiles, Mapping):
+        for name, item in experiment_profiles.items():
+            if isinstance(item, Mapping) and isinstance(item.get("train"), Mapping) and item.get("train"):
+                _check_train_row(item.get("train"), f"step3.experiment_profiles.{name}.train", world=ddp_world)
+    allocator = ((step3.get("memory") or {}).get("allocator") if isinstance(step3, Mapping) else {})
+    if isinstance(allocator, Mapping) and bool(allocator.get("enabled", False)):
+        if allocator.get("cuda_alloc_conf") != "expandable_segments:True":
+            findings.append(Finding("configs/odcr.yaml", 1, "step3.memory.allocator.cuda_alloc_conf", "Step3 allocator transport must be One-Control-owned expandable_segments:True."))
+        if "step3.memory.allocator" not in resolver or "PYTORCH_CUDA_ALLOC_CONF" not in runner_text:
+            findings.append(Finding("code/odcr_core/config_resolver.py", 1, "step3.memory.allocator", "Allocator transport must resolve through config_resolver and runners."))
     perf = ((step3.get("performance_candidates") or {}).get("batch_ladder") if isinstance(step3, Mapping) else {})
     if isinstance(perf, Mapping):
         for name, item in perf.items():
             _check_train_row(item, f"step3.performance_candidates.batch_ladder.{name}", world=int((item or {}).get("ddp_world_size") or ddp_world) if isinstance(item, Mapping) else ddp_world)
-
-    schema = _read(repo_root / "code" / "odcr_core" / "config_schema.py")
-    resolver = _read(repo_root / "code" / "odcr_core" / "config_resolver.py")
-    config_py = _read(repo_root / "code" / "config.py")
-    odcr_py = _read(repo_root / "code" / "odcr.py")
-    step3_core = _read(repo_root / "code" / "executors" / "step3_train_core.py")
-    step5_engine = _read(repo_root / "code" / "executors" / "step5_engine.py")
-    manifests = _read(repo_root / "code" / "odcr_core" / "manifests.py")
 
     active_field_patterns = {
         "code/odcr_core/config_schema.py": (schema, (r"^\s*gradient_accumulation_steps\s*:", r"^\s*grad_accum\s*:")),

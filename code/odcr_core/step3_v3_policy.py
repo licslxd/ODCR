@@ -12,13 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from odcr_core.csb_contract import CSB_ODCR_METHOD_NAME, CSB_PACKET_SCHEMA_VERSION
 
-STEP3_V3_POLICY_SCHEMA_VERSION = "odcr_step3_v3_policy/1"
+
+STEP3_V3_POLICY_SCHEMA_VERSION = "csb_odcr_step3_v3_policy/1"
 STEP3_OBJECTIVE_DRIFT_SCHEMA_VERSION = "odcr_step3_objective_drift/1"
 STEP3_RECOVERY_PLAN_SCHEMA_VERSION = "odcr_step3_recovery_plan/1"
-STEP3_PHASE_SCHEDULE_SCHEMA_VERSION = "odcr_step3_phase_loss_schedule/1"
-STEP3_GRADIENT_CONFLICT_SCHEMA_VERSION = "odcr_step3_loss_gradient_conflict_audit/1"
-STEP3_PAPER_CANDIDATE_SCHEMA_VERSION = "odcr_step3_paper_candidate_selection/1"
+STEP3_PHASE_SCHEDULE_SCHEMA_VERSION = "csb_odcr_step3_phase_loss_schedule/1"
+STEP3_GRADIENT_CONFLICT_SCHEMA_VERSION = "csb_odcr_step3_loss_gradient_conflict_audit/1"
+STEP3_PAPER_CANDIDATE_SCHEMA_VERSION = "csb_odcr_step3_paper_candidate_selection/1"
 
 
 STEP3_TOTAL_LOSS_COMPONENTS: tuple[str, ...] = (
@@ -240,19 +242,19 @@ def resolve_phase_for_epoch(
     phases = list(cfg.get("phases") or [])
     if not phases:
         phases = [
-            {"name": "alignment_warmup", "start_epoch": 1, "end_epoch": 2, "loss_multipliers": {}},
-            {"name": "task_refinement", "start_epoch": 3, "end_epoch": 24, "loss_multipliers": {}},
-            {"name": "light_regularization", "start_epoch": 25, "end_epoch": None, "loss_multipliers": {}},
+            {"name": "primary_fit", "start_epoch": 1, "end_epoch": 2, "loss_multipliers": {}},
+            {"name": "csb_alignment_controlled_injection", "start_epoch": 3, "end_epoch": 24, "loss_multipliers": {}},
+            {"name": "recovery_pareto_candidate", "start_epoch": 25, "end_epoch": None, "loss_multipliers": {}},
         ]
     selected = phases[-1]
     if recovery_active:
         for phase in phases:
-            if str(phase.get("name")) == "task_refinement":
+            if str(phase.get("name")) == "csb_alignment_controlled_injection":
                 selected = phase
                 break
     elif str(objective_drift_status) in {"objective_drift", "severe_objective_drift"}:
         for phase in phases:
-            if str(phase.get("name")) == "task_refinement":
+            if str(phase.get("name")) == "csb_alignment_controlled_injection":
                 selected = phase
                 break
     else:
@@ -267,7 +269,7 @@ def resolve_phase_for_epoch(
         "schema_version": STEP3_PHASE_SCHEDULE_SCHEMA_VERSION,
         "enabled": bool(cfg.get("enabled", True)),
         "epoch": int(epoch),
-        "phase": str(selected.get("name") or "task_refinement"),
+        "phase": str(selected.get("name") or "csb_alignment_controlled_injection"),
         "transition": str(cfg.get("transition") or "epoch_or_objective_drift"),
         "objective_drift_status": str(objective_drift_status),
         "recovery_active": bool(recovery_active),
@@ -379,6 +381,9 @@ def candidate_paper_score(candidate: Mapping[str, Any], config: Mapping[str, Any
     rmse = metrics.get("RMSE", float("inf"))
     dist1 = metrics.get("DIST-1", 0.0)
     dist2 = metrics.get("DIST-2", 0.0)
+    candidate_conflict_rate = float(candidate.get("candidate_conflict_rate", metrics.get("candidate_conflict_rate", 0.0)))
+    rating_aux_conflict_rate = float(candidate.get("rating_aux_conflict_rate", metrics.get("rating_aux_conflict_rate", candidate_conflict_rate)))
+    csb_stability_score = float(candidate.get("csb_stability_score", metrics.get("csb_stability_score", 0.0)))
     rating_ok = mae <= max_mae and rmse <= max_rmse
     diversity_ok = dist1 >= dist1_floor and dist2 >= dist2_floor
     text_score = (
@@ -390,6 +395,8 @@ def candidate_paper_score(candidate: Mapping[str, Any], config: Mapping[str, Any
     )
     rating_score = -(mae + rmse)
     collapse_penalty = float(diversity_guard.get("collapse_penalty", 100.0)) if not diversity_ok else 0.0
+    conflict_penalty = max(0.0, candidate_conflict_rate) + max(0.0, rating_aux_conflict_rate)
+    csb_bonus = max(0.0, min(1.0, csb_stability_score)) * 0.10
     return {
         "candidate_id": str(candidate.get("candidate_id") or candidate.get("checkpoint_scope") or "candidate"),
         "checkpoint": str(candidate.get("checkpoint") or ""),
@@ -400,8 +407,13 @@ def candidate_paper_score(candidate: Mapping[str, Any], config: Mapping[str, Any
         "diversity_guard_pass": bool(diversity_ok),
         "text_score": float(text_score),
         "rating_score": float(rating_score),
-        "explainer_score": float(text_score - collapse_penalty),
+        "explainer_score": float(text_score - collapse_penalty - conflict_penalty + csb_bonus),
         "collapse_penalty": float(collapse_penalty),
+        "candidate_conflict_rate": float(candidate_conflict_rate),
+        "rating_aux_conflict_rate": float(rating_aux_conflict_rate),
+        "csb_stability_score": float(csb_stability_score),
+        "conflict_penalty": float(conflict_penalty),
+        "csb_bonus": float(csb_bonus),
     }
 
 
@@ -417,15 +429,22 @@ def select_paper_aware_candidates(
     explainer = max(explainer_pool, key=lambda item: item["explainer_score"], default=None)
     return {
         "schema_version": STEP3_PAPER_CANDIDATE_SCHEMA_VERSION,
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "csb_packet_schema_version": CSB_PACKET_SCHEMA_VERSION,
         "selection_available": bool(scored),
         "paper_eval_required": True,
         "candidate_count": len(scored),
         "candidate_scores": scored,
         "scorer_downstream_checkpoint": scorer,
         "explainer_downstream_checkpoint": explainer,
+        "csb_control_checkpoint": explainer or scorer,
+        "csb_packet_source": (explainer or scorer or {}).get("checkpoint") if (explainer or scorer) else "",
+        "route_calibration_source": scorer,
         "scorer_explainer_can_differ": True,
         "no_paper_eval_no_selection": len(scored) == 0,
         "dist_guard_active": True,
+        "low_dist_blocks_explainer": True,
+        "csb_candidate_selection": True,
     }
 
 

@@ -123,10 +123,9 @@ kill, or switch tmux sessions; and must not manage GPU allocation. Codex may
 trust only the current tmux session's real-time CUDA environment. GPU use is
 allowed by default for repo-local validation, probe, and bounded runtime after
 fast sanity and current-pane validation. The controlled tmux GPU bridge
-`python code/tools/odcr_tmux_gpu_bridge.py` targets a user-created,
-already-entered, uniquely validated GPU pane with one bridge-generated command
-file; this is not arbitrary send-keys and is no longer limited by a GPU
-whitelist hard blocker. Bridge outputs stay under
+`./odcr runtime bridge ...` targets a user-created, already-entered, uniquely
+validated GPU pane with one bridge-generated command file selected by the
+stage-dispatch allowlist; this is not arbitrary send-keys. Bridge outputs stay under
 `AI_analysis/06_probe_evidence` or `runs/step3_validation` by default. The
 formal namespace guard remains mandatory. post-edit full is not a GPU
 prerequisite, and runtime evidence takes priority over static full-suite

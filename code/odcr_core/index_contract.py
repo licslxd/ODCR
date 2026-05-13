@@ -17,19 +17,39 @@ import pandas as pd
 import torch
 
 from config import get_odcr_embed_dim
+from odcr_core.csb_contract import (
+    CSB_ODCR_METHOD_NAME,
+    CSB_PACKET_SCHEMA_VERSION,
+    CSB_REQUIRED_TENSOR_FIELDS,
+    csb_contract_hash,
+    default_csb_contract_payload,
+)
 from odcr_core.training_checkpoint import CheckpointLineageError, file_fingerprint, stable_hash
 from paths_config import DEFAULT_SENTENCE_EMBED_MODEL_ID, get_sentence_embed_model_dir
 
-INDEX_CONTRACT_SCHEMA_VERSION = "odcr_index_contract/2.2"
+INDEX_CONTRACT_SCHEMA_VERSION = "csb_odcr_index_contract/3.0"
 INDEX_CONTRACT_FILENAME = "index_contract.json"
 # Step4 → Step5 正式训练表文件名（唯一真源；禁止再默认 factuals_counterfactuals.csv）
 ODCR_ROUTING_TRAIN_CSV = "odcr_routing_train.csv"
 GLOBAL_COL_USER = "user_idx_global"
 GLOBAL_COL_ITEM = "item_idx_global"
 
-STEP4_RCR_EXPORT_SCHEMA_VERSION = "odcr_step4_rcr_export/1.0"
-STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION = "odcr_step4_route_posterior/1.0"
-STEP4_EXPORT_LINEAGE_SCHEMA_VERSION = "odcr_step4_export_lineage/4A"
+STEP4_RCR_EXPORT_SCHEMA_VERSION = "csb_odcr_step4_rcr_export/1.0"
+STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION = "csb_odcr_step4_route_posterior/1.0"
+STEP4_EXPORT_LINEAGE_SCHEMA_VERSION = "csb_odcr_step4_export_lineage/1"
+STEP4_CSB_DIAGNOSTIC_COLUMNS = (
+    "csb_contract_hash",
+    "csb_schema_version",
+    "z_content_summary",
+    "z_style_summary",
+    "z_domain_summary",
+    "z_uncertainty_summary",
+)
+STEP4_CSB_AWARE_ROUTE_COLUMNS = (
+    "csb_route_confidence",
+    "csb_scorer_clean_score",
+    "csb_explainer_control_score",
+)
 STEP4_RCR_SCORE_COLUMNS = (
     "content_retention_score",
     "style_shift_score",
@@ -120,7 +140,13 @@ def step4_rcr_export_contract_summary() -> Dict[str, Any]:
         "schema_version": STEP4_RCR_EXPORT_SCHEMA_VERSION,
         "posterior_contract_version": STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION,
         "train_csv": ODCR_ROUTING_TRAIN_CSV,
+        "method_name": CSB_ODCR_METHOD_NAME,
         "required_columns": list(STEP4_RCR_REQUIRED_COLUMNS),
+        "csb_contract": default_csb_contract_payload(),
+        "csb_contract_hash": csb_contract_hash(default_csb_contract_payload()),
+        "csb_diagnostic_columns": list(STEP4_CSB_DIAGNOSTIC_COLUMNS),
+        "csb_aware_route_fields": list(STEP4_CSB_AWARE_ROUTE_COLUMNS),
+        "old_scalar_only_formal_allowed": False,
         "required_fields_hash": step4_rcr_required_fields_hash(),
         "score_columns": list(STEP4_RCR_SCORE_COLUMNS),
         "decision_columns": list(STEP4_RCR_DECISION_COLUMNS),
@@ -186,7 +212,18 @@ def build_step4_export_lineage(
     step4_rcr_config: Mapping[str, Any],
     step4_run: str | None = None,
     frozen_step3_lineage: Mapping[str, Any] | None = None,
+    csb_contract: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    if not isinstance(csb_contract, Mapping) or not csb_contract:
+        raise CheckpointLineageError("Step4 export lineage requires resolved CSB contract; missing fallback is forbidden.")
+    csb_payload = dict(csb_contract)
+    if str(csb_payload.get("schema_version") or "") != CSB_PACKET_SCHEMA_VERSION:
+        raise CheckpointLineageError("Step4 export lineage CSB packet schema mismatch.")
+    fields = csb_payload.get("required_tensor_fields")
+    missing = [field for field in CSB_REQUIRED_TENSOR_FIELDS if field not in (fields or [])]
+    if missing:
+        raise CheckpointLineageError(f"Step4 export lineage CSB contract missing required tensor fields: {missing}")
+    csb_payload["contract_hash"] = csb_contract_hash(csb_payload)
     frozen = dict(
         frozen_step3_lineage
         or {
@@ -195,7 +232,7 @@ def build_step4_export_lineage(
             "step3_checkpoint_hash": str(step3_checkpoint_lineage_hash),
             "step3_checkpoint_lineage_hash": str(step3_checkpoint_lineage_hash),
             "step3_stage_status_hash": "unknown",
-            "step3_eval_handoff_hash": "unknown",
+            "step3_readiness_audit_hash": "unknown",
         }
     )
     payload: Dict[str, Any] = {
@@ -206,6 +243,9 @@ def build_step4_export_lineage(
         "frozen_step3_lineage": frozen,
         "step4_rcr_config_hash": stable_hash(dict(step4_rcr_config)),
         "step4_export_schema_version": STEP4_RCR_EXPORT_SCHEMA_VERSION,
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "csb_contract": csb_payload,
+        "csb_contract_hash": csb_payload["contract_hash"],
         "rcr_required_fields_hash": step4_rcr_required_fields_hash(),
         "route_posterior_contract_version": STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION,
         "preprocess_route_prior_boundary": step4_prior_boundary_contract(),
@@ -251,6 +291,7 @@ def validate_step4_export_lineage(
         step4_rcr_config=current_step4_rcr_config,
         step4_run=str(lineage.get("step4_run") or "unknown"),
         frozen_step3_lineage=dict(lineage.get("frozen_step3_lineage") or {}),
+        csb_contract=dict(lineage.get("csb_contract") or {}),
     )
     frozen = lineage.get("frozen_step3_lineage")
     if not isinstance(frozen, Mapping):
@@ -260,7 +301,7 @@ def validate_step4_export_lineage(
         "step3_checkpoint_path",
         "step3_checkpoint_hash",
         "step3_stage_status_hash",
-        "step3_eval_handoff_hash",
+        "step3_readiness_audit_hash",
     ):
         if not str(frozen.get(required_key) or "").strip():
             raise CheckpointLineageError(
@@ -270,6 +311,9 @@ def validate_step4_export_lineage(
         "producer_stage": "step4",
         "step4_rcr_config_hash": expected["step4_rcr_config_hash"],
         "step4_export_schema_version": STEP4_RCR_EXPORT_SCHEMA_VERSION,
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "csb_contract": expected["csb_contract"],
+        "csb_contract_hash": expected["csb_contract_hash"],
         "rcr_required_fields_hash": step4_rcr_required_fields_hash(),
         "route_posterior_contract_version": STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION,
         "preprocess_route_prior_boundary": step4_prior_boundary_contract(),
@@ -286,6 +330,28 @@ def validate_step4_export_lineage(
                 f"Step4 export lineage mismatch for {key}: export={lineage.get(key)!r} current={expected_value!r}"
             )
     return dict(lineage)
+
+
+def validate_csb_step4_gate(contract: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a Step4/Step5-readable CSB gate payload or fail fast."""
+
+    csb = contract.get("csb_contract") if isinstance(contract.get("csb_contract"), Mapping) else {}
+    if not csb:
+        csb = contract.get("step4_export_lineage", {}).get("csb_contract") if isinstance(contract.get("step4_export_lineage"), Mapping) else {}
+    fields = csb.get("required_tensor_fields") if isinstance(csb, Mapping) else []
+    missing = [field for field in CSB_REQUIRED_TENSOR_FIELDS if field not in (fields or [])]
+    if missing:
+        raise CheckpointLineageError(f"CSB Step4 gate missing required tensor fields: {missing}")
+    contract_hash = str(csb.get("contract_hash") or contract.get("csb_contract_hash") or "")
+    if not contract_hash:
+        raise CheckpointLineageError("CSB Step4 gate missing contract_hash.")
+    return {
+        "schema_version": "csb_odcr_step4_gate/1",
+        "status": "pass",
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "contract_hash": contract_hash,
+        "required_tensor_fields": list(CSB_REQUIRED_TENSOR_FIELDS),
+    }
 
 
 def _ctx_tail(ctx: Mapping[str, Any]) -> str:
@@ -989,6 +1055,7 @@ __all__ = [
     "build_index_contract",
     "build_step4_export_lineage",
     "validate_step4_export_lineage",
+    "validate_csb_step4_gate",
     "step4_rcr_required_fields_hash",
     "write_index_contract",
     "load_index_contract",

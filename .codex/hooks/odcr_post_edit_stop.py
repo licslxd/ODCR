@@ -19,6 +19,11 @@ from typing import Callable, Iterable
 
 
 EXPECTED_REPO_ROOT = Path("/public/home/zhangliml/lc/ODCR/ODCR-main")
+CODE_DIR = EXPECTED_REPO_ROOT / "code"
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from odcr_core.aux.governance.rule_registry import hook_scope_for_path as registry_hook_scope_for_path
+
 POST_EDIT_REL = Path("code") / "tools" / "odcr_post_edit_check.py"
 HOOK_REL = Path(".codex") / "hooks" / "odcr_post_edit_stop.py"
 LOG_DIR_REL = Path("AI_analysis") / "01_raw_logs" / "codex_hooks"
@@ -554,79 +559,10 @@ def _looks_like(rel_path: str, needles: Iterable[str]) -> bool:
 
 def _scope_for_path(rel_path: str) -> str | None:
     rel = rel_path.replace("\\", "/")
-    name = Path(rel).name
 
     if _is_ignored_path(rel) or rel.startswith("_archive/"):
         return None
-    if rel in {"README.md", "AGENTS.md"} or rel.startswith("docs/"):
-        return "governance-fast"
-    if rel.startswith(".codex/"):
-        return "governance-fast"
-    if rel in CROSS_STAGE_SCOPE_FILES or _looks_like(
-        rel,
-        ("lineage", "cache_manifest", "checkpoint_lineage", "export_contract"),
-    ):
-        return "all"
-    if rel in {
-        "code/tools/check_one_control_guardrails.py",
-        "code/tools/odcr_post_edit_check.py",
-        "code/tests/test_one_control_guardrails.py",
-        "code/tests/test_post_edit_check.py",
-    }:
-        return "governance-fast"
-    if rel in {
-        "code/odcr_core/logging_meta.py",
-        "code/tests/test_run_summary_logging.py",
-        "code/tests/test_logging_console_file.py",
-        "code/train_logging.py",
-    }:
-        return "logging"
-    if rel.startswith("configs/") or name in {
-        "config_schema.py",
-        "config_resolver.py",
-        "config.py",
-        "paths_config.py",
-        "runners.py",
-        "path_layout.py",
-    }:
-        return "config"
-    if name in {
-        "preprocess_data.py",
-        "split_data.py",
-        "combine_data.py",
-        "compute_embeddings.py",
-        "infer_domain_semantics.py",
-        "preprocess_schema.py",
-        "preprocess_runtime.py",
-        "preprocess_status.py",
-        "preprocess_registry.py",
-    } or name.startswith("preprocess_") or _looks_like(rel, ("preprocess",)):
-        return "preprocess"
-    if name in {
-        "step3_train_core.py",
-        "step3_entry.py",
-        "odcr_representation.py",
-        "odcr_losses.py",
-    } or _looks_like(rel, ("step3", "test_step3")):
-        return "step3"
-    if name in {
-        "step4_engine.py",
-        "step4_entry.py",
-        "odcr_cf_routing.py",
-        "step4_training_export.py",
-    } or _looks_like(rel, ("step4", "test_step4", "test_index_contract")):
-        return "step4"
-    if name in {
-        "step5_engine.py",
-        "step5_entry.py",
-        "step5_innovation.py",
-        "step5_native_lora.py",
-        "step5_word_losses.py",
-    } or _looks_like(rel, ("step5", "test_step5")):
-        return "step5"
-    if _looks_like(rel, ("eval", "rerank", "bleu", "bert_score", "bertscore", "decode")):
-        return "eval"
-    return None
+    return registry_hook_scope_for_path(rel)
 
 
 def _scope_candidates(changed_files: Iterable[str]) -> tuple[str, ...]:

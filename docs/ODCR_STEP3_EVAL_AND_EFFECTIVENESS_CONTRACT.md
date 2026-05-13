@@ -4,10 +4,13 @@ This file preserves the Step3 eval/effectiveness contract history. It is not a
 live project-state source. Use `docs/CURRENT_PROJECT_STATE.md` and
 `runs/*/meta/stage_status.json` for current run status.
 
-# ODCR Step3 Eval And Effectiveness Contract
+# CSB-ODCR Step3 Eval And Effectiveness Contract
 
 This contract locks the Step3 paper-compatible eval surface, two-phase eval
 runtime, explicit LR damping semantics, and training-effectiveness evidence.
+The active paper-facing method name is CSB-ODCR; this file keeps eval protocol
+semantics and defers CSB tensor handoff details to
+`docs/CSB_ODCR_CROSS_STAGE_CONTRACT.md`.
 
 ## Eval Protocol Layers
 
@@ -23,7 +26,7 @@ Step3 eval protocols are mutually labeled and must not be mixed.
   `data/<target>/{valid,test}.csv`, uses 25-token reference/decode, records
   `paper_comparable=true`, and computes only MAE/RMSE, ROUGE-1/ROUGE-L,
   BLEU-1/2/3/4, DIST-1/2, and METEOR.
-- `full_pipeline_final_eval`: reserved interface for Step4/Step5 final ODCR
+- `full_pipeline_final_eval`: reserved interface for Step4/Step5 final CSB-ODCR
   paper metrics. Step3 diagnostic output is never a substitute for this layer.
 
 ## Paper Metric Lock
@@ -87,10 +90,10 @@ summarized in:
 These artifacts explain whether post-epoch gains are optimizer-limited,
 component-saturated, protocol-misaligned, or likely in need of loss rebalance.
 
-## Run2 Semantics
+## Failed Post-Train Eval Semantics
 
-Run2 training completed, but post-train eval failed. The run summary must split
-this as `train_status=completed`, `eval_status=failed`,
+If training completes but post-train eval fails, the run summary must split the
+status as `train_status=completed`, `eval_status=failed`,
 `quality_status=not_evaluated`, `downstream_ready=false`, and
 `failure_phase=post_train_eval`. The checkpoint remains eligible for
 eval-only validation, but Step4/Step5 downstream handoff remains blocked until

@@ -254,7 +254,7 @@ def validate_step4_export_ready(
             "step3_checkpoint_path",
             "step3_checkpoint_hash",
             "step3_stage_status_hash",
-            "step3_eval_handoff_hash",
+            "step3_readiness_audit_hash",
         )
         missing_frozen = [key for key in frozen_required if not str(frozen.get(key) or "").strip()]
         if missing_frozen:

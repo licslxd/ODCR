@@ -23,9 +23,11 @@ from odcr_core.index_contract import (  # noqa: E402
     STEP4_RCR_REQUIRED_COLUMNS,
     build_step4_export_lineage,
 )
+from odcr_core.csb_contract import default_csb_contract_payload  # noqa: E402
 from odcr_core.manifests import build_run_manifest  # noqa: E402
 from odcr_core.preprocess_runtime import PreprocessRuntime  # noqa: E402
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST  # noqa: E402
+from odcr_core.stage_truth_antiforgery import write_step3_fixture  # noqa: E402
 from tools.check_one_control_guardrails import (  # noqa: E402
     D4C_PYTHON_ABS,
     GUARDRAIL_GROUPS,
@@ -135,8 +137,9 @@ def _write_step4_upstream_fixture(repo: Path, *, task_id: int, run_id: str = "1_
             "step3_checkpoint_path": f"runs/step3/task{task_id}/2/model/best_observed.pth",
             "step3_checkpoint_hash": "fixture_checkpoint_hash",
             "step3_stage_status_hash": "fixture_stage_status_hash",
-            "step3_eval_handoff_hash": "fixture_eval_handoff_hash",
+            "step3_readiness_audit_hash": "fixture_readiness_audit_hash",
         },
+        csb_contract=default_csb_contract_payload(),
     )
     _write_json(
         run / INDEX_CONTRACT_FILENAME,
@@ -357,16 +360,24 @@ class TestOneControlGuardrails(unittest.TestCase):
     def test_step4_rcr_params_resolve_from_one_control_config(self) -> None:
         raw = load_yaml_config(REPO_ROOT / "configs" / "odcr.yaml")
         expected = raw["step4"]["rcr"]
-        cfg, _, snapshot = resolve_config(
-            config_path=REPO_ROOT / "configs" / "odcr.yaml",
-            command="step4",
-            task_id=2,
-            set_overrides=[],
-            dry_run=True,
-            from_step3="2",
-            eval_profile="balanced_2gpu",
-            mode="full",
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_step3_fixture(repo, task=2, run_id="2", active=True, eligible=True)
+            old_root = config_resolver._REPO_ROOT
+            try:
+                config_resolver._REPO_ROOT = repo
+                cfg, _, snapshot = resolve_config(
+                    config_path=REPO_ROOT / "configs" / "odcr.yaml",
+                    command="step4",
+                    task_id=2,
+                    set_overrides=[],
+                    dry_run=True,
+                    from_step3="2",
+                    eval_profile="balanced_2gpu",
+                    mode="full",
+                )
+            finally:
+                config_resolver._REPO_ROOT = old_root
         self.assertEqual(snapshot["field_sources"]["step4_rcr"], "step4.rcr")
         resolved = snapshot["step4_rcr"]
         self.assertEqual(
@@ -1245,7 +1256,7 @@ class TestOneControlGuardrails(unittest.TestCase):
         yaml_text = (REPO_ROOT / "configs" / "odcr.yaml").read_text(encoding="utf-8")
         self.assertIn("max_parallel_cpu: 12", yaml_text)
         self.assertNotIn("max_parallel_cpu: 16", yaml_text)
-        bridge_text = (REPO_ROOT / "code" / "tools" / "odcr_tmux_gpu_bridge.py").read_text(encoding="utf-8")
+        bridge_text = (REPO_ROOT / "code" / "odcr_core" / "aux" / "runtime" / "gpu_bridge.py").read_text(encoding="utf-8")
         self.assertIn('"repo-command"', bridge_text)
         self.assertIn('"repo-script"', bridge_text)
         self.assertIn('"repo-module"', bridge_text)

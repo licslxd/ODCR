@@ -13,6 +13,7 @@ rating/explainer + orthogonal + invariance + separation + evidence/prototype geo
 import os
 import sys
 import copy
+import gc
 import json
 import time
 import hashlib
@@ -137,6 +138,7 @@ from odcr_core.step3_quality import (
     inspect_gradients,
     metric_improved,
     sync_grad_finite_decision,
+    sync_grad_gate_diagnostics,
     timing_row_with_closure,
     write_step3_quality_audit,
 )
@@ -178,7 +180,7 @@ from executors.decode_controller import (
     prepare_logits,
     sample_next_token,
 )
-from odcr_core.odcr_representation import ODCRDisentangler
+from odcr_core.odcr_representation import CSBODCRBottleneck
 from odcr_core.odcr_losses import (
     anchor_score_alignment_loss,
     build_orthogonal_losses,
@@ -254,6 +256,14 @@ from odcr_core.step3_v3_policy import (
     resolve_phase_for_epoch,
     safe_damping_v2_decision,
 )
+from odcr_core.csb_contract import (
+    CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+    CSB_ODCR_METHOD_NAME,
+    apply_csb_conflict_routing_weights,
+    csb_contract_hash,
+    default_csb_contract_payload,
+    validate_csb_forward_output_schema,
+)
 
 def _nonfinite_loss_abort_threshold() -> int:
     raw = os.environ.get("ODCR_NONFINITE_LOSS_ABORT_AFTER", "0").strip()
@@ -282,6 +292,14 @@ STEP3_TOTAL_LOSS_COMPONENT_KEYS: tuple[str, ...] = (
     "L_prototype_separation",
 )
 
+STEP3_DISABLED_FORMAL_LOSS_COMPONENT_KEYS: tuple[str, ...] = ("L_light_explainer",)
+STEP3_FORMAL_PRIMARY_LOSS_KEYS: tuple[str, ...] = ("L_rating_shared",)
+STEP3_SIDECAR_LOSS_COMPONENT_KEYS: tuple[str, ...] = tuple(
+    key
+    for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS
+    if key not in STEP3_FORMAL_PRIMARY_LOSS_KEYS and key not in STEP3_DISABLED_FORMAL_LOSS_COMPONENT_KEYS
+)
+
 STEP3_DIAGNOSTIC_LOSS_KEYS: tuple[str, ...] = (
     "L_orthogonal_xcov",
     "L_orthogonal_cosine",
@@ -303,6 +321,10 @@ STEP3_STRUCTURED_LOSS_INPUT_KEYS: tuple[str, ...] = (
     "residual_local",
     "anchor_pred_content",
     "anchor_pred_style",
+    "z_content",
+    "z_style",
+    "z_domain",
+    "z_uncertainty",
 )
 
 
@@ -312,9 +334,17 @@ class Step3ForwardOutput(NamedTuple):
     word_dist: torch.Tensor
     shared_proj: torch.Tensor
     specific_proj: torch.Tensor
-    odcr_latents: Any
+    csb_latents: Any
     structured_loss_inputs: dict[str, torch.Tensor]
     diagnostics: dict[str, Any]
+    z_content: torch.Tensor
+    z_style: torch.Tensor
+    z_domain: torch.Tensor
+    z_uncertainty: torch.Tensor
+    csb_packet: dict[str, Any]
+    csb_diagnostics: dict[str, Any]
+    csb_schema_version: str
+    csb_contract_hash: str
 
     def legacy_tuple(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (self.rating, self.context_dist, self.word_dist, self.shared_proj, self.specific_proj)
@@ -338,10 +368,13 @@ class Step3LossSemantics:
 @dataclass(frozen=True)
 class Step3LossBundle:
     total_loss: torch.Tensor
+    primary_loss: torch.Tensor
+    sidecar_loss: torch.Tensor
     components: dict[str, torch.Tensor]
     weights: dict[str, float]
     weighted_components: dict[str, torch.Tensor]
     participates_in_total: dict[str, bool]
+    component_roles: dict[str, str]
     finite_status: dict[str, bool]
     graph_tied_zero_status: dict[str, bool]
     duplicate_loss_check_summary: dict[str, Any]
@@ -518,7 +551,7 @@ def _step3_cross_rank_loss_context(
     return context["shared_repr"], context["specific_repr"], context["domain_ids"], summary
 
 
-def _detach_odcr_latent_bundle(latents: Any) -> Any:
+def _detach_csb_latent_bundle(latents: Any) -> Any:
     values = {}
     for item in fields(latents):
         value = getattr(latents, item.name)
@@ -541,6 +574,10 @@ def _structured_loss_inputs_from_latents(latents: Any) -> dict[str, torch.Tensor
         "residual_local": latents.residual_local,
         "anchor_pred_content": latents.anchor_pred_content,
         "anchor_pred_style": latents.anchor_pred_style,
+        "z_content": latents.z_content,
+        "z_style": latents.z_style,
+        "z_domain": latents.z_domain,
+        "z_uncertainty": latents.z_uncertainty,
     }
 
 
@@ -552,6 +589,11 @@ def _tensor_is_graph_tied_zero(value: torch.Tensor) -> bool:
     except Exception:
         is_zero = False
     return bool(is_zero and value.requires_grad)
+
+
+def _step3_csb_ddp_graph_anchor_zero(forward_output: Step3ForwardOutput) -> torch.Tensor:
+    """Primary-path graph-safe zero; CSB sidecar participates through sidecar_loss."""
+    return forward_output.rating.sum() * 0.0
 
 
 def duplicate_step3_loss_check(component_keys: Sequence[str]) -> dict[str, Any]:
@@ -609,7 +651,11 @@ def step3_sync_loss_bundle_finite_status(
     world_size: int,
 ) -> dict[str, Any]:
     """Aggregate total/component finite flags in one DDP all-reduce."""
-    flags = [torch.isfinite(loss_bundle.total_loss.detach()).all()]
+    flags = [
+        torch.isfinite(loss_bundle.total_loss.detach()).all(),
+        torch.isfinite(loss_bundle.primary_loss.detach()).all(),
+        torch.isfinite(loss_bundle.sidecar_loss.detach()).all(),
+    ]
     flags.extend(torch.isfinite(loss_bundle.components[key].detach()).all() for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS)
     local_vec = torch.stack([flag.to(dtype=torch.int32) for flag in flags]).to(device=loss_bundle.total_loss.device)
     local_total_finite = bool(int(local_vec[0].item()))
@@ -619,18 +665,38 @@ def step3_sync_loss_bundle_finite_status(
         dist.all_reduce(local_vec, op=dist.ReduceOp.MIN)
     global_vec = [bool(int(value.item())) for value in local_vec]
     component_status = {
-        key: bool(global_vec[idx + 1])
+        key: bool(global_vec[idx + 3])
         for idx, key in enumerate(STEP3_TOTAL_LOSS_COMPONENT_KEYS)
     }
     summary = {
         "local_total_finite": local_total_finite,
         "global_total_finite": bool(global_vec[0]),
+        "global_primary_finite": bool(global_vec[1]),
+        "global_sidecar_finite": bool(global_vec[2]),
         "global_component_finite_status": component_status,
         "sync_method": "single_all_reduce_min_vector",
         "component_count": len(STEP3_TOTAL_LOSS_COMPONENT_KEYS),
     }
     loss_bundle.logging_summary["global_finite_status"] = summary
     return summary
+
+
+def backward_step3_primary_and_sidecar_losses(loss_bundle: Step3LossBundle) -> dict[str, Any]:
+    """Run Step3's contract-first DDP backward through detached firewall graphs."""
+    primary = loss_bundle.primary_loss
+    sidecar = loss_bundle.sidecar_loss
+    sidecar_backward = bool(sidecar.requires_grad)
+    ddp_firewall_loss = primary + (sidecar if sidecar_backward else sidecar.detach())
+    ddp_firewall_loss.backward()
+    return {
+        "schema_version": "odcr_step3_gradient_firewall_backward/1",
+        "primary_backward_loss": "L_rating_shared",
+        "sidecar_backward_loss": "csb_sidecar_loss",
+        "sidecar_backward_executed": sidecar_backward,
+        "single_ddp_firewall_backward": True,
+        "mixed_total_loss_backward": False,
+        "gradient_firewall": True,
+    }
 
 
 @dataclass(frozen=True)
@@ -767,7 +833,7 @@ def step3_loss_semantics_from_config(final_cfg: FinalTrainingConfig) -> Step3Los
 def _step3_component_weights(weights: Step3StructuredLossWeights) -> dict[str, float]:
     return {
         "L_rating_shared": 1.0,
-        "L_light_explainer": float(weights.light_explainer_weight),
+        "L_light_explainer": 0.0,
         "L_orthogonal": float(weights.orthogonal_weight),
         "L_variance": float(weights.variance_weight),
         "L_shared_invariance": float(weights.shared_invariance_weight),
@@ -819,6 +885,145 @@ def apply_step3_phase_loss_multipliers(
     return Step3StructuredLossWeights(**values)
 
 
+def _fp32_stable_tensor(x: torch.Tensor) -> torch.Tensor:
+    return x.float() if torch.is_tensor(x) else x
+
+
+def _stable_cosine_loss(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    sample_weight: torch.Tensor | None = None,
+    eps: float,
+    sample_weight_eps: float = 1e-6,
+) -> torch.Tensor:
+    loss = 1.0 - F.cosine_similarity(
+        _fp32_stable_tensor(source),
+        _fp32_stable_tensor(target),
+        dim=-1,
+        eps=max(float(eps), 1e-6),
+    )
+    if sample_weight is None:
+        return loss.mean()
+    w = _fp32_stable_tensor(sample_weight).reshape(-1).clamp_min(max(float(sample_weight_eps), 1e-6))
+    return (loss * w).sum() / w.sum().clamp_min(max(float(sample_weight_eps), 1e-6))
+
+
+def _stable_variance_loss(latent: torch.Tensor, *, target_std: float, eps: float) -> torch.Tensor:
+    if latent.shape[0] < 2:
+        return latent.float().sum() * 0.0
+    x = _fp32_stable_tensor(latent)
+    centered = x - x.mean(dim=0, keepdim=True)
+    std = torch.sqrt(centered.pow(2).mean(dim=0) + max(float(eps), 1e-6))
+    return torch.relu(std.new_tensor(float(target_std)) - std).mean()
+
+
+def _stable_projection(source: torch.Tensor, basis: torch.Tensor, *, eps: float = 1e-6) -> torch.Tensor:
+    src = _fp32_stable_tensor(source)
+    ref = _fp32_stable_tensor(basis)
+    denom = ref.pow(2).sum(dim=-1, keepdim=True).clamp_min(max(float(eps), 1e-6))
+    return (src * ref).sum(dim=-1, keepdim=True) / denom
+
+
+def _stable_weighted_loss_sum(weighted: Mapping[str, torch.Tensor], anchor_zero: torch.Tensor) -> torch.Tensor:
+    total = anchor_zero.float()
+    for key in sorted(weighted):
+        total = total + _fp32_stable_tensor(weighted[key])
+    return total
+
+
+def _parse_step3_numerical_stability_config(final_cfg: FinalTrainingConfig) -> dict[str, Any]:
+    raw = str(getattr(final_cfg, "numerical_stability_config_json", "") or "{}")
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        obj = {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _warmup_schedule_value(block: Mapping[str, Any], epoch: int) -> float:
+    if not bool(block.get("enabled", True)):
+        return 1.0
+    schedule = block.get("schedule") if isinstance(block.get("schedule"), Mapping) else {}
+    key = "epoch1" if int(epoch) <= 1 else ("epoch2" if int(epoch) == 2 else "epoch3_plus")
+    return float(schedule.get(key, 1.0) or 0.0)
+
+
+def apply_step3_numerical_stability_warmup(
+    weights: Step3StructuredLossWeights,
+    *,
+    final_cfg: FinalTrainingConfig,
+    epoch: int,
+) -> tuple[Step3StructuredLossWeights, dict[str, Any]]:
+    cfg = _parse_step3_numerical_stability_config(final_cfg)
+    if not bool(cfg.get("enabled", False)):
+        return weights, {
+            "enabled": False,
+            "epoch": int(epoch),
+            "auxiliary_multiplier": 1.0,
+            "light_explainer_multiplier": 1.0,
+            "conflict_routing_multiplier": 1.0,
+            "controlled_injection_multiplier": 1.0,
+            "component_multipliers": {},
+        }
+    aux_m = _warmup_schedule_value(cfg.get("auxiliary_warmup", {}) if isinstance(cfg.get("auxiliary_warmup"), Mapping) else {}, epoch)
+    light_m = _warmup_schedule_value(cfg.get("light_explainer_warmup", {}) if isinstance(cfg.get("light_explainer_warmup"), Mapping) else {}, epoch)
+    conflict_m = _warmup_schedule_value(cfg.get("conflict_routing_warmup", {}) if isinstance(cfg.get("conflict_routing_warmup"), Mapping) else {}, epoch)
+    control_m = _warmup_schedule_value(cfg.get("controlled_injection_warmup", {}) if isinstance(cfg.get("controlled_injection_warmup"), Mapping) else {}, epoch)
+    values = {field.name: float(getattr(weights, field.name)) * float(aux_m) for field in fields(Step3StructuredLossWeights)}
+    values["light_explainer_weight"] = float(values["light_explainer_weight"]) * float(light_m)
+    warmed = Step3StructuredLossWeights(**values)
+    component_multipliers: dict[str, float] = {
+        "L_anchor_content": float(conflict_m),
+        "L_anchor_style": float(conflict_m),
+        "L_prototype_separation": float(conflict_m),
+        "L_content_alignment": float(control_m),
+        "L_style_alignment": float(control_m),
+        "L_shared_proto": float(control_m),
+        "L_domain_style_alignment": float(control_m),
+        "L_local_style_alignment": float(control_m),
+        "L_polarity_alignment": float(control_m),
+        "L_residual_specific": float(control_m),
+    }
+    return warmed, {
+        "enabled": True,
+        "epoch": int(epoch),
+        "auxiliary_multiplier": float(aux_m),
+        "light_explainer_multiplier": float(light_m),
+        "conflict_routing_multiplier": float(conflict_m),
+        "controlled_injection_multiplier": float(control_m),
+        "component_multipliers": component_multipliers,
+    }
+
+
+def _parse_csb_odcr_config(final_cfg: FinalTrainingConfig) -> dict[str, Any]:
+    raw = str(getattr(final_cfg, "csb_odcr_config_json", "") or "{}")
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        obj = {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _require_resolved_csb_contract(payload: Mapping[str, Any], *, context: str) -> dict[str, Any]:
+    csb_cfg = payload.get("step3_csb_odcr")
+    if not isinstance(csb_cfg, Mapping):
+        raise RuntimeError(f"{context} requires resolved step3_csb_odcr from One-Control payload.")
+    contract = csb_cfg.get("contract")
+    if not isinstance(contract, Mapping):
+        raise RuntimeError(f"{context} requires resolved step3.csb_odcr.contract; missing CSB fallback is forbidden.")
+    out = dict(contract)
+    stored_hash = str(out.get("contract_hash") or "").strip()
+    if not stored_hash:
+        raise RuntimeError(f"{context} requires step3.csb_odcr.contract.contract_hash.")
+    computed_hash = csb_contract_hash(out)
+    if stored_hash != computed_hash:
+        raise RuntimeError(
+            f"{context} CSB contract hash mismatch: stored={stored_hash} computed={computed_hash}."
+        )
+    return out
+
+
 def compose_step3_loss_from_forward_output(
     *,
     forward_output: Step3ForwardOutput,
@@ -826,6 +1031,7 @@ def compose_step3_loss_from_forward_output(
     final_cfg: FinalTrainingConfig,
     weights: Step3StructuredLossWeights | None = None,
     semantics: Step3LossSemantics | None = None,
+    numerical_warmup: Mapping[str, Any] | None = None,
 ) -> Step3LossBundle:
     if not isinstance(forward_output, Step3ForwardOutput):
         raise RuntimeError("Step3 loss builder requires Step3ForwardOutput from model.forward.")
@@ -840,116 +1046,192 @@ def compose_step3_loss_from_forward_output(
     eq = batch.evidence_quality_prior
     if c_a is None or s_a is None or eq is None:
         raise RuntimeError("Step3 loss builder requires anchor and evidence-quality tensors from GatheredBatch.")
-    q_w = (
-        semantics.quality_evidence_base
-        + semantics.quality_evidence_scale * eq.view(-1).to(dtype=torch.float32).clamp(0.0, 1.0)
-    ).detach()
-    q_content = q_w * (
-        semantics.quality_anchor_base
-        + semantics.quality_anchor_scale * c_a.view(-1).to(dtype=torch.float32).clamp(0.0, 1.0)
-    )
-    q_style = q_w * (
-        semantics.quality_anchor_base
-        + semantics.quality_anchor_scale * s_a.view(-1).to(dtype=torch.float32).clamp(0.0, 1.0)
-    )
-    structured_shared, structured_specific, structured_domain_idx, gather_summary = _step3_cross_rank_loss_context(
-        structured_inputs=s,
-        batch=batch,
-        final_cfg=final_cfg,
-    )
-    orth = build_orthogonal_losses(
-        structured_shared,
-        structured_specific,
-        eps=float(semantics.orthogonal_eps),
-        w_xcov=float(weights.orthogonal_xcov_weight),
-        w_cos=float(weights.orthogonal_cosine_weight),
-    )
-    var = variance_floor_loss(
-        structured_shared,
-        structured_specific,
-        target_std=float(semantics.variance_target_std),
-        eps=float(semantics.variance_eps),
-    )
-    components = {
-        "L_rating_shared": F.mse_loss(forward_output.rating, batch.rating, reduction="mean"),
-        "L_light_explainer": F.cross_entropy(
-            forward_output.word_dist.view(-1, forward_output.word_dist.size(-1)),
-            batch.tgt_output.reshape(-1),
-            ignore_index=0,
-        ),
-        "L_orthogonal": orth.loss_ortho_total,
-        "L_variance": var.loss_var_total,
-        "L_shared_invariance": shared_invariance_loss(structured_shared, structured_domain_idx),
-        "L_specific_separation": specific_separation_loss(
-            structured_specific,
-            structured_domain_idx,
-            margin=float(semantics.specific_separation_margin),
-        ),
-        "L_anchor_content": anchor_score_alignment_loss(
-            s["anchor_pred_content"],
-            c_a.view(-1),
-            sample_weight=q_content,
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_anchor_style": anchor_score_alignment_loss(
-            s["anchor_pred_style"],
-            s_a.view(-1),
-            sample_weight=q_style,
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_content_alignment": cosine_pull_loss(
-            s["shared_latent"],
-            s["content_evidence_target"],
-            sample_weight=q_content,
-            eps=float(semantics.cosine_eps),
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_style_alignment": cosine_pull_loss(
-            s["specific_latent"],
-            s["style_evidence_target"],
-            sample_weight=q_style,
-            eps=float(semantics.cosine_eps),
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_shared_proto": shared_prototype_pull_loss(
-            s["shared_latent"],
-            s["shared_prototype"],
-            sample_weight=q_content,
-            eps=float(semantics.cosine_eps),
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_domain_style_alignment": cosine_pull_loss(
-            s["domain_style_component"],
-            s["domain_style_target"],
-            sample_weight=q_style,
-            eps=float(semantics.cosine_eps),
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_local_style_alignment": cosine_pull_loss(
-            s["residual_local"],
-            s["local_style_target"],
-            sample_weight=q_style,
-            eps=float(semantics.cosine_eps),
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_polarity_alignment": cosine_pull_loss(
-            s["specific_latent"],
-            s["polarity_target"],
-            sample_weight=q_style,
-            eps=float(semantics.cosine_eps),
-            sample_weight_eps=float(semantics.sample_weight_eps),
-        ),
-        "L_residual_specific": residual_l2_penalty(s["residual_local"]),
-        "L_prototype_separation": domain_style_prototype_separation(
-            s["domain_style_proto"],
-            eps=float(semantics.prototype_separation_eps),
-        ),
-    }
+    with torch.cuda.amp.autocast(enabled=False):
+        q_w = (
+            float(semantics.quality_evidence_base)
+            + float(semantics.quality_evidence_scale) * eq.view(-1).float().clamp(0.0, 1.0)
+        ).detach()
+        q_content = q_w * (
+            float(semantics.quality_anchor_base)
+            + float(semantics.quality_anchor_scale) * c_a.view(-1).float().clamp(0.0, 1.0)
+        )
+        q_style = q_w * (
+            float(semantics.quality_anchor_base)
+            + float(semantics.quality_anchor_scale) * s_a.view(-1).float().clamp(0.0, 1.0)
+        )
+        structured_shared, structured_specific, structured_domain_idx, gather_summary = _step3_cross_rank_loss_context(
+            structured_inputs=s,
+            batch=batch,
+            final_cfg=final_cfg,
+        )
+        structured_shared = _fp32_stable_tensor(structured_shared)
+        structured_specific = _fp32_stable_tensor(structured_specific)
+        stable_inputs = {
+            key: (_fp32_stable_tensor(value) if torch.is_tensor(value) and value.dtype.is_floating_point else value)
+            for key, value in s.items()
+        }
+        sidecar_inputs = {
+            key: (
+                _fp32_stable_tensor(value)
+                if key in {"z_content", "z_style", "z_domain", "z_uncertainty", "anchor_pred_content", "anchor_pred_style"}
+                else (_fp32_stable_tensor(value).detach() if torch.is_tensor(value) and value.dtype.is_floating_point else value)
+            )
+            for key, value in s.items()
+        }
+        sidecar_rows = int(sidecar_inputs["z_content"].shape[0])
+
+        def _sidecar_rows(value: Any) -> Any:
+            if torch.is_tensor(value) and int(value.shape[0]) != sidecar_rows:
+                return value[:sidecar_rows]
+            return value
+
+        q_content = _sidecar_rows(q_content)
+        q_style = _sidecar_rows(q_style)
+        c_a = _sidecar_rows(c_a)
+        s_a = _sidecar_rows(s_a)
+        structured_domain_idx = _sidecar_rows(structured_domain_idx)
+        for key in (
+            "anchor_pred_content",
+            "anchor_pred_style",
+            "content_evidence_target",
+            "style_evidence_target",
+            "shared_prototype",
+            "domain_style_target",
+            "local_style_target",
+            "polarity_target",
+        ):
+            sidecar_inputs[key] = _sidecar_rows(sidecar_inputs[key])
+        orth = build_orthogonal_losses(
+            sidecar_inputs["z_content"],
+            sidecar_inputs["z_style"],
+            eps=max(float(semantics.orthogonal_eps), 1e-6),
+            w_xcov=float(weights.orthogonal_xcov_weight),
+            w_cos=float(weights.orthogonal_cosine_weight),
+        )
+        var = variance_floor_loss(
+            sidecar_inputs["z_content"],
+            sidecar_inputs["z_style"],
+            target_std=float(semantics.variance_target_std),
+            eps=max(float(semantics.variance_eps), 1e-6),
+        )
+        stable_variance_total = _stable_variance_loss(
+            sidecar_inputs["z_content"],
+            target_std=float(semantics.variance_target_std),
+            eps=max(float(semantics.variance_eps), 1e-6),
+        ) + _stable_variance_loss(
+            sidecar_inputs["z_style"],
+            target_std=float(semantics.variance_target_std),
+            eps=max(float(semantics.variance_eps), 1e-6),
+        )
+        graph_anchor_zero = _step3_csb_ddp_graph_anchor_zero(forward_output)
+        components = {
+            "L_rating_shared": F.mse_loss(forward_output.rating.float(), batch.rating.float(), reduction="mean"),
+            "L_light_explainer": graph_anchor_zero,
+            "L_orthogonal": orth.loss_ortho_total.float(),
+            "L_variance": stable_variance_total.float(),
+            "L_shared_invariance": shared_invariance_loss(sidecar_inputs["z_content"], structured_domain_idx).float(),
+            "L_specific_separation": specific_separation_loss(
+                sidecar_inputs["z_style"],
+                structured_domain_idx,
+                margin=float(semantics.specific_separation_margin),
+            ).float(),
+            "L_anchor_content": anchor_score_alignment_loss(
+                sidecar_inputs["anchor_pred_content"],
+                c_a.view(-1).float(),
+                sample_weight=q_content,
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_anchor_style": anchor_score_alignment_loss(
+                sidecar_inputs["anchor_pred_style"],
+                s_a.view(-1).float(),
+                sample_weight=q_style,
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_content_alignment": _stable_cosine_loss(
+                sidecar_inputs["z_content"],
+                sidecar_inputs["content_evidence_target"],
+                sample_weight=q_content,
+                eps=max(float(semantics.cosine_eps), 1e-6),
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_style_alignment": _stable_cosine_loss(
+                sidecar_inputs["z_style"],
+                sidecar_inputs["style_evidence_target"],
+                sample_weight=q_style,
+                eps=max(float(semantics.cosine_eps), 1e-6),
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_shared_proto": _stable_cosine_loss(
+                sidecar_inputs["z_content"],
+                sidecar_inputs["shared_prototype"],
+                sample_weight=q_content,
+                eps=max(float(semantics.cosine_eps), 1e-6),
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_domain_style_alignment": _stable_cosine_loss(
+                sidecar_inputs["z_domain"],
+                sidecar_inputs["domain_style_target"],
+                sample_weight=q_style,
+                eps=max(float(semantics.cosine_eps), 1e-6),
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_local_style_alignment": _stable_cosine_loss(
+                sidecar_inputs["z_style"],
+                sidecar_inputs["local_style_target"],
+                sample_weight=q_style,
+                eps=max(float(semantics.cosine_eps), 1e-6),
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_polarity_alignment": _stable_cosine_loss(
+                sidecar_inputs["z_style"],
+                sidecar_inputs["polarity_target"],
+                sample_weight=q_style,
+                eps=max(float(semantics.cosine_eps), 1e-6),
+                sample_weight_eps=max(float(semantics.sample_weight_eps), 1e-6),
+            ).float(),
+            "L_residual_specific": residual_l2_penalty(sidecar_inputs["z_uncertainty"]).float(),
+            "L_prototype_separation": domain_style_prototype_separation(
+                sidecar_inputs["domain_style_proto"],
+                eps=max(float(semantics.prototype_separation_eps), 1e-6),
+            ).float(),
+        }
     component_weights = _step3_component_weights(weights)
+    csb_cfg = _parse_csb_odcr_config(final_cfg)
+    controlled_cfg = csb_cfg.get("controlled_injection") if isinstance(csb_cfg.get("controlled_injection"), Mapping) else {}
+    routing_cfg = csb_cfg.get("conflict_routing") if isinstance(csb_cfg.get("conflict_routing"), Mapping) else {}
+    component_weights, csb_conflict_summary = apply_csb_conflict_routing_weights(
+        component_weights,
+        {"enabled": False, "mode": "sidecar_only"},
+        csb_enabled=bool(csb_cfg.get("enabled", True)),
+        controlled_injection_enabled=False,
+    )
+    warmup_summary = dict(numerical_warmup or {})
+    component_warmup = (
+        warmup_summary.get("component_multipliers")
+        if isinstance(warmup_summary.get("component_multipliers"), Mapping)
+        else {}
+    )
+    for key, multiplier in dict(component_warmup).items():
+        if key in component_weights and key != "L_rating_shared":
+            component_weights[key] = float(component_weights[key]) * float(multiplier)
     duplicate_summary = duplicate_step3_loss_check(list(STEP3_TOTAL_LOSS_COMPONENT_KEYS))
     weighted = {key: components[key] * float(component_weights[key]) for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS}
-    total = sum((weighted[key] for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS), components["L_rating_shared"].sum() * 0.0)
-    participates = {key: True for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS}
+    csb_ddp_graph_anchor_zero = graph_anchor_zero
+    primary_loss = weighted["L_rating_shared"] + csb_ddp_graph_anchor_zero
+    sidecar_loss = _stable_weighted_loss_sum(
+        {key: weighted[key] for key in STEP3_SIDECAR_LOSS_COMPONENT_KEYS},
+        weighted["L_rating_shared"].detach() * 0.0,
+    )
+    total = primary_loss
+    participates = {key: key in STEP3_FORMAL_PRIMARY_LOSS_KEYS for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS}
+    component_roles = {
+        key: (
+            "primary_rating_loss"
+            if key in STEP3_FORMAL_PRIMARY_LOSS_KEYS
+            else ("disabled_moved_to_step5" if key in STEP3_DISABLED_FORMAL_LOSS_COMPONENT_KEYS else "csb_sidecar_only")
+        )
+        for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS
+    }
     finite_status = {key: bool(torch.isfinite(value.detach()).all().item()) for key, value in components.items()}
     graph_zero = {key: _tensor_is_graph_tied_zero(value) for key, value in components.items()}
     diagnostics = {
@@ -961,6 +1243,7 @@ def compose_step3_loss_from_forward_output(
         "specific_std_mean": var.specific_std_mean,
         "shared_std_min": var.shared_std_min,
         "specific_std_min": var.specific_std_min,
+        "L_csb_ddp_graph_anchor_zero": csb_ddp_graph_anchor_zero,
     }
     logging_summary = {
         "components": {
@@ -971,21 +1254,44 @@ def compose_step3_loss_from_forward_output(
                 "participates_in_total": bool(participates[key]),
                 "finite": bool(finite_status[key]),
                 "graph_tied_zero": bool(graph_zero[key]),
+                "role": component_roles[key],
             }
             for key in STEP3_TOTAL_LOSS_COMPONENT_KEYS
         },
         "diagnostics": {key: float(value.detach().item()) for key, value in diagnostics.items()},
         "total_loss": float(total.detach().item()),
+        "primary_loss": float(primary_loss.detach().item()),
+        "sidecar_loss": float(sidecar_loss.detach().item()),
         "duplicate_loss_check_summary": duplicate_summary,
-        "loss_builder_contract": "Step3ForwardOutput + GatheredBatch + resolved_config",
+        "loss_builder_contract": "contract_first_primary_rating_plus_detached_csb_sidecar",
         "cross_rank_gather": gather_summary,
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "csb_conflict_routing": csb_conflict_summary,
+        "gradient_firewall": {
+            "enabled": True,
+            "primary_backward": ["L_rating_shared"],
+            "sidecar_backward": [
+                key for key in STEP3_SIDECAR_LOSS_COMPONENT_KEYS if key not in STEP3_DISABLED_FORMAL_LOSS_COMPONENT_KEYS
+            ],
+            "sidecar_input_boundary": "shared_repr.detach() + detached evidence targets",
+            "disabled_step3_formal_losses": list(STEP3_DISABLED_FORMAL_LOSS_COMPONENT_KEYS),
+        },
+        "numerical_stability_warmup": warmup_summary,
+        "csb_training_signal_roles": {
+            "EASD": "z_content",
+            "HSS": "z_style/z_domain",
+            "geometry": "CSB separation/stability",
+        },
     }
     bundle = Step3LossBundle(
         total_loss=total,
+        primary_loss=primary_loss,
+        sidecar_loss=sidecar_loss,
         components=components,
         weights=component_weights,
         weighted_components=weighted,
         participates_in_total=participates,
+        component_roles=component_roles,
         finite_status=finite_status,
         graph_tied_zero_status=graph_zero,
         duplicate_loss_check_summary=duplicate_summary,
@@ -1005,26 +1311,29 @@ def validate_step3_graph_safety_preflight(
 ) -> dict[str, Any]:
     if not isinstance(forward_output, Step3ForwardOutput):
         raise RuntimeError(f"{ctx}: model.forward must return Step3ForwardOutput.")
+    validate_csb_forward_output_schema(forward_output)
     missing_inputs = [key for key in STEP3_STRUCTURED_LOSS_INPUT_KEYS if key not in forward_output.structured_loss_inputs]
     if missing_inputs:
         raise RuntimeError(f"{ctx}: missing structured_loss_inputs {missing_inputs}.")
     _validate_step3_loss_bundle(loss_bundle, ctx=ctx, check_finite=False)
     detached_last = None
-    if underlying_model is not None and hasattr(underlying_model, "last_odcr_latents"):
-        last = getattr(underlying_model, "last_odcr_latents")
+    if underlying_model is not None and hasattr(underlying_model, "last_csb_latents"):
+        last = getattr(underlying_model, "last_csb_latents")
         if last is not None:
             detached_last = all(
                 (not torch.is_tensor(getattr(last, item.name))) or (not getattr(last, item.name).requires_grad)
                 for item in fields(last)
             )
             if not detached_last:
-                raise RuntimeError(f"{ctx}: last_odcr_latents must be detached debug state, not loss state.")
+                raise RuntimeError(f"{ctx}: last_csb_latents must be detached debug state, not loss state.")
     summary = {
         "status": "pass",
         "forward_output_type": "Step3ForwardOutput",
         "structured_loss_input_count": len(forward_output.structured_loss_inputs),
         "required_loss_keys_present": True,
-        "last_odcr_latents_detached": detached_last,
+        "csb_forward_output_schema": str(forward_output.csb_schema_version),
+        "csb_contract_hash": str(forward_output.csb_contract_hash),
+        "last_csb_latents_detached": detached_last,
         "loss_builder_contract": "no module side-channel parameter reads",
         "duplicate_loss_check_summary": dict(loss_bundle.duplicate_loss_check_summary),
     }
@@ -1394,6 +1703,11 @@ def _build_step3_checkpoint_lineage(
     structured = payload.get("step3_structured_losses") or json.loads(
         str(final_cfg.step3_structured_loss_weights_json or "{}")
     )
+    csb_cfg = payload.get("step3_csb_odcr")
+    if not isinstance(csb_cfg, Mapping):
+        raise RuntimeError("Step3 checkpoint lineage requires resolved step3_csb_odcr from One-Control payload.")
+    csb_contract_payload = _require_resolved_csb_contract(payload, context="Step3 checkpoint lineage")
+    method_cfg = payload.get("method") or json.loads(str(getattr(final_cfg, "method_config_json", "") or "{}"))
     loss_semantics = payload.get("step3_loss_semantics") or json.loads(
         str(getattr(final_cfg, "step3_loss_semantics_json", "") or "{}")
     )
@@ -1402,6 +1716,10 @@ def _build_step3_checkpoint_lineage(
     tokenizer_config = payload.get("step3_tokenizer") or json.loads(str(final_cfg.tokenizer_config_json or "{}"))
     evidence_config = payload.get("step3_evidence") or json.loads(str(final_cfg.evidence_config_json or "{}"))
     scheduler_config = payload.get("step3_scheduler") or json.loads(str(final_cfg.scheduler_config_json or "{}"))
+    grad_finite_config = payload.get("step3_grad_finite") or json.loads(str(final_cfg.grad_finite_config_json or "{}"))
+    numerical_stability_config = payload.get("step3_numerical_stability") or json.loads(
+        str(getattr(final_cfg, "numerical_stability_config_json", "") or "{}")
+    )
     valid_batch_config = payload.get("step3_eval") or json.loads(str(final_cfg.valid_batch_config_json or "{}"))
     scenario_profile = payload.get("step3_scenario_profile") or json.loads(str(final_cfg.scenario_profile_json or "{}"))
     arch = _step3_model_architecture_lineage(final_cfg)
@@ -1460,14 +1778,20 @@ def _build_step3_checkpoint_lineage(
         "sentence_embed_model_identity": _step3_sentence_embed_model_identity(),
     }
     semantic_model_payload = {
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "method_schema": method_cfg,
+        "csb_contract": csb_contract_payload,
+        "csb_contract_hash": str(csb_contract_payload["contract_hash"]),
+        "csb_config_hash": stable_hash(csb_cfg),
         "resolved_config_compatibility": resolved_compatibility,
         "source_table_compatibility": source_table_compatibility,
         "embed_dim": int(final_cfg.emsize),
         "model_architecture_config_hash": stable_hash(arch),
         "representation_output_contract_hash": stable_hash(
             {
-                "Step3ForwardOutput": "odcr_step3_forward_output/structured_shared_specific_v1",
-                "Step3LossBundle": "odcr_step3_loss_bundle/structured_shared_specific_v1",
+                "Step3ForwardOutput": CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+                "Step3LossBundle": "csb_odcr_step3_loss_bundle/1",
+                "CSBPacket": csb_contract_payload,
             }
         ),
         "structured_losses_hash": stable_hash(structured),
@@ -1479,6 +1803,8 @@ def _build_step3_checkpoint_lineage(
         "step3_structured_losses": structured,
         "step3_loss_semantics": loss_semantics,
         "cross_rank_structured_gather": payload.get("step3_cross_rank_structured_gather"),
+        "grad_finite": grad_finite_config,
+        "numerical_stability": numerical_stability_config,
         "effective_structured_pool": {
             "local_per_gpu_batch": (payload.get("training_row") or {}).get("local_per_gpu_batch"),
             "effective_pool": (payload.get("training_row") or {}).get("effective_structured_pool"),
@@ -1503,6 +1829,8 @@ def _build_step3_checkpoint_lineage(
     optimizer_payload = {
         "step3_optimizer_config": optimizer_config,
         "step3_scheduler_config": scheduler_config,
+        "step3_grad_finite_config": grad_finite_config,
+        "step3_numerical_stability_config": numerical_stability_config,
         "learning_rate": float(final_cfg.learning_rate),
         "max_grad_norm": float(final_cfg.max_grad_norm),
     }
@@ -1613,11 +1941,22 @@ def _build_step3_checkpoint_lineage(
         "schema_contract_versions": {
             "lineage_gate_schema_version": "odcr_lineage_gate/4A",
             "step3_checkpoint_sidecar_schema_version": STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
+            "method_schema_version": str(method_cfg.get("schema_version") or "csb_odcr_method/1"),
+            "csb_forward_output_schema_version": CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+            "csb_packet_schema_version": str(csb_contract_payload["schema_version"]),
+            "csb_cross_stage_contract_version": str(csb_contract_payload["cross_stage_contract_version"]),
             "preprocess_contract_version": PREPROCESS_CONTRACT_VERSION,
             "step3_upstream_gate_schema_version": upstream_evidence.get("schema_version"),
             "step3_upstream_contract_schema_version": upstream_evidence.get("contract_schema_version"),
             "step3_tokenizer_cache_schema_version": STEP3_TOKENIZE_CACHE_SCHEMA_VERSION,
         },
+        "method_name": CSB_ODCR_METHOD_NAME,
+        "method_schema": method_cfg,
+        "method_schema_hash": stable_hash(method_cfg),
+        "csb_contract": csb_contract_payload,
+        "csb_contract_hash": str(csb_contract_payload["contract_hash"]),
+        "step3_csb_odcr_config": csb_cfg,
+        "step3_csb_odcr_config_hash": stable_hash(csb_cfg),
         "embed_dim": int(final_cfg.emsize),
         "env": {
             "embed_dim": int(get_odcr_embed_dim()),
@@ -1640,6 +1979,10 @@ def _build_step3_checkpoint_lineage(
         "step3_evidence_config_hash": stable_hash(evidence_config),
         "step3_scheduler_config": scheduler_config,
         "step3_scheduler_config_hash": stable_hash(scheduler_config),
+        "step3_grad_finite_config": grad_finite_config,
+        "step3_grad_finite_config_hash": stable_hash(grad_finite_config),
+        "step3_numerical_stability_config": numerical_stability_config,
+        "step3_numerical_stability_config_hash": stable_hash(numerical_stability_config),
         "step3_valid_batch_config": valid_batch_config,
         "step3_valid_batch_config_hash": stable_hash(valid_batch_config),
         "step3_scenario_profile": scenario_profile,
@@ -1884,7 +2227,7 @@ class Model(nn.Module):
         self.register_buffer("item_style_profiles", item_style_profiles.detach(), persistent=False)
         self.word_embeddings = nn.Embedding(ntoken, emsize)
         self.recommender = PETER_MLP(emsize)
-        self.odcr_disentangler = ODCRDisentangler(hidden_size=emsize, proj_size=emsize, dropout=dropout)
+        self.csb_odcr_bottleneck = CSBODCRBottleneck(hidden_size=emsize, proj_size=emsize, dropout=dropout)
         self.hidden2token = nn.Linear(emsize, ntoken)
         self.shared_id_adapter = nn.Linear(emsize, emsize)
         self.specific_id_adapter = nn.Linear(emsize, emsize)
@@ -1897,6 +2240,25 @@ class Model(nn.Module):
         self.shared_stream_norm = nn.LayerNorm(emsize)
         self.specific_stream_norm = nn.LayerNorm(emsize)
         self.evidence_pool_norm = nn.LayerNorm(emsize)
+        self.csb_prefix_adapter = nn.Linear(emsize, emsize)
+        self.csb_prefix_gate = nn.Sequential(
+            nn.Linear(emsize * 4, emsize),
+            nn.ReLU(),
+            nn.Linear(emsize, 1),
+            nn.Sigmoid(),
+        )
+        self.csb_rating_safe_adapter = nn.Linear(emsize * 2, emsize)
+        self.csb_enabled = True
+        self.csb_controlled_injection_enabled = False
+        self.csb_rating_safe_injection_enabled = False
+        self.step3_primary_training = "rating_only"
+        self.csb_mode = "sidecar"
+        self.gradient_firewall_enabled = True
+        self.light_explainer_step3_loss_enabled = False
+        self.conflict_routing_step3_primary_enabled = False
+        self.csb_rating_safe_adapter_train_enabled = False
+        self.csb_injection_strength = 0.35
+        self.last_csb_injection_gate: torch.Tensor | None = None
         self.polarity_embedding = nn.Embedding(3, emsize)
         self.decoder_eos_id = -1
         safe_decode = SAFE_DECODE_PLACEHOLDER
@@ -1925,10 +2287,15 @@ class Model(nn.Module):
         self.exp_loss_fn = nn.CrossEntropyLoss(ignore_index=0)
         self.profile_buffer_policy = "gpu_resident"
         self.activation_checkpointing_policy = {"enabled": False, "policy": "selective", "modules": []}
-        self.last_odcr_latents = None
+        self.last_csb_latents = None
         self.last_shared_proj: torch.Tensor | None = None
         self.last_specific_proj: torch.Tensor | None = None
         self.init_weights()
+
+    @staticmethod
+    def _set_module_trainable(module: nn.Module, trainable: bool) -> None:
+        for param in module.parameters():
+            param.requires_grad_(bool(trainable))
 
     def init_weights(self):
         for m in self.modules():
@@ -1956,6 +2323,52 @@ class Model(nn.Module):
         self.decode_token_repeat_window = int(getattr(cfg, "decode_token_repeat_window", 4))
         self.decode_token_repeat_max = int(getattr(cfg, "decode_token_repeat_max", 2))
         self.evidence_length = int(getattr(cfg, "evidence_max_length", 0) or 0)
+        try:
+            csb_cfg = json.loads(str(getattr(cfg, "csb_odcr_config_json", "") or "{}"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Step3 CSB-ODCR config JSON is invalid: {exc}") from exc
+        if not isinstance(csb_cfg, Mapping):
+            raise RuntimeError("Step3 CSB-ODCR config must be a JSON object.")
+        contract_cfg = csb_cfg.get("contract")
+        if not isinstance(contract_cfg, Mapping):
+            raise RuntimeError("Step3 runtime requires resolved step3.csb_odcr.contract; missing CSB fallback is forbidden.")
+        self.csb_odcr_bottleneck.set_csb_contract_payload(contract_cfg)
+        controlled_cfg = csb_cfg.get("controlled_injection") if isinstance(csb_cfg.get("controlled_injection"), Mapping) else {}
+        self.csb_enabled = bool(csb_cfg.get("enabled", True))
+        self.step3_primary_training = str(csb_cfg.get("primary_training") or "rating_only")
+        self.csb_mode = str(csb_cfg.get("csb_mode") or "sidecar")
+        self.gradient_firewall_enabled = bool(csb_cfg.get("gradient_firewall", True))
+        self.light_explainer_step3_loss_enabled = bool(csb_cfg.get("light_explainer_step3_loss", False))
+        self.conflict_routing_step3_primary_enabled = bool(csb_cfg.get("conflict_routing_step3_primary", False))
+        self.csb_rating_safe_adapter_train_enabled = bool(csb_cfg.get("csb_rating_safe_adapter_train", False))
+        self.csb_controlled_injection_enabled = bool(
+            controlled_cfg.get("enabled", False)
+            and csb_cfg.get("controlled_injection_formal_train", False)
+            and self.light_explainer_step3_loss_enabled
+        )
+        self.csb_rating_safe_injection_enabled = bool(
+            controlled_cfg.get("rating_safe_injection", False)
+            and self.csb_rating_safe_adapter_train_enabled
+            and self.light_explainer_step3_loss_enabled
+        )
+        self.csb_injection_strength = float(controlled_cfg.get("gate_init", 0.35) or 0.35)
+        freeze_text = bool(self.gradient_firewall_enabled and not self.light_explainer_step3_loss_enabled)
+        for module in (
+            self.hidden2token,
+            self.transformer_encoder,
+            self.csb_prefix_adapter,
+            self.csb_prefix_gate,
+            self.csb_rating_safe_adapter,
+        ):
+            self._set_module_trainable(module, not freeze_text)
+        if self.gradient_firewall_enabled and self.csb_mode == "sidecar":
+            for name, param in self.named_parameters():
+                if name.startswith("csb_odcr_bottleneck.") and not any(
+                    marker in name for marker in STEP3_SIDECAR_PARAMETER_MARKERS
+                ):
+                    param.requires_grad_(False)
+                if any(marker in name for marker in STEP3_FORMAL_DISABLED_PARAMETER_MARKERS):
+                    param.requires_grad_(False)
         if self.evidence_length <= 0:
             raise RuntimeError("Step3 model requires resolved evidence_max_length.")
         eid = getattr(tok, "eos_token_id", None)
@@ -2103,24 +2516,43 @@ class Model(nn.Module):
         latents,
         guides: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        csb_stack = torch.stack(
+            [latents.z_content, latents.z_style, latents.z_domain, latents.z_uncertainty],
+            dim=1,
+        )
+        gate_raw = self.csb_prefix_gate(torch.cat(
+            [latents.z_content, latents.z_style, latents.z_domain, latents.z_uncertainty],
+            dim=-1,
+        ))
+        gate = gate_raw * float(self.csb_injection_strength)
+        if (not self.csb_enabled) or (not self.csb_controlled_injection_enabled):
+            gate = gate * 0.0
+        self.last_csb_injection_gate = gate.detach()
+        structural_tokens = self.csb_prefix_adapter(csb_stack) * gate.unsqueeze(1)
+        rating_safe = self.csb_rating_safe_adapter(torch.cat([latents.z_content, latents.z_uncertainty], dim=-1))
+        if (not self.csb_enabled) or (not self.csb_rating_safe_injection_enabled):
+            rating_safe = rating_safe * 0.0
         return torch.stack(
             [
                 latents.shared,
-                latents.specific,
                 guides["domain_content"],
-                latents.domain_style_component,
                 guides["user_content"],
                 guides["item_content"],
-                guides["user_style"],
-                guides["item_style"],
                 latents.content_evidence_target,
-                latents.style_evidence_target,
+                rating_safe,
+                structural_tokens[:, 0, :],
+                structural_tokens[:, 1, :],
+                structural_tokens[:, 2, :],
+                structural_tokens[:, 3, :],
+                latents.style_evidence_target * gate,
+                guides["user_style"] * gate,
+                guides["item_style"] * gate,
             ],
             dim=1,
         )
 
     def _prefix_len(self) -> int:
-        return 10
+        return 13
 
     def _make_generate_config(self) -> GenerateConfig:
         return GenerateConfig(
@@ -2154,7 +2586,7 @@ class Model(nn.Module):
         local_style_hint_ids: torch.Tensor | None,
         polarity_ids: torch.Tensor | None,
         evidence_quality_prior: torch.Tensor | None,
-    ) -> tuple[Any, Dict[str, torch.Tensor], Step3EvidenceBatch]:
+    ) -> tuple[Any, Dict[str, torch.Tensor], Step3EvidenceBatch, torch.Tensor]:
         device = user.device
         batch_size = int(user.size(0))
         if content_anchor is None:
@@ -2172,9 +2604,11 @@ class Model(nn.Module):
             evidence_quality_prior=evidence_quality_prior,
         )
         shared_seed, specific_seed, guides = self._build_stream_seeds(user, item, domain_idx, evidence)
-        latents = self.odcr_disentangler(
-            shared_seed,
-            specific_seed,
+        sidecar_shared_seed = shared_seed.detach() if self.gradient_firewall_enabled or self.csb_mode == "sidecar" else shared_seed
+        sidecar_specific_seed = specific_seed.detach() if self.gradient_firewall_enabled or self.csb_mode == "sidecar" else specific_seed
+        latents = self.csb_odcr_bottleneck(
+            sidecar_shared_seed,
+            sidecar_specific_seed,
             domain_idx.view(-1),
             content_guide=guides["content_guide"],
             style_guide=guides["style_guide"],
@@ -2184,7 +2618,7 @@ class Model(nn.Module):
             content_anchor_score=content_anchor.view(-1),
             style_anchor_score=style_anchor.view(-1),
         )
-        return latents, guides, evidence
+        return latents, guides, evidence, shared_seed
 
     def forward(
         self,
@@ -2203,7 +2637,7 @@ class Model(nn.Module):
         evidence_quality_prior=None,
     ):
         device = user.device
-        latents, guides, evidence = self._compute_latents(
+        latents, guides, evidence, primary_shared_repr = self._compute_latents(
             user,
             item,
             domain_idx,
@@ -2216,32 +2650,60 @@ class Model(nn.Module):
             polarity_ids=polarity_ids,
             evidence_quality_prior=evidence_quality_prior,
         )
-        prefix = self._build_prefix(user, item, domain_idx, latents, guides)
-        word_feature = self.word_embeddings(tgt_input)
-        src = torch.cat([prefix, word_feature], dim=1)
-        src = src * math.sqrt(self.emsize)
-        src = self.pos_encoder(src)
-        attn_mask = _domain_fusion_causal_mask(tgt_input.shape[1], device, prefix_len=self._prefix_len())
-        hidden, _ = self.transformer_encoder(src=src, mask=attn_mask)
-        self.last_odcr_latents = _detach_odcr_latent_bundle(latents)
+        self.last_csb_latents = _detach_csb_latent_bundle(latents)
         self.last_shared_proj = latents.shared_proj.detach()
         self.last_specific_proj = latents.specific_proj.detach()
-        rating = self.recommender(latents.shared)
-        context_logits = self.hidden2token(latents.specific).unsqueeze(1)
-        context_dist = context_logits.repeat(1, tgt_input.shape[1], 1)
-        word_dist = self.hidden2token(hidden[:, self._prefix_len():])
+        rating = self.recommender(primary_shared_repr)
+        if self.light_explainer_step3_loss_enabled:
+            prefix = self._build_prefix(user, item, domain_idx, latents, guides)
+            word_feature = self.word_embeddings(tgt_input)
+            src = torch.cat([prefix, word_feature], dim=1)
+            src = src * math.sqrt(self.emsize)
+            src = self.pos_encoder(src)
+            attn_mask = _domain_fusion_causal_mask(tgt_input.shape[1], device, prefix_len=self._prefix_len())
+            hidden, _ = self.transformer_encoder(src=src, mask=attn_mask)
+            context_logits = self.hidden2token(latents.specific).unsqueeze(1)
+            context_dist = context_logits.expand(-1, tgt_input.shape[1], -1)
+            word_dist = self.hidden2token(hidden[:, self._prefix_len():])
+        else:
+            with torch.no_grad():
+                context_logits = self.hidden2token(latents.specific.detach()).unsqueeze(1)
+            context_dist = context_logits.expand(-1, tgt_input.shape[1], -1)
+            word_dist = context_dist
+        csb_diagnostics = dict(latents.csb_diagnostics)
+        if self.last_csb_injection_gate is not None:
+            csb_diagnostics["controlled_injection_gate_shape"] = list(self.last_csb_injection_gate.shape)
+        csb_diagnostics["controlled_injection_enabled"] = bool(self.csb_controlled_injection_enabled)
+        csb_diagnostics["light_explainer_step3_loss"] = bool(self.light_explainer_step3_loss_enabled)
+        csb_diagnostics["primary_training"] = str(self.step3_primary_training)
+        csb_diagnostics["csb_mode"] = str(self.csb_mode)
+        csb_diagnostics["gradient_firewall"] = bool(self.gradient_firewall_enabled)
         return Step3ForwardOutput(
             rating=rating,
             context_dist=context_dist,
             word_dist=word_dist,
             shared_proj=latents.shared_proj,
             specific_proj=latents.specific_proj,
-            odcr_latents=latents,
+            csb_latents=latents,
             structured_loss_inputs=_structured_loss_inputs_from_latents(latents),
             diagnostics={
                 "prefix_len": self._prefix_len(),
                 "structured_loss_input_keys": STEP3_STRUCTURED_LOSS_INPUT_KEYS,
+                "method_name": CSB_ODCR_METHOD_NAME,
+                "primary_path": "rating_only_primary_scorer",
+                "structure_branch": "detached_csb_sidecar_z_content_z_style_z_domain_z_uncertainty",
+                "controlled_structural_injection": bool(self.csb_controlled_injection_enabled),
+                "light_explainer_step3_loss": bool(self.light_explainer_step3_loss_enabled),
+                "gradient_firewall": bool(self.gradient_firewall_enabled),
             },
+            z_content=latents.z_content,
+            z_style=latents.z_style,
+            z_domain=latents.z_domain,
+            z_uncertainty=latents.z_uncertainty,
+            csb_packet=latents.csb_packet,
+            csb_diagnostics=csb_diagnostics,
+            csb_schema_version=CSB_FORWARD_OUTPUT_SCHEMA_VERSION,
+            csb_contract_hash=latents.csb_contract_hash,
         )
 
     def gather(self, batch, device):
@@ -2311,7 +2773,7 @@ class Model(nn.Module):
         polarity_ids=None,
         evidence_quality_prior=None,
     ):
-        latents, _, _ = self._compute_latents(
+        latents, _, _, primary_shared_repr = self._compute_latents(
             user,
             item,
             domain,
@@ -2324,7 +2786,7 @@ class Model(nn.Module):
             polarity_ids=polarity_ids,
             evidence_quality_prior=evidence_quality_prior,
         )
-        rating = self.recommender(latents.shared)
+        rating = self.recommender(primary_shared_repr)
         return rating
 
     def generate(
@@ -2348,7 +2810,7 @@ class Model(nn.Module):
         bos_idx = 0
         device = user.device
         batch_size = user.shape[0]
-        latents, guides, _ = self._compute_latents(
+        latents, guides, _, _ = self._compute_latents(
             user,
             item,
             domain,
@@ -2406,7 +2868,7 @@ class Model(nn.Module):
 def validModel(model, valid_dataloader, device):
     _model = get_underlying_model(model)
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         avg_loss = 0
         for batch in valid_dataloader:
             g = require_gathered_batch(_model.gather(batch, device))
@@ -2442,11 +2904,13 @@ def validModel(model, valid_dataloader, device):
                     local_style_hint_ids=lsh,
                     polarity_ids=pol,
                     evidence_quality_prior=eq,
-                )
+            )
             loss_r = F.mse_loss(out.rating, rating, reduction="mean")
-            loss_e = F.cross_entropy(out.word_dist.view(-1, out.word_dist.size(-1)), tgt_output.reshape(-1), ignore_index=0)
-            loss = loss_r + loss_e
+            loss_e = out.word_dist.detach().sum() * 0.0
+            loss = loss_r
             avg_loss += loss.item()
+            del out, loss_r, loss_e, loss, g, batch, user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx
+            del ca, sa, ce, se, dsa, lsh, pol, eq
         avg_loss /= len(valid_dataloader)
         return avg_loss
 
@@ -2461,7 +2925,7 @@ def validModel_sum_batches(model, valid_dataloader, device):
     """
     _model = get_underlying_model(model)
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         loss_sum = 0.0
         n_samples = 0
         for batch in valid_dataloader:
@@ -2499,12 +2963,14 @@ def validModel_sum_batches(model, valid_dataloader, device):
                     local_style_hint_ids=lsh,
                     polarity_ids=pol,
                     evidence_quality_prior=eq,
-                )
+            )
             loss_r = F.mse_loss(out.rating, rating, reduction="mean")
-            loss_e = F.cross_entropy(out.word_dist.view(-1, out.word_dist.size(-1)), tgt_output.reshape(-1), ignore_index=0)
-            loss = loss_r + loss_e
+            loss_e = out.word_dist.detach().sum() * 0.0
+            loss = loss_r
             loss_sum += loss.detach().double().item() * bsz
             n_samples += bsz
+            del out, loss_r, loss_e, loss, g, batch, user_idx, item_idx, rating, tgt_input, tgt_output, domain_idx
+            del ca, sa, ce, se, dsa, lsh, pol, eq
         return loss_sum, n_samples
 
 
@@ -2569,6 +3035,29 @@ _STEP3_PREFETCH_TIMING_FIELDS = (
     "nonfinite_param_count",
     "nonfinite_param_topk",
     "nonfinite_param_group_topk",
+    "pre_clip_grad_norm",
+    "post_clip_grad_norm",
+    "grad_norm_isfinite",
+    "grad_norm_was_clipped",
+    "rank_local_grad_tensor_finite",
+    "rank_local_grad_norm_finite",
+    "rank_global_grad_finite",
+    "rank_global_grad_norm_finite",
+    "first_bad_param_name",
+    "first_bad_param_reason",
+    "topk_grad_norm_params",
+    "topk_nonfinite_params",
+    "loss_total_snapshot",
+    "loss_component_snapshot",
+    "current_lr",
+    "optimizer_step_attempt_slot",
+    "physical_batch_index",
+    "successful_global_step",
+    "continuous_high_grad_steps",
+    "skip_reason",
+    "rank_id",
+    "local_rank",
+    "world_size",
     "continuous_nonfinite_steps",
 )
 
@@ -2586,6 +3075,8 @@ def _step3_loss_breakdown_row(
     if not isinstance(components, Mapping):
         components = {}
     phase = summary.get("phase") if isinstance(summary.get("phase"), Mapping) else {}
+    warmup = summary.get("numerical_stability_warmup") if isinstance(summary.get("numerical_stability_warmup"), Mapping) else {}
+    component_warmup = warmup.get("component_multipliers") if isinstance(warmup.get("component_multipliers"), Mapping) else {}
     rows: list[dict[str, Any]] = []
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for loss_name in sorted(loss_bundle.components):
@@ -2606,6 +3097,12 @@ def _step3_loss_breakdown_row(
                 "rank": int(rank),
                 "loss_name": str(loss_name),
                 "loss_phase": str(phase.get("phase") or ""),
+                "numerical_stability_warmup_enabled": bool(warmup.get("enabled", False)),
+                "auxiliary_warmup_multiplier": float(warmup.get("auxiliary_multiplier", 1.0) or 1.0),
+                "light_explainer_warmup_multiplier": float(warmup.get("light_explainer_multiplier", 1.0) or 1.0),
+                "conflict_routing_warmup_multiplier": float(warmup.get("conflict_routing_multiplier", 1.0) or 1.0),
+                "controlled_injection_warmup_multiplier": float(warmup.get("controlled_injection_multiplier", 1.0) or 1.0),
+                "component_warmup_multiplier": float(component_warmup.get(loss_name, 1.0) or 1.0),
                 "raw_value": raw_value,
                 "weight": weight,
                 "weighted_value": weighted_value,
@@ -2712,6 +3209,127 @@ def _step3_gpu_profile_row(
         except Exception:
             pass
     return row
+
+
+def _to_scalar_cpu_json(value: Any) -> Any:
+    if torch.is_tensor(value):
+        item = value.detach().cpu()
+        if item.numel() == 1:
+            return item.item()
+        return item.tolist()
+    if isinstance(value, Mapping):
+        return {str(key): _to_scalar_cpu_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_scalar_cpu_json(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _log_memory_phase(
+    *,
+    final_cfg: FinalTrainingConfig,
+    rank: int,
+    device: int | str | torch.device,
+    global_step: int | None,
+    epoch: int,
+    phase: str,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    row = _step3_gpu_profile_row(
+        final_cfg=final_cfg,
+        rank=rank,
+        device=device,
+        global_step=global_step,
+        epoch=epoch,
+        phase=phase,
+    )
+    if extra:
+        row.update({str(key): _to_scalar_cpu_json(value) for key, value in extra.items()})
+    append_step3_gpu_profile_jsonl(log_file=getattr(final_cfg, "log_file", None), row=row)
+    return row
+
+
+def _cleanup_cuda_epoch_boundary(
+    *,
+    final_cfg: FinalTrainingConfig,
+    rank: int,
+    device: int | str | torch.device,
+    global_step: int | None,
+    epoch: int,
+    phase: str = "after_epoch_boundary_cleanup",
+    reset_peak: bool = True,
+) -> dict[str, Any]:
+    gc.collect()
+    after_empty_allocated = None
+    after_empty_reserved = None
+    if torch.cuda.is_available():
+        dev = int(device) if isinstance(device, int) else torch.device(device).index
+        if dev is None:
+            dev = torch.cuda.current_device()
+        torch.cuda.empty_cache()
+        if reset_peak:
+            try:
+                torch.cuda.reset_peak_memory_stats(dev)
+            except Exception:
+                pass
+        after_empty_allocated = round(float(torch.cuda.memory_allocated(dev)) / (1024**3), 6)
+        after_empty_reserved = round(float(torch.cuda.memory_reserved(dev)) / (1024**3), 6)
+    return _log_memory_phase(
+        final_cfg=final_cfg,
+        rank=rank,
+        device=device,
+        global_step=global_step,
+        epoch=epoch,
+        phase=phase,
+        extra={
+            "cleanup_gc_collect": True,
+            "cleanup_empty_cache": bool(torch.cuda.is_available()),
+            "cleanup_reset_peak_memory_stats": bool(reset_peak and torch.cuda.is_available()),
+            "after_empty_cache_allocated": after_empty_allocated,
+            "after_empty_cache_reserved": after_empty_reserved,
+        },
+    )
+
+
+def _cleanup_after_validation(
+    *,
+    final_cfg: FinalTrainingConfig,
+    rank: int,
+    device: int | str | torch.device,
+    global_step: int | None,
+    epoch: int,
+    reset_peak: bool = False,
+) -> dict[str, Any]:
+    return _cleanup_cuda_epoch_boundary(
+        final_cfg=final_cfg,
+        rank=rank,
+        device=device,
+        global_step=global_step,
+        epoch=epoch,
+        phase="after_validation",
+        reset_peak=reset_peak,
+    )
+
+
+def _cleanup_after_checkpoint(
+    *,
+    final_cfg: FinalTrainingConfig,
+    rank: int,
+    device: int | str | torch.device,
+    global_step: int | None,
+    epoch: int,
+    reset_peak: bool = False,
+) -> dict[str, Any]:
+    return _cleanup_cuda_epoch_boundary(
+        final_cfg=final_cfg,
+        rank=rank,
+        device=device,
+        global_step=global_step,
+        epoch=epoch,
+        phase="after_checkpoint_save",
+        reset_peak=reset_peak,
+    )
 
 
 class Step3CUDAPrefetcher:
@@ -4478,6 +5096,70 @@ def _step3_optimizer_group_for_name(name: str) -> str:
     return "dense"
 
 
+STEP3_SIDECAR_PARAMETER_MARKERS: tuple[str, ...] = (
+    "csb_odcr_bottleneck.csb_content_head",
+    "csb_odcr_bottleneck.csb_style_head",
+    "csb_odcr_bottleneck.csb_domain_head",
+    "csb_odcr_bottleneck.csb_uncertainty_head",
+    "csb_odcr_bottleneck.csb_content_norm",
+    "csb_odcr_bottleneck.csb_style_norm",
+    "csb_odcr_bottleneck.csb_domain_norm",
+    "csb_odcr_bottleneck.csb_uncertainty_norm",
+    "csb_odcr_bottleneck.shared_projector",
+    "csb_odcr_bottleneck.specific_projector",
+    "csb_odcr_bottleneck.anchor_head_content",
+    "csb_odcr_bottleneck.anchor_head_style",
+)
+
+STEP3_FORMAL_DISABLED_PARAMETER_MARKERS: tuple[str, ...] = (
+    "csb_prefix_adapter",
+    "csb_prefix_gate",
+    "csb_rating_safe_adapter",
+    "hidden2token",
+    "transformer_encoder",
+    "specific_id_adapter",
+    "specific_stream_attn",
+    "specific_stream_norm",
+    "polarity_embedding",
+)
+
+
+def step3_parameter_training_role(name: str) -> str:
+    if any(marker in name for marker in STEP3_SIDECAR_PARAMETER_MARKERS):
+        return "csb_sidecar"
+    if any(marker in name for marker in STEP3_FORMAL_DISABLED_PARAMETER_MARKERS):
+        return "disabled_step3_formal_text_or_injection"
+    if name.startswith("csb_odcr_bottleneck."):
+        return "disabled_step3_formal_text_or_injection"
+    return "primary_scorer"
+
+
+def summarize_step3_gradient_firewall(model: nn.Module) -> dict[str, Any]:
+    role_counts: dict[str, int] = {"primary_scorer": 0, "csb_sidecar": 0, "disabled_step3_formal_text_or_injection": 0}
+    trainable_counts: dict[str, int] = {key: 0 for key in role_counts}
+    for name, param in get_underlying_model(model).named_parameters():
+        role = step3_parameter_training_role(name)
+        role_counts[role] = role_counts.get(role, 0) + int(param.numel())
+        if param.requires_grad:
+            trainable_counts[role] = trainable_counts.get(role, 0) + int(param.numel())
+    return {
+        "schema_version": "odcr_step3_gradient_firewall/1",
+        "primary_training": "rating_only",
+        "csb_mode": "sidecar",
+        "gradient_firewall": True,
+        "role_param_counts": role_counts,
+        "role_trainable_param_counts": trainable_counts,
+        "sidecar_input_boundary": "detached primary representation",
+        "disabled_formal_paths": [
+            "light_explainer_step3_loss",
+            "controlled_injection_formal_backward",
+            "csb_rating_safe_adapter_formal_backward",
+            "conflict_routing_step3_primary",
+            "detached_csb_upstream_encoders",
+        ],
+    }
+
+
 def build_step3_optimizer_param_groups(
     model: nn.Module,
     final_cfg: FinalTrainingConfig,
@@ -4837,7 +5519,7 @@ def trainModel_ddp(
                 "Train profile: lr_scheduler=%s warmup_epochs=%g %s",
                 lr_scheduler_type,
                 warmup_epochs,
-                "train-loop-metrics=valid_loss_only",
+                "train-loop-metrics=csb_paper_aware_guarded",
                 extra=log_route_extra(_lg, ROUTE_SUMMARY),
             )
 
@@ -4993,6 +5675,7 @@ def trainModel_ddp(
     topk_candidates: list[tuple[float, int, Dict[str, Any]]] = []
     grad_inf_count_until_epoch = 0
     continuous_nonfinite_steps = 0
+    continuous_high_grad_steps = 0
     post_clip_zero_count = 0
     optimizer_step_attempts = 0
     scheduler_events: list[dict[str, Any]] = []
@@ -5095,21 +5778,24 @@ def trainModel_ddp(
         lineage_path = write_checkpoint_lineage(str(path), lineage)
         atomic_write_json(
             os.path.join(state_dir, "trainer_state.json"),
-            {"epoch": int(epoch), "global_step": int(global_step), "continuous_nonfinite_steps": int(continuous_nonfinite_steps)},
+            {
+                "epoch": int(epoch),
+                "global_step": int(global_step),
+                "continuous_nonfinite_steps": int(continuous_nonfinite_steps),
+                "continuous_high_grad_steps": int(continuous_high_grad_steps),
+            },
         )
         event = checkpoint_event_from_sidecar(lineage, reason=reason, replaced_previous=replaced_previous)
         event["lineage_path"] = str(lineage_path)
         event["checkpoint_io_ms"] = (time.perf_counter() - ckpt_t0) * 1000.0
-        append_step3_gpu_profile_jsonl(
-            log_file=getattr(final_cfg, "log_file", None),
-            row=_step3_gpu_profile_row(
-                final_cfg=final_cfg,
-                rank=rank,
-                device=device,
-                global_step=global_step,
-                epoch=epoch,
-                phase="after_checkpoint_save",
-            ),
+        del state_to_save, lineage
+        _cleanup_after_checkpoint(
+            final_cfg=final_cfg,
+            rank=rank,
+            device=device,
+            global_step=global_step,
+            epoch=epoch,
+            reset_peak=False,
         )
         return event
 
@@ -5309,8 +5995,15 @@ def trainModel_ddp(
                 structured_weights,
                 phase_record.get("loss_multipliers") if bool(phase_record.get("enabled", True)) else {},
             )
+            phase_weights, numerical_warmup_summary = apply_step3_numerical_stability_warmup(
+                phase_weights,
+                final_cfg=final_cfg,
+                epoch=epoch_1,
+            )
             if rank == 0:
-                phase_history.append(dict(phase_record))
+                phase_record_with_warmup = dict(phase_record)
+                phase_record_with_warmup["numerical_stability_warmup"] = dict(numerical_warmup_summary)
+                phase_history.append(phase_record_with_warmup)
             loss_sum = torch.zeros((), dtype=torch.double, device=device)
             n_samples = torch.zeros((), dtype=torch.double, device=device)
             optimizer.zero_grad(set_to_none=True)
@@ -5388,8 +6081,10 @@ def trainModel_ddp(
                         final_cfg=final_cfg,
                         weights=phase_weights,
                         semantics=loss_semantics,
+                        numerical_warmup=numerical_warmup_summary,
                     )
                     loss_bundle.logging_summary["phase"] = phase_record
+                    loss_bundle.logging_summary["numerical_stability_warmup"] = numerical_warmup_summary
                     loss = loss_bundle.total_loss
                     step_timing["loss_time"] += time.perf_counter() - _loss_t0
                     if graph_preflight_enabled and graph_preflight_summary is None:
@@ -5412,10 +6107,14 @@ def trainModel_ddp(
                     global_loss_finite = bool(finite_sync["global_total_finite"])
                     if global_loss_finite:
                         _backward_t0 = time.perf_counter()
-                        loss.backward()
+                        backward_summary = backward_step3_primary_and_sidecar_losses(loss_bundle)
+                        loss_bundle.logging_summary["gradient_firewall_backward"] = backward_summary
                         step_timing["backward_time"] += time.perf_counter() - _backward_t0
                     else:
                         _nonfinite_skips += 1
+                        skipped_step_reason = "nonfinite_loss"
+                        step_timing["skipped_step_reason"] = skipped_step_reason
+                        step_timing["skip_reason"] = skipped_step_reason
                         optimizer.zero_grad(set_to_none=True)
                         if rank == 0 and _lg:
                             _lg.warning(
@@ -5425,6 +6124,40 @@ def trainModel_ddp(
                                 global_step + 1,
                                 str(local_loss_finite).lower(),
                                 extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                            )
+                            append_train_epoch_metrics_jsonl(
+                                log_file=getattr(final_cfg, "log_file", None),
+                                row={
+                                    "run_id": str(getattr(final_cfg, "run_id", "") or ""),
+                                    "task_id": int(getattr(final_cfg, "task_idx", 0) or 0),
+                                    "profile_id": str(getattr(final_cfg, "task_profile_id", "") or ""),
+                                    "epoch": int(epoch_1),
+                                    "global_step": int(global_step),
+                                    "rank": int(rank),
+                                    "split": "train",
+                                    "loss_total": float(loss.detach().item()),
+                                    "lr": float(step_timing.get("current_lr", 0.0) or 0.0),
+                                    "finite": bool(global_loss_finite),
+                                    "grad_finite": False,
+                                    "optimizer_step_executed": False,
+                                    "scheduler_step_executed": False,
+                                    "skipped_step_reason": skipped_step_reason,
+                                    "skip_reason": skipped_step_reason,
+                                    "continuous_nonfinite_steps": int(continuous_nonfinite_steps),
+                                    "continuous_high_grad_steps": int(continuous_high_grad_steps),
+                                    "pre_clip_grad_norm": 0.0,
+                                    "post_clip_grad_norm": 0.0,
+                                    "rank_local_grad_tensor_finite": False,
+                                    "rank_local_grad_norm_finite": False,
+                                    "rank_global_grad_finite": False,
+                                    "rank_global_grad_norm_finite": False,
+                                    "first_bad_param_name": "__loss_total__",
+                                    "first_bad_param_reason": "nonfinite_loss",
+                                    "topk_grad_norm_params": [],
+                                    "topk_nonfinite_params": [],
+                                    "nonfinite_param_count": 0,
+                                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                },
                             )
                         if _nonfinite_abort_th > 0 and _nonfinite_skips >= _nonfinite_abort_th:
                             raise RuntimeError(
@@ -5441,50 +6174,168 @@ def trainModel_ddp(
                     step_timing["grad_check_ms"] += (time.perf_counter() - grad_check_t0) * 1000.0
                     step_timing["grad_norm_compute_ms"] += float(step_timing["grad_check_ms"])
                     gn_pre_m = float(grad_inspection.grad_norm_pre_clip)
-                    global_grad_finite = sync_grad_finite_decision(
-                        bool(grad_inspection.grad_finite),
+                    warn_th = float(grad_finite_cfg.get("high_grad_norm_warn_threshold", math.inf) or math.inf)
+                    skip_th = float(grad_finite_cfg.get("high_grad_norm_skip_threshold", math.inf) or math.inf)
+                    abort_high_th = float(grad_finite_cfg.get("high_grad_norm_abort_threshold", math.inf) or math.inf)
+                    local_high_grad_warn = bool(math.isfinite(gn_pre_m) and gn_pre_m > warn_th)
+                    local_high_grad_skip = bool(math.isfinite(gn_pre_m) and gn_pre_m > skip_th)
+                    local_high_grad_abort = bool((math.isfinite(gn_pre_m) and gn_pre_m > abort_high_th) or not math.isfinite(gn_pre_m))
+                    grad_gate_diag = sync_grad_gate_diagnostics(
+                        local_tensor_finite=bool(grad_inspection.grad_tensor_finite),
+                        local_norm_finite=bool(grad_inspection.grad_norm_finite),
+                        local_high_grad_skip=local_high_grad_skip,
+                        local_high_grad_abort=local_high_grad_abort,
                         device=torch.device(f"cuda:{int(device)}" if isinstance(device, int) else device),
                         world_size=world_size,
+                        rank=int(rank),
                     )
+                    global_grad_finite = bool(
+                        grad_gate_diag["rank_global_grad_finite"]
+                        and grad_gate_diag["rank_global_grad_norm_finite"]
+                    )
+                    global_high_grad_skip = bool(grad_gate_diag["rank_global_high_grad_skip"])
+                    global_high_grad_abort = bool(grad_gate_diag["rank_global_high_grad_abort"])
                     step_timing["grad_finite"] = bool(global_grad_finite)
                     step_timing["grad_norm_pre_clip"] = gn_pre_m
+                    step_timing["pre_clip_grad_norm"] = gn_pre_m
+                    step_timing["grad_norm_isfinite"] = bool(grad_inspection.grad_norm_finite)
+                    step_timing["rank_local_grad_tensor_finite"] = bool(grad_inspection.grad_tensor_finite)
+                    step_timing["rank_local_grad_norm_finite"] = bool(grad_inspection.grad_norm_finite)
+                    step_timing["rank_global_grad_finite"] = bool(grad_gate_diag["rank_global_grad_finite"])
+                    step_timing["rank_global_grad_norm_finite"] = bool(grad_gate_diag["rank_global_grad_norm_finite"])
+                    step_timing["first_bad_param_name"] = str(grad_inspection.first_bad_param_name)
+                    step_timing["first_bad_param_reason"] = str(grad_inspection.first_bad_param_reason)
+                    step_timing["topk_grad_norm_params"] = list(grad_inspection.topk_grad_norm_params)
+                    step_timing["topk_nonfinite_params"] = list(grad_inspection.topk_nonfinite_params)
                     step_timing["nonfinite_param_count"] = int(grad_inspection.nonfinite_param_count)
                     step_timing["nonfinite_param_topk"] = list(grad_inspection.nonfinite_param_topk)
                     step_timing["nonfinite_param_group_topk"] = list(grad_inspection.nonfinite_param_group_topk)
+                    step_timing["loss_total_snapshot"] = float(loss.detach().item())
+                    step_timing["loss_component_snapshot"] = {
+                        str(key): float(value.detach().item()) for key, value in loss_bundle.components.items()
+                    }
+                    step_timing["current_lr"] = float(optimizer.param_groups[0].get("lr", 0.0) or 0.0)
+                    step_timing["optimizer_step_attempt_slot"] = int(optimizer_step_attempts + 1)
+                    step_timing["physical_batch_index"] = int(step_idx + 1)
+                    step_timing["successful_global_step"] = int(global_step)
+                    step_timing["rank_id"] = int(rank)
+                    step_timing["local_rank"] = int(rank)
+                    step_timing["world_size"] = int(world_size)
                     optimizer_step_executed = False
                     scheduler_step_executed = False
                     skipped_step_reason = ""
+                    if local_high_grad_warn and rank == 0 and _lg:
+                        _lg.warning(
+                            "[Step3][GradFinite] high grad norm warning: epoch=%d step=%d pre_clip_grad_norm=%.6g warn_threshold=%.6g topk_grad_norm_params=%s",
+                            epoch_1,
+                            global_step + 1,
+                            gn_pre_m,
+                            warn_th,
+                            json.dumps(list(grad_inspection.topk_grad_norm_params), ensure_ascii=False),
+                            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                        )
                     if not global_grad_finite and bool(grad_finite_cfg.get("skip_optimizer_on_nonfinite", True)):
                         grad_inf_count_until_epoch += 1
                         continuous_nonfinite_steps += 1
+                        continuous_high_grad_steps = 0
                         skipped_step_reason = "nonfinite_grad"
+                        step_timing["skip_reason"] = skipped_step_reason
                         step_timing["nonfinite_detect_ms"] += float(step_timing["grad_check_ms"])
                         _zero_t0 = time.perf_counter()
                         optimizer.zero_grad(set_to_none=True)
                         step_timing["zero_grad_ms"] += (time.perf_counter() - _zero_t0) * 1000.0
-                        if sched is not None and bool(grad_finite_cfg.get("scheduler_step_on_skipped_optimizer", False)):
-                            _scheduler_t0 = time.perf_counter()
-                            sched.step()
-                            scheduler_step_executed = True
-                            step_timing["scheduler_ms"] += (time.perf_counter() - _scheduler_t0) * 1000.0
-                            step_timing["scheduler_time"] += float(step_timing["scheduler_ms"]) / 1000.0
                         if rank == 0 and _lg:
                             _lg.warning(
-                                "[Step3][GradFinite] nonfinite grad skip optimizer: epoch=%d step=%d nonfinite_params=%d topk=%s continuous=%d",
+                                "[Step3][GradFinite] nonfinite grad skip optimizer: epoch=%d step=%d "
+                                "pre_clip_grad_norm=%.6g grad_tensor_finite=%s grad_norm_finite=%s "
+                                "global_tensor_finite=%s global_norm_finite=%s offender_rank=%s "
+                                "first_bad=%s/%s nonfinite_params=%d topk_nonfinite=%s topk_grad_norm=%s continuous=%d",
                                 epoch_1,
                                 global_step + 1,
+                                gn_pre_m,
+                                str(grad_inspection.grad_tensor_finite).lower(),
+                                str(grad_inspection.grad_norm_finite).lower(),
+                                str(grad_gate_diag["rank_global_grad_finite"]).lower(),
+                                str(grad_gate_diag["rank_global_grad_norm_finite"]).lower(),
+                                str(grad_gate_diag.get("offender_rank")),
+                                str(grad_inspection.first_bad_param_name),
+                                str(grad_inspection.first_bad_param_reason),
                                 int(grad_inspection.nonfinite_param_count),
                                 json.dumps(list(grad_inspection.nonfinite_param_topk), ensure_ascii=False),
+                                json.dumps(list(grad_inspection.topk_grad_norm_params), ensure_ascii=False),
                                 int(continuous_nonfinite_steps),
                                 extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                            )
+                            append_train_epoch_metrics_jsonl(
+                                log_file=getattr(final_cfg, "log_file", None),
+                                row={
+                                    "run_id": str(getattr(final_cfg, "run_id", "") or ""),
+                                    "task_id": int(getattr(final_cfg, "task_idx", 0) or 0),
+                                    "profile_id": str(getattr(final_cfg, "task_profile_id", "") or ""),
+                                    "epoch": int(epoch_1),
+                                    "global_step": int(global_step),
+                                    "rank": int(rank),
+                                    "split": "train",
+                                    "loss_total": float(loss.detach().item()),
+                                    "lr": float(step_timing.get("current_lr", 0.0) or 0.0),
+                                    "finite": bool(global_loss_finite),
+                                    "grad_finite": True,
+                                    "optimizer_step_executed": False,
+                                    "scheduler_step_executed": False,
+                                    "skipped_step_reason": skipped_step_reason,
+                                    "skip_reason": skipped_step_reason,
+                                    "continuous_nonfinite_steps": int(continuous_nonfinite_steps),
+                                    "continuous_high_grad_steps": int(continuous_high_grad_steps),
+                                    "pre_clip_grad_norm": float(gn_pre_m),
+                                    "post_clip_grad_norm": 0.0,
+                                    "rank_local_grad_tensor_finite": bool(grad_inspection.grad_tensor_finite),
+                                    "rank_local_grad_norm_finite": bool(grad_inspection.grad_norm_finite),
+                                    "rank_global_grad_finite": bool(grad_gate_diag["rank_global_grad_finite"]),
+                                    "rank_global_grad_norm_finite": bool(grad_gate_diag["rank_global_grad_norm_finite"]),
+                                    "topk_grad_norm_params": list(grad_inspection.topk_grad_norm_params),
+                                    "topk_nonfinite_params": list(grad_inspection.topk_nonfinite_params),
+                                    "nonfinite_param_count": int(grad_inspection.nonfinite_param_count),
+                                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                },
                             )
                         abort_th = int(grad_finite_cfg.get("continuous_nonfinite_abort_threshold", 0) or 0)
                         if abort_th > 0 and continuous_nonfinite_steps >= abort_th:
                             raise RuntimeError(
                                 f"Step3 nonfinite gradient gate aborted after {continuous_nonfinite_steps} continuous skipped steps."
                             )
+                    elif global_high_grad_skip or global_high_grad_abort:
+                        continuous_high_grad_steps += 1
+                        continuous_nonfinite_steps = 0
+                        skipped_step_reason = "high_grad_norm_abort" if global_high_grad_abort else "high_grad_norm_skip"
+                        step_timing["skip_reason"] = skipped_step_reason
+                        _zero_t0 = time.perf_counter()
+                        optimizer.zero_grad(set_to_none=True)
+                        step_timing["zero_grad_ms"] += (time.perf_counter() - _zero_t0) * 1000.0
+                        if rank == 0 and _lg:
+                            _lg.warning(
+                                "[Step3][GradFinite] high grad norm skip optimizer: epoch=%d step=%d "
+                                "pre_clip_grad_norm=%.6g skip_threshold=%.6g abort_threshold=%.6g "
+                                "global_high_skip=%s global_high_abort=%s offender_rank=%s topk_grad_norm=%s continuous_high=%d",
+                                epoch_1,
+                                global_step + 1,
+                                gn_pre_m,
+                                skip_th,
+                                abort_high_th,
+                                str(global_high_grad_skip).lower(),
+                                str(global_high_grad_abort).lower(),
+                                str(grad_gate_diag.get("offender_rank")),
+                                json.dumps(list(grad_inspection.topk_grad_norm_params), ensure_ascii=False),
+                                int(continuous_high_grad_steps),
+                                extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                            )
+                        high_abort_th = int(grad_finite_cfg.get("continuous_high_grad_abort_threshold", 0) or 0)
+                        if global_high_grad_abort or (high_abort_th > 0 and continuous_high_grad_steps >= high_abort_th):
+                            raise RuntimeError(
+                                f"Step3 high gradient norm gate aborted after {continuous_high_grad_steps} continuous skipped steps."
+                            )
                     else:
                         continuous_nonfinite_steps = 0
+                        continuous_high_grad_steps = 0
                         _clip_t0 = time.perf_counter()
                         nn.utils.clip_grad_norm_(
                             step3_trainable_parameters(model),
@@ -5495,6 +6346,10 @@ def trainModel_ddp(
                         if rank == 0 and _lg:
                             gn_post_m = grad_norm_total(step3_trainable_parameters(model))
                             step_timing["grad_norm_post_clip"] = float(gn_post_m)
+                            step_timing["post_clip_grad_norm"] = float(gn_post_m)
+                            step_timing["grad_norm_was_clipped"] = bool(
+                                math.isfinite(gn_pre_m) and float(gn_pre_m) > float(final_cfg.max_grad_norm)
+                            )
                             if float(gn_post_m) == 0.0:
                                 post_clip_zero_count += 1
                             log_grad_monitor(
@@ -5534,7 +6389,9 @@ def trainModel_ddp(
                     step_timing["optimizer_step_executed"] = bool(optimizer_step_executed)
                     step_timing["scheduler_step_executed"] = bool(scheduler_step_executed)
                     step_timing["skipped_step_reason"] = skipped_step_reason
+                    step_timing["skip_reason"] = skipped_step_reason
                     step_timing["continuous_nonfinite_steps"] = int(continuous_nonfinite_steps)
+                    step_timing["continuous_high_grad_steps"] = int(continuous_high_grad_steps)
                     optimizer_step_attempts += 1
                     maybe_log_grad_norm_diff_ddp(
                         model,
@@ -5615,7 +6472,24 @@ def trainModel_ddp(
                                 "optimizer_step_executed": bool(step_timing.get("optimizer_step_executed", False)),
                                 "scheduler_step_executed": bool(step_timing.get("scheduler_step_executed", False)),
                                 "skipped_step_reason": str(step_timing.get("skipped_step_reason") or ""),
+                                "skip_reason": str(step_timing.get("skip_reason") or ""),
                                 "continuous_nonfinite_steps": int(step_timing.get("continuous_nonfinite_steps", 0) or 0),
+                                "continuous_high_grad_steps": int(step_timing.get("continuous_high_grad_steps", 0) or 0),
+                                "pre_clip_grad_norm": float(step_timing.get("pre_clip_grad_norm", step_timing.get("grad_norm_pre_clip", 0.0)) or 0.0),
+                                "post_clip_grad_norm": float(step_timing.get("post_clip_grad_norm", step_timing.get("grad_norm_post_clip", 0.0)) or 0.0),
+                                "grad_norm_isfinite": bool(step_timing.get("grad_norm_isfinite", True)),
+                                "grad_norm_was_clipped": bool(step_timing.get("grad_norm_was_clipped", False)),
+                                "rank_local_grad_tensor_finite": bool(step_timing.get("rank_local_grad_tensor_finite", True)),
+                                "rank_local_grad_norm_finite": bool(step_timing.get("rank_local_grad_norm_finite", True)),
+                                "rank_global_grad_finite": bool(step_timing.get("rank_global_grad_finite", True)),
+                                "rank_global_grad_norm_finite": bool(step_timing.get("rank_global_grad_norm_finite", True)),
+                                "first_bad_param_name": str(step_timing.get("first_bad_param_name") or ""),
+                                "first_bad_param_reason": str(step_timing.get("first_bad_param_reason") or ""),
+                                "topk_grad_norm_params": step_timing.get("topk_grad_norm_params") or [],
+                                "topk_nonfinite_params": step_timing.get("topk_nonfinite_params") or [],
+                                "optimizer_step_attempt_slot": int(step_timing.get("optimizer_step_attempt_slot", 0) or 0),
+                                "physical_batch_index": int(step_timing.get("physical_batch_index", 0) or 0),
+                                "successful_global_step": int(step_timing.get("successful_global_step", global_step) or 0),
                                 "nonfinite_param_count": int(step_timing.get("nonfinite_param_count", 0) or 0),
                                 "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                             },
@@ -5669,6 +6543,32 @@ def trainModel_ddp(
                         route_detail=ROUTE_DETAIL,
                     )
 
+                try:
+                    del (
+                        forward_out,
+                        loss_bundle,
+                        loss,
+                        finite_sync,
+                        g,
+                        batch,
+                        user_idx,
+                        item_idx,
+                        rating,
+                        tgt_input,
+                        tgt_output,
+                        domain_idx,
+                        c_a,
+                        s_a,
+                        ce,
+                        se,
+                        dsa,
+                        lsh,
+                        pol,
+                        eq,
+                    )
+                except UnboundLocalError:
+                    pass
+
                 # 用于快速验证：跑到指定 steps 后直接退出，观察是否触发 DDP reduction 错误
                 if max_steps is not None and step_count >= max_steps:
                     return
@@ -5694,6 +6594,14 @@ def trainModel_ddp(
                 rec = None
 
             # 各 rank valid 分片上样本加权求和，一次 all_reduce 得全局 avg valid loss（与 train / Step5 一致）。
+            _log_memory_phase(
+                final_cfg=final_cfg,
+                rank=rank,
+                device=device,
+                global_step=global_step,
+                epoch=epoch_1,
+                phase="before_validation",
+            )
             _t_valid0 = time.perf_counter()
             valid_loss_sum, valid_n_samples = validModel_sum_batches(model, valid_dataloader, device)
             if rank == 0 and _lg:
@@ -5710,6 +6618,16 @@ def trainModel_ddp(
             )
             dist.all_reduce(v_stat, op=dist.ReduceOp.SUM)
             current_valid_loss = float(v_stat[0] / v_stat[1]) if v_stat[1] > 0 else 0.0
+            del v_stat
+            _cleanup_after_validation(
+                final_cfg=final_cfg,
+                rank=rank,
+                device=device,
+                global_step=global_step,
+                epoch=epoch_1,
+                reset_peak=False,
+            )
+            model.train()
             is_best_observed_epoch = metric_improved(
                 current_valid_loss,
                 best_observed_metric,
@@ -6021,6 +6939,14 @@ def trainModel_ddp(
             if not recovery_requested:
                 _apply_validation_aware_lr_damping(epoch_1, current_valid_loss, emit=bool(rank == 0))
             prev_valid_loss = current_valid_loss
+            _cleanup_cuda_epoch_boundary(
+                final_cfg=final_cfg,
+                rank=rank,
+                device=device,
+                global_step=global_step,
+                epoch=epoch_1,
+                reset_peak=True,
+            )
 
             if odcr_ddp_epoch_end_barrier():
                 ddp_heartbeat(_lg, "before_epoch_end_barrier", rank=rank, epoch=epoch_1)
@@ -6101,6 +7027,13 @@ def trainModel_ddp(
                         "count": int(recovery_state.get("count", 0) or 0),
                     },
                     "phase_history": phase_history,
+                    "csb_phase_history": phase_history,
+                    "csb_conflict_summary": {
+                        "legacy_conflict_aware": conflict_aware_cfg,
+                        "csb_conflict_routing": json.loads(str(getattr(final_cfg, "csb_conflict_routing_config_json", "") or "{}")),
+                    },
+                    "csb_recovery_events": recovery_events,
+                    "csb_candidate_selection": json.loads(str(getattr(final_cfg, "paper_candidate_selection_config_json", "") or "{}")),
                     "conflict_aware": conflict_aware_cfg,
                     "adapter_gating": adapter_gating_cfg,
                 }

@@ -132,11 +132,16 @@ def _checkpoint_lineage_for_cache(cfg: Any) -> tuple[str, dict[str, Any]]:
     lineage_hash = str(payload.get("lineage_hash") or "")
     if not lineage_hash:
         raise Step4RuntimeError(f"Step3 checkpoint lineage hash missing: {sidecar}")
+    csb_contract = payload.get("csb_contract")
+    if not isinstance(csb_contract, dict) or not str(payload.get("csb_contract_hash") or csb_contract.get("contract_hash") or "").strip():
+        raise Step4RuntimeError(f"Step3 checkpoint lineage missing CSB contract/hash: {sidecar}")
     return lineage_hash, {
         "checkpoint_path": str(checkpoint),
         "checkpoint_hash": str(payload.get("checkpoint_file_hash") or ""),
         "checkpoint_lineage_path": str(sidecar),
         "checkpoint_lineage_hash": lineage_hash,
+        "csb_contract": dict(csb_contract),
+        "csb_contract_hash": str(payload.get("csb_contract_hash") or csb_contract.get("contract_hash") or ""),
     }
 
 
@@ -337,7 +342,7 @@ def _formal_namespace_snapshot(cfg: Any) -> dict[str, Any]:
         "eval_latest": _tree_fingerprint(root / "runs" / "eval" / f"task{task}" / "latest.json"),
         "config": _tree_fingerprint(root / "configs" / "odcr.yaml"),
         "step3_stage_status": _tree_fingerprint(step3_dir / "meta" / "stage_status.json"),
-        "step3_eval_handoff": _tree_fingerprint(step3_dir / "meta" / "eval_handoff.json"),
+        "step3_readiness_audit": _tree_fingerprint(step3_dir / "meta" / "readiness_audit.json"),
         "step3_selected_checkpoint": _tree_fingerprint(step3_dir / "model" / "best_observed.pth"),
     }
 
@@ -350,7 +355,7 @@ def _snapshot_polluted(before: Mapping[str, Any], after: Mapping[str, Any]) -> b
         "eval_latest",
         "config",
         "step3_stage_status",
-        "step3_eval_handoff",
+        "step3_readiness_audit",
         "step3_selected_checkpoint",
     )
     for key in keys:
@@ -747,7 +752,7 @@ def run_step4_bounded_preflight(
         "step3_checkpoint_hash": checkpoint_lineage["checkpoint_hash"],
         "step3_checkpoint_lineage_hash": checkpoint_lineage_hash,
         "step3_stage_status_hash": _upstream_artifact_hash(cfg, "status_path"),
-        "step3_eval_handoff_hash": _upstream_artifact_hash(cfg, "eval_handoff"),
+        "step3_readiness_audit_hash": _upstream_artifact_hash(cfg, "readiness_audit"),
     }
     lineage = build_step4_export_lineage(
         task_id=int(cfg.task_id),
@@ -757,6 +762,7 @@ def run_step4_bounded_preflight(
         step4_rcr_config=rcr_config.to_dict(),
         step4_run=str(getattr(cfg, "step4_run", "") or "preflight"),
         frozen_step3_lineage=frozen_lineage,
+        csb_contract=checkpoint_lineage.get("csb_contract"),
     )
     manifest_preview = mark_schema_preview(
         {
@@ -806,7 +812,7 @@ def run_step4_bounded_preflight(
         "sample_count": int(len(routed)),
         "sample_rows_hash": sample_hash,
         "uses_real_task_data": True,
-        "uses_real_run2_checkpoint": str(cfg.from_run) == "2",
+        "uses_selected_step3_checkpoint": bool(str(cfg.from_run or "").strip()),
         "upstream_step3_run_id": str(cfg.from_run),
         "checkpoint": checkpoint_lineage,
         "rcr_distribution": dist_payload,

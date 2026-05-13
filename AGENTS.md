@@ -117,9 +117,9 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     manage GPU allocation. GPU use is allowed by default for repo-local
     validation, probe, and bounded runtime when the current tmux GPU pane is
     user-created, already-entered, uniquely validated GPU pane. The controlled tmux
-    GPU bridge at `python code/tools/odcr_tmux_gpu_bridge.py` may send one
-    bridge-generated command file to that pane; this is not arbitrary
-    send-keys. Bridge output must live under `AI_analysis/06_probe_evidence`
+    GPU bridge at `./odcr runtime bridge ...` may send one bridge-generated
+    command file to that pane through the stage-dispatch allowlist; this is not
+    arbitrary send-keys. Bridge output must live under `AI_analysis/06_probe_evidence`
     or `runs/step3_validation` unless a future request explicitly confirms a
     formal run. The formal namespace guard remains mandatory: validation must
     not write formal latest pointers, formal checkpoints, Step4/Step5/eval/
@@ -195,6 +195,11 @@ Before introducing a new feature, fill or mirror the checklist in
 `docs/ODCR_EVOLUTION_PROTOCOL.md`.
 
 ## Mandatory Codex Change Workflow
+
+Auxiliary runtime, evidence, governance, artifact, control, and prompt-template
+policy now lives under `code/odcr_core/aux/`. Future prompts should reference
+`code/odcr_core/aux/templates/` instead of restating tmux/GPU bridge rules,
+AI_analysis layout rules, or command templates by hand.
 
 Future Codex/AI-assisted code changes must use
 `docs/CODEX_CHANGE_REQUEST_TEMPLATE.md` as the request shape. Codex must not

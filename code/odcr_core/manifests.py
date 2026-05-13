@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from odcr_core.artifacts import train_csv_path
+from odcr_core.csb_contract import CSB_ODCR_METHOD_NAME, method_payload
 from odcr_core.file_atomic import atomic_write_json
 from odcr_core.index_contract import INDEX_CONTRACT_FILENAME
 from odcr_core import path_layout
@@ -48,10 +49,13 @@ OPTIONAL_ARTIFACT_REASONS = {
 }
 
 _STEP3_FORMAL_VIEW_KEYS = (
+    "method",
     "task",
     "hardware",
     "train",
     "step3_structured_losses",
+    "experiment_profile",
+    "step3_csb_odcr",
     "step3_loss_semantics",
     "step3_ddp",
     "step3_task_profile",
@@ -60,6 +64,9 @@ _STEP3_FORMAL_VIEW_KEYS = (
     "step3_tokenizer",
     "step3_evidence",
     "step3_scheduler",
+    "step3_grad_finite",
+    "step3_numerical_stability",
+    "step3_phase_loss_schedule",
     "step3_eval",
     "step3_worker_profiles",
     "step3_prefetcher",
@@ -154,6 +161,186 @@ def _read_text_if_file(path: Path, *, max_chars: int = 2_000_000) -> str:
     return text
 
 
+def _oom_failure_details(
+    *,
+    text: str,
+    latest_error: str | None,
+    training_loop_started: bool,
+    checkpoint_created: bool,
+) -> dict[str, Any] | None:
+    combined = "\n".join(part for part in (str(latest_error or ""), text) if part)
+    lowered = combined.lower()
+    oom_seen = (
+        "cuda out of memory" in lowered
+        or "torch.outofmemoryerror" in lowered
+        or "outofmemoryerror" in lowered
+    )
+    if not oom_seen:
+        return None
+    backward_seen = (
+        "loss.backward" in lowered
+        or "backward oom" in lowered
+        or re.search(r"\bbackward\b", lowered) is not None
+    )
+    torchrun_child = (
+        "childfailederror" in lowered
+        or "torch.distributed.elastic" in lowered
+        or re.search(r"\brank\s*[:=]\s*\d+", combined, flags=re.IGNORECASE) is not None
+    )
+    epoch_boundary = bool(
+        checkpoint_created
+        or "after_checkpoint_save" in lowered
+        or "after_validation" in lowered
+        or "epoch boundary" in lowered
+        or "epoch-boundary" in lowered
+    )
+    failure_phase = "epoch_boundary_backward_oom" if epoch_boundary and backward_seen else "train_backward_oom"
+    signature_match = re.search(
+        r"(torch\.OutOfMemoryError|CUDA out of memory|loss\.backward\(\)|ChildFailedError)[^\n]*",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    return {
+        "failure_phase": failure_phase,
+        "fatal_source": "torchrun_child_rank_oom" if torchrun_child else "cuda_oom",
+        "fatal_signature": signature_match.group(0).strip() if signature_match else "CUDA out of memory during loss.backward",
+        "root_cause": "cuda_out_of_memory_during_loss_backward" if backward_seen else "cuda_out_of_memory",
+        "oom_detected": True,
+        "backward_oom_detected": bool(backward_seen),
+        "training_loop_started": bool(training_loop_started),
+        "checkpoint_created": bool(checkpoint_created),
+    }
+
+
+def _nonempty_csv(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    text = _read_text_if_file(path, max_chars=32_000)
+    return len([line for line in text.splitlines() if line.strip()]) > 1
+
+
+def _jsonl_has_train_rows(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+    for line in _read_text_if_file(path, max_chars=2_000_000).splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            if '"split": "train"' in line or '"split":"train"' in line or '"loss_name"' in line:
+                return True
+            continue
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("split") or "").lower() == "train":
+            return True
+        if row.get("loss_name") and row.get("epoch") is not None:
+            return True
+    return False
+
+
+def _training_loop_evidence(meta: Path, text: str, checkpoint_created: bool) -> dict[str, Any]:
+    markers = any(token in text for token in ("[Epoch Summary]", "[Train/no_accum]", "n_optimizer_steps="))
+    runtime_cfg = meta / TRAINING_RUNTIME_CONFIG_FILENAME
+    runtime_started = False
+    if runtime_cfg.is_file():
+        try:
+            runtime_payload = json.loads(runtime_cfg.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            runtime_payload = {}
+        if isinstance(runtime_payload, Mapping):
+            runtime_started = bool(runtime_payload.get("training_loop_started", False))
+    epoch_summary_nonempty = _nonempty_csv(meta / path_layout.metrics_filename("epoch_summary"))
+    metrics_train_rows = _jsonl_has_train_rows(meta / path_layout.metrics_filename("metrics"))
+    loss_train_rows = _jsonl_has_train_rows(meta / path_layout.metrics_filename("loss_breakdown"))
+    return {
+        "training_loop_started": bool(
+            markers
+            or runtime_started
+            or checkpoint_created
+            or epoch_summary_nonempty
+            or metrics_train_rows
+            or loss_train_rows
+        ),
+        "training_marker_seen": bool(markers),
+        "training_runtime_config_started": bool(runtime_started),
+        "epoch_summary_nonempty": bool(epoch_summary_nonempty),
+        "metrics_train_rows": bool(metrics_train_rows),
+        "loss_breakdown_train_rows": bool(loss_train_rows),
+    }
+
+
+def _signature_line(pattern: str, text: str, fallback: str) -> str:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(0).strip() if match else fallback
+
+
+def _nonfinite_gradient_failure_details(text: str, latest_error: str | None) -> dict[str, Any] | None:
+    combined = "\n".join(part for part in (str(latest_error or ""), text) if part)
+    lowered = combined.lower()
+    if not any(
+        token in lowered
+        for token in (
+            "nonfinite gradient",
+            "non-finite gradient",
+            "grad finite gate",
+            "gradfinite",
+            "nonfinite grad",
+            "non-finite grad",
+        )
+    ):
+        return None
+    signature = _signature_line(
+        r"Step3 nonfinite gradient gate aborted after \d+ continuous skipped steps\.?",
+        combined,
+        "Step3 nonfinite gradient gate aborted after 3 continuous skipped steps",
+    )
+    return {
+        "failure_phase": "training_loop_nonfinite_gradient_gate",
+        "fatal_source": "Step3 grad finite gate",
+        "fatal_signature": signature,
+        "root_cause": "epoch2 post-backward gradient norm explosion / nonfinite grad-norm decision",
+        "train_nonfinite_gradient": True,
+    }
+
+
+def _high_grad_norm_failure_details(text: str, latest_error: str | None) -> dict[str, Any] | None:
+    combined = "\n".join(part for part in (str(latest_error or ""), text) if part)
+    lowered = combined.lower()
+    if "high gradient norm gate aborted" not in lowered and "high_grad_norm_abort" not in lowered:
+        return None
+    signature = _signature_line(
+        r"Step3 high gradient norm gate aborted after \d+ continuous skipped steps\.?",
+        combined,
+        "Step3 high gradient norm gate aborted",
+    )
+    return {
+        "failure_phase": "train_high_grad_norm_abort",
+        "fatal_source": "Step3 high finite grad norm gate",
+        "fatal_signature": signature,
+        "root_cause": "post-backward finite gradient norm exceeded high-grad stability gate",
+        "train_high_grad_norm_abort": True,
+    }
+
+
+def _ddp_runtime_failure_details(text: str, latest_error: str | None) -> dict[str, Any] | None:
+    combined = "\n".join(part for part in (str(latest_error or ""), text) if part)
+    lowered = combined.lower()
+    if not any(token in lowered for token in ("childfailederror", "worknccl", "torch.distributed.elastic", "nccl")):
+        return None
+    return {
+        "failure_phase": "train_ddp_runtime_error",
+        "fatal_source": "torch.distributed runtime",
+        "fatal_signature": _signature_line(
+            r"(ChildFailedError|WorkNCCL\([^\n]+|torch\.distributed\.elastic[^\n]+)",
+            combined,
+            "Step3 DDP runtime error",
+        ),
+        "root_cause": "distributed training runtime failure after Step3 training started",
+    }
+
+
 def _extract_failure_root_signature(
     *,
     meta: Path,
@@ -174,14 +361,35 @@ def _extract_failure_root_signature(
     )
     rank_match = re.search(r"rank\s*[:=]\s*(\d+).*?local_rank\s*[:=]\s*(\d+)", text, flags=re.IGNORECASE | re.DOTALL)
     progress_matches = re.findall(r"Tokenize \(num_proc=\d+\):\s+\d+%.*?\|\s*(\d+)/(\d+)", text)
+    checkpoint_created = bool(checkpoint_path and _artifact_exists(repo_root, checkpoint_path))
+    training_evidence = _training_loop_evidence(meta, text, checkpoint_created)
+    training_loop_started = bool(training_evidence["training_loop_started"])
     details: dict[str, Any] = {
         "failure_phase": "unknown",
         "fatal_signature": str(latest_error or "").strip(),
         "fatal_source": "latest_error",
-        "training_loop_started": any(token in text for token in ("[Epoch Summary]", "[Train/no_accum]", "n_optimizer_steps=")),
-        "checkpoint_created": bool(checkpoint_path and _artifact_exists(repo_root, checkpoint_path)),
+        "training_loop_started": training_loop_started,
+        "checkpoint_created": checkpoint_created,
+        **training_evidence,
     }
-    if "Tokenize" in text or cache_key_match:
+    nonfinite_details = _nonfinite_gradient_failure_details(text, latest_error)
+    high_grad_details = _high_grad_norm_failure_details(text, latest_error)
+    oom_details = _oom_failure_details(
+        text=text,
+        latest_error=latest_error,
+        training_loop_started=training_loop_started,
+        checkpoint_created=checkpoint_created,
+    )
+    ddp_details = _ddp_runtime_failure_details(text, latest_error) if training_loop_started else None
+    if training_loop_started and nonfinite_details:
+        details.update(nonfinite_details)
+    elif training_loop_started and high_grad_details:
+        details.update(high_grad_details)
+    elif oom_details:
+        details.update(oom_details)
+    elif training_loop_started and ddp_details:
+        details.update(ddp_details)
+    elif (not training_loop_started) and ("Tokenize" in text or cache_key_match):
         details["failure_phase"] = "tokenization_cache"
     eval_runtime_seen = any(
         token in text
@@ -193,8 +401,11 @@ def _extract_failure_root_signature(
             "eval_ddp_gpu_inference_phase",
         )
     )
-    if nccl_match:
-        details["failure_phase"] = "post_train_eval" if eval_runtime_seen else ("tokenization_cache" if "Tokenize" in text else "ddp_startup")
+    if nccl_match and not (oom_details or nonfinite_details or high_grad_details):
+        if training_loop_started:
+            details["failure_phase"] = "post_train_eval" if eval_runtime_seen else "train_ddp_runtime_error"
+        else:
+            details["failure_phase"] = "post_train_eval" if eval_runtime_seen else ("tokenization_cache" if "Tokenize" in text else "ddp_startup")
         details["fatal_source"] = "logs"
         details["fatal_signature"] = nccl_match.group(0)
         details["nccl"] = {
@@ -517,11 +728,14 @@ def build_run_summary(
         payload.update(
             {
                 "quality_status": "not_evaluated",
+                "readiness_status": "not_evaluated",
                 "downstream_ready": False,
                 "quality_block_reasons": [],
                 "quality_warnings": [],
-                "quality_gate_version": "odcr_step3_quality_gate/1",
+                "quality_gate_version": "odcr_step3_upstream_readiness_gate/1",
                 "quality_gate_inputs": {},
+                "paper_metric_gate": False,
+                "paper_metrics_excluded_from_readiness": ["BLEU", "ROUGE", "DIST", "METEOR", "paper_target_only_eval"],
                 "selected_downstream_checkpoint": None,
                 "selected_downstream_checkpoint_scope": None,
                 "selected_downstream_checkpoint_epoch": None,
@@ -576,6 +790,37 @@ def _apply_step3_train_eval_status_split(
     latest_error: str | None,
     key_artifacts: Mapping[str, Any],
 ) -> None:
+    readiness_path = meta / "readiness_audit.json"
+    readiness = {}
+    if readiness_path.is_file():
+        try:
+            readiness = json.loads(readiness_path.read_text(encoding="utf-8"))
+        except Exception:
+            readiness = {}
+    if isinstance(readiness, Mapping) and readiness:
+        payload["readiness_audit"] = _repo_relative(Path(cfg.repo_root), readiness_path)
+        payload["quality_status"] = str(readiness.get("quality_status") or readiness.get("readiness_status") or "")
+        payload["readiness_status"] = str(readiness.get("readiness_status") or readiness.get("quality_status") or "")
+        payload["downstream_ready"] = bool(readiness.get("downstream_ready") is True)
+        payload["status"] = "step4_ready" if payload["downstream_ready"] else payload.get("status")
+        payload["stage_status"] = "step4_ready" if payload["downstream_ready"] else "not_ready"
+        payload["paper_metric_gate"] = False
+        payload["paper_metrics_excluded_from_readiness"] = list(
+            readiness.get("paper_metrics_excluded_from_readiness") or ["BLEU", "ROUGE", "DIST", "METEOR"]
+        )
+        for key in (
+            "selected_downstream_checkpoint",
+            "selected_downstream_checkpoint_hash",
+            "selected_downstream_checkpoint_scope",
+            "selected_downstream_checkpoint_epoch",
+            "selected_downstream_checkpoint_metric",
+        ):
+            if key in readiness:
+                payload[key] = readiness[key]
+        payload["selected_checkpoint"] = readiness.get("selected_downstream_checkpoint") or payload.get("selected_checkpoint")
+        payload["selected_checkpoint_hash"] = readiness.get("selected_downstream_checkpoint_hash") or payload.get("selected_checkpoint_hash")
+        payload["status_source"] = "step3_upstream_readiness_gate"
+        return
     sidecar = _read_step3_eval_status_sidecar(meta)
     if sidecar:
         for key in (
@@ -773,6 +1018,7 @@ def build_run_summary_for_config(
         key_artifacts["timing_profile"] = meta / path_layout.metrics_filename("timing_profile")
         key_artifacts["gpu_profile"] = meta / path_layout.metrics_filename("gpu_profile")
         key_artifacts["epoch_summary"] = meta / path_layout.metrics_filename("epoch_summary")
+        key_artifacts["readiness_audit"] = meta / "readiness_audit.json"
     if cfg.command in ("step4", "step5"):
         try:
             key_artifacts["training_csv"] = train_csv_path(cfg)
@@ -805,6 +1051,55 @@ def build_run_summary_for_config(
         validation_status=validation_status,
         post_edit_scope=post_edit_scope,
     )
+    method_config: dict[str, Any] = {}
+    try:
+        method_config = json.loads(str(getattr(cfg, "method_config_json", "") or "{}"))
+    except json.JSONDecodeError:
+        method_config = {}
+    if not method_config:
+        method_config = method_payload()
+    payload["method_name"] = str(method_config.get("method_name") or CSB_ODCR_METHOD_NAME)
+    payload["method"] = dict(method_config)
+    payload["method_schema"] = str(method_config.get("schema_version") or method_payload()["schema_version"])
+    payload["method_schema_hash"] = str(method_config.get("method_schema_hash") or method_payload()["method_schema_hash"])
+    if cfg.command == "step3":
+        try:
+            experiment_profile = json.loads(str(getattr(cfg, "experiment_profile_config_json", "") or "{}"))
+        except json.JSONDecodeError:
+            experiment_profile = {}
+        try:
+            csb_config = json.loads(str(getattr(cfg, "csb_odcr_config_json", "") or "{}"))
+        except json.JSONDecodeError:
+            csb_config = {}
+        payload["experiment_profile"] = str(experiment_profile.get("name") or getattr(cfg, "experiment_profile", ""))
+        payload["ablation_profile"] = str(
+            experiment_profile.get("ablation_profile") or getattr(cfg, "ablation_profile", "")
+        )
+        payload["csb_contract"] = dict(csb_config.get("contract") or {})
+        payload["csb_contract_hash"] = str((csb_config.get("contract") or {}).get("contract_hash") or "")
+        try:
+            memory_config = json.loads(str(getattr(cfg, "memory_config_json", "") or "{}"))
+        except json.JSONDecodeError:
+            memory_config = {}
+        allocator = memory_config.get("allocator") if isinstance(memory_config, Mapping) else {}
+        if isinstance(allocator, Mapping):
+            payload["allocator"] = dict(allocator)
+        try:
+            grad_finite = json.loads(str(getattr(cfg, "grad_finite_config_json", "") or "{}"))
+        except json.JSONDecodeError:
+            grad_finite = {}
+        if isinstance(grad_finite, Mapping):
+            payload["grad_finite"] = dict(grad_finite)
+        try:
+            numerical_stability = json.loads(str(getattr(cfg, "numerical_stability_config_json", "") or "{}"))
+        except json.JSONDecodeError:
+            numerical_stability = {}
+        if isinstance(numerical_stability, Mapping):
+            payload["numerical_stability"] = dict(numerical_stability)
+        try:
+            payload["launcher_env_effective"] = json.loads(str(getattr(cfg, "launcher_env_effective_json", "") or "{}"))
+        except json.JSONDecodeError:
+            payload["launcher_env_effective"] = {}
     if cfg.command == "step3":
         _apply_step3_train_eval_status_split(
             payload,
@@ -961,6 +1256,13 @@ def _manifest_training_runtime_block(cfg: ResolvedConfig) -> dict[str, Any]:
     }
     if cfg.command == "step3":
         out["step3_batch_semantics"] = "odcr_no_accum/1"
+        try:
+            memory_cfg = json.loads(str(getattr(cfg, "memory_config_json", "") or "{}"))
+        except json.JSONDecodeError:
+            memory_cfg = {}
+        allocator = memory_cfg.get("allocator") if isinstance(memory_cfg, Mapping) else {}
+        if isinstance(allocator, Mapping):
+            out["allocator"] = dict(allocator)
     return out
 
 

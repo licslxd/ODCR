@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
+from odcr_core.csb_contract import default_csb_contract_payload, csb_contract_hash, method_payload
 from odcr_core.stage_promotion import promote_upstream
 from odcr_core.stage_status import build_and_write_stage_status
 from odcr_core.training_checkpoint import (
@@ -38,8 +39,12 @@ def write_step3_fixture(
     run = repo / "runs" / "step3" / f"task{int(task)}" / str(run_id)
     meta = run / "meta"
     model = run / "model"
+    state = run / "state"
     meta.mkdir(parents=True, exist_ok=True)
     model.mkdir(parents=True, exist_ok=True)
+    state.mkdir(parents=True, exist_ok=True)
+    csb_contract = default_csb_contract_payload()
+    csb_contract["contract_hash"] = csb_contract_hash(csb_contract)
     checkpoint = model / "best_observed.pth"
     checkpoint.write_bytes(f"checkpoint-{task}-{run_id}".encode("utf-8"))
     write_checkpoint_lineage(
@@ -62,7 +67,7 @@ def write_step3_fixture(
             "selection_direction": "min",
         },
     )
-    status = "completed_with_eval_handoff" if eligible else "quality_blocked"
+    status = "step4_ready" if eligible else "quality_blocked"
     write_json(
         meta / "resolved_config.json",
         {"task": {"id": int(task), "source": source, "target": target}, "run": {"stage_run_dir": str(run)}},
@@ -75,13 +80,18 @@ def write_step3_fixture(
             "run_id": str(run_id),
             "stage": "step3",
             "task_id": int(task),
+            "method_name": "CSB-ODCR",
+            "method": method_payload(),
+            "csb_contract": csb_contract,
+            "csb_contract_hash": csb_contract["contract_hash"],
             "source_domain": source,
             "target_domain": target,
             "status": status,
             "run_dir": f"runs/step3/task{int(task)}/{run_id}",
             "meta_dir": f"runs/step3/task{int(task)}/{run_id}/meta",
             "train_status": "completed" if eligible else "failed",
-            "paper_eval_status": "completed" if eligible else "not_started",
+            "validation_status": "completed" if eligible else "failed",
+            "paper_eval_status": "not_applicable",
             "downstream_ready": bool(eligible),
             "selected_checkpoint": f"runs/step3/task{int(task)}/{run_id}/model/best_observed.pth",
             "selected_checkpoint_hash": checkpoint_file_sha256(checkpoint),
@@ -90,21 +100,43 @@ def write_step3_fixture(
             "failure_history": [{"status": "failed", "source": "fixture"}] if eligible else [],
         },
     )
-    if eligible:
-        write_json(
-            meta / "eval_handoff.json",
-            {
-                "schema_version": "odcr_step3_eval_handoff/1",
-                "task_id": int(task),
-                "run_id": str(run_id),
-                "checkpoint_path": f"runs/step3/task{int(task)}/{run_id}/model/best_observed.pth",
-                "checkpoint_hash": checkpoint_file_sha256(checkpoint),
-                "train_status": "completed",
-                "paper_eval_status": "completed",
-                "paper_eval_protocol": "paper_target_only_eval",
-                "old_failure_history_preserved": True,
+    (meta / "metrics.jsonl").write_text(json.dumps({"split": "valid", "valid_loss": 1.0, "MAE": 0.1, "RMSE": 0.2}) + "\n", encoding="utf-8")
+    (meta / "loss_breakdown.jsonl").write_text(json.dumps({"L_rating_shared": 1.0, "L_light_explainer": 0.0}) + "\n", encoding="utf-8")
+    (meta / "timing_profile.jsonl").write_text(json.dumps({"step_total_ms": 1.0}) + "\n", encoding="utf-8")
+    (meta / "gpu_profile.jsonl").write_text(json.dumps({"allocated_gib": 1.0}) + "\n", encoding="utf-8")
+    (meta / "epoch_summary.csv").write_text("epoch,valid_loss\n1,1.0\n", encoding="utf-8")
+    write_json(
+        state / "best_event.json",
+        {
+            "best_observed_event": {
+                "epoch": 1,
+                "checkpoint_file": str(checkpoint),
+                "checkpoint_file_hash": checkpoint_file_sha256(checkpoint),
+            }
+        },
+    )
+    write_json(
+        meta / "readiness_audit.json",
+        {
+            "schema_version": "odcr_step3_readiness_audit/1",
+            "quality_gate_version": "odcr_step3_upstream_readiness_gate/1",
+            "readiness_gate": "step3_upstream_readiness_gate",
+            "readiness_status": "pass" if eligible else "blocked",
+            "quality_status": "pass" if eligible else "blocked",
+            "downstream_ready": bool(eligible),
+            "stage_status": "step4_ready" if eligible else "not_ready",
+            "ready_for": ["step4"] if eligible else [],
+            "paper_metrics_excluded_from_readiness": ["BLEU", "ROUGE", "DIST", "METEOR", "paper_target_only_eval"],
+            "selected_downstream_checkpoint": f"runs/step3/task{int(task)}/{run_id}/model/best_observed.pth",
+            "selected_downstream_checkpoint_hash": checkpoint_file_sha256(checkpoint),
+            "csb_contract_health": {
+                "required_z_fields": ["z_content", "z_style", "z_domain", "z_uncertainty"],
+                "missing_z_fields": [],
+                "csb_contract_hash_present": True,
+                "sidecar_only": True,
             },
-        )
+        },
+    )
     write_json(
         meta / "quality_audit.json",
         {
@@ -153,10 +185,13 @@ def run_antiforgery_selftest() -> dict[str, Any]:
     results: dict[str, Any] = {"schema_version": "odcr_stage_truth_antiforgery_selftest/1"}
     with tempfile.TemporaryDirectory() as tmp:
         repo = Path(tmp)
-        write_step3_fixture(repo, task=2, run_id="1", active=False, eligible=False)
-        write_step3_fixture(repo, task=2, run_id="2", active=True, eligible=True, latest_status="failed")
-        write_step3_fixture(repo, task=2, run_id="3", active=False, eligible=True)
-        minimal = repo / "runs" / "step3" / "task2" / "3" / "meta" / "stage_status.json"
+        blocked_run = "11"
+        active_run = "12"
+        forged_run = "13"
+        write_step3_fixture(repo, task=2, run_id=blocked_run, active=False, eligible=False)
+        write_step3_fixture(repo, task=2, run_id=active_run, active=True, eligible=True, latest_status="failed")
+        write_step3_fixture(repo, task=2, run_id=forged_run, active=False, eligible=True)
+        minimal = repo / "runs" / "step3" / "task2" / forged_run / "meta" / "stage_status.json"
         write_json(
             minimal,
             {
@@ -164,9 +199,9 @@ def run_antiforgery_selftest() -> dict[str, Any]:
                 "stage": "step3",
                 "task": 2,
                 "task_id": 2,
-                "run_id": "3",
-                "run_dir": "runs/step3/task2/3",
-                "final_status": "completed_with_eval_handoff",
+                "run_id": forged_run,
+                "run_dir": f"runs/step3/task2/{forged_run}",
+                "final_status": "step4_ready",
                 "downstream_ready": True,
                 "ready_for": ["step4"],
                 "artifacts": {},
@@ -174,23 +209,22 @@ def run_antiforgery_selftest() -> dict[str, Any]:
         )
         ok, msg = expect_reject(
             "forged minimal status",
-            lambda: resolve_upstream(repo_root=repo, stage="step3", task=2, from_run="3", consumer_stage="step4"),
+            lambda: resolve_upstream(repo_root=repo, stage="step3", task=2, from_run=forged_run, consumer_stage="step4"),
         )
         results["forged_status_rejected"] = ok
         results["forged_status_message"] = msg
         ok, msg = expect_reject(
-            "run1 alias gate",
-            lambda: resolve_upstream(repo_root=repo, stage="step3", task=2, from_run="1", consumer_stage="step4"),
+            "blocked run gate",
+            lambda: resolve_upstream(repo_root=repo, stage="step3", task=2, from_run=blocked_run, consumer_stage="step4"),
         )
-        results["alias_run1_rejected"] = ok
-        results["alias_run1_message"] = msg
-        run2 = repo / "runs" / "step3" / "task2" / "2"
+        results["blocked_run_rejected"] = ok
+        results["blocked_run_message"] = msg
         resolved = resolve_upstream(repo_root=repo, stage="step3", task=2, consumer_stage="step4")
-        results["latest_pointer_only_passed"] = resolved.run_id == "2"
+        results["latest_pointer_only_passed"] = resolved.run_id == active_run
         results["latest_warnings"] = (resolved.validation or {}).get("latest_warnings", [])
-        missing_eval = repo / "runs" / "step3" / "task2" / "4"
+        missing_readiness = repo / "runs" / "step3" / "task2" / "4"
         write_step3_fixture(repo, task=2, run_id="4", active=False, eligible=True)
-        (missing_eval / "meta" / "eval_handoff.json").unlink()
+        (missing_readiness / "meta" / "readiness_audit.json").unlink()
         ok, msg = expect_reject(
             "missing artifact",
             lambda: resolve_upstream(repo_root=repo, stage="step3", task=2, from_run="4", consumer_stage="step4"),
@@ -216,14 +250,13 @@ def run_antiforgery_selftest() -> dict[str, Any]:
         results["stale_exists_message"] = msg
         ok, msg = expect_reject(
             "malformed promotion target",
-            lambda: promote_upstream(repo_root=repo, stage="step3", task=2, run_id="3", dry_run=True),
+            lambda: promote_upstream(repo_root=repo, stage="step3", task=2, run_id=forged_run, dry_run=True),
         )
         results["promotion_malformed_target_rejected"] = ok
         results["promotion_malformed_target_message"] = msg
-        promotion = promote_upstream(repo_root=repo, stage="step3", task=2, run_id="2", dry_run=True)
+        promotion = promote_upstream(repo_root=repo, stage="step3", task=2, run_id=active_run, dry_run=True)
         results["promotion_valid_dry_run_passed"] = promotion.get("dry_run") is True
         results["quality_audit_cannot_override_stage_status"] = bool(resolve_upstream(repo_root=repo, stage="step3", task=2, consumer_stage="step4"))
-        _ = run2
     required = (
         "forged_status_rejected",
         "missing_artifact_rejected",
@@ -231,7 +264,7 @@ def run_antiforgery_selftest() -> dict[str, Any]:
         "stale_exists_rejected",
         "promotion_malformed_target_rejected",
         "latest_pointer_only_passed",
-        "alias_run1_rejected",
+        "blocked_run_rejected",
         "quality_audit_cannot_override_stage_status",
     )
     results["passed"] = all(bool(results.get(key)) for key in required)

@@ -39,6 +39,17 @@ from odcr_core.step3_eval_protocol import (
     normalize_eval_protocol,
     step3_eval_protocol_spec,
 )
+from odcr_core.csb_contract import (
+    CSB_CROSS_STAGE_CONTRACT_VERSION,
+    CSB_ODCR_METHOD_FAMILY,
+    CSB_ODCR_METHOD_FULL_NAME,
+    CSB_ODCR_METHOD_NAME,
+    CSB_PACKET_SCHEMA_VERSION,
+    CSB_REQUIRED_TENSOR_FIELDS,
+    csb_contract_hash,
+    default_csb_contract_payload,
+    method_payload,
+)
 from odcr_core.upstream_resolver import UpstreamResolutionError, resolve_latest, resolve_upstream
 
 _CODE_DIR = Path(__file__).resolve().parent.parent
@@ -97,6 +108,8 @@ def apply_cli_sets(cfg: dict[str, Any], raw_sets: Iterable[str]) -> tuple[dict[s
         key = key.strip()
         if not key:
             raise OneControlConfigError("--set key cannot be empty")
+        if key == "experiment_profile":
+            key = "step3.experiment_profile"
         _reject_retired_accum_name(key)
         parts = key.split(".")
         cur: Any = out
@@ -286,11 +299,82 @@ def _validate_step3_named_runtime_profiles(raw: Mapping[str, Any], context: str,
             _reject_unknown_keys(item, allowed, f"{context}.{name}")
 
 
+def _validate_step3_experiment_profiles_shape(raw: Mapping[str, Any]) -> None:
+    allowed = {
+        "ablation_profile",
+        "candidate_role",
+        "safe_profile",
+        "recommended_next_full",
+        "fallback_only",
+        "not_default",
+        "deprecated",
+        "blocked_reason",
+        "primary_training",
+        "csb_mode",
+        "gradient_firewall",
+        "controlled_injection_formal_train",
+        "light_explainer_step3_loss",
+        "conflict_routing_step3_primary",
+        "csb_rating_safe_adapter_train",
+        "paper_metric_gate",
+        "csb_enabled",
+        "controlled_injection_enabled",
+        "rcr_uci_enabled",
+        "ccv_fca_diversity_enabled",
+        "conflict_routing_enabled",
+        "formal_allowed",
+        "description",
+        "train",
+        "scheduler",
+    }
+    train_allowed = {
+        "batch_size",
+        "per_gpu_batch_size",
+        "lr",
+        "max_grad_norm",
+        "max_epochs",
+        "min_epochs",
+        "early_stop_patience",
+        "validate_every_epochs",
+        "train_label_max_length",
+        "backend",
+    }
+    backend_allowed = {
+        "train_precision",
+        "allow_tf32",
+        "amp_autocast",
+        "grad_scaler",
+        "train_dynamic_padding",
+        "ema_enabled",
+        "ema_decay",
+        "generate_during_train",
+        "full_bleu_decode_strategy",
+    }
+    scheduler_allowed = {"name", "warmup_ratio", "min_lr_ratio", "validation_aware_lr_damping"}
+    for name, item in raw.items():
+        if not isinstance(item, Mapping):
+            continue
+        _reject_unknown_keys(item, allowed, f"step3.experiment_profiles.{name}")
+        train = item.get("train")
+        if isinstance(train, Mapping):
+            _reject_unknown_keys(train, train_allowed, f"step3.experiment_profiles.{name}.train")
+            backend = train.get("backend")
+            if isinstance(backend, Mapping):
+                _reject_unknown_keys(backend, backend_allowed, f"step3.experiment_profiles.{name}.train.backend")
+        scheduler = item.get("scheduler")
+        if isinstance(scheduler, Mapping):
+            _reject_unknown_keys(scheduler, scheduler_allowed, f"step3.experiment_profiles.{name}.scheduler")
+
+
 def _validate_step3_config_shape(cfg: Mapping[str, Any]) -> None:
     raw = _mapping(_get(cfg, "step3"), "step3")
     _reject_unknown_keys(
         raw,
         {
+            "method",
+            "experiment_profile",
+            "experiment_profiles",
+            "csb_odcr",
             "ddp",
             "loss_semantics",
             "structured_losses",
@@ -308,6 +392,7 @@ def _validate_step3_config_shape(cfg: Mapping[str, Any]) -> None:
             "checkpoint_policy",
             "quality_gate",
             "grad_finite",
+            "numerical_stability",
             "diagnostic_eval",
             "cross_rank_structured_gather",
             "memory",
@@ -325,6 +410,9 @@ def _validate_step3_config_shape(cfg: Mapping[str, Any]) -> None:
             "train",
         },
         "step3",
+    )
+    _validate_step3_experiment_profiles_shape(
+        _mapping(raw.get("experiment_profiles"), "step3.experiment_profiles")
     )
     for name, item in _mapping(raw.get("scenario_profiles"), "step3.scenario_profiles").items():
         if isinstance(item, Mapping):
@@ -386,6 +474,50 @@ def _validate_step3_config_shape(cfg: Mapping[str, Any]) -> None:
     )
     cache = _mapping(raw.get("cache"), "step3.cache")
     _reject_unknown_keys(cache, {"tokenizer_schema_version", "formal_cache_namespace"}, "step3.cache")
+    grad_finite = _mapping(raw.get("grad_finite"), "step3.grad_finite")
+    _reject_unknown_keys(
+        grad_finite,
+        {
+            "enabled",
+            "skip_optimizer_on_nonfinite",
+            "scheduler_step_on_skipped_optimizer",
+            "continuous_nonfinite_abort_threshold",
+            "high_grad_norm_warn_threshold",
+            "high_grad_norm_skip_threshold",
+            "high_grad_norm_abort_threshold",
+            "continuous_high_grad_abort_threshold",
+            "monitor_interval_steps",
+            "anomaly_topk",
+            "full_scan_on_anomaly",
+        },
+        "step3.grad_finite",
+    )
+    numerical = _mapping(raw.get("numerical_stability"), "step3.numerical_stability")
+    _reject_unknown_keys(
+        numerical,
+        {
+            "enabled",
+            "auxiliary_warmup",
+            "light_explainer_warmup",
+            "conflict_routing_warmup",
+            "controlled_injection_warmup",
+        },
+        "step3.numerical_stability",
+    )
+    for block_name in (
+        "auxiliary_warmup",
+        "light_explainer_warmup",
+        "conflict_routing_warmup",
+        "controlled_injection_warmup",
+    ):
+        block = _mapping(numerical.get(block_name), f"step3.numerical_stability.{block_name}")
+        _reject_unknown_keys(block, {"enabled", "schedule"}, f"step3.numerical_stability.{block_name}")
+        schedule = _mapping(block.get("schedule"), f"step3.numerical_stability.{block_name}.schedule")
+        _reject_unknown_keys(
+            schedule,
+            {"epoch1", "epoch2", "epoch3_plus"},
+            f"step3.numerical_stability.{block_name}.schedule",
+        )
 
 
 def _validate_config_shape(cfg: Mapping[str, Any]) -> None:
@@ -733,6 +865,7 @@ def _resolve_step4_rcr_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     train_keep = _mapping(raw.get("train_keep"), "step4.rcr.train_keep")
     sample_weight = _mapping(raw.get("sample_weight_hint"), "step4.rcr.sample_weight_hint")
     export = _mapping(raw.get("export"), "step4.rcr.export")
+    csb = _mapping(raw.get("csb_contract"), "step4.rcr.csb_contract")
     required = export.get("required_fields")
     if not isinstance(required, list) or not all(isinstance(x, str) and x for x in required):
         raise OneControlConfigError("step4.rcr.export.required_fields must be a non-empty string list")
@@ -742,6 +875,17 @@ def _resolve_step4_rcr_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
             "step4.rcr.export.required_fields must include the Step4 RCR contract columns: "
             + ", ".join(missing_required)
         )
+    for required_contract_key in ("schema_version", "cross_stage_contract_version", "required_tensor_fields"):
+        if required_contract_key not in csb:
+            raise OneControlConfigError(f"step4.rcr.csb_contract.{required_contract_key} is required.")
+    step4_csb_fields = list(csb.get("required_tensor_fields") or [])
+    missing_csb_fields = [field for field in CSB_REQUIRED_TENSOR_FIELDS if field not in step4_csb_fields]
+    if missing_csb_fields:
+        raise OneControlConfigError(f"step4.rcr.csb_contract missing required tensor fields: {missing_csb_fields}")
+    if str(csb.get("schema_version")) != CSB_PACKET_SCHEMA_VERSION:
+        raise OneControlConfigError("step4.rcr.csb_contract.schema_version must match CSB packet schema.")
+    if str(csb.get("cross_stage_contract_version")) != CSB_CROSS_STAGE_CONTRACT_VERSION:
+        raise OneControlConfigError("step4.rcr.csb_contract.cross_stage_contract_version must match CSB cross-stage contract.")
     return {
         "cf_reliability_weights": _resolve_rcr_weights(
             raw,
@@ -802,6 +946,16 @@ def _resolve_step4_rcr_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         },
         "export": {
             "required_fields": list(required),
+        },
+        "csb_contract": {
+            "required": _bool(csb.get("required", True)),
+            "schema_version": str(csb.get("schema_version")),
+            "cross_stage_contract_version": str(
+                csb.get("cross_stage_contract_version")
+            ),
+            "required_tensor_fields": step4_csb_fields,
+            "diagnostics_required": _bool(csb.get("diagnostics_required", True)),
+            "old_scalar_only_formal_allowed": _bool(csb.get("old_scalar_only_formal_allowed", False)),
         },
     }
 
@@ -970,6 +1124,238 @@ def _resolve_named_float_map(
     }
 
 
+def _resolve_method_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    project = _mapping(_get(cfg, "project"), "project")
+    step3_method = _mapping(_get(cfg, "step3.method"), "step3.method")
+    payload = method_payload()
+    name = str(step3_method.get("name") or project.get("method_name") or project.get("name") or CSB_ODCR_METHOD_NAME)
+    family = str(step3_method.get("family") or project.get("method_family") or CSB_ODCR_METHOD_FAMILY)
+    if name != CSB_ODCR_METHOD_NAME:
+        raise OneControlConfigError("active method_name must be CSB-ODCR.")
+    if family != CSB_ODCR_METHOD_FAMILY:
+        raise OneControlConfigError("active method_family must be csb_odcr.")
+    payload.update(
+        {
+            "method_name": name,
+            "method_full_name": str(
+                step3_method.get("full_name")
+                or project.get("method_full_name")
+                or CSB_ODCR_METHOD_FULL_NAME
+            ),
+            "method_family": family,
+            "display_name": str(step3_method.get("display_name") or name),
+            "model_family": str(step3_method.get("model_family") or family),
+        }
+    )
+    payload["method_schema_hash"] = fingerprint(payload)
+    return payload
+
+
+def _resolve_step3_experiment_profiles_config(cfg: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_profiles = _mapping(_get(cfg, "step3.experiment_profiles"), "step3.experiment_profiles")
+    if not raw_profiles:
+        raise OneControlConfigError("step3.experiment_profiles must define CSB-ODCR ablation profiles.")
+    active = str(_get(cfg, "step3.experiment_profile", "csb_odcr_sidecar_stable") or "csb_odcr_sidecar_stable").strip()
+    if active not in raw_profiles:
+        raise OneControlConfigError(f"step3.experiment_profile={active!r} is not defined.")
+    required = {
+        "csb_odcr_sidecar_stable",
+        "csb_odcr_full",
+        "csb_odcr_wo_csb",
+        "csb_odcr_wo_controlled_injection",
+        "csb_odcr_wo_rcr_uci",
+        "csb_odcr_wo_ccv_fca_diversity",
+        "csb_odcr_wo_conflict_routing",
+    }
+    missing = sorted(required - set(str(key) for key in raw_profiles))
+    if missing:
+        raise OneControlConfigError(f"step3.experiment_profiles missing required profile(s): {missing}")
+    profiles: dict[str, Any] = {}
+    for name, item in raw_profiles.items():
+        if not isinstance(item, Mapping):
+            raise OneControlConfigError(f"step3.experiment_profiles.{name} must be an object.")
+        train_override = item.get("train")
+        resolved_train: dict[str, Any] = {}
+        if isinstance(train_override, Mapping):
+            resolved_train = deepcopy(dict(train_override))
+            _reject_retired_accum_keys(resolved_train, f"step3.experiment_profiles.{name}.train")
+            batch = resolved_train.get("batch_size")
+            per_gpu = resolved_train.get("per_gpu_batch_size")
+            if batch is not None or per_gpu is not None:
+                if batch is None or per_gpu is None:
+                    raise OneControlConfigError(
+                        f"step3.experiment_profiles.{name}.train must set batch_size and per_gpu_batch_size together."
+                    )
+                batch_i = _positive_int(batch, f"step3.experiment_profiles.{name}.train.batch_size")
+                per_gpu_i = _positive_int(per_gpu, f"step3.experiment_profiles.{name}.train.per_gpu_batch_size")
+                default_world = _positive_int(
+                    _get(cfg, "hardware.profiles.default.ddp_world_size", 1),
+                    "hardware.profiles.default.ddp_world_size",
+                )
+                if batch_i != per_gpu_i * default_world:
+                    raise OneControlConfigError(
+                        f"step3.experiment_profiles.{name}.train batch formula failed: "
+                        f"{batch_i} != {per_gpu_i} * {default_world}."
+                    )
+                resolved_train["batch_size"] = batch_i
+                resolved_train["per_gpu_batch_size"] = per_gpu_i
+        profiles[str(name)] = {
+            "name": str(name),
+            "ablation_profile": str(item.get("ablation_profile") or name),
+            "candidate_role": str(item.get("candidate_role") or ""),
+            "safe_profile": _bool(item.get("safe_profile", False)),
+            "recommended_next_full": _bool(item.get("recommended_next_full", False)),
+            "fallback_only": _bool(item.get("fallback_only", False)),
+            "not_default": _bool(item.get("not_default", False)),
+            "deprecated": _bool(item.get("deprecated", False)),
+            "blocked_reason": str(item.get("blocked_reason") or ""),
+            "primary_training": str(item.get("primary_training") or "rating_only"),
+            "csb_mode": str(item.get("csb_mode") or ("sidecar" if str(name) == "csb_odcr_sidecar_stable" else "legacy_joint")),
+            "gradient_firewall": _bool(item.get("gradient_firewall", str(name) == "csb_odcr_sidecar_stable")),
+            "controlled_injection_formal_train": _bool(item.get("controlled_injection_formal_train", False)),
+            "light_explainer_step3_loss": _bool(item.get("light_explainer_step3_loss", False)),
+            "conflict_routing_step3_primary": _bool(item.get("conflict_routing_step3_primary", False)),
+            "csb_rating_safe_adapter_train": _bool(item.get("csb_rating_safe_adapter_train", False)),
+            "paper_metric_gate": _bool(item.get("paper_metric_gate", False)),
+            "csb_enabled": _bool(item.get("csb_enabled", True)),
+            "controlled_injection_enabled": _bool(item.get("controlled_injection_enabled", True)),
+            "rcr_uci_enabled": _bool(item.get("rcr_uci_enabled", True)),
+            "ccv_fca_diversity_enabled": _bool(item.get("ccv_fca_diversity_enabled", True)),
+            "conflict_routing_enabled": _bool(item.get("conflict_routing_enabled", True)),
+            "formal_allowed": _bool(item.get("formal_allowed", True)),
+            "description": str(item.get("description") or ""),
+            "train": resolved_train,
+            "scheduler": deepcopy(dict(item.get("scheduler") or {})) if isinstance(item.get("scheduler"), Mapping) else {},
+        }
+    selected = dict(profiles[active])
+    selected["schema_version"] = "csb_odcr_experiment_profile/1"
+    return profiles, selected
+
+
+def _resolve_step3_csb_odcr_config(
+    cfg: Mapping[str, Any],
+    experiment_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw = _mapping(_get(cfg, "step3.csb_odcr"), "step3.csb_odcr")
+    contract_raw = _mapping(raw.get("contract"), "step3.csb_odcr.contract")
+    bottleneck_raw = _mapping(raw.get("bottleneck"), "step3.csb_odcr.bottleneck")
+    injection_raw = _mapping(raw.get("controlled_injection"), "step3.csb_odcr.controlled_injection")
+    routing_raw = _mapping(raw.get("conflict_routing"), "step3.csb_odcr.conflict_routing")
+    enabled = _bool(raw.get("enabled", True)) and _bool(experiment_profile.get("csb_enabled", True))
+    primary_training = str(experiment_profile.get("primary_training") or "rating_only")
+    csb_mode = str(experiment_profile.get("csb_mode") or "sidecar")
+    gradient_firewall = _bool(experiment_profile.get("gradient_firewall", True))
+    controlled_injection_formal_train = _bool(experiment_profile.get("controlled_injection_formal_train", False))
+    light_explainer_step3_loss = _bool(experiment_profile.get("light_explainer_step3_loss", False))
+    conflict_routing_step3_primary = _bool(experiment_profile.get("conflict_routing_step3_primary", False))
+    csb_rating_safe_adapter_train = _bool(experiment_profile.get("csb_rating_safe_adapter_train", False))
+    paper_metric_gate = _bool(experiment_profile.get("paper_metric_gate", False))
+    if primary_training != "rating_only":
+        raise OneControlConfigError("Step3 primary_training must be rating_only.")
+    if csb_mode != "sidecar":
+        raise OneControlConfigError("Step3 csb_mode must be sidecar for active formal profiles.")
+    if not gradient_firewall:
+        raise OneControlConfigError("Step3 gradient_firewall must be true.")
+    if any(
+        (
+            controlled_injection_formal_train,
+            light_explainer_step3_loss,
+            conflict_routing_step3_primary,
+            csb_rating_safe_adapter_train,
+            paper_metric_gate,
+        )
+    ):
+        raise OneControlConfigError(
+            "Step3 sidecar rebuild forbids light explainer, controlled injection, conflict routing, "
+            "rating-safe adapter train, and paper metric gates in formal Step3."
+        )
+    injection_enabled = _bool(injection_raw.get("enabled", True)) and _bool(
+        experiment_profile.get("controlled_injection_enabled", False)
+    )
+    routing_enabled = _bool(routing_raw.get("enabled", True)) and _bool(
+        experiment_profile.get("conflict_routing_enabled", False)
+    )
+    mode = str(routing_raw.get("mode") or "rating_anchor_projection")
+    if mode not in {"rating_anchor_projection", "rating_anchor_downweight", "csb_branch_only"}:
+        raise OneControlConfigError("step3.csb_odcr.conflict_routing.mode is unsupported.")
+    for required_contract_key in ("schema_version", "cross_stage_contract_version", "required_tensor_fields"):
+        if required_contract_key not in contract_raw:
+            raise OneControlConfigError(f"step3.csb_odcr.contract.{required_contract_key} is required.")
+    contract = default_csb_contract_payload()
+    contract.update(
+        {
+            "schema_version": str(contract_raw.get("schema_version")),
+            "cross_stage_contract_version": str(
+                contract_raw.get("cross_stage_contract_version")
+            ),
+            "required_tensor_fields": list(contract_raw.get("required_tensor_fields") or []),
+        }
+    )
+    if contract["schema_version"] != CSB_PACKET_SCHEMA_VERSION:
+        raise OneControlConfigError("step3.csb_odcr.contract.schema_version must match CSB packet schema.")
+    if contract["cross_stage_contract_version"] != CSB_CROSS_STAGE_CONTRACT_VERSION:
+        raise OneControlConfigError("step3.csb_odcr.contract.cross_stage_contract_version must match CSB cross-stage contract.")
+    missing_fields = [field for field in CSB_REQUIRED_TENSOR_FIELDS if field not in contract["required_tensor_fields"]]
+    if missing_fields:
+        raise OneControlConfigError(f"step3.csb_odcr.contract missing required tensor fields: {missing_fields}")
+    contract["contract_hash"] = csb_contract_hash(contract)
+    conflict_routing = {
+        "enabled": routing_enabled,
+        "mode": mode,
+        "rating_anchor": str(routing_raw.get("rating_anchor") or "L_rating_shared"),
+        "explanation_anchor": str(routing_raw.get("explanation_anchor") or "L_light_explainer"),
+        "diversity_guard": list(routing_raw.get("diversity_guard") or ["DIST-1", "DIST-2"]),
+        "aux_soft_cap": _rcr_float(routing_raw.get("aux_soft_cap", 0.75), "step3.csb_odcr.conflict_routing.aux_soft_cap", min_value=0.0, max_value=1.0),
+        "projection_threshold": _rcr_float(routing_raw.get("projection_threshold", -0.05), "step3.csb_odcr.conflict_routing.projection_threshold"),
+        "dynamic_downweight": _bool(routing_raw.get("dynamic_downweight", True)),
+        "formal_allowed": _bool(routing_raw.get("formal_allowed", True)),
+        "ddp_graph_safe_zero_required": _bool(routing_raw.get("ddp_graph_safe_zero_required", True)),
+    }
+    if conflict_routing["rating_anchor"] != "L_rating_shared":
+        raise OneControlConfigError("CSB-ODCR rating anchor must be L_rating_shared.")
+    if conflict_routing["explanation_anchor"] != "L_light_explainer":
+        raise OneControlConfigError("CSB-ODCR explanation anchor must be L_light_explainer.")
+    controlled_injection = {
+        "enabled": injection_enabled,
+        "mode": str(injection_raw.get("mode") or "structural_prefix"),
+        "structural_prefix_tokens": _positive_int(injection_raw.get("structural_prefix_tokens", 4), "step3.csb_odcr.controlled_injection.structural_prefix_tokens"),
+        "gate_init": _rcr_float(injection_raw.get("gate_init", 0.35), "step3.csb_odcr.controlled_injection.gate_init", min_value=0.0, max_value=1.0),
+        "rating_safe_injection": _bool(injection_raw.get("rating_safe_injection", True)),
+        "rating_allowed_fields": list(injection_raw.get("rating_allowed_fields") or ["z_content", "z_uncertainty"]),
+        "explainer_allowed_fields": list(injection_raw.get("explainer_allowed_fields") or CSB_REQUIRED_TENSOR_FIELDS),
+    }
+    if controlled_injection["mode"] not in {"structural_prefix", "gated_adapter", "structural_prefix_gated_adapter"}:
+        raise OneControlConfigError("step3.csb_odcr.controlled_injection.mode is unsupported.")
+    return {
+        "schema_version": "csb_odcr_step3_config/1",
+        "enabled": enabled,
+        "experiment_profile": str(experiment_profile.get("name") or "csb_odcr_full"),
+        "primary_training": primary_training,
+        "csb_mode": csb_mode,
+        "gradient_firewall": gradient_firewall,
+        "controlled_injection_formal_train": controlled_injection_formal_train,
+        "light_explainer_step3_loss": light_explainer_step3_loss,
+        "conflict_routing_step3_primary": conflict_routing_step3_primary,
+        "csb_rating_safe_adapter_train": csb_rating_safe_adapter_train,
+        "paper_metric_gate": paper_metric_gate,
+        "contract": contract,
+        "bottleneck": {
+            "structure_branch_stop_gradient": _bool(bottleneck_raw.get("structure_branch_stop_gradient", True)),
+            "z_content_role": "rating_safe_content_basis",
+            "z_style_role": "explanation_style_basis",
+            "z_domain_role": "counterfactual_domain_variation",
+            "z_uncertainty_role": "reliability_uncertainty_routing_confidence",
+        },
+        "controlled_injection": controlled_injection,
+        "conflict_routing": conflict_routing,
+        "training_signal_roles": {
+            "EASD": "z_content",
+            "HSS": "z_style/z_domain",
+            "geometry": "CSB separation/stability",
+        },
+    }
+
+
 def _resolve_step5_innovation_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step5"), "step5")
     train = raw.get("train")
@@ -987,6 +1373,7 @@ def _resolve_step5_innovation_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     ccv = _mapping(raw.get("ccv"), "step5.ccv")
     fca = _mapping(raw.get("fca"), "step5.fca")
     native_lora = _mapping(ccv.get("native_lora"), "step5.ccv.native_lora")
+    csb_control = _mapping(ccv.get("csb_control_packet"), "step5.ccv.csb_control_packet")
     control_fields = ccv.get("control_fields")
     if not isinstance(control_fields, list) or not all(isinstance(x, str) and x for x in control_fields):
         raise OneControlConfigError("step5.ccv.control_fields must be a non-empty string list")
@@ -1015,6 +1402,19 @@ def _resolve_step5_innovation_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     )
     if control_adapter_blocks != 6:
         raise OneControlConfigError("step5.ccv.control_adapter_input_blocks must be 6 for the current CCV adapter")
+    for required_packet_key in ("schema_version", "scorer_clean_fields", "explainer_rich_fields"):
+        if required_packet_key not in csb_control:
+            raise OneControlConfigError(f"step5.ccv.csb_control_packet.{required_packet_key} is required.")
+    if str(csb_control.get("schema_version")) != CSB_PACKET_SCHEMA_VERSION:
+        raise OneControlConfigError("step5.ccv.csb_control_packet.schema_version must match CSB packet schema.")
+    scorer_clean_fields = list(csb_control.get("scorer_clean_fields") or [])
+    explainer_rich_fields = list(csb_control.get("explainer_rich_fields") or [])
+    missing_scorer_fields = [field for field in ("z_content", "z_uncertainty") if field not in scorer_clean_fields]
+    missing_rich_fields = [field for field in CSB_REQUIRED_TENSOR_FIELDS if field not in explainer_rich_fields]
+    if missing_scorer_fields:
+        raise OneControlConfigError(f"step5.ccv.csb_control_packet.scorer_clean_fields missing {missing_scorer_fields}")
+    if missing_rich_fields:
+        raise OneControlConfigError(f"step5.ccv.csb_control_packet.explainer_rich_fields missing {missing_rich_fields}")
     lora_targets = native_lora.get("target_modules", [])
     if not isinstance(lora_targets, list) or not all(isinstance(x, str) for x in lora_targets):
         raise OneControlConfigError("step5.ccv.native_lora.target_modules must be a string list")
@@ -1093,6 +1493,14 @@ def _resolve_step5_innovation_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
             "soft_prompt_len": soft_prompt_len,
             "numeric_control_dim": numeric_control_dim,
             "control_adapter_input_blocks": control_adapter_blocks,
+            "csb_control_packet": {
+                "required": _bool(csb_control.get("required", True)),
+                "schema_version": str(csb_control.get("schema_version")),
+                "contract_hash_required": _bool(csb_control.get("contract_hash_required", True)),
+                "scorer_clean_fields": scorer_clean_fields,
+                "explainer_rich_fields": explainer_rich_fields,
+                "diversity_guard_required": _bool(csb_control.get("diversity_guard_required", True)),
+            },
             "native_lora": {
                 "enabled": _bool(native_lora.get("enabled", True)),
                 "r": _positive_int(native_lora.get("r"), "step5.ccv.native_lora.r"),
@@ -1472,10 +1880,15 @@ def _resolve_step3_tokenizer_evidence_config(
     return {"max_length": tok_len}, {"max_evidence_length": evd_len}
 
 
-def _resolve_step3_scheduler_config(cfg: Mapping[str, Any], task_profile: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def _resolve_step3_scheduler_config(
+    cfg: Mapping[str, Any],
+    task_profile: Mapping[str, Any] | None = None,
+    experiment_profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     raw = _merge_dicts(
         _mapping(_get(cfg, "step3.scheduler"), "step3.scheduler"),
         task_profile.get("scheduler") if isinstance(task_profile, Mapping) else None,
+        experiment_profile.get("scheduler") if isinstance(experiment_profile, Mapping) else None,
     )
     name = str(raw.get("name") or "").strip().lower()
     if name not in {"warmup_cosine", "safe_damping_v2"}:
@@ -1659,9 +2072,12 @@ def _resolve_step3_phase_loss_schedule_config(cfg: Mapping[str, Any]) -> dict[st
             }
         )
     names = {phase["name"] for phase in phases}
-    required = {"alignment_warmup", "task_refinement", "light_regularization"}
+    required = {"primary_fit", "csb_sidecar_alignment", "recovery_pareto_candidate"}
     if not required.issubset(names):
-        raise OneControlConfigError("step3.phase_loss_schedule must define alignment_warmup, task_refinement, and light_regularization.")
+        raise OneControlConfigError(
+            "step3.phase_loss_schedule must define primary_fit, "
+            "csb_sidecar_alignment, and recovery_pareto_candidate."
+        )
     return {
         "enabled": _bool(raw.get("enabled", True)),
         "transition": str(raw.get("transition") or "epoch_or_objective_drift"),
@@ -1748,6 +2164,8 @@ def _resolve_step3_paper_candidate_selection_config(cfg: Mapping[str, Any]) -> d
         "outputs": {
             "paper_candidate_selection": str(outputs.get("paper_candidate_selection") or "paper_candidate_selection.json"),
             "candidate_eval_registry": str(outputs.get("candidate_eval_registry") or "candidate_eval_registry.jsonl"),
+            "csb_control_checkpoint": str(outputs.get("csb_control_checkpoint") or "csb_control_checkpoint.json"),
+            "route_calibration_source": str(outputs.get("route_calibration_source") or "route_calibration_source.json"),
         },
     }
 
@@ -1971,6 +2389,9 @@ def _resolve_step3_batch_candidate_role(
     active_task_profile_id: str,
     active_candidate: str = "",
 ) -> str:
+    role_override = str(train.get("candidate_role") or train.get("step3_batch_candidate_role") or "").strip()
+    if role_override:
+        return role_override
     profile_id = str(active_task_profile_id or "").strip()
     candidate = str(active_candidate or "").strip()
     if profile_id == "task2_strong_forward_g1s" and candidate == "G1S":
@@ -2081,14 +2502,77 @@ def _resolve_step3_quality_gate_config(cfg: Mapping[str, Any]) -> dict[str, Any]
 
 def _resolve_step3_grad_finite_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step3.grad_finite"), "step3.grad_finite")
+    warn_th = _rcr_float(
+        raw.get("high_grad_norm_warn_threshold", 100.0),
+        "step3.grad_finite.high_grad_norm_warn_threshold",
+        min_value=0.0,
+    )
+    skip_th = _rcr_float(
+        raw.get("high_grad_norm_skip_threshold", 10000.0),
+        "step3.grad_finite.high_grad_norm_skip_threshold",
+        min_value=0.0,
+    )
+    abort_th = _rcr_float(
+        raw.get("high_grad_norm_abort_threshold", 100000000.0),
+        "step3.grad_finite.high_grad_norm_abort_threshold",
+        min_value=0.0,
+    )
+    if not (warn_th <= skip_th <= abort_th):
+        raise OneControlConfigError(
+            "step3.grad_finite high-grad thresholds must satisfy warn <= skip <= abort."
+        )
     return {
         "enabled": _bool(raw.get("enabled", True)),
         "skip_optimizer_on_nonfinite": _bool(raw.get("skip_optimizer_on_nonfinite", True)),
         "scheduler_step_on_skipped_optimizer": _bool(raw.get("scheduler_step_on_skipped_optimizer", False)),
         "continuous_nonfinite_abort_threshold": _nonnegative_int(raw.get("continuous_nonfinite_abort_threshold", 3), "step3.grad_finite.continuous_nonfinite_abort_threshold"),
+        "high_grad_norm_warn_threshold": float(warn_th),
+        "high_grad_norm_skip_threshold": float(skip_th),
+        "high_grad_norm_abort_threshold": float(abort_th),
+        "continuous_high_grad_abort_threshold": _nonnegative_int(
+            raw.get("continuous_high_grad_abort_threshold", 3),
+            "step3.grad_finite.continuous_high_grad_abort_threshold",
+        ),
         "monitor_interval_steps": _positive_int(raw.get("monitor_interval_steps", 50), "step3.grad_finite.monitor_interval_steps"),
         "anomaly_topk": _positive_int(raw.get("anomaly_topk", 5), "step3.grad_finite.anomaly_topk"),
         "full_scan_on_anomaly": _bool(raw.get("full_scan_on_anomaly", True)),
+    }
+
+
+def _resolve_step3_numerical_stability_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    raw = _mapping(_get(cfg, "step3.numerical_stability"), "step3.numerical_stability")
+
+    def _schedule(block_name: str, default: tuple[float, float, float]) -> dict[str, Any]:
+        block = _mapping(raw.get(block_name), f"step3.numerical_stability.{block_name}")
+        sched = _mapping(block.get("schedule"), f"step3.numerical_stability.{block_name}.schedule")
+        e1_default, e2_default, e3_default = default
+        return {
+            "enabled": _bool(block.get("enabled", True)),
+            "schedule": {
+                "epoch1": _rcr_float(
+                    sched.get("epoch1", e1_default),
+                    f"step3.numerical_stability.{block_name}.schedule.epoch1",
+                    min_value=0.0,
+                ),
+                "epoch2": _rcr_float(
+                    sched.get("epoch2", e2_default),
+                    f"step3.numerical_stability.{block_name}.schedule.epoch2",
+                    min_value=0.0,
+                ),
+                "epoch3_plus": _rcr_float(
+                    sched.get("epoch3_plus", e3_default),
+                    f"step3.numerical_stability.{block_name}.schedule.epoch3_plus",
+                    min_value=0.0,
+                ),
+            },
+        }
+
+    return {
+        "enabled": _bool(raw.get("enabled", True)),
+        "auxiliary_warmup": _schedule("auxiliary_warmup", (0.5, 0.75, 1.0)),
+        "light_explainer_warmup": _schedule("light_explainer_warmup", (0.5, 0.7, 1.0)),
+        "conflict_routing_warmup": _schedule("conflict_routing_warmup", (0.3, 0.6, 1.0)),
+        "controlled_injection_warmup": _schedule("controlled_injection_warmup", (0.5, 0.75, 1.0)),
     }
 
 
@@ -2176,7 +2660,20 @@ def _resolve_step3_memory_config(cfg: Mapping[str, Any], task_profile: Mapping[s
     if profile_policy not in ("gpu_resident", "cpu_pinned_batch_gather"):
         raise OneControlConfigError("step3.memory.profile_buffer_policy must be gpu_resident or cpu_pinned_batch_gather.")
     phase_profiler = _mapping(raw.get("phase_profiler"), "step3.memory.phase_profiler")
+    allocator = _mapping(raw.get("allocator"), "step3.memory.allocator")
     allocator_candidates = _mapping(raw.get("allocator_candidates"), "step3.memory.allocator_candidates")
+    allocator_enabled = _bool(allocator.get("enabled", True))
+    expandable_segments = _bool(allocator.get("expandable_segments", False))
+    cuda_alloc_conf = str(allocator.get("cuda_alloc_conf") or "").strip()
+    if allocator_enabled and expandable_segments and not cuda_alloc_conf:
+        cuda_alloc_conf = "expandable_segments:True"
+    if allocator_enabled and expandable_segments and "expandable_segments:True" not in cuda_alloc_conf:
+        raise OneControlConfigError(
+            "step3.memory.allocator.cuda_alloc_conf must include expandable_segments:True when expandable_segments=true."
+        )
+    applies_to = [str(item).strip() for item in (allocator.get("applies_to") or ["step3"]) if str(item).strip()]
+    if allocator_enabled and "step3" not in applies_to:
+        raise OneControlConfigError("step3.memory.allocator.applies_to must include step3 when allocator is enabled.")
     return {
         "activation_checkpointing": {
             "enabled": _bool(ckpt.get("enabled", False)),
@@ -2193,6 +2690,14 @@ def _resolve_step3_memory_config(cfg: Mapping[str, Any], task_profile: Mapping[s
             "phases": list(phase_profiler.get("phases") or MEMORY_PHASES),
             "required_fields": list(MEMORY_REQUIRED_FIELDS) if "MEMORY_REQUIRED_FIELDS" in globals() else [],
             "empty_cache_policy": str(phase_profiler.get("empty_cache_policy") or "phase_boundary_only"),
+        },
+        "allocator": {
+            "enabled": allocator_enabled,
+            "expandable_segments": expandable_segments,
+            "cuda_alloc_conf": cuda_alloc_conf,
+            "applies_to": applies_to,
+            "source": str(allocator.get("source") or "step3.memory.allocator"),
+            "transport_env": "PYTORCH_CUDA_ALLOC_CONF" if allocator_enabled and cuda_alloc_conf else "",
         },
         "allocator_candidates": {
             "expandable_segments": _bool(allocator_candidates.get("expandable_segments", False)),
@@ -2442,6 +2947,7 @@ def resolve_config(
     project = cfg["project"]
     if not isinstance(project, Mapping):
         raise OneControlConfigError("project must be a mapping")
+    method_config = _resolve_method_config(cfg)
     repo_root = _REPO_ROOT
     runtime_roots = _resolve_global_runtime_roots(cfg, repo_root)
     tid = int(task_id or project.get("default_task") or 2)
@@ -2470,13 +2976,22 @@ def resolve_config(
     step3_scenario_profile: dict[str, Any] = {}
     step3_task_profile_key = ""
     step3_task_profile_raw: dict[str, Any] = {}
+    step3_experiment_profiles_config: dict[str, Any] = {}
+    step3_experiment_profile_config: dict[str, Any] = {}
+    step3_experiment_train_override: dict[str, Any] = {}
     if stage_for_train == "step3":
         scenario, direction, step3_scenario_profile = _resolve_step3_scenario_profile(cfg, task, task_id=tid)
         step3_task_profile_key, step3_task_profile_raw = _select_step3_task_profile(cfg, task, task_id=tid)
+        step3_experiment_profiles_config, step3_experiment_profile_config = _resolve_step3_experiment_profiles_config(cfg)
+        step3_experiment_train_override = dict(step3_experiment_profile_config.get("train") or {})
+        candidate_role = str(step3_experiment_profile_config.get("candidate_role") or "").strip()
+        if candidate_role and int(tid) == 2:
+            step3_experiment_train_override["candidate_role"] = candidate_role
     train = _merge_dicts(
         train_base,
         step3_scenario_profile.get("train") if stage_for_train == "step3" else None,
         step3_task_profile_raw.get("train") if stage_for_train == "step3" else None,
+        step3_experiment_train_override if stage_for_train == "step3" else None,
         _stage_task_override(stage_cfg, tid),
     )
     _apply_train_cli_overrides(cfg=cfg, cli_sources=cli_sources, stage=stage_for_train, train=train)
@@ -2505,6 +3020,7 @@ def resolve_config(
     step3_checkpoint_policy_config: dict[str, Any] = {}
     step3_quality_gate_config: dict[str, Any] = {}
     step3_grad_finite_config: dict[str, Any] = {}
+    step3_numerical_stability_config: dict[str, Any] = {}
     step3_diagnostic_eval_config: dict[str, Any] = {}
     step3_cross_rank_gather_config: dict[str, Any] = {}
     step3_memory_config: dict[str, Any] = {}
@@ -2519,15 +3035,21 @@ def resolve_config(
     step3_adapter_gating_config: dict[str, Any] = {}
     step3_paper_candidate_selection_config: dict[str, Any] = {}
     step3_checkpoint_averaging_config: dict[str, Any] = {}
+    step3_csb_odcr_config: dict[str, Any] = {}
     step3_batch_candidate_role = ""
     if stage_for_train == "step3":
+        step3_csb_odcr_config = _resolve_step3_csb_odcr_config(cfg, step3_experiment_profile_config)
         step3_optimizer_config = _resolve_step3_optimizer_config(cfg, step3_task_profile_raw)
         step3_backend_config = _resolve_step3_backend_config(train)
         step3_tokenizer_config, step3_evidence_config = _resolve_step3_tokenizer_evidence_config(
             cfg,
             _merge_dicts(step3_scenario_profile, step3_task_profile_raw),
         )
-        step3_scheduler_config = _resolve_step3_scheduler_config(cfg, step3_task_profile_raw)
+        step3_scheduler_config = _resolve_step3_scheduler_config(
+            cfg,
+            step3_task_profile_raw,
+            step3_experiment_profile_config,
+        )
         step3_eval_config = _resolve_step3_eval_config(train, stage_cfg, ddp_world_size)
         step3_worker_profiles_config = _resolve_step3_worker_profiles_config(
             cfg,
@@ -2538,6 +3060,7 @@ def resolve_config(
         step3_checkpoint_policy_config = _resolve_step3_checkpoint_policy_config(cfg)
         step3_quality_gate_config = _resolve_step3_quality_gate_config(cfg)
         step3_grad_finite_config = _resolve_step3_grad_finite_config(cfg)
+        step3_numerical_stability_config = _resolve_step3_numerical_stability_config(cfg)
         step3_diagnostic_eval_config = _resolve_step3_diagnostic_eval_config(cfg)
         step3_cross_rank_gather_config = _resolve_step3_cross_rank_gather_config(cfg, step3_task_profile_raw)
         step3_memory_config = _resolve_step3_memory_config(cfg, step3_task_profile_raw)
@@ -2706,12 +3229,55 @@ def resolve_config(
     step5_ddp_config = _resolve_step5_ddp_config(cfg) if stage_for_train == "step5" else {}
     row = _training_row(stage_for_train, train, task, eval_batch_size=eval_batch_size if command in ("step5", "eval") else None)
     train_precision, train_precision_source = _resolve_train_precision(stage_for_train, train, row)
+    if (
+        stage_for_train == "step3"
+        and isinstance(step3_experiment_train_override.get("backend"), Mapping)
+        and "train_precision" in step3_experiment_train_override.get("backend", {})
+    ):
+        train_precision_source = (
+            f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.train.backend.train_precision"
+        )
     row["train_precision"] = train_precision
     row.setdefault("tokenizer_max_length", int(step3_tokenizer_config["max_length"]))
     row.setdefault("evidence_max_length", int(step3_evidence_config["max_evidence_length"]))
     if stage_for_train == "step3":
         row.update(
             {
+                "method_name": method_config["method_name"],
+                "method_full_name": method_config["method_full_name"],
+                "method_family": method_config["method_family"],
+                "model_family": method_config["model_family"],
+                "method_schema": method_config["schema_version"],
+                "method_schema_hash": method_config["method_schema_hash"],
+                "experiment_profile": str(step3_experiment_profile_config.get("name", "")),
+                "ablation_profile": str(step3_experiment_profile_config.get("ablation_profile", "")),
+                "csb_contract_hash": str(step3_csb_odcr_config.get("contract", {}).get("contract_hash", "")),
+                "csb_packet_schema_version": str(step3_csb_odcr_config.get("contract", {}).get("schema_version", "")),
+                "csb_controlled_injection_enabled": bool(
+                    step3_csb_odcr_config.get("controlled_injection", {}).get("enabled", False)
+                ),
+                "primary_training": str(step3_csb_odcr_config.get("primary_training", "")),
+                "csb_mode": str(step3_csb_odcr_config.get("csb_mode", "")),
+                "gradient_firewall": bool(step3_csb_odcr_config.get("gradient_firewall", False)),
+                "controlled_injection_formal_train": bool(
+                    step3_csb_odcr_config.get("controlled_injection_formal_train", False)
+                ),
+                "light_explainer_step3_loss": bool(
+                    step3_csb_odcr_config.get("light_explainer_step3_loss", False)
+                ),
+                "conflict_routing_step3_primary": bool(
+                    step3_csb_odcr_config.get("conflict_routing_step3_primary", False)
+                ),
+                "csb_rating_safe_adapter_train": bool(
+                    step3_csb_odcr_config.get("csb_rating_safe_adapter_train", False)
+                ),
+                "paper_metric_gate": bool(step3_csb_odcr_config.get("paper_metric_gate", False)),
+                "csb_conflict_routing_mode": str(
+                    step3_csb_odcr_config.get("conflict_routing", {}).get("mode", "")
+                ),
+                "csb_conflict_routing_enabled": bool(
+                    step3_csb_odcr_config.get("conflict_routing", {}).get("enabled", False)
+                ),
                 "scenario": scenario,
                 "direction": direction,
                 "candidate": step3_batch_candidate_role,
@@ -2778,6 +3344,39 @@ def resolve_config(
                 "checkpoint_policy": str(step3_checkpoint_policy_config["downstream_default_scope"]),
                 "quality_gate_version": str(step3_quality_gate_config["schema_version"]),
                 "grad_finite_enabled": bool(step3_grad_finite_config["enabled"]),
+                "grad_finite_high_grad_norm_warn_threshold": float(
+                    step3_grad_finite_config["high_grad_norm_warn_threshold"]
+                ),
+                "grad_finite_high_grad_norm_skip_threshold": float(
+                    step3_grad_finite_config["high_grad_norm_skip_threshold"]
+                ),
+                "grad_finite_high_grad_norm_abort_threshold": float(
+                    step3_grad_finite_config["high_grad_norm_abort_threshold"]
+                ),
+                "grad_finite_continuous_high_grad_abort_threshold": int(
+                    step3_grad_finite_config["continuous_high_grad_abort_threshold"]
+                ),
+                "step3_numerical_stability_enabled": bool(
+                    step3_numerical_stability_config.get("enabled", False)
+                ),
+                "step3_auxiliary_warmup_epoch1": float(
+                    step3_numerical_stability_config.get("auxiliary_warmup", {}).get("schedule", {}).get("epoch1", 1.0)
+                ),
+                "step3_auxiliary_warmup_epoch2": float(
+                    step3_numerical_stability_config.get("auxiliary_warmup", {}).get("schedule", {}).get("epoch2", 1.0)
+                ),
+                "step3_auxiliary_warmup_epoch3_plus": float(
+                    step3_numerical_stability_config.get("auxiliary_warmup", {}).get("schedule", {}).get("epoch3_plus", 1.0)
+                ),
+                "step3_light_explainer_warmup_epoch2": float(
+                    step3_numerical_stability_config.get("light_explainer_warmup", {}).get("schedule", {}).get("epoch2", 1.0)
+                ),
+                "step3_conflict_routing_warmup_epoch2": float(
+                    step3_numerical_stability_config.get("conflict_routing_warmup", {}).get("schedule", {}).get("epoch2", 1.0)
+                ),
+                "step3_controlled_injection_warmup_epoch2": float(
+                    step3_numerical_stability_config.get("controlled_injection_warmup", {}).get("schedule", {}).get("epoch2", 1.0)
+                ),
                 "diagnostic_eval_protocol": "odcr_step3_diagnostic",
                 "cross_rank_structured_gather_enabled": bool(step3_cross_rank_gather_config["enabled"]),
                 "gather_mode": str(step3_cross_rank_gather_config["mode"]),
@@ -2819,9 +3418,14 @@ def resolve_config(
         "profile_isolation_hash": step3_task_profile_config.get("profile_isolation_hash", "") if stage_for_train == "step3" else "",
         "runtime_roots": runtime_roots,
     }
+    payload["method"] = method_config
     payload["step3_structured_losses"] = step3_structured_losses_config
     payload["step3_loss_semantics"] = step3_loss_semantics_config
     if stage_for_train == "step3":
+        payload["experiment_profiles"] = step3_experiment_profiles_config
+        payload["experiment_profile"] = step3_experiment_profile_config
+        payload["ablation_profile"] = step3_experiment_profile_config.get("ablation_profile", "")
+        payload["step3_csb_odcr"] = step3_csb_odcr_config
         payload["step3_ddp"] = step3_ddp_config
         payload["step3_scenario_profile"] = step3_scenario_profile
         payload["step3_task_profile"] = step3_task_profile_config
@@ -2838,6 +3442,7 @@ def resolve_config(
         payload["step3_checkpoint_policy"] = step3_checkpoint_policy_config
         payload["step3_quality_gate"] = step3_quality_gate_config
         payload["step3_grad_finite"] = step3_grad_finite_config
+        payload["step3_numerical_stability"] = step3_numerical_stability_config
         payload["step3_diagnostic_eval"] = step3_diagnostic_eval_config
         payload["step3_cross_rank_structured_gather"] = step3_cross_rank_gather_config
         payload["step3_memory"] = step3_memory_config
@@ -2887,10 +3492,19 @@ def resolve_config(
     launcher_env = {}
     if hw.get("cuda_visible_devices") not in (None, ""):
         launcher_env["CUDA_VISIBLE_DEVICES"] = str(hw["cuda_visible_devices"])
+    if stage_for_train == "step3":
+        allocator = step3_memory_config.get("allocator") if isinstance(step3_memory_config, Mapping) else {}
+        if isinstance(allocator, Mapping) and _bool(allocator.get("enabled", False)):
+            cuda_alloc_conf = str(allocator.get("cuda_alloc_conf") or "").strip()
+            if cuda_alloc_conf:
+                launcher_env["PYTORCH_CUDA_ALLOC_CONF"] = cuda_alloc_conf
 
     field_sources = {
         "config": str(Path(config_path)),
         "override_chain": "CLI --set > configs/odcr.yaml > resolver schema defaults",
+        "method_name": "project.method_name / step3.method.name",
+        "method_family": "project.method_family / step3.method.family",
+        "model_family": "step3.method.model_family",
         "task": f"tasks.{tid}",
         "task.scenario": f"tasks.{tid}.scenario",
         "task.direction": f"tasks.{tid}.direction",
@@ -2903,6 +3517,12 @@ def resolve_config(
         "step4_runtime": "step4.runtime",
         "step3_structured_losses": "step3.structured_losses",
         "step3_loss_semantics": "step3.loss_semantics",
+        "step3_experiment_profile": "step3.experiment_profile" if stage_for_train == "step3" else None,
+        "step3_experiment_profiles": "step3.experiment_profiles" if stage_for_train == "step3" else None,
+        "step3_csb_odcr": "step3.csb_odcr" if stage_for_train == "step3" else None,
+        "step3_csb_contract": "step3.csb_odcr.contract" if stage_for_train == "step3" else None,
+        "step3_csb_conflict_routing": "step3.csb_odcr.conflict_routing" if stage_for_train == "step3" else None,
+        "step3_controlled_injection": "step3.csb_odcr.controlled_injection" if stage_for_train == "step3" else None,
         "step3_ddp_find_unused_parameters": "step3.ddp.find_unused_parameters",
         "step3_ddp_static_graph": "step3.ddp.static_graph",
         "step3_ddp_graph_safety_preflight": "step3.ddp.graph_safety_preflight",
@@ -2926,7 +3546,14 @@ def resolve_config(
             if stage_for_train == "step3"
             else None
         ),
-        "step3_scheduler": "step3.scheduler" if stage_for_train == "step3" else None,
+        "step3_scheduler": (
+            (
+                f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.scheduler over "
+                f"step3.task_profiles.{step3_task_profile_key}.scheduler over step3.scheduler"
+            )
+            if stage_for_train == "step3"
+            else None
+        ),
         "step3_scheduler_damping": "step3.scheduler.validation_aware_lr_damping" if stage_for_train == "step3" else None,
         "step3_max_grad_norm": "step3.train.max_grad_norm" if stage_for_train == "step3" else None,
         "step3_batch_semantics": "step3.train global_batch_size/per_gpu_batch_size with hardware.ddp_world_size" if stage_for_train == "step3" else None,
@@ -2947,9 +3574,11 @@ def resolve_config(
         "step3_checkpoint_policy": "step3.checkpoint_policy" if stage_for_train == "step3" else None,
         "step3_quality_gate": "step3.quality_gate" if stage_for_train == "step3" else None,
         "step3_grad_finite": "step3.grad_finite" if stage_for_train == "step3" else None,
+        "step3_numerical_stability": "step3.numerical_stability" if stage_for_train == "step3" else None,
         "step3_diagnostic_eval": "step3.diagnostic_eval" if stage_for_train == "step3" else None,
         "step3_cross_rank_structured_gather": "step3.cross_rank_structured_gather" if stage_for_train == "step3" else None,
         "step3_memory": "step3.memory" if stage_for_train == "step3" else None,
+        "step3_memory_allocator": "step3.memory.allocator" if stage_for_train == "step3" else None,
         "step3_timing": "step3.timing" if stage_for_train == "step3" else None,
         "step3_performance_candidates": "step3.performance_candidates" if stage_for_train == "step3" else None,
         "step3_cache_policy": "step3.cache" if stage_for_train == "step3" else None,
@@ -2984,6 +3613,11 @@ def resolve_config(
         "runtime_env.TOKENIZERS_PARALLELISM": "hardware.tokenizers_parallelism -> TOKENIZERS_PARALLELISM transport",
         "runtime_env.thread_env_requested": "hardware profile thread controls",
         "runtime_env.thread_env_effective": "resolver-owned thread controls",
+        "runtime_env.PYTORCH_CUDA_ALLOC_CONF": (
+            "step3.memory.allocator.cuda_alloc_conf -> PYTORCH_CUDA_ALLOC_CONF transport"
+            if stage_for_train == "step3" and "PYTORCH_CUDA_ALLOC_CONF" in launcher_env
+            else None
+        ),
         "hardware.dataloader_num_workers_train": f"hardware.profiles.{hw_name}.dataloader_num_workers_train",
         "hardware.dataloader_num_workers_valid": f"hardware.profiles.{hw_name}.dataloader_num_workers_valid",
         "hardware.dataloader_num_workers_test": f"hardware.profiles.{hw_name}.dataloader_num_workers_test",
@@ -2994,6 +3628,28 @@ def resolve_config(
         "hardware.persistent_workers": f"hardware.profiles.{hw_name}.persistent_workers",
         "hardware.non_blocking_h2d": f"hardware.profiles.{hw_name}.non_blocking_h2d",
         "train_precision": train_precision_source,
+        "train.global_batch_size": (
+            f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.train.batch_size"
+            if stage_for_train == "step3" and step3_experiment_train_override.get("batch_size") is not None
+            else f"{stage_for_train}.train.batch_size"
+        ),
+        "train.per_gpu_batch_size": (
+            f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.train.per_gpu_batch_size"
+            if stage_for_train == "step3" and step3_experiment_train_override.get("per_gpu_batch_size") is not None
+            else f"{stage_for_train}.train.per_gpu_batch_size"
+        ),
+        "train.warmup_ratio": (
+            f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.scheduler.warmup_ratio"
+            if stage_for_train == "step3"
+            and isinstance(step3_experiment_profile_config.get("scheduler"), Mapping)
+            and step3_experiment_profile_config.get("scheduler", {}).get("warmup_ratio") is not None
+            else "step3.scheduler.warmup_ratio"
+        ),
+        "step3_train_profile_override": (
+            f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.train"
+            if stage_for_train == "step3" and step3_experiment_train_override
+            else None
+        ),
         "runtime_precision_mode": "ResolvedConfig.train_precision -> ODCR_RUNTIME_PRECISION_MODE transport",
         "runs_dir": "project.run_root",
         "cache_dir": "project.cache_dir",
@@ -3027,6 +3683,7 @@ def resolve_config(
         "train_keep",
         "sample_weight_hint",
         "export.required_fields",
+        "csb_contract",
     ):
         field_sources[f"step4_rcr.{key}"] = f"step4.rcr.{key}"
     for key in (
@@ -3040,6 +3697,7 @@ def resolve_config(
         field_sources[f"step4_runtime.{key}"] = f"step4.runtime.{key}"
     consumed = {
         "single_config": str(Path(config_path)),
+        "method": "project.method_name / step3.method",
         "hardware_profile": hw_name,
         "eval_profile": eval_profile_name or None,
         "decode_profile": decode_id or None,
@@ -3050,6 +3708,9 @@ def resolve_config(
         "active_stage_status": active_stage_status_payload if active_stage_status_payload else None,
         "step3_structured_losses": "step3.structured_losses",
         "step3_loss_semantics": "step3.loss_semantics",
+        "step3_experiment_profile": "step3.experiment_profile" if stage_for_train == "step3" else None,
+        "step3_experiment_profiles": "step3.experiment_profiles" if stage_for_train == "step3" else None,
+        "step3_csb_odcr": "step3.csb_odcr" if stage_for_train == "step3" else None,
         "step3_ddp": "step3.ddp",
         "step3_scenario_profile": f"step3.scenario_profiles.{scenario}" if stage_for_train == "step3" else None,
         "step3_task_profile": f"step3.task_profiles.{step3_task_profile_key}" if stage_for_train == "step3" else None,
@@ -3057,7 +3718,14 @@ def resolve_config(
         "step3_precision": "step3.train.backend" if stage_for_train == "step3" else None,
         "step3_tokenizer": "step3.tokenizer + scenario profile tokenizer + isolated task profile tokenizer" if stage_for_train == "step3" else None,
         "step3_evidence": "step3.evidence + scenario profile evidence + isolated task profile evidence" if stage_for_train == "step3" else None,
-        "step3_scheduler": "step3.scheduler" if stage_for_train == "step3" else None,
+        "step3_scheduler": (
+            (
+                f"step3.experiment_profiles.{step3_experiment_profile_config.get('name')}.scheduler over "
+                f"step3.task_profiles.{step3_task_profile_key}.scheduler over step3.scheduler"
+            )
+            if stage_for_train == "step3"
+            else None
+        ),
         "step3_eval": "step3.eval" if stage_for_train == "step3" else None,
         "step3_backup_profiles": "step3.backup_profiles" if stage_for_train == "step3" else None,
         "step3_exploration_profiles": "step3.exploration_profiles" if stage_for_train == "step3" else None,
@@ -3066,9 +3734,11 @@ def resolve_config(
         "step3_checkpoint_policy": "step3.checkpoint_policy" if stage_for_train == "step3" else None,
         "step3_quality_gate": "step3.quality_gate" if stage_for_train == "step3" else None,
         "step3_grad_finite": "step3.grad_finite" if stage_for_train == "step3" else None,
+        "step3_numerical_stability": "step3.numerical_stability" if stage_for_train == "step3" else None,
         "step3_diagnostic_eval": "step3.diagnostic_eval" if stage_for_train == "step3" else None,
         "step3_cross_rank_structured_gather": "step3.cross_rank_structured_gather" if stage_for_train == "step3" else None,
         "step3_memory": "step3.memory" if stage_for_train == "step3" else None,
+        "step3_memory_allocator": "step3.memory.allocator" if stage_for_train == "step3" else None,
         "step3_timing": "step3.timing" if stage_for_train == "step3" else None,
         "step3_performance_candidates": "step3.performance_candidates" if stage_for_train == "step3" else None,
         "step3_cache_policy": "step3.cache" if stage_for_train == "step3" else None,
@@ -3111,6 +3781,7 @@ def resolve_config(
     sources = [SourceRecord(k, v, field_sources.get(k, "configs/odcr.yaml")) for k, v in sorted(field_sources.items())]
 
     resolved_snapshot = {
+        "method": method_config,
         "task": {
             "id": tid,
             "source": auxiliary,
@@ -3138,6 +3809,9 @@ def resolve_config(
         },
         "train": {
             "stage": stage_for_train,
+            "method_name": method_config["method_name"],
+            "method_family": method_config["method_family"],
+            "model_family": method_config["model_family"],
             "global_batch_size": batch_size,
             "batch_size": batch_size,
             "per_gpu_batch_size": per_gpu,
@@ -3151,6 +3825,9 @@ def resolve_config(
                     "step3_batch_formula": "global_batch_size = per_gpu_batch_size * ddp_world_size",
                     "step3_batch_candidate_role": step3_batch_candidate_role,
                     "candidate": step3_batch_candidate_role,
+                    "experiment_profile": str(step3_experiment_profile_config.get("name", "")),
+                    "ablation_profile": str(step3_experiment_profile_config.get("ablation_profile", "")),
+                    "csb_contract_hash": str(step3_csb_odcr_config.get("contract", {}).get("contract_hash", "")),
                 }
                 if stage_for_train == "step3"
                 else {}
@@ -3213,6 +3890,9 @@ def resolve_config(
         "step4_rcr": step4_rcr_config if command == "step4" else None,
         "step4_runtime": step4_runtime_config if command == "step4" else None,
         "step3_structured_losses": step3_structured_losses_config if stage_for_train == "step3" else None,
+        "experiment_profiles": step3_experiment_profiles_config if stage_for_train == "step3" else None,
+        "experiment_profile": step3_experiment_profile_config if stage_for_train == "step3" else None,
+        "step3_csb_odcr": step3_csb_odcr_config if stage_for_train == "step3" else None,
         "step3_loss_semantics": step3_loss_semantics_config if stage_for_train == "step3" else None,
         "step3_ddp": step3_ddp_config if stage_for_train == "step3" else None,
         "step3_scenario_profile": step3_scenario_profile if stage_for_train == "step3" else None,
@@ -3230,6 +3910,7 @@ def resolve_config(
         "step3_checkpoint_policy": step3_checkpoint_policy_config if stage_for_train == "step3" else None,
         "step3_quality_gate": step3_quality_gate_config if stage_for_train == "step3" else None,
         "step3_grad_finite": step3_grad_finite_config if stage_for_train == "step3" else None,
+        "step3_numerical_stability": step3_numerical_stability_config if stage_for_train == "step3" else None,
         "step3_diagnostic_eval": step3_diagnostic_eval_config if stage_for_train == "step3" else None,
         "step3_cross_rank_structured_gather": step3_cross_rank_gather_config if stage_for_train == "step3" else None,
         "step3_memory": step3_memory_config if stage_for_train == "step3" else None,
@@ -3287,6 +3968,9 @@ def resolve_config(
                 "omp_num_threads": f"hardware.profiles.{hw_name}.omp_num_threads",
                 "mkl_num_threads": f"hardware.profiles.{hw_name}.mkl_num_threads",
                 "tokenizers_parallelism": f"hardware.profiles.{hw_name}.tokenizers_parallelism",
+                "PYTORCH_CUDA_ALLOC_CONF": "step3.memory.allocator.cuda_alloc_conf"
+                if stage_for_train == "step3" and "PYTORCH_CUDA_ALLOC_CONF" in launcher_env
+                else None,
             },
         },
         "roots": {
@@ -3420,15 +4104,26 @@ def resolve_config(
         checkpoint_policy_config_json=json_dumps(step3_checkpoint_policy_config),
         quality_gate_config_json=json_dumps(step3_quality_gate_config),
         grad_finite_config_json=json_dumps(step3_grad_finite_config),
+        numerical_stability_config_json=json_dumps(step3_numerical_stability_config),
         diagnostic_eval_config_json=json_dumps(step3_diagnostic_eval_config),
         cross_rank_structured_gather_config_json=json_dumps(step3_cross_rank_gather_config),
         memory_config_json=json_dumps(step3_memory_config),
+        allocator_config_json=json_dumps(
+            step3_memory_config.get("allocator", {}) if stage_for_train == "step3" else {}
+        ),
         timing_config_json=json_dumps(step3_timing_config),
         performance_candidates_config_json=json_dumps(step3_performance_candidates_config),
         cache_policy_config_json=json_dumps(step3_cache_policy_config),
         objective_drift_config_json=json_dumps(step3_objective_drift_config),
         recovery_config_json=json_dumps(step3_recovery_config),
         phase_loss_schedule_config_json=json_dumps(step3_phase_loss_schedule_config),
+        method_config_json=json_dumps(method_config),
+        experiment_profile_config_json=json_dumps(step3_experiment_profile_config),
+        experiment_profiles_config_json=json_dumps(step3_experiment_profiles_config),
+        csb_odcr_config_json=json_dumps(step3_csb_odcr_config),
+        csb_contract_config_json=json_dumps(step3_csb_odcr_config.get("contract", {})),
+        csb_conflict_routing_config_json=json_dumps(step3_csb_odcr_config.get("conflict_routing", {})),
+        controlled_injection_config_json=json_dumps(step3_csb_odcr_config.get("controlled_injection", {})),
         conflict_aware_config_json=json_dumps(step3_conflict_aware_config),
         loss_gradient_conflict_probe_config_json=json_dumps(step3_loss_gradient_conflict_probe_config),
         adapter_gating_config_json=json_dumps(step3_adapter_gating_config),

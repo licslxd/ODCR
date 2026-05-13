@@ -275,6 +275,7 @@ def _minimal_cfg_for_mainline() -> FinalTrainingConfig:
         checkpoint_policy_config_json="{}",
         quality_gate_config_json="{}",
         grad_finite_config_json="{}",
+        numerical_stability_config_json="{}",
         diagnostic_eval_config_json="{}",
         cross_rank_structured_gather_config_json="{}",
         memory_config_json="{}",

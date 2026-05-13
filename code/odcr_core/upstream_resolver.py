@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from odcr_core import path_layout, run_naming
+from odcr_core.csb_contract import require_csb_contract_for_stage
 from odcr_core.stage_status import (
     BAD_FINAL_STATUSES,
     STAGE_STATUS_SCHEMA_VERSION,
@@ -253,7 +254,7 @@ def _artifact_missing_reasons(repo_root: Path, status: Mapping[str, Any], *, con
         if isinstance(item, Mapping) and item.get("path") and item.get("exists") is not True:
             reasons.append(f"{key}_missing")
     if consumer_stage == "step4":
-        for key in ("eval_handoff", "selected_checkpoint"):
+        for key in ("readiness_audit", "selected_checkpoint"):
             item = artifacts.get(key)
             if isinstance(item, Mapping) and item.get("exists") is not True:
                 reasons.append(f"{key}_missing")
@@ -314,6 +315,14 @@ def validate_upstream_eligibility(
             f"run{resolution.run_id} is not eligible for {label} {resolved_mode} upstream; "
             f"reason = {' / '.join(missing)}; current active run = {current_active}"
         )
+    if resolution.producer_stage == "step3" and consumer == "step4":
+        try:
+            require_csb_contract_for_stage(status, consumer_stage="step4")
+        except ValueError as exc:
+            raise UpstreamResolutionError(
+                f"run{resolution.run_id} is not eligible for {label} {resolved_mode} upstream; "
+                f"reason = csb_contract_gate_failed: {exc}; current active run = {current_active}"
+            ) from exc
     latest_payload: Mapping[str, Any] | None = None
     if resolution.latest_path.is_file():
         latest_payload = _load_json(resolution.latest_path, context=f"{resolution.producer_stage} latest.json")

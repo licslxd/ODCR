@@ -23,7 +23,7 @@ class TestStep3G1BackupNotDefault(unittest.TestCase):
             run_id="auto",
             mode="full",
         )
-        self.assertEqual(snapshot["train"]["candidate"], "G1S")
+        self.assertEqual(snapshot["train"]["candidate"], "G1S-sidecar-stable")
         g1 = snapshot["step3_backup_profiles"]["task2_g1_backup"]
         self.assertEqual(g1["candidate"], "G1")
         self.assertTrue(g1["backup_only"])

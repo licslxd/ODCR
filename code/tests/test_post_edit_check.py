@@ -14,7 +14,7 @@ CODE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = CODE_DIR.parent
 sys.path.insert(0, str(CODE_DIR))
 
-from tools.odcr_post_edit_check import SCOPES, build_plan, suggest_scope_for_paths  # noqa: E402
+from tools.odcr_post_edit_check import CheckCommand, SCOPES, build_plan, post_edit_summary_payload, run_commands, suggest_scope_for_paths  # noqa: E402
 
 
 def _hook_module():
@@ -110,6 +110,18 @@ class TestPostEditCheck(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("invalid choice", proc.stdout)
 
+    def test_timeout_fail_closes(self) -> None:
+        command = CheckCommand(
+            label="timeout probe",
+            argv=(sys.executable, "-c", "import time; time.sleep(5)"),
+            display_argv=("python", "-c", "sleep"),
+        )
+        results = run_commands([command], repo_root=REPO_ROOT, max_seconds=1)
+        self.assertEqual(results[0].status, "FAIL")
+        self.assertEqual(results[0].classification, "timeout")
+        self.assertTrue(results[0].blocks_formal)
+        self.assertEqual(post_edit_summary_payload(results)["result"], "FAIL")
+
     def test_stage_scopes_do_not_include_real_training_commands(self) -> None:
         for scope in ("step3", "step4", "step5"):
             with self.subTest(scope=scope):
@@ -140,7 +152,7 @@ class TestPostEditCheck(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, joined)
         self.assertFalse([command for command in commands if _is_real_stage_run(command)])
-        self.assertIn("./odcr step4 --task 2 --dry-run", commands)
+        self.assertIn("python -c 'step4 CSB resolver dry-run'", commands)
         self.assertIn("step5 resolver dry-run", "\n".join(commands))
 
     def test_governance_fast_dry_run_is_minimal(self) -> None:

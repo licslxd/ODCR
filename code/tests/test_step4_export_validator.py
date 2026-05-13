@@ -19,6 +19,7 @@ from odcr_core.index_contract import (
     STEP4_RCR_REQUIRED_COLUMNS,
     build_step4_export_lineage,
 )
+from odcr_core.csb_contract import default_csb_contract_payload
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST, validate_step4_export_ready
 
 
@@ -54,8 +55,9 @@ def _write_ready_fixture(run: Path) -> None:
             "step3_checkpoint_path": "runs/step3/task2/2/model/best.pth",
             "step3_checkpoint_hash": "h",
             "step3_stage_status_hash": "s",
-            "step3_eval_handoff_hash": "e",
+            "step3_readiness_audit_hash": "e",
         },
+        csb_contract=default_csb_contract_payload(),
     )
     (run / INDEX_CONTRACT_FILENAME).write_text(
         json.dumps(

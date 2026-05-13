@@ -21,20 +21,14 @@ from typing import Iterable, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+CODE_DIR = REPO_ROOT / "code"
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+from odcr_core.aux.evidence.ai_analysis_writer import atomic_write_text, ensure_ai_analysis_tree
+from odcr_core.aux.governance.rule_registry import POST_EDIT_SCOPES, suggest_scope_for_paths as registry_suggest_scope_for_paths
+
 DEFAULT_SCOPE = "governance"
-SCOPES = (
-    "governance-fast",
-    "docs",
-    "governance",
-    "config",
-    "logging",
-    "preprocess",
-    "step3",
-    "step4",
-    "step5",
-    "eval",
-    "all",
-)
+SCOPES = POST_EDIT_SCOPES
 DEFAULT_MANUAL_MAX_SECONDS = 900
 REAL_STAGE_SUBCOMMANDS = {"step3", "step4", "step5"}
 FORBIDDEN_REAL_SUBCOMMANDS = {"preprocess", "eval", "rerank"}
@@ -241,6 +235,7 @@ def _step3_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "code/tests/test_stage2_runtime_first_flow.py",
                 "code/tests/test_stage2_candidate_selection_uses_runtime_evidence.py",
                 "code/tests/test_step3_startup_validation_entry.py",
+                "code/tests/test_csb_odcr_contract.py",
                 "code/tests/test_step3_structured_stability.py",
                 "code/tests/test_step3_pre_ddp_tokenizer_cache_startup.py",
                 "code/tests/test_step3_tokenizer_cache_atomic_manifest.py",
@@ -263,7 +258,7 @@ def _step3_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "code/tests/test_step3_num_proc_distinct_from_dataloader_workers.py",
                 "code/tests/test_step3_num_proc_source_table.py",
                 "code/tests/test_step3_cache_check_selected_num_proc.py",
-                "code/tests/test_step3_failed_run2_latest_rejection.py",
+                "code/tests/test_step3_failed_latest_pointer_rejection.py",
                 "code/tests/test_step3_eval_two_phase_no_barrier_after_cpu_metric.py",
                 "code/tests/test_step3_eval_prediction_shards_have_sample_id.py",
                 "code/tests/test_step3_eval_cpu_metric_after_destroy_pg.py",
@@ -273,7 +268,7 @@ def _step3_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "code/tests/test_step3_eval_diagnostic_48_not_paper_comparable.py",
                 "code/tests/test_step3_eval_batch_invariance.py",
                 "code/tests/test_step3_eval_batch_scaling_no_metric_change.py",
-                "code/tests/test_step3_eval_run2_checkpoint_eval_only.py",
+                "code/tests/test_step3_eval_checkpoint_protocols.py",
                 "code/tests/test_step3_eval_handoff.py",
                 "code/tests/test_scheduler_pure_warmup_cosine_no_damping.py",
                 "code/tests/test_scheduler_explicit_damping_semantics.py",
@@ -304,13 +299,42 @@ def _step3_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
 
 def _step4_commands(repo_root: Path, *, python_executable: str) -> list[CheckCommand]:
     return [
-        _odcr_command("show step4", "show", "--stage", "step4", "--task", "2"),
-        _odcr_command("step4 dry-run", "step4", "--task", "2", "--dry-run"),
+        CheckCommand(
+            label="step4 CSB resolver dry-run",
+            argv=(
+                python_executable,
+                "-c",
+                (
+                    "import json, sys, tempfile; "
+                    "from pathlib import Path; "
+                    "sys.path.insert(0, 'code'); "
+                    "from odcr_core.config_resolver import resolve_config; "
+                    "import odcr_core.config_resolver as cr; "
+                    "from odcr_core.stage_truth_antiforgery import write_step3_fixture; "
+                    "tmp=tempfile.TemporaryDirectory(); repo=Path(tmp.name); "
+                    "write_step3_fixture(repo, task=2, run_id='1', active=True, eligible=True); "
+                    "old=cr._REPO_ROOT\n"
+                    "cr._REPO_ROOT=repo\n"
+                    "try:\n"
+                    "    cfg, sources, snapshot = resolve_config(config_path=Path.cwd()/'configs'/'odcr.yaml', "
+                    "command='step4', task_id=2, set_overrides=[], dry_run=True, run_id='auto', mode='full')\n"
+                    "    upstream=json.loads(cfg.upstream_resolution_json)\n"
+                    "    assert upstream['stage_status']['csb_contract_hash']\n"
+                    "    assert upstream['stage_status']['method_name']=='CSB-ODCR'\n"
+                    "finally:\n"
+                    "    cr._REPO_ROOT=old\n"
+                    "    tmp.cleanup()\n"
+                ),
+            ),
+            display_argv=("python", "-c", "step4 CSB resolver dry-run"),
+            group="dry-run",
+        ),
         *_existing_tests(
             repo_root,
             (
                 "code/tests/test_step4_rcr_routing.py",
                 "code/tests/test_index_contract.py",
+                "code/tests/test_csb_odcr_contract.py",
             ),
             python_executable=python_executable,
         ),
@@ -407,10 +431,7 @@ def plan_safety_violations(commands: Iterable[CheckCommand]) -> list[str]:
 def suggest_scope_for_paths(paths: Iterable[str]) -> str | None:
     """Return a lightweight scope hint for path-triggered post-edit checks."""
 
-    normalized = [str(path).replace("\\", "/") for path in paths]
-    if any(any(hint in path for hint in LOGGING_SCOPE_PATH_HINTS) for path in normalized):
-        return "logging"
-    return None
+    return registry_suggest_scope_for_paths(paths)
 
 
 def command_group(command: CheckCommand) -> str:
@@ -452,7 +473,7 @@ def classification_blocks_gpu_probe(classification: str) -> bool:
 
 
 def classification_blocks_formal(classification: str) -> bool:
-    return classification in {"semantic_fail", "test_fail", "P0_semantic_blocker"}
+    return classification in {"semantic_fail", "test_fail", "P0_semantic_blocker", "timeout"}
 
 
 def _is_single_test_command(command: CheckCommand) -> bool:
@@ -611,14 +632,31 @@ def run_commands(commands: Sequence[CheckCommand], *, repo_root: Path, max_secon
             elapsed = time.monotonic() - started
             rss_after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             classification, killed_signal = classify_exit(None, timed_out=True)
-            print(f"[{idx}/{len(commands)}] PASS {command.label} (timeout diagnostic after {max_seconds}s)", flush=True)
+            timeout_detail = f"timeout after {max_seconds}s; classification={classification}"
+            try:
+                raw_dir = ensure_ai_analysis_tree(repo_root / "AI_analysis")["raw_logs"] / "codex_hooks"
+                atomic_write_text(
+                    raw_dir / "post_edit_timeout.log",
+                    "\n".join(
+                        [
+                            "ODCR post-edit timeout",
+                            f"command: {command.display()}",
+                            f"elapsed_seconds: {elapsed:.3f}",
+                            timeout_detail,
+                        ]
+                    )
+                    + "\n",
+                )
+            except Exception:
+                pass
+            print(f"[{idx}/{len(commands)}] FAIL {command.label} (timeout after {max_seconds}s)", flush=True)
             results.append(
                 CommandResult(
                     command,
-                    "PASS",
+                    "FAIL",
                     None,
                     elapsed,
-                    f"timeout after {max_seconds}s; classification={classification}",
+                    timeout_detail,
                     classification=classification,
                     blocks_gpu_probe=classification_blocks_gpu_probe(classification),
                     blocks_formal=classification_blocks_formal(classification),

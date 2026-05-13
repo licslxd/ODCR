@@ -24,7 +24,7 @@ class TestStep3Task2FormalDefaultIsG1S(unittest.TestCase):
             mode="full",
         )
         self.assertEqual(cfg.task_profile_id, "task2_strong_forward_g1s")
-        self.assertEqual(snapshot["train"]["candidate"], "G1S")
+        self.assertEqual(snapshot["train"]["candidate"], "G1S-sidecar-stable")
         self.assertEqual(snapshot["step3_task_profile"]["candidate"], "G1S")
         self.assertTrue(snapshot["step3_task_profile"]["formal_allowed"])
         self.assertFalse(snapshot["step3_task_profile"]["probe_only"])

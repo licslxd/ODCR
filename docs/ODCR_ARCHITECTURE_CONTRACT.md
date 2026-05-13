@@ -337,10 +337,10 @@ not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions; and must not manage GPU allocation.
 GPU use is allowed by default for repo-local validation, probe, and bounded
 runtime after fast sanity and current-pane validation. The controlled tmux GPU
-bridge at `python code/tools/odcr_tmux_gpu_bridge.py` can target only a
-user-created, already-entered, uniquely validated GPU pane and can send one
-bridge-generated command file. It is not arbitrary send-keys and is no longer
-limited by a GPU whitelist hard blocker. Its validation outputs stay under
+bridge at `./odcr runtime bridge ...` can target only a user-created,
+already-entered, uniquely validated GPU pane and can send one bridge-generated
+command file through the stage-dispatch allowlist. It is not arbitrary
+send-keys. Its validation outputs stay under
 `AI_analysis/06_probe_evidence` or `runs/step3_validation` by default, with a
 mandatory formal namespace guard. post-edit full is not a GPU prerequisite, and
 runtime evidence takes priority over static full-suite instability.

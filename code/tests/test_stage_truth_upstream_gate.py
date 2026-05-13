@@ -20,6 +20,7 @@ from odcr_core.index_contract import (  # noqa: E402
     STEP4_RCR_REQUIRED_COLUMNS,
     build_step4_export_lineage,
 )
+from odcr_core.csb_contract import default_csb_contract_payload  # noqa: E402
 from odcr_core.stage_promotion import promote_upstream  # noqa: E402
 from odcr_core.stage_status import build_and_write_stage_status, mark_superseded, read_stage_status  # noqa: E402
 from odcr_core.stage_truth_antiforgery import write_step3_fixture  # noqa: E402
@@ -83,8 +84,9 @@ def _write_step4_run(repo: Path, *, task: int, run_id: str, from_step3: str, act
             "step3_checkpoint_path": f"runs/step3/task{task}/{from_step3}/model/best_observed.pth",
             "step3_checkpoint_hash": "fixture_checkpoint_hash",
             "step3_stage_status_hash": "fixture_stage_status_hash",
-            "step3_eval_handoff_hash": "fixture_eval_handoff_hash",
+            "step3_readiness_audit_hash": "fixture_readiness_audit_hash",
         },
+        csb_contract=default_csb_contract_payload(),
     )
     _write_json(
         run / INDEX_CONTRACT_FILENAME,
@@ -140,9 +142,9 @@ class StageTruthUpstreamGateTest(unittest.TestCase):
             res = resolve_upstream(repo_root=repo, stage="step3", task=2, consumer_stage="step4")
             self.assertEqual(res.run_id, "2")
             self.assertTrue(res.stage_status["downstream_ready"])
-            self.assertEqual(res.stage_status["final_status"], "completed_with_eval_handoff")
+            self.assertEqual(res.stage_status["final_status"], "step4_ready")
             self.assertTrue(res.stage_status["do_not_use_quality_audit_as_final_truth"])
-            self.assertTrue((repo / "runs" / "step3" / "task2" / "2" / "meta" / "quality_audit.json.superseded_by.json").is_file())
+            self.assertTrue(res.stage_status["readiness_audit"].endswith("readiness_audit.json"))
 
     def test_explicit_failed_old_run_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -24,6 +24,7 @@ from odcr_core.index_contract import (  # noqa: E402
     STEP4_RCR_REQUIRED_COLUMNS,
     build_step4_export_lineage,
 )
+from odcr_core.csb_contract import default_csb_contract_payload  # noqa: E402
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST  # noqa: E402
 from odcr_core.step5_innovation import (  # noqa: E402
     STEP5_EVIDENCE_FEATURE_DIM,
@@ -76,8 +77,9 @@ def _write_step4_upstream_fixture(repo: Path, *, task_id: int = 4, run_id: str =
             "step3_checkpoint_path": f"runs/step3/task{task_id}/2/model/best_observed.pth",
             "step3_checkpoint_hash": "fixture_checkpoint_hash",
             "step3_stage_status_hash": "fixture_stage_status_hash",
-            "step3_eval_handoff_hash": "fixture_eval_handoff_hash",
+            "step3_readiness_audit_hash": "fixture_readiness_audit_hash",
         },
+        csb_contract=default_csb_contract_payload(),
     )
     _write_json(
         run / INDEX_CONTRACT_FILENAME,

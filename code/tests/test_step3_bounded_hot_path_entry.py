@@ -27,7 +27,7 @@ class Step3BoundedHotPathEntryTest(unittest.TestCase):
             "build_config_and_data_ddp",
             "Step3CUDAPrefetcher",
             "compose_step3_loss_from_forward_output",
-            "loss.backward()",
+            "backward_step3_primary_and_sidecar_losses",
             "optimizer.step()",
             "step3_sync_loss_bundle_finite_status",
         ):
@@ -57,4 +57,3 @@ class Step3BoundedHotPathEntryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

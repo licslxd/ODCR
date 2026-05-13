@@ -38,7 +38,7 @@ def run_step3_cli() -> None:
         sys.argv,
         executor_label=_STEP3_RUNNER,
         torchrun_hint=(
-            "推荐: python code/odcr.py step3 --task N --preset step3 …\n"
+            "推荐: python code/odcr.py step3 --task N …\n"
             "须自行 torchrun 时见 docs/ODCR_Scripts_and_Runtime_Guide.md 附录。\n"
         ),
     )
@@ -72,7 +72,7 @@ def run_step3_cli() -> None:
         ddp_utils.exit_if_not_torchrun(
             executor_label=_STEP3_RUNNER,
             examples=(
-                "推荐: python code/odcr.py step3 --task N --preset step3 …\n"
+                "推荐: python code/odcr.py step3 --task N …\n"
                 "附录: 高级 torchrun 排障见 docs/ODCR_Scripts_and_Runtime_Guide.md。\n"
             ),
         )
