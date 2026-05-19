@@ -46,8 +46,8 @@ not write:
 
 Validation/probe output defaults to:
 
-- `AI_analysis/06_probe_evidence/...`
-- `runs/step3_validation/...`
+- `AI_analysis/01_raw_logs/...`
+- `AI_analysis/05_final_reports/...`
 
 Formal full train still requires explicit user confirmation in a future
 request.
@@ -59,3 +59,46 @@ Runtime evidence takes priority over static full-suite instability. Candidate
 recommendations require `runtime_verified=true`, `evidence_complete=true`,
 complete timing/memory/prefetch/grad/DDP evidence, finite gradients, closed
 timing, safe memory, and no formal namespace pollution.
+
+Safe memory means real memory truth, not PyTorch reserved-pool headroom.
+Candidate admission may reject OOM, allocator failure, failed forward/backward,
+non-finite loss, DDP graph failure, rank imbalance, configured allocated-memory
+ratio, long-window allocated-memory creep, nvidia-smi process-memory
+instability, formal namespace pollution, resolver bypass, or missing required
+fields. `max_memory_reserved_gb` and reserved-minus-allocated are retained only
+as allocator/cache diagnostics and must not be hard gates, ranking blockers, or
+larger-batch skip rules.
+## Current Runtime Bridge Contract
+
+The first execution protocol is now registry-driven:
+
+```bash
+./odcr runtime bridge discover
+./odcr runtime bridge validate-only
+./odcr runtime bridge marker-probe
+./odcr runtime bridge cuda-probe
+```
+
+The user must already be inside the GPU allocation in the same tmux pane. Codex
+must not run `odcr-enter-gpu`, `srun`, `sbatch`, `scancel`, arbitrary shell, or
+generic repo execution modes. GPU evidence is current-pane evidence only and is
+written to `AI_analysis/01_raw_logs/aux_runtime_gpu_handshake.log` and
+`AI_analysis/05_final_reports/aux_runtime_gpu_validation_report.md`.
+
+The user workflow remains exactly two commands:
+
+```bash
+tmux -L odcr_gpu new-session -A -s odcr
+odcr-enter-gpu <JOBID>
+```
+
+`odcr-enter-gpu` automatically writes the bridge handoff. It captures tmux
+metadata on the admin side before `srun`, then captures CUDA metadata on the GPU
+side after `srun`; the GPU-side writer must not rely on `tmux display-message`
+or any tmux metadata probe. On success it atomically writes
+`AI_analysis/runtime/current_gpu_pane.json` with schema
+`odcr_current_gpu_pane_handoff/2`. On handoff failure it deletes stale active
+handoff state, writes a failure report when possible, prints a warning, and
+continues into the GPU shell. The bridge must read only a fresh
+`current_gpu_pane.json`, then rerun validate/cuda-probe; the old
+`AI_analysis/runtime/gpu_pane.json` is historical hint material only.

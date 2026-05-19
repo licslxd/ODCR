@@ -24,6 +24,7 @@ from odcr_core.logging_meta import (
 )
 from odcr_core.manifests import build_run_manifest, write_run_manifest_json, write_training_runtime_config_artifact
 from odcr_core import path_layout
+from odcr_core.step5_rating_handoff import finalize_step5A_rating_eval_handoff
 
 ResolvedConfig = Any
 
@@ -116,7 +117,14 @@ def _odcr_layout_env(cfg: ResolvedConfig) -> dict[str, str]:
     if cfg.eval_run_dir:
         out["ODCR_EVAL_RUN_DIR"] = str(Path(cfg.eval_run_dir).resolve())
     if cfg.command == "step4" and cfg.step3_checkpoint_dir:
+        out["ODCR_STEP4_RUN_ID"] = str(cfg.step4_run or "")
         out["ODCR_STEP3_RUN_DIR"] = str(Path(cfg.step3_checkpoint_dir).resolve())
+        from odcr_core.step4_runtime import step3_selected_checkpoint_binding
+
+        binding = step3_selected_checkpoint_binding(cfg)
+        out["ODCR_STEP3_SELECTED_CHECKPOINT"] = binding["selected_checkpoint_path"]
+        out["ODCR_STEP3_SELECTED_CHECKPOINT_HASH"] = binding["selected_checkpoint_hash"]
+        out["ODCR_STEP3_SELECTED_CHECKPOINT_SOURCE"] = binding["checkpoint_source"]
     _ur = (getattr(cfg, "upstream_resolution_json", "") or "").strip()
     if _ur:
         out["ODCR_UPSTREAM_RESOLUTION_JSON"] = _ur
@@ -393,6 +401,8 @@ def _run_step3_train(cfg: ResolvedConfig, *, console_level: str = "summary") -> 
 
     py_args = [
         "train",
+        "--task-head",
+        str(getattr(cfg, "step5_head", "combined") or "combined"),
         "--auxiliary",
         cfg.auxiliary,
         "--target",
@@ -473,9 +483,33 @@ def run_step4(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
         prepare_step4_encoded_cache,
         reject_step4_formal_env_overrides,
         step4_runtime_env,
+        validate_step4_prelaunch_lineage_for_config,
     )
 
     reject_step4_formal_env_overrides(mode="formal")
+    lineage_validation = validate_step4_prelaunch_lineage_for_config(cfg, phase="formal_prelaunch")
+    append_full_log(
+        cfg,
+        [
+            "[step4 prelaunch lineage] "
+            + json.dumps(
+                {
+                    "status": lineage_validation.get("status"),
+                    "checkpoint_model_architecture_hash": lineage_validation.get("checkpoint_model_architecture_hash"),
+                    "checkpoint_state_dict_model_architecture_hash": lineage_validation.get(
+                        "checkpoint_state_dict_model_architecture_hash"
+                    ),
+                    "expected_model_architecture_hash": lineage_validation.get("expected_model_architecture_hash"),
+                    "observed_current_loader_mismatch_keys": lineage_validation.get("observed_current_loader_mismatch_keys"),
+                    "sidecar_model_architecture_metadata_mismatch_keys": lineage_validation.get(
+                        "sidecar_model_architecture_metadata_mismatch_keys"
+                    ),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        ],
+    )
     prepare_step4_encoded_cache(cfg, dry_run=False, build_allowed=True)
     env_extra = dict(_odcr_profile_env(cfg))
     # Step4 导出到 numpy 路径不接受 bf16，强制用 fp32。
@@ -487,6 +521,8 @@ def run_step4(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
     py_args = [
         "--task",
         str(cfg.task_id),
+        "--run-id",
+        str(cfg.step4_run),
         "--batch-size",
         str(g_eval),
         "--num-proc",
@@ -578,6 +614,9 @@ def _torchrun_hardware_env(cfg: ResolvedConfig) -> dict[str, str]:
 
 def run_step5(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
     assert cfg.from_run is not None and cfg.step5_run is not None
+    if str(getattr(cfg, "step5_lifecycle_phase", "") or "") == "eval_only":
+        _run_step5_rating_eval_only(cfg, console_level=console_level)
+        return
     ensure_step5_csv_symlink(cfg)
     Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
     _maybe_write_run_manifest(cfg)
@@ -609,6 +648,91 @@ def run_step5(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
         with stub.open("a", encoding="utf-8") as fh:
             fh.write("step5 --train-only：本次跳过训练后 valid 评估；完整指标请运行: python code/odcr.py eval …\n")
     _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
+
+
+def _step5_rating_eval_batch_size(cfg: ResolvedConfig, *, split: str) -> int:
+    if split == "valid":
+        value = int(getattr(cfg, "valid_global_batch_size", 0) or getattr(cfg, "global_eval_batch_size", 0) or 0)
+    else:
+        per_gpu = int(getattr(cfg, "test_per_gpu_batch_size", 0) or 0)
+        value = per_gpu * int(getattr(cfg, "ddp_world_size", 1) or 1) if per_gpu > 0 else 0
+        if value <= 0:
+            value = int(getattr(cfg, "global_eval_batch_size", 0) or getattr(cfg, "valid_global_batch_size", 0) or 0)
+    if value <= 0:
+        raise ValueError(f"Step5A rating eval batch size is not configured for {split}")
+    return value
+
+
+def _run_step5_rating_eval_only(cfg: ResolvedConfig, *, console_level: str = "summary") -> dict[str, Any]:
+    if str(getattr(cfg, "step5_head", "") or "") != "step5A":
+        raise RuntimeError("Step5 eval-only rating handoff currently supports --head step5A only")
+    ensure_step5_csv_symlink(cfg)
+    Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
+    eval_dir = Path(cfg.eval_run_dir or (Path(cfg.checkpoint_dir) / "eval")).resolve()
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    log_file = _full_log_file(cfg)
+    checkpoint = Path(cfg.model_path).expanduser().resolve() if cfg.model_path else path_layout.best_model_path(Path(cfg.checkpoint_dir))
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Step5A eval-only checkpoint missing: {checkpoint}")
+
+    env_extra: dict[str, str] = dict(_odcr_profile_env(cfg))
+    split_outputs: dict[str, Path] = {}
+    for split, command in (("valid", "eval"), ("test", "test")):
+        py_args = [
+            command,
+            "--auxiliary",
+            cfg.auxiliary,
+            "--target",
+            cfg.target,
+            "--eval-batch-size",
+            str(_step5_rating_eval_batch_size(cfg, split=split)),
+            "--num-proc",
+            str(cfg.num_proc),
+            "--seed",
+            str(cfg.seed),
+            "--log_file",
+            log_file,
+            "--save_file",
+            str(checkpoint),
+            "--task-head",
+            "step5A",
+            "--rating-only",
+            "--rating-metric-protocol",
+            "code1_compatible_rating_v1",
+            *_step5_decode_cli_args(cfg),
+        ]
+        _run_torchrun(
+            cfg,
+            env_extra=env_extra,
+            script=TORCHRUN_STEP5_SCRIPT,
+            py_args=py_args,
+            console_level=console_level,
+        )
+        split_outputs[split] = eval_dir / f"rating_{split}_metrics.json"
+
+    target_dir = Path(cfg.data_dir).resolve() / str(cfg.target)
+    result = finalize_step5A_rating_eval_handoff(
+        repo_root=cfg.repo_root,
+        task=int(cfg.task_id),
+        source_run_id=str(cfg.step5_run),
+        checkpoint=checkpoint,
+        valid_metrics_path=split_outputs["valid"],
+        test_metrics_path=split_outputs["test"],
+        valid_file=target_dir / "valid.csv",
+        test_file=target_dir / "test.csv",
+        expected_valid_count=109732 if int(cfg.task_id) == 2 and str(cfg.target) == "AM_CDs" else None,
+        expected_test_count=109720 if int(cfg.task_id) == 2 and str(cfg.target) == "AM_CDs" else None,
+    )
+    append_full_log(cfg, ["[step5 rating eval handoff] " + json.dumps(result, ensure_ascii=False, default=str)])
+    emit_console_lines(
+        cfg,
+        [
+            "[step5 rating eval handoff] completed "
+            f"valid_mae={result['valid']['mae']} valid_rmse={result['valid']['rmse']} "
+            f"test_mae={result['test']['mae']} test_rmse={result['test']['rmse']}"
+        ],
+    )
+    return result
 
 
 def run_eval(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:

@@ -29,13 +29,31 @@ class PostEditNotGpuGateTest(unittest.TestCase):
         self.assertEqual(classification, "resource_kill")
         self.assertEqual(sig, signal.SIGKILL)
         self.assertFalse(classification_blocks_gpu_probe(classification))
-        self.assertFalse(classification_blocks_formal(classification))
+        self.assertTrue(classification_blocks_formal(classification))
 
     def test_semantic_p0_can_block_formal_but_not_gpu_probe(self) -> None:
         self.assertFalse(classification_blocks_gpu_probe("P0_semantic_blocker"))
         self.assertTrue(classification_blocks_formal("P0_semantic_blocker"))
 
-    def test_resource_kill_rerun_pass_is_flaky_resource_kill(self) -> None:
+    def test_timeout_fails_closed_for_formal_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = run_commands(
+                [
+                    CheckCommand(
+                        "sleeping command",
+                        (sys.executable, "-c", "import time; time.sleep(2)"),
+                    )
+                ],
+                repo_root=root,
+                max_seconds=1,
+            )[0]
+        self.assertEqual(result.status, "FAIL")
+        self.assertEqual(result.classification, "timeout")
+        self.assertTrue(result.blocks_formal)
+        self.assertFalse(result.blocks_gpu_probe)
+
+    def test_resource_kill_fails_closed_without_rerun_pass_masking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             test_dir = root / "code" / "tests"
@@ -55,10 +73,10 @@ class PostEditNotGpuGateTest(unittest.TestCase):
                 repo_root=root,
                 max_seconds=10,
             )[0]
-        self.assertEqual(result.classification, "flaky_resource_kill")
-        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.classification, "resource_kill")
+        self.assertEqual(result.status, "FAIL")
         self.assertFalse(post_edit_results_block_gpu_probe([result]))
-        self.assertFalse(post_edit_results_block_formal([result]))
+        self.assertTrue(post_edit_results_block_formal([result]))
 
     def test_resource_kill_rerun_fail_becomes_semantic_fail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,7 +99,7 @@ class PostEditNotGpuGateTest(unittest.TestCase):
                 repo_root=root,
                 max_seconds=10,
             )[0]
-        self.assertEqual(result.classification, "semantic_fail")
+        self.assertEqual(result.classification, "resource_kill")
         self.assertTrue(result.blocks_formal)
         self.assertFalse(result.blocks_gpu_probe)
 

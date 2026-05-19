@@ -136,6 +136,38 @@ def _manifest_invocation_info(manifest: Mapping[str, Any]) -> tuple[str, str]:
     return "(缺失)", ""
 
 
+def _repo_path(repo_root: str | Path, raw: Any) -> Path | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    root = Path(repo_root).expanduser().resolve()
+    path = Path(text).expanduser()
+    return (root / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def _step4_selected_checkpoint_path(cfg: ResolvedConfig, step3_dir: Path) -> Path | None:
+    raw = (getattr(cfg, "upstream_resolution_json", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    validation = payload.get("stage_status_validation")
+    if not isinstance(validation, Mapping):
+        validation = {}
+    status = payload.get("stage_status")
+    if not isinstance(status, Mapping):
+        status = {}
+    selected = validation.get("selected_checkpoint") or status.get("selected_checkpoint")
+    resolved = _repo_path(cfg.repo_root, selected)
+    if resolved is not None:
+        return resolved
+    return (step3_dir / "model" / "stage_status.selected_checkpoint").resolve()
+
+
 def _external_upstream_findings(cfg: ResolvedConfig, step3_dir: Path) -> list[str]:
     findings: list[str] = []
     if not cfg.from_run:
@@ -193,7 +225,7 @@ def _external_upstream_findings(cfg: ResolvedConfig, step3_dir: Path) -> list[st
 def _step4_preflight_findings(cfg: ResolvedConfig) -> list[str]:
     findings = _default_data_root_findings()
     step3_dir = Path(cfg.step3_checkpoint_dir or "")
-    step3_model = path_layout.model_file_path(step3_dir)
+    step3_model = _step4_selected_checkpoint_path(cfg, step3_dir)
     manifest_path = path_layout.logs_dir(step3_dir) / "manifest.json"
 
     if not step3_dir.is_dir():
@@ -208,22 +240,22 @@ def _step4_preflight_findings(cfg: ResolvedConfig) -> list[str]:
 
     findings.extend(_manifest_lineage_findings(manifest_path, cfg.repo_root))
 
-    if not step3_model.is_file():
+    if step3_model is None or not step3_model.is_file():
         legacy_model = step3_dir / "model" / "model.pth"
         if legacy_model.is_file():
             findings.append(
-                "Step3 权重文件名仍为旧布局 model/model.pth，当前主线要求 canonical 路径 model/best.pth。\n"
+                "Step3 权重文件名仍为旧布局 model/model.pth，当前 Step4 主线要求 stage_status.selected_checkpoint。\n"
                 f"   - 期望路径: {step3_model}\n"
                 f"   - 实际发现: {legacy_model}\n"
                 "   - 原因: 这通常表示旧 D4C-main upstream 或旧 checkpoint 产物。\n"
-                "   - 下一步: 先生成当前 ODCR 主线 canonical checkpoint，再重试 Step4。"
+                "   - 下一步: 先生成当前 ODCR 主线 stage_status.selected_checkpoint，再重试 Step4。"
             )
             findings.extend(_legacy_checkpoint_findings(legacy_model))
         else:
             findings.append(
-                "step4 需要 Step3 已产出的 canonical 权重 model/best.pth，但当前目录中缺失。\n"
+                "step4 需要 Step3 stage_status.selected_checkpoint 指向的权重，但当前目录中缺失。\n"
                 f"   - 期望路径: {step3_model}\n"
-                "   - 下一步: 先完成当前 ODCR 主线 Step3，确保产出 model/best.pth。"
+                "   - 下一步: 先完成当前 ODCR 主线 Step3，确保 stage_status.selected_checkpoint 可验证。"
             )
         return findings
 
@@ -239,7 +271,7 @@ def _format_step4_preflight_error(cfg: ResolvedConfig, findings: list[str]) -> s
         "  - 默认 data root(<repo>/data) / merged root(<repo>/merged) 是否存在\n"
         "  - 当前仓库下的 Step3 upstream 路径是否存在\n"
         "  - Step3 manifest 的 repo_root / invocation 字段（cli_invocation、invoked_command_line、invoked_command）lineage\n"
-        "  - Step3 checkpoint 是否为 canonical model/best.pth，且不含旧 3-tensor key\n"
+        "  - Step3 checkpoint 是否来自 stage_status.selected_checkpoint，且不含旧 3-tensor key\n"
         "发现:\n"
     )
     body = "\n".join(f"  {idx}. {item}" for idx, item in enumerate(findings, start=1))
@@ -247,7 +279,7 @@ def _format_step4_preflight_error(cfg: ResolvedConfig, findings: list[str]) -> s
         "\n下一步建议:\n"
         f"  - 为 task={cfg.task_id} iter={cfg.iteration_id} 在当前 ODCR-main 下生成合法的 Step3 upstream\n"
         "  - 补齐 <repo>/data 与 <repo>/merged，或显式设置 ODCR_DATA_DIR / ODCR_MERGED_DATA_DIR 指向当前主线资产\n"
-        "  - 不要混用旧 D4C-main lineage、旧 model/model.pth、旧 3-tensor checkpoint\n"
+        "  - 不要混用旧 D4C-main lineage、旧 model/model.pth、旧 best.pth primary alias 或旧 3-tensor checkpoint\n"
         + _hint_tail()
     )
     return head + body + tail

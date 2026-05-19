@@ -34,6 +34,8 @@ class GatheredBatch:
     local_style_hint_ids: Optional[torch.Tensor] = None
     polarity_ids: Optional[torch.Tensor] = None
     evidence_quality_prior: Optional[torch.Tensor] = None
+    sampler_component_id: Optional[torch.Tensor] = None
+    sampler_tier_id: Optional[torch.Tensor] = None
 
     def assert_uniform_batch_dim(self) -> None:
         """校验各张量首维（batch）一致；失败时指出字段名。"""
@@ -84,6 +86,8 @@ class GatheredBatch:
             ("local_style_hint_ids", self.local_style_hint_ids),
             ("polarity_ids", self.polarity_ids),
             ("evidence_quality_prior", self.evidence_quality_prior),
+            ("sampler_component_id", self.sampler_component_id),
+            ("sampler_tier_id", self.sampler_tier_id),
         ):
             if t is not None and int(t.shape[0]) != b:
                 raise ValueError(

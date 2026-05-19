@@ -49,7 +49,7 @@ def promote_upstream(
 ) -> dict[str, Any]:
     root = Path(repo_root).expanduser().resolve()
     stage_name = str(stage or "").strip().lower()
-    rid = run_naming.parse_run_id(str(run_id))
+    rid = run_naming.parse_stage_run_id(stage_name, str(run_id))
     target = resolve_run(repo_root=root, stage=stage_name, task=int(task), run_id=rid, repair=True)
     consumer = {
         "step3": "step4",

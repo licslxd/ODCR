@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import csv
 import hashlib
 import json
@@ -17,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from odcr_core.preprocess_registry import instantiate_preprocess_preset
+from odcr_core.aux.artifacts.path_policy import repo_relative_path
 from odcr_core.preprocess_metadata import (
     csv_header_metadata as _contract_csv_header_metadata,
     dataset_current_headers,
@@ -36,7 +35,6 @@ from odcr_core.preprocess_schema import (
     PreprocessCConfig,
     PreprocessConfig,
     PreprocessHardwareConfig,
-    apply_preprocess_cli_overrides,
     preprocess_b_expected_shape_dtype,
     preprocess_b_output_artifact_contract,
     preprocess_c_expected_shape_dtype,
@@ -83,20 +81,6 @@ def _timestamp_tag() -> str:
 
 def _render_command(cmd: list[str]) -> str:
     return shlex.join(cmd)
-
-
-def _repo_relative_path(repo_root: Path, value: str | Path | None) -> str | None:
-    if value is None:
-        return None
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = (repo_root / path).resolve()
-    else:
-        path = path.resolve()
-    try:
-        return path.relative_to(repo_root).as_posix()
-    except ValueError:
-        return path.as_posix()
 
 
 def _safe_run_git(repo_root: Path, *args: str) -> str | None:
@@ -149,14 +133,9 @@ def _config_stage_label(config: PreprocessConfig) -> str:
     return "infer_domain_semantics"
 
 
-def resolve_preprocess_cli_config(args: argparse.Namespace) -> PreprocessConfig:
-    preset_config = instantiate_preprocess_preset(str(args.preset))
-    if getattr(args, "stage", None) and str(args.stage) != preset_config.stage:
-        raise ValueError(
-            f"Preset {args.preset!r} resolves to stage {preset_config.stage!r}, "
-            f"but CLI requested stage {args.stage!r}."
-        )
-    return apply_preprocess_cli_overrides(preset_config, args)
+def _preprocess_entry_command(stage: str) -> str:
+    stage_letter = {"preprocess_a": "a", "preprocess_b": "b", "preprocess_c": "c"}.get(stage, stage)
+    return f"./odcr preprocess {stage_letter}"
 
 
 class PreprocessRuntime:
@@ -1307,7 +1286,7 @@ class PreprocessRuntime:
             validation_status="ok" if status == "ok" else ("failed" if status == "failed" else "pending"),
         )
         if verify_report_path is not None:
-            summary["verify_report_path"] = _repo_relative_path(self.repo_root, verify_report_path)
+            summary["verify_report_path"] = repo_relative_path(self.repo_root, verify_report_path)
         if self.config.stage == "preprocess_c":
             summary["domain_shape_contract_version"] = PREPROCESS_C_DOMAIN_CONTRACT_VERSION
         summary["fingerprint_hash"] = self.stage_fingerprint_hash
@@ -1469,9 +1448,7 @@ class PreprocessRuntime:
         return env
 
     def _run_preprocess_a(self) -> int:
-        self._log(
-            f"preprocess_a canonical entry: python code/odcr.py preprocess --stage preprocess_a --preset {self.config.preset_name}"
-        )
+        self._log(f"preprocess_a canonical entry: {_preprocess_entry_command(self.config.stage)}")
         forced_task_ids = {task_id for task_id in self.combine_task_ids if self._task_forced(task_id)}
         pending_datasets: list[str] = []
         pending_tasks: list[int] = []
@@ -1944,9 +1921,7 @@ class PreprocessRuntime:
             self._assert_gpu_admission()
         pending = self._prepare_gpu_pending_datasets()
         workers = self._gpu_worker_ids(self.config.hardware)
-        self._log(
-            f"{self.config.stage} canonical entry: python code/odcr.py preprocess --stage {self.config.stage} --preset {self.config.preset_name}"
-        )
+        self._log(f"{self.config.stage} canonical entry: {_preprocess_entry_command(self.config.stage)}")
         self._log(f"[{self.config.stage}] gpu_ids={self.config.hardware.gpu_ids} workers={len(workers)}")
         self._log(f"[{self.config.stage}] pending_datasets={pending or ['<none>']}")
 
@@ -2150,9 +2125,3 @@ class PreprocessRuntime:
         if failure_event.is_set():
             return 1
         return 0
-
-
-def run_preprocess_cli(args: argparse.Namespace) -> None:
-    config = resolve_preprocess_cli_config(args)
-    runtime = PreprocessRuntime(config)
-    runtime.run()

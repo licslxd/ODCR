@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping
@@ -151,6 +152,19 @@ STEP3_CHECKPOINT_RECORD_ONLY_FIELDS = (
     "precision_config_hash",
     "batch_semantics_hash",
 )
+STEP3_MODEL_ARCHITECTURE_FIELDS = (
+    "nuser",
+    "nitem",
+    "ntoken",
+    "emsize",
+    "nlayers",
+    "nhead",
+    "nhid",
+    "dropout",
+)
+STEP3_MODEL_ARCHITECTURE_INT_FIELDS = frozenset(
+    key for key in STEP3_MODEL_ARCHITECTURE_FIELDS if key != "dropout"
+)
 STEP3_CHECKPOINT_NULLABLE_REQUIRED_FIELDS = frozenset(
     {
         "after_min_epochs_best_epoch",
@@ -185,6 +199,175 @@ def stable_json_dumps(data: Any) -> str:
 
 def stable_hash(data: Any, *, length: int = 32) -> str:
     return hashlib.sha256(stable_json_dumps(data).encode("utf-8")).hexdigest()[: int(length)]
+
+
+def build_step3_model_architecture_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the canonical Step3 checkpoint-load architecture payload.
+
+    This scope is intentionally limited to fields that define the Step3 model
+    module shapes/structure used by downstream checkpoint consumers. Step4 RCR,
+    decode, runtime, evidence-level, hardware, batch, and guardrail/doc fields
+    must stay outside this hash.
+    """
+
+    missing = [key for key in STEP3_MODEL_ARCHITECTURE_FIELDS if key not in payload]
+    if missing:
+        raise CheckpointLineageError(
+            "Step3 model architecture payload missing fields: " + ", ".join(missing)
+        )
+    out: dict[str, Any] = {}
+    for key in STEP3_MODEL_ARCHITECTURE_FIELDS:
+        value = payload[key]
+        if key in STEP3_MODEL_ARCHITECTURE_INT_FIELDS:
+            out[key] = int(value)
+        else:
+            out[key] = float(value)
+    return out
+
+
+def compute_model_architecture_config_hash(payload: Mapping[str, Any]) -> str:
+    return stable_hash(build_step3_model_architecture_config(payload))
+
+
+def extract_checkpoint_model_architecture_payload(lineage: Mapping[str, Any]) -> dict[str, Any]:
+    raw = lineage.get("model_architecture_config")
+    if isinstance(raw, Mapping):
+        arch = build_step3_model_architecture_config(raw)
+    else:
+        arch = build_step3_model_architecture_config(lineage)
+    stored_hash = str(lineage.get("model_architecture_config_hash") or "")
+    computed_hash = compute_model_architecture_config_hash(arch)
+    if stored_hash and stored_hash != computed_hash:
+        raise CheckpointLineageError(
+            "Step3 checkpoint model_architecture_config_hash is internally inconsistent: "
+            f"stored={stored_hash!r} computed={computed_hash!r}"
+        )
+    return arch
+
+
+def _state_dict_tensor_shape(state: Mapping[str, Any], key: str) -> tuple[int, ...]:
+    value = state.get(key)
+    if value is None:
+        value = state.get(f"module.{key}")
+    if value is None or not hasattr(value, "shape"):
+        raise CheckpointLineageError(f"Step3 checkpoint state_dict missing tensor: {key}")
+    return tuple(int(dim) for dim in value.shape)
+
+
+def extract_checkpoint_state_dict_architecture_payload(
+    checkpoint_path: str | Path,
+    *,
+    fallback_payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Infer the checkpoint-load architecture from actual state_dict shapes.
+
+    Historical Step3 lineage sidecars can record configuration-derived values
+    that are not identical to the tensors saved in the checkpoint. Downstream
+    consumers need the tensor-derived payload for the hard checkpoint load
+    compatibility gate; sidecar values remain useful for non-shape fields that
+    cannot be inferred from tensors, such as ``nhead`` and ``dropout``.
+    """
+
+    fallback = build_step3_model_architecture_config(fallback_payload or {}) if fallback_payload else {}
+    checkpoint = Path(checkpoint_path).expanduser().resolve()
+    try:
+        import torch
+
+        state = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
+    except Exception as exc:  # pragma: no cover - exact torch errors vary by version.
+        raise CheckpointLineageError(f"Step3 checkpoint state_dict could not be read for shape gate: {checkpoint}") from exc
+    if not isinstance(state, Mapping):
+        raise CheckpointLineageError(f"Step3 checkpoint state_dict root must be a mapping: {checkpoint}")
+
+    user_shape = _state_dict_tensor_shape(state, "user_embeddings.weight")
+    item_shape = _state_dict_tensor_shape(state, "item_embeddings.weight")
+    word_shape = _state_dict_tensor_shape(state, "word_embeddings.weight")
+    hidden_weight_shape = _state_dict_tensor_shape(state, "hidden2token.weight")
+    hidden_bias_shape = _state_dict_tensor_shape(state, "hidden2token.bias")
+    if len(user_shape) != 2 or len(item_shape) != 2 or len(word_shape) != 2:
+        raise CheckpointLineageError("Step3 checkpoint embedding tensors must be rank-2 for architecture shape gate.")
+    if len(hidden_weight_shape) != 2 or len(hidden_bias_shape) != 1:
+        raise CheckpointLineageError("Step3 checkpoint hidden2token tensors have invalid ranks for architecture shape gate.")
+
+    emsize = int(user_shape[1])
+    consistency = {
+        "item_embeddings.weight": int(item_shape[1]),
+        "word_embeddings.weight": int(word_shape[1]),
+        "hidden2token.weight": int(hidden_weight_shape[1]),
+    }
+    mismatched = {key: value for key, value in consistency.items() if value != emsize}
+    if mismatched:
+        raise CheckpointLineageError(
+            "Step3 checkpoint embedding/decoder hidden sizes are inconsistent: "
+            + ", ".join(f"{key}={value!r} expected={emsize!r}" for key, value in sorted(mismatched.items()))
+        )
+    ntoken = int(word_shape[0])
+    if int(hidden_weight_shape[0]) != ntoken or int(hidden_bias_shape[0]) != ntoken:
+        raise CheckpointLineageError(
+            "Step3 checkpoint token projection shape is inconsistent: "
+            f"word_embeddings={ntoken!r} hidden2token.weight={hidden_weight_shape[0]!r} "
+            f"hidden2token.bias={hidden_bias_shape[0]!r}"
+        )
+
+    layer_ids: set[int] = set()
+    for raw_key in state:
+        key = str(raw_key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        match = re.match(r"transformer_encoder\.layers\.(\d+)\.", key)
+        if match:
+            layer_ids.add(int(match.group(1)))
+    nlayers = int(max(layer_ids) + 1) if layer_ids else int(fallback.get("nlayers", 0) or 0)
+    if nlayers <= 0:
+        raise CheckpointLineageError("Step3 checkpoint transformer layer count could not be inferred.")
+    linear1_shape = _state_dict_tensor_shape(state, "transformer_encoder.layers.0.linear1.weight")
+    linear2_shape = _state_dict_tensor_shape(state, "transformer_encoder.layers.0.linear2.weight")
+    if len(linear1_shape) != 2 or len(linear2_shape) != 2:
+        raise CheckpointLineageError("Step3 checkpoint transformer feed-forward tensors have invalid ranks.")
+    nhid = int(linear1_shape[0])
+    if int(linear1_shape[1]) != emsize or int(linear2_shape[0]) != emsize or int(linear2_shape[1]) != nhid:
+        raise CheckpointLineageError(
+            "Step3 checkpoint transformer feed-forward shapes are inconsistent: "
+            f"linear1={linear1_shape!r} linear2={linear2_shape!r} emsize={emsize!r}"
+        )
+
+    return build_step3_model_architecture_config(
+        {
+            "nuser": int(user_shape[0]),
+            "nitem": int(item_shape[0]),
+            "ntoken": ntoken,
+            "emsize": emsize,
+            "nlayers": nlayers,
+            "nhead": int(fallback.get("nhead", 0) or 0),
+            "nhid": nhid,
+            "dropout": float(fallback.get("dropout", 0.0)),
+        }
+    )
+
+
+def diff_model_architecture_payloads(
+    checkpoint_payload: Mapping[str, Any],
+    expected_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    checkpoint_arch = build_step3_model_architecture_config(checkpoint_payload)
+    expected_arch = build_step3_model_architecture_config(expected_payload)
+    mismatches: dict[str, dict[str, Any]] = {}
+    for key in STEP3_MODEL_ARCHITECTURE_FIELDS:
+        checkpoint_value = checkpoint_arch.get(key)
+        expected_value = expected_arch.get(key)
+        if checkpoint_value != expected_value:
+            mismatches[key] = {
+                "checkpoint": checkpoint_value,
+                "expected": expected_value,
+            }
+    return {
+        "checkpoint_payload": checkpoint_arch,
+        "expected_payload": expected_arch,
+        "checkpoint_hash": compute_model_architecture_config_hash(checkpoint_arch),
+        "expected_hash": compute_model_architecture_config_hash(expected_arch),
+        "mismatch_keys": sorted(mismatches),
+        "mismatches": mismatches,
+    }
 
 
 def parse_json_object(raw: str | Mapping[str, Any] | None, *, context: str, required: bool = False) -> dict[str, Any]:
@@ -645,7 +828,12 @@ def write_checkpoint_lineage(checkpoint_path: str | Path, payload: Mapping[str, 
     return path
 
 
-def read_checkpoint_lineage(checkpoint_path: str | Path, *, expected_stage: str | None = None) -> dict[str, Any]:
+def read_checkpoint_lineage(
+    checkpoint_path: str | Path,
+    *,
+    expected_stage: str | None = None,
+    allow_derived_lineage_hash: bool = False,
+) -> dict[str, Any]:
     path = checkpoint_lineage_path_for_weight(checkpoint_path)
     if not path.is_file():
         legacy_path = _legacy_checkpoint_lineage_path_for_weight(checkpoint_path)
@@ -668,6 +856,20 @@ def read_checkpoint_lineage(checkpoint_path: str | Path, *, expected_stage: str 
             f"expected {LINEAGE_GATE_SCHEMA_VERSION!r}. path={path}"
         )
     actual_hash = stable_hash(_hashable_lineage_payload(data))
+    stored_hash = data.get("lineage_hash")
+    if stored_hash != actual_hash:
+        if allow_derived_lineage_hash and not stored_hash:
+            data["lineage_hash"] = actual_hash
+            data["lineage_hash_source"] = "derived_from_checkpoint_lineage_payload_missing_stored_lineage_hash"
+            data["lineage_hash_derivation"] = {
+                "hash_algorithm": "stable_hash",
+                "excluded_fields": ["lineage_hash", "created_at_utc"],
+                "source_path": str(path),
+            }
+        else:
+            raise CheckpointLineageError(
+                f"Checkpoint lineage hash mismatch: stored={data.get('lineage_hash')} computed={actual_hash} path={path}"
+            )
     if data.get("lineage_hash") != actual_hash:
         raise CheckpointLineageError(
             f"Checkpoint lineage hash mismatch: stored={data.get('lineage_hash')} computed={actual_hash} path={path}"
@@ -713,10 +915,15 @@ def validate_step3_checkpoint_lineage(
     checkpoint_path: str | Path,
     *,
     expected: Mapping[str, Any],
+    allow_derived_lineage_hash: bool = False,
 ) -> dict[str, Any]:
     """Validate a Step3 checkpoint sidecar before downstream consumers load weights."""
 
-    lineage = read_checkpoint_lineage(checkpoint_path, expected_stage="step3")
+    lineage = read_checkpoint_lineage(
+        checkpoint_path,
+        expected_stage="step3",
+        allow_derived_lineage_hash=allow_derived_lineage_hash,
+    )
     context = "Step3 checkpoint compatibility"
     require_keys(lineage, STEP3_CHECKPOINT_REQUIRED_FIELDS, context=context)
     for key in STEP3_CHECKPOINT_REQUIRED_FIELDS:
@@ -751,6 +958,16 @@ def validate_step3_checkpoint_lineage(
         raise CheckpointLineageError(
             "Step3 checkpoint compatibility tokenizer cache manifest hash mismatch: "
             f"sidecar={lineage.get('step3_tokenizer_cache_manifest_hash')!r} computed={tokenizer_manifest_hash!r}"
+        )
+    source_table_section = lineage.get("source_table")
+    if not isinstance(source_table_section, Mapping):
+        raise CheckpointLineageError("Step3 checkpoint compatibility missing frozen source_table lineage.")
+    frozen_source_table_compat_hash = stable_hash(step3_source_table_compatibility_payload(source_table_section))
+    if lineage.get("source_table_compatibility_hash") != frozen_source_table_compat_hash:
+        raise CheckpointLineageError(
+            "Step3 checkpoint compatibility frozen source_table hash mismatch: "
+            f"sidecar={lineage.get('source_table_compatibility_hash')!r} "
+            f"computed={frozen_source_table_compat_hash!r}"
         )
     for key, expected_value in expected.items():
         if lineage.get(key) != expected_value:

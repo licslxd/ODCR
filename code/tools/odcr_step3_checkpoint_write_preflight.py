@@ -49,7 +49,7 @@ REQUIRED_EVENT_FIELDS = (
 
 
 def _evidence_dir(task_id: int, output_root: str | Path | None = None) -> Path:
-    root = Path(output_root) if output_root else REPO_ROOT / "AI_analysis" / "06_probe_evidence"
+    root = Path(output_root) if output_root else REPO_ROOT / "test_artifacts" / "tmp"
     return root / "step3_formal_checkpoint_profile_cache_numproc_rebuild" / f"task{int(task_id)}" / "checkpoint_write_preflight"
 
 

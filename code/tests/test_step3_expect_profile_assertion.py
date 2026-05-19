@@ -5,7 +5,10 @@ import sys
 import unittest
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+pytestmark = pytest.mark.slow
 
 
 class TestStep3ExpectProfileAssertion(unittest.TestCase):

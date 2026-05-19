@@ -8,8 +8,11 @@ import sys
 from pathlib import Path
 import unittest
 
+import pytest
+
 _CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _REPO_ROOT = Path(_CODE_DIR).resolve().parent
+pytestmark = [pytest.mark.smoke, pytest.mark.slow]
 
 
 def _run_odcr(*args: str) -> str:

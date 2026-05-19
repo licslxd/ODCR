@@ -31,10 +31,22 @@ session that is still on an admin node are not evidence.
 
 The validation writes only isolated evidence:
 
-- `AI_analysis/06_probe_evidence/step3_tmux_gpu_bridge_startup_validation_closeout/`
-- `runs/step3_validation/step3_tmux_gpu_bridge_startup_validation_closeout/`
+- `AI_analysis/01_raw_logs/step3_tmux_gpu_bridge_startup_validation_closeout/`
+- `AI_analysis/05_final_reports/step3_tmux_gpu_bridge_startup_validation_closeout/`
 
 A passing `step3-startup-validation` means the Step3 startup P0 contract has
 been reproduced under the current 2-rank GPU runtime. It is still not a
 training result or a paper metric. Only after this pass may the next handoff
 request a formal task2 Step3 startup prompt.
+## Superseded Direct Bridge Tooling
+
+Step3 validation now uses the active aux runtime bridge through `./odcr`:
+
+```bash
+./odcr runtime probe --stage step3 --task 2 --bounded
+```
+
+The old direct `python code/tools/odcr_tmux_gpu_bridge.py` generic execution
+surface is retired. The wrapper may only delegate to the aux runtime bridge or
+fail fast; it must not execute `repo-command`, `repo-script`, `repo-module`,
+`command-file`, arbitrary shell, background long-run, or allocation commands.

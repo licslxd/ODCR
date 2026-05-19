@@ -3,15 +3,17 @@ from __future__ import annotations
 import unittest
 import sys
 
-from code.tests.test_step4_export_validator import _write_ready_fixture
-
 import tempfile
 from pathlib import Path
 
 CODE_DIR = Path(__file__).resolve().parents[1]
+TEST_DIR = Path(__file__).resolve().parent
+if str(TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(TEST_DIR))
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
+from test_step4_export_validator import _write_ready_fixture  # noqa: E402
 from odcr_core.stage_status import build_stage_status
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST
 

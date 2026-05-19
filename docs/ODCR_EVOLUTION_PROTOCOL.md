@@ -127,7 +127,7 @@ fast sanity and current-pane validation. The controlled tmux GPU bridge
 already-entered, uniquely validated GPU pane with one bridge-generated command
 file; this is not arbitrary send-keys and is no longer limited by a GPU
 whitelist hard blocker. Bridge outputs stay under
-`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default. The
+`AI_analysis/01_raw_logs` or `AI_analysis/05_final_reports` by default. The
 formal namespace guard remains mandatory. post-edit full is not a GPU
 prerequisite, and runtime evidence takes priority over static full-suite
 instability. If current tmux CUDA is not visible, fail fast and ask the user to
@@ -582,3 +582,15 @@ changes must preserve the S2-R split:
 - Governed `step3-performance-probe` and `step3-short-pilot` modes must keep a
   fixed command shape, AI_analysis-only outputs, no formal latest/checkpoint or
   formal cache writes, and no downstream-consumable pilot checkpoints.
+## Aux Infrastructure Evolution
+
+Auxiliary changes must extend the active aux registries instead of adding new
+side tables. Static guardrail rules live in
+`code/odcr_core/aux/governance/rule_registry.py`; post-edit scopes and reasons
+live in `code/odcr_core/aux/governance/post_edit_registry.py`; runtime/tmux/GPU
+allowlist entries live in `code/odcr_core/aux/runtime/command_registry.py`.
+
+Any new runtime command needs a `RuntimeCommandSpec`, tests, AI_analysis output
+through `code/odcr_core/aux/evidence/ai_analysis_writer.py`, and an explicit
+formal namespace policy. It must not reintroduce arbitrary shell, repo-command,
+repo-script, repo-module, command-file, or allocation paths.

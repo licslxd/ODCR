@@ -341,7 +341,7 @@ bridge at `python code/tools/odcr_tmux_gpu_bridge.py` can target only a
 user-created, already-entered, uniquely validated GPU pane and can send one
 bridge-generated command file. It is not arbitrary send-keys and is no longer
 limited by a GPU whitelist hard blocker. Its validation outputs stay under
-`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default, with a
+`AI_analysis/01_raw_logs` / `AI_analysis/05_final_reports` by default, with a
 mandatory formal namespace guard. post-edit full is not a GPU prerequisite, and
 runtime evidence takes priority over static full-suite instability.
 

@@ -35,13 +35,18 @@ class TestHardwareControlPlane(unittest.TestCase):
             os.environ["ODCR_HARDWARE_PROFILE_JSON"] = json.dumps(
                 {
                     "max_parallel_cpu": 6,
+                    "max_num_proc": 6,
                     "num_proc": 2,
+                    "reserved_cpu": 1,
                     "dataloader_num_workers_train": 3,
                     "dataloader_num_workers_valid": 1,
                     "dataloader_num_workers_test": 1,
                     "dataloader_prefetch_factor_train": 2,
                     "dataloader_prefetch_factor_valid": 2,
                     "dataloader_prefetch_factor_test": 2,
+                    "pin_memory": True,
+                    "persistent_workers": True,
+                    "non_blocking_h2d": True,
                     "ddp_world_size": 1,
                 },
                 sort_keys=True,

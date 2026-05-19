@@ -85,7 +85,11 @@ when controlled validation shows unknown time below the configured threshold.
 Memory evidence records phase-level allocated, reserved, peak allocated, peak
 reserved, reserved-minus-allocated, inactive split, non-releasable, malloc retry,
 OOM count, and optional snapshot paths. Reserved memory is not treated as batch
-headroom without phase evidence.
+headroom without phase evidence, and it must not be a hard reject or batch-skip
+gate. Runtime admission should fail on real OOM/allocator failure, failed
+forward/backward, non-finite loss, graph/rank instability, configured
+allocated-memory ratio, or long-window allocated-memory creep. Reserved memory
+remains diagnostic evidence for the PyTorch caching allocator only.
 
 ## Prefetch Evidence
 
@@ -120,7 +124,7 @@ risk evidence for Step3, not a substitute for the final pipeline.
 
 `step3-performance-probe` is a validation-only tmux GPU bridge operation. It
 requires a fresh validated GPU pane and writes validation namespace evidence
-only under `AI_analysis/06_probe_evidence` and `runs/step3_validation`. It must
+only under `AI_analysis/01_raw_logs` and `AI_analysis/05_final_reports`. It must
 not update formal latest pointers, create formal checkpoints, start
 Step4/Step5/eval/rerank, run preprocess, or execute arbitrary send-keys. GPU
 use is allowed by default for repo-local validation, probe, and bounded

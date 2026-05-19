@@ -31,6 +31,7 @@ def print_step4_root_help() -> None:
         help="全局 eval 推理 batch（= eval_profile.eval_batch_size；须能被 WORLD_SIZE 整除；由 odcr.py 传入）",
     )
     p.add_argument("--num-proc", type=int, default=None, help="datasets.map 进程数")
+    p.add_argument("--run-id", type=str, default=None, help="父进程规划的 Step4 run id；内部一致性校验")
     p.add_argument("--log_file", type=str, default=None, help="PerfMonitor 结构化日志路径；mainline 默认 runs/.../meta/full.log")
     p.print_help()
 
@@ -63,6 +64,7 @@ def run_step4_cli() -> None:
         help="全局 eval 推理 batch（= eval_profile.eval_batch_size；须能被 WORLD_SIZE 整除；由 odcr.py 传入）",
     )
     parser.add_argument("--num-proc", type=int, default=None, help="datasets.map 进程数")
+    parser.add_argument("--run-id", type=str, default=None, help="父进程规划的 Step4 run id；内部一致性校验")
     parser.add_argument(
         "--log_file",
         type=str,
@@ -127,7 +129,7 @@ def run_step4_cli() -> None:
                 )
             lf = os.path.abspath(os.path.expanduser(lf))
             _run_one_task(
-                task_idx, batch_size, nproc, rank, world_size, local_rank, log_file=lf
+                task_idx, batch_size, nproc, rank, world_size, local_rank, log_file=lf, run_id=args.run_id
             )
     finally:
         _teardown_distributed()

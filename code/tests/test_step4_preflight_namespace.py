@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 CODE_DIR = Path(__file__).resolve().parents[1]
 if str(CODE_DIR) not in sys.path:
@@ -15,12 +16,16 @@ from odcr_core.step4_runtime import run_step4_bounded_preflight
 class Step4PreflightNamespaceTest(unittest.TestCase):
     def test_dry_run_uses_non_formal_namespace(self) -> None:
         cfg = SimpleNamespace(repo_root=Path("/tmp/odcr"), task_id=2, step4_runtime_config_json="{}")
-        payload = run_step4_bounded_preflight(
-            cfg,
-            max_samples=8,
-            validation_namespace="step4_preflight_smoke",
-            dry_run=True,
-        )
+        with patch(
+            "odcr_core.step4_runtime.validate_step4_prelaunch_lineage_for_config",
+            return_value={"status": "ok", "phase": "preflight_dry_run"},
+        ):
+            payload = run_step4_bounded_preflight(
+                cfg,
+                max_samples=8,
+                validation_namespace="step4_preflight_smoke",
+                dry_run=True,
+            )
         self.assertIn("runs/step4_preflight/task2/step4_preflight_smoke", payload["output_dir"])
         self.assertNotIn("runs/step4/task2", payload["output_dir"])
         self.assertFalse(payload["formal_latest_write"])

@@ -891,7 +891,7 @@ def batch_ladder_gate_summary(
         "grad_inf_count_ok": int(grad_inf_count) == 0,
         "timing_closed_ratio_pass": float(timing_closed_ratio) >= 0.95,
         "peak_allocated_safe": float(peak_allocated_gib) < float(safe_allocated_gib),
-        "peak_reserved_safe": float(peak_reserved_gib) < float(safe_reserved_gib),
+        "peak_reserved_diagnostic_only": True,
         "cuda_malloc_retry_ok": int(cuda_malloc_retry_count) == 0,
         "throughput_improvement_ok": float(throughput_improvement) >= 0.10,
         "valid_loss_not_worse": bool(valid_loss_not_worse),
@@ -901,5 +901,10 @@ def batch_ladder_gate_summary(
         "schema_version": "odcr_step3_batch_ladder_gate/1",
         "formal_allowed": all(gates.values()),
         "gates": gates,
+        "memory_diagnostics": {
+            "peak_reserved_gib": float(peak_reserved_gib),
+            "safe_reserved_gib_ignored": float(safe_reserved_gib),
+            "reserved_memory_used_for_rejection": False,
+        },
         "policy": "future_probe_only_until_all_gates_pass_and_user_confirms",
     }

@@ -148,6 +148,17 @@ class ResolvedConfig:
     evidence_max_length: int
     valid_batch_size: int
     valid_micro_batch_size: int
+    valid_per_gpu_batch_size: int
+    valid_global_batch_size: int
+    valid_forward_micro_batch_size: int
+    test_per_gpu_batch_size: int
+    test_forward_micro_batch_size: int
+    validation_microbatch_accumulation: bool
+    validation_memory_policy: str
+    step5A_validation_mode: str
+    formal_entry_E4_validation_required: bool
+    old_eval_batch_2048_retired: bool
+    valid_loss_components_json: str
     num_proc: int
     ddp_world_size: int
     seed: int
@@ -174,6 +185,8 @@ class ResolvedConfig:
 
     step3_mode: str
     step5_train_only: bool
+    step5_lifecycle_phase: str
+    step5_allow_embedded_final_eval: bool
 
     hardware_preset_id: str
     decode_preset_id: str
@@ -254,9 +267,40 @@ class ResolvedConfig:
     upstream_resolution_json: str = ""
     step4_rcr_config_json: str = "{}"
     step4_runtime_config_json: str = "{}"
+    step4_step5_dedicated_exports_config_json: str = "{}"
+    step4_step5_pool_exports_config_json: str = "{}"
+    step4_gold_quality_config_json: str = "{}"
+    step4_cf_tiers_config_json: str = "{}"
     step5_innovation_config_json: str = ""
-    ddp_find_unused_parameters: bool = True
-    ddp_find_unused_false_preflight: str = "synthetic_one_batch"
+    step5_task_decoupled_policy_config_json: str = "{}"
+    step5_head: str = "combined"
+    lora_target_policy_id: str = ""
+    head_specific_lora_allowlist_id: str = ""
+    final_lora_target_modules: Tuple[str, ...] = ()
+    forbidden_lora_targets: Tuple[str, ...] = ()
+    deleted_legacy_modules: Tuple[str, ...] = ()
+    combined_formal_enabled: bool = False
+    all_trainable_grad_required: bool = False
+    head_specific_trainable_policy: str = ""
+    head_gated_loss_contract_json: str = "{}"
+    step5_selected_tuning_candidate: str = ""
+    step5_fallback_tuning_candidate: str = ""
+    step5_effective_samples_json: str = "{}"
+    step5_optimizer_steps_json: str = "{}"
+    step5_export_loader_config_json: str = "{}"
+    step5_data_pipeline_config_json: str = "{}"
+    step5_sampler_config_json: str = "{}"
+    step5_prompt_templates_config_json: str = "{}"
+    step5_effective_epoch_config_json: str = "{}"
+    step5_batch_candidates_config_json: str = "{}"
+    step5_tuning_config_json: str = "{}"
+    step5_eval_config_json: str = "{}"
+    step5_e4_bounded_config_json: str = "{}"
+    step5_lifecycle_config_json: str = "{}"
+    step5_memory_truth_config_json: str = "{}"
+    step5_gradient_checkpointing_reentrant_policy: str = "non_reentrant"
+    ddp_find_unused_parameters: bool = False
+    ddp_find_unused_false_preflight: str = "real_sample_plan_one_batch"
     ddp_static_graph: bool = False
     ddp_graph_safety_preflight: bool = True
     step3_loss_semantics_json: str = ""

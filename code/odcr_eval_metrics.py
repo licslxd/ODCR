@@ -22,6 +22,109 @@ if _NLTK_LOCAL not in nltk.data.path:
 
 from nltk import word_tokenize
 
+CODE1_COMPATIBLE_RATING_PROTOCOL_ID = "code1_compatible_rating_v1"
+
+
+def code1_compatible_rating_protocol() -> Dict[str, Any]:
+    return {
+        "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID,
+        "prediction_clipping": False,
+        "prediction_rounding_before_metric": False,
+        "rating_normalization": False,
+        "rating_denormalization": False,
+        "target_only": True,
+        "mae_formula": "round(mean(abs(pred_rating - gt_rating)), 4)",
+        "rmse_formula": "round(sqrt(mean(square(pred_rating - gt_rating))), 4)",
+        "averaging": "sample_mean",
+        "invalid_prediction_filtering": False,
+        "code1_formula_matched": True,
+        "paper_protocol_single_run": True,
+        "paper_protocol_mean_std": False,
+    }
+
+
+def code1_compatible_rating_metrics(
+    predictions: Sequence[Any],
+    references: Sequence[Any],
+) -> Dict[str, Any]:
+    pred = [float(x) for x in predictions]
+    ref = [float(x) for x in references]
+    if len(pred) != len(ref):
+        raise ValueError(f"prediction/reference length mismatch: {len(pred)} != {len(ref)}")
+    if not pred:
+        raise ValueError("rating metrics require at least one prediction")
+    diffs = [p - r for p, r in zip(pred, ref)]
+    mae = sum(abs(d) for d in diffs) / len(diffs)
+    rmse = (sum(d * d for d in diffs) / len(diffs)) ** 0.5
+    return {
+        "mae": round(float(mae), 4),
+        "rmse": round(float(rmse), 4),
+        "sample_count": int(len(pred)),
+        **code1_compatible_rating_protocol(),
+    }
+
+
+def code1_compatible_rating_metrics_from_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    return code1_compatible_rating_metrics(
+        [row["pred_rating"] for row in rows],
+        [row["gt_rating"] for row in rows],
+    )
+
+
+def compare_code1_rating_prediction_rows(
+    baseline_rows: Sequence[Mapping[str, Any]],
+    candidate_rows: Sequence[Mapping[str, Any]],
+    *,
+    tolerance: float = 1e-5,
+) -> Dict[str, Any]:
+    base_by_id = {str(row.get("sample_id")): row for row in baseline_rows}
+    cand_by_id = {str(row.get("sample_id")): row for row in candidate_rows}
+    base_ids = set(base_by_id)
+    cand_ids = set(cand_by_id)
+    common_ids = sorted(base_ids & cand_ids, key=lambda x: int(x) if x.isdigit() else x)
+    pred_deltas: List[float] = []
+    for sid in common_ids:
+        pred_deltas.append(abs(float(base_by_id[sid]["pred_rating"]) - float(cand_by_id[sid]["pred_rating"])))
+    base_metrics = code1_compatible_rating_metrics_from_rows([base_by_id[sid] for sid in common_ids]) if common_ids else {}
+    cand_metrics = code1_compatible_rating_metrics_from_rows([cand_by_id[sid] for sid in common_ids]) if common_ids else {}
+    mae_delta = (
+        abs(float(base_metrics["mae"]) - float(cand_metrics["mae"]))
+        if base_metrics and cand_metrics
+        else None
+    )
+    rmse_delta = (
+        abs(float(base_metrics["rmse"]) - float(cand_metrics["rmse"]))
+        if base_metrics and cand_metrics
+        else None
+    )
+    max_abs_pred_delta = max(pred_deltas) if pred_deltas else None
+    sample_count_equal = len(baseline_rows) == len(candidate_rows)
+    sample_id_set_equal = base_ids == cand_ids
+    passed = (
+        sample_count_equal
+        and sample_id_set_equal
+        and max_abs_pred_delta is not None
+        and max_abs_pred_delta <= tolerance
+        and mae_delta is not None
+        and mae_delta <= tolerance
+        and rmse_delta is not None
+        and rmse_delta <= tolerance
+    )
+    return {
+        "sample_count_equal": sample_count_equal,
+        "sample_id_set_equal": sample_id_set_equal,
+        "baseline_sample_count": int(len(baseline_rows)),
+        "candidate_sample_count": int(len(candidate_rows)),
+        "missing_sample_ids": sorted(base_ids - cand_ids)[:100],
+        "unexpected_sample_ids": sorted(cand_ids - base_ids)[:100],
+        "max_abs_pred_delta": max_abs_pred_delta,
+        "mae_delta": mae_delta,
+        "rmse_delta": rmse_delta,
+        "tolerance": float(tolerance),
+        "passed": bool(passed),
+        "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID,
+    }
+
 
 def merge_eval_rows_by_sample_id(
     rows_per_rank: Sequence[Sequence[Dict[str, Any]]],

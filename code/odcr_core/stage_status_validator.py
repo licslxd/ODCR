@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from odcr_core import path_layout, run_naming
+from odcr_core.index_contract import INDEX_CONTRACT_SCHEMA_VERSION, load_index_contract
 from odcr_core.stage_status import BAD_FINAL_STATUSES, STAGE_STATUS_SCHEMA_VERSION
+from odcr_core.step4_dedicated_exports import validate_step4_dedicated_exports
+from odcr_core.step4_pool_exports import validate_step4_pool_exports
 from odcr_core.step3_eval_handoff import EVAL_HANDOFF_SCHEMA_VERSION, PAPER_TARGET_ONLY_EVAL
 from odcr_core.training_checkpoint import (
     CHECKPOINT_EVENT_LEDGER_SCHEMA_VERSION,
@@ -63,6 +66,43 @@ STEP3_STEP4_REQUIRED_ARTIFACTS = (
     "checkpoint_lineage",
     "source_table",
     "resolved_config",
+)
+
+STEP4_READY_FINAL_STATUSES = {"completed"}
+
+STEP4_STEP5_REQUIRED_FIELDS = (
+    "schema_version",
+    "validator_version",
+    "generated_at",
+    "updated_at",
+    "stage",
+    "task",
+    "task_id",
+    "run_id",
+    "run_dir",
+    "final_status",
+    "downstream_ready",
+    "ready_for",
+    "selected_export",
+    "export_manifest",
+    "index_contract",
+    "export_readiness",
+    "run_summary",
+    "source_table",
+    "resolved_config",
+    "status_source",
+    "do_not_use_quality_audit_as_final_truth",
+    "artifacts",
+    "required_artifacts",
+)
+
+STEP4_STEP5_REQUIRED_ARTIFACTS = (
+    "run_summary",
+    "source_table",
+    "resolved_config",
+    "selected_export",
+    "export_manifest",
+    "index_contract",
 )
 
 FORBIDDEN_ARTIFACT_PREFIXES = {"AI_analysis", "docs", "tmp", "history", "_archive"}
@@ -195,7 +235,7 @@ def _require(condition: bool, message: str) -> None:
         raise StageStatusValidationError(message)
 
 
-def _required_artifact_keys(payload: Mapping[str, Any]) -> set[str]:
+def _required_artifact_keys(payload: Mapping[str, Any], expected: tuple[str, ...]) -> set[str]:
     raw = payload.get("required_artifacts")
     if isinstance(raw, Mapping):
         keys = {str(key) for key in raw.keys()}
@@ -205,10 +245,11 @@ def _required_artifact_keys(payload: Mapping[str, Any]) -> set[str]:
         raise StageStatusValidationError("required_artifacts must be a non-empty list or mapping")
     if not keys:
         raise StageStatusValidationError("required_artifacts must not be empty")
-    unknown = keys.difference(STEP3_STEP4_REQUIRED_ARTIFACTS)
+    expected_set = set(expected)
+    unknown = keys.difference(expected_set)
     if unknown:
         raise StageStatusValidationError("unknown required_artifacts keys: " + ", ".join(sorted(unknown)))
-    missing = set(STEP3_STEP4_REQUIRED_ARTIFACTS).difference(keys)
+    missing = expected_set.difference(keys)
     if missing:
         raise StageStatusValidationError("required_artifacts missing keys: " + ", ".join(sorted(missing)))
     return keys
@@ -359,7 +400,7 @@ def _validate_step3_step4_ready(
     missing = [field for field in STEP3_STEP4_REQUIRED_FIELDS if payload.get(field) in (None, "", [], {})]
     if missing:
         raise StageStatusValidationError("stage_status missing required ready fields: " + ", ".join(missing))
-    _required_artifact_keys(payload)
+    _required_artifact_keys(payload, STEP3_STEP4_REQUIRED_ARTIFACTS)
     _require(str(payload.get("validator_version")) == STAGE_STATUS_VALIDATOR_VERSION, "validator_version mismatch")
     final_status = str(payload.get("final_status") or "").strip()
     _require(final_status in STEP3_READY_FINAL_STATUSES, f"final_status {final_status!r} is not an accepted Step3 handoff")
@@ -516,6 +557,211 @@ def _validate_step3_step4_ready(
     )
 
 
+def _validate_step4_step5_ready(
+    *,
+    repo_root: Path,
+    task: int,
+    run_id: str,
+    run_dir: Path,
+    status_path: Path,
+    payload: Mapping[str, Any],
+    latest_payload: Mapping[str, Any] | None,
+    latest_path: Path | None,
+    require_latest: bool,
+) -> StageStatusValidation:
+    missing = [field for field in STEP4_STEP5_REQUIRED_FIELDS if payload.get(field) in (None, "", [], {})]
+    if missing:
+        raise StageStatusValidationError("stage_status missing required ready fields: " + ", ".join(missing))
+    _required_artifact_keys(payload, STEP4_STEP5_REQUIRED_ARTIFACTS)
+    _require(str(payload.get("validator_version")) == STAGE_STATUS_VALIDATOR_VERSION, "validator_version mismatch")
+    final_status = str(payload.get("final_status") or "").strip().lower()
+    _require(final_status in STEP4_READY_FINAL_STATUSES, f"final_status {final_status!r} is not an accepted Step4 handoff")
+    _require(payload.get("downstream_ready") is True, "downstream_ready must be true for accepted Step4 handoff")
+    ready_for = {str(item) for item in payload.get("ready_for") or []}
+    _require("step5" in ready_for, "ready_for must include step5")
+    _require(str(payload.get("status_source") or "") == "step4_export_readiness_validator", "status_source must be step4_export_readiness_validator")
+    _require(
+        payload.get("do_not_use_quality_audit_as_final_truth") is True,
+        "do_not_use_quality_audit_as_final_truth must be true",
+    )
+    meta = run_dir / "meta"
+    run_summary_path = _path_from_status(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        payload=payload,
+        field="run_summary",
+        artifact_key="run_summary",
+        must_be_under=meta,
+    )
+    source_table_path = _path_from_status(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        payload=payload,
+        field="source_table",
+        artifact_key="source_table",
+        must_be_under=meta,
+    )
+    resolved_config_path = _path_from_status(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        payload=payload,
+        field="resolved_config",
+        artifact_key="resolved_config",
+        must_be_under=meta,
+    )
+    selected_export_path = _path_from_status(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        payload=payload,
+        field="selected_export",
+        artifact_key="selected_export",
+        must_be_under=run_dir,
+    )
+    export_manifest_path = _path_from_status(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        payload=payload,
+        field="export_manifest",
+        artifact_key="export_manifest",
+        must_be_under=run_dir,
+    )
+    index_contract_path = _path_from_status(
+        repo_root=repo_root,
+        run_dir=run_dir,
+        payload=payload,
+        field="index_contract",
+        artifact_key="index_contract",
+        must_be_under=run_dir,
+    )
+    run_summary = _load_json(run_summary_path, field="run_summary")
+    _require(str(run_summary.get("stage") or "") == "step4", "run_summary stage mismatch")
+    _require(int(run_summary.get("task_id") or -1) == int(task), "run_summary task_id mismatch")
+    _require(str(run_summary.get("run_id") or "") == str(run_id), "run_summary run_id mismatch")
+    _require(str(run_summary.get("status") or "") in {"ok", "completed", "success"}, "run_summary status mismatch")
+    source_table = _load_json(source_table_path, field="source_table")
+    _require(isinstance(source_table, Mapping), "source_table must be an object")
+    resolved_config = _load_json(resolved_config_path, field="resolved_config")
+    task_payload = resolved_config.get("task") if isinstance(resolved_config.get("task"), Mapping) else {}
+    if task_payload:
+        _require(int(task_payload.get("id") or -1) == int(task), "resolved_config task.id mismatch")
+    readiness = payload.get("export_readiness")
+    if not isinstance(readiness, Mapping) or readiness.get("ready") is not True:
+        raise StageStatusValidationError("export_readiness.ready must be true")
+    if readiness.get("errors"):
+        raise StageStatusValidationError("export_readiness.errors must be empty")
+    diagnostics = readiness.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        raise StageStatusValidationError("export_readiness.diagnostics must be an object")
+    expected_hashes = {
+        "selected_export": diagnostics.get("export_sha256"),
+        "export_manifest": diagnostics.get("manifest_sha256"),
+        "index_contract": diagnostics.get("index_contract_sha256"),
+    }
+    if not all(str(value or "").strip() for value in expected_hashes.values()):
+        raise StageStatusValidationError("export_readiness.diagnostics missing artifact hashes")
+    actual_paths = {
+        "selected_export": selected_export_path,
+        "export_manifest": export_manifest_path,
+        "index_contract": index_contract_path,
+    }
+    for key, expected_hash in expected_hashes.items():
+        artifact = payload.get("artifacts", {}).get(key) if isinstance(payload.get("artifacts"), Mapping) else {}
+        if isinstance(artifact, Mapping) and artifact.get("sha256"):
+            _require(str(artifact.get("sha256")) == str(expected_hash), f"artifacts.{key}.sha256 mismatch")
+    _require(_file_sha256(export_manifest_path) == str(expected_hashes["export_manifest"]), "export_manifest hash mismatch during Step4 handoff validation")
+    _require(_file_sha256(index_contract_path) == str(expected_hashes["index_contract"]), "index_contract hash mismatch during Step4 handoff validation")
+    manifest = _load_json(export_manifest_path, field="export_manifest")
+    row_counts = manifest.get("row_counts") if isinstance(manifest.get("row_counts"), Mapping) else {}
+    if row_counts:
+        _require(int(row_counts.get("total_rows") or -1) == int(readiness.get("row_count") or -2), "export_readiness row_count mismatch")
+    contract = load_index_contract(str(index_contract_path))
+    _require(str(contract.get("schema_version") or "") == INDEX_CONTRACT_SCHEMA_VERSION, "index_contract schema mismatch")
+    train_fp = (contract.get("fingerprints") or {}).get("train_csv") if isinstance(contract.get("fingerprints"), Mapping) else {}
+    _require(isinstance(train_fp, Mapping), "index_contract train_csv fingerprint missing")
+    _require(train_fp.get("exists") is True and train_fp.get("is_file") is True, "index_contract train_csv fingerprint is stale")
+    fp_path = _repo_path(repo_root, train_fp.get("path"), field="index_contract.fingerprints.train_csv.path")
+    _require(fp_path.resolve() == selected_export_path.resolve(), "index_contract train_csv path mismatch")
+    _require(str(train_fp.get("sha256") or "") == str(expected_hashes["selected_export"]), "index_contract train_csv sha256 mismatch")
+    stat = selected_export_path.stat()
+    if train_fp.get("size") is not None:
+        _require(int(train_fp.get("size")) == int(stat.st_size), "index_contract train_csv size mismatch")
+    if train_fp.get("mtime_ns") is not None:
+        _require(
+            int(train_fp.get("mtime_ns")) == int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            "index_contract train_csv mtime_ns mismatch",
+        )
+    latest_warnings = _validate_latest_pointer(
+        repo_root=repo_root,
+        stage="step4",
+        task=int(task),
+        run_id=str(run_id),
+        run_summary=run_summary_path,
+        status_path=status_path,
+        latest_payload=latest_payload,
+        latest_path=latest_path,
+        require_latest=require_latest,
+        final_status=final_status,
+    )
+    dedicated_validation = None
+    pool_validation = None
+    train_input_role = str(payload.get("step5_train_input_role") or "")
+    if train_input_role == "pool_manifest_sampling_contract" or payload.get("step5_pool_exports_ready") is not None:
+        pool_validation = validate_step4_pool_exports(run_dir, repo_root=repo_root)
+        if not pool_validation.ready:
+            raise StageStatusValidationError(
+                "Step5 pool exports failed validation: "
+                + "; ".join(pool_validation.errors or ["unknown"])
+            )
+        _require(payload.get("step5_pool_exports_ready") is True, "step5_pool_exports_ready must be true")
+        _require(
+            train_input_role == "pool_manifest_sampling_contract",
+            "step5_train_input_role must be pool_manifest_sampling_contract",
+        )
+        _require(
+            payload.get("full_audit_default_train_forbidden") is True,
+            "full_audit_default_train_forbidden must be true",
+        )
+    elif payload.get("step5_dedicated_exports_ready") is not None or payload.get("step5_train_input_role"):
+        dedicated_validation = validate_step4_dedicated_exports(
+            run_dir,
+            repo_root=repo_root,
+            expected_source_full_export_sha256=str(expected_hashes["selected_export"]),
+        )
+        if not dedicated_validation.ready:
+            raise StageStatusValidationError(
+                "dedicated Step5 exports failed validation: "
+                + "; ".join(dedicated_validation.errors or ["unknown"])
+            )
+        _require(payload.get("step5_dedicated_exports_ready") is True, "step5_dedicated_exports_ready must be true")
+        _require(str(payload.get("full_audit_table_role") or "") == "audit_only", "full_audit_table_role must be audit_only")
+        _require(
+            str(payload.get("step5_train_input_role") or "") == "dedicated_split_exports",
+            "step5_train_input_role must be dedicated_split_exports",
+        )
+    return StageStatusValidation(
+        stage="step4",
+        task=int(task),
+        run_id=str(run_id),
+        consumer_stage="step5",
+        run_dir=run_dir,
+        status_path=status_path,
+        run_summary=run_summary_path,
+        source_table=source_table_path,
+        resolved_config=resolved_config_path,
+        latest_path=latest_path,
+        latest_warnings=latest_warnings,
+        diagnostics={
+            "step4_export_readiness": dict(readiness),
+            "step4_dedicated_exports_readiness": dedicated_validation.to_payload(repo_root) if dedicated_validation else None,
+            "step4_pool_exports_readiness": pool_validation.to_payload(repo_root) if pool_validation else None,
+            "read_time_validation": "manifest/index_contract rehashed; selected_export stat and recorded sha verified through refreshed index_contract",
+            "selected_export": _repo_relative(repo_root, selected_export_path),
+            "export_manifest": _repo_relative(repo_root, export_manifest_path),
+            "index_contract": _repo_relative(repo_root, index_contract_path),
+        },
+    )
+
+
 def validate_stage_status_evidence(
     *,
     repo_root: str | Path,
@@ -532,7 +778,7 @@ def validate_stage_status_evidence(
     root = Path(repo_root).expanduser().resolve()
     stage_name = _canonical_stage(stage)
     consumer = _canonical_stage(consumer_stage)
-    rid = run_naming.parse_run_id(str(run_id))
+    rid = run_naming.parse_stage_run_id(stage_name, str(run_id))
     expected_run_dir = path_layout.get_stage_run_root(root, int(task), "v1", stage_name, rid).resolve()
     actual_run_dir = Path(run_dir).expanduser().resolve() if run_dir is not None else expected_run_dir
     _require(actual_run_dir == expected_run_dir, f"run_dir path mismatch for {stage_name} task{task} run{rid}")
@@ -562,6 +808,18 @@ def validate_stage_status_evidence(
         )
     if stage_name == "step3" and consumer == "step4":
         return _validate_step3_step4_ready(
+            repo_root=root,
+            task=int(task),
+            run_id=rid,
+            run_dir=expected_run_dir,
+            status_path=status_path,
+            payload=payload,
+            latest_payload=latest_payload,
+            latest_path=Path(latest_path).expanduser().resolve() if latest_path else None,
+            require_latest=require_latest,
+        )
+    if stage_name == "step4" and consumer == "step5":
+        return _validate_step4_step5_ready(
             repo_root=root,
             task=int(task),
             run_id=rid,

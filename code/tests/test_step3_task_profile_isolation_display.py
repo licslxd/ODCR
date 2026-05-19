@@ -8,11 +8,15 @@ import sys
 from pathlib import Path
 import unittest
 
+import pytest
+
 _CODE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, _CODE_DIR)
 _REPO_ROOT = Path(_CODE_DIR).resolve().parent
 
 from odcr_core.config_resolver import resolve_config  # noqa: E402
+
+pytestmark = pytest.mark.slow
 
 
 def _show(task_id: int) -> str:

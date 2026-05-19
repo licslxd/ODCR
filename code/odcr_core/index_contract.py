@@ -365,12 +365,29 @@ def _fingerprint_for_path(path: str) -> Dict[str, Any]:
         fp = {"schema_version": "odcr_file_fingerprint/1", "path": abs_path, "exists": False}
     fp.setdefault("path", abs_path)
     fp.setdefault("exists", False)
+    fp.setdefault("is_file", None)
     fp.setdefault("size", None)
     fp.setdefault("mtime_ns", None)
     fp.setdefault("sha256", None)
     fp.setdefault("sample_sha256", None)
     fp["fingerprint_version"] = str(fp.get("schema_version") or "odcr_file_fingerprint/1")
     return fp
+
+
+def refresh_index_contract_train_csv_fingerprint(
+    contract: Mapping[str, Any],
+    train_csv_path: str,
+) -> Dict[str, Any]:
+    """Return a contract copy whose train_csv fingerprint reflects the written CSV."""
+    refreshed: Dict[str, Any] = dict(contract)
+    fingerprints = dict(refreshed.get("fingerprints") or {})
+    train_fp = _fingerprint_for_path(train_csv_path)
+    train_fp["path"] = os.path.abspath(os.path.expanduser(train_csv_path))
+    train_fp["fingerprint_version"] = str(train_fp.get("schema_version") or "odcr_file_fingerprint/1")
+    fingerprints["train_csv"] = train_fp
+    refreshed["fingerprints"] = fingerprints
+    refreshed["train_csv_path"] = os.path.abspath(os.path.expanduser(train_csv_path))
+    return refreshed
 
 
 def _raise_if_missing_dual_files(required_paths: List[str]) -> None:
@@ -989,6 +1006,7 @@ __all__ = [
     "build_index_contract",
     "build_step4_export_lineage",
     "validate_step4_export_lineage",
+    "refresh_index_contract_train_csv_fingerprint",
     "step4_rcr_required_fields_hash",
     "write_index_contract",
     "load_index_contract",

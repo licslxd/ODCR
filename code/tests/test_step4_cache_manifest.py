@@ -15,7 +15,7 @@ from executors import step4_engine
 
 
 class Step4CacheManifestTest(unittest.TestCase):
-    def _env(self, repo: Path, model_dir: Path) -> mock._patch_dict:
+    def _env(self, repo: Path, model_dir: Path, selected_checkpoint: Path) -> mock._patch_dict:
         payload = {
             "schema_version": "test",
             "runtime_roots": {
@@ -40,6 +40,9 @@ class Step4CacheManifestTest(unittest.TestCase):
                 "ODCR_RESOLVED_MODELS_DIR": str(repo / "models"),
                 "ODCR_RESOLVED_SENTENCE_EMBED_MODEL": str(repo / "models" / "sent"),
                 "ODCR_RESOLVED_EMBED_DIM": "8",
+                "ODCR_STEP3_RUN_DIR": str(selected_checkpoint.parents[1]),
+                "ODCR_STEP3_SELECTED_CHECKPOINT": str(selected_checkpoint),
+                "ODCR_STEP3_SELECTED_CHECKPOINT_SOURCE": "stage_status.selected_checkpoint",
             },
             clear=False,
         )
@@ -51,7 +54,10 @@ class Step4CacheManifestTest(unittest.TestCase):
         model_dir = repo / "models" / "flan"
         model_dir.mkdir(parents=True)
         (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
-        with self._env(repo, model_dir):
+        selected_checkpoint = repo / "runs" / "step3" / "task4" / "2" / "model" / "best_observed.pth"
+        selected_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        selected_checkpoint.write_bytes(b"selected")
+        with self._env(repo, model_dir, selected_checkpoint):
             fp = step4_engine._step4_encoded_cache_fingerprint(
                 4,
                 str(source),

@@ -8,11 +8,20 @@ from types import SimpleNamespace
 
 
 CODE_DIR = Path(__file__).resolve().parents[1]
+TEST_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CODE_DIR.parent
+if str(TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(TEST_DIR))
 sys.path.insert(0, str(CODE_DIR))
 
 from odcr_core import path_layout  # noqa: E402
 from odcr_core.logging_meta import run_log_paths  # noqa: E402
+from helpers.test_artifacts import (  # noqa: E402
+    assert_not_formal_runs_path,
+    assert_path_under_test_artifacts,
+    explain_artifact_policy,
+    make_test_run_root,
+)
 
 
 class TestPathLayoutBoundaries(unittest.TestCase):
@@ -72,10 +81,22 @@ class TestPathLayoutBoundaries(unittest.TestCase):
         self.assertIn("do not mirror full training logs", registry["ai_analysis"].retention_note)
 
     def test_post_edit_hook_logs_only_under_ai_analysis_codex_hooks(self) -> None:
-        hook = (REPO_ROOT / ".codex" / "hooks" / "odcr_post_edit_stop.py").read_text(encoding="utf-8")
+        hook = (
+            REPO_ROOT / "code" / "odcr_core" / "aux" / "governance" / "hook_scope.py"
+        ).read_text(encoding="utf-8")
         self.assertIn('Path("AI_analysis") / "01_raw_logs" / "codex_hooks"', hook)
         self.assertNotIn('Path("runs")', hook)
         self.assertNotIn("_launcher_logs", hook)
+
+    def test_test_run_like_artifacts_stay_out_of_formal_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            run_root = make_test_run_root("step4", 2, "unit", repo_root=repo)
+            self.assertEqual(run_root, repo / "test_artifacts" / "runs_like" / "step4" / "task2" / "unit")
+            assert_path_under_test_artifacts(run_root / "meta" / "run_summary.json", repo_root=repo)
+            with self.assertRaises(AssertionError):
+                assert_not_formal_runs_path(repo / "runs" / "step4" / "task2" / "unit", repo_root=repo)
+            self.assertIn("Run-like test files", explain_artifact_policy())
 
     def test_metrics_filename_helper(self) -> None:
         self.assertEqual(path_layout.metrics_filename("metrics"), "metrics.jsonl")

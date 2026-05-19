@@ -116,12 +116,16 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     `scancel`; must not create, kill, or switch tmux sessions; and must not
     manage GPU allocation. GPU use is allowed by default for repo-local
     validation, probe, and bounded runtime when the current tmux GPU pane is
-    user-created, already-entered, uniquely validated GPU pane. The controlled tmux
-    GPU bridge at `python code/tools/odcr_tmux_gpu_bridge.py` may send one
-    bridge-generated command file to that pane; this is not arbitrary
-    send-keys. Bridge output must live under `AI_analysis/06_probe_evidence`
-    or `runs/step3_validation` unless a future request explicitly confirms a
-    formal run. The formal namespace guard remains mandatory: validation must
+    user-created, already-entered, uniquely validated GPU pane. The only Codex
+    GPU protocol is `./odcr runtime bridge discover`, `./odcr runtime bridge
+    validate-only`, `./odcr runtime bridge marker-probe`, `./odcr runtime
+    bridge cuda-probe`, and registered `./odcr runtime probe --stage ... --task
+    ... --bounded` commands. `python code/tools/odcr_tmux_gpu_bridge.py` is a
+    thin compatibility wrapper only; `repo-command`, `repo-script`,
+    `repo-module`, `command-file`, arbitrary shell, and allocation commands
+    must fail fast. Runtime evidence lives under
+    `AI_analysis/01_raw_logs` and `AI_analysis/05_final_reports`; validation
+    and probes must not write formal run namespaces. The formal namespace guard remains mandatory: validation must
     not write formal latest pointers, formal checkpoints, Step4/Step5/eval/
     rerank outputs, or paper metrics. Codex may only use the current tmux
     session's real-time CUDA environment. If CUDA is not visible in the current
@@ -133,6 +137,17 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     plus current-pane validation is the GPU preflight, and runtime evidence
     takes priority over static full-suite instability. Formal full train still
     requires explicit user confirmation.
+22. `code/` is the only active runtime tree. `code2/` is a reference baseline
+    for review and diffing only; it must not be a direct overwrite source,
+    runtime fallback, or hidden import/read source. `code1/` is paper-original
+    reference only and is not a recovery target. For task2 run2, the current
+    Step3 truth source is `runs/step3/task2/2`; Step4 consumes
+    `stage_status.selected_checkpoint` or the equivalent accepted eval-handoff
+    selection. `best.pth` and `latest.pth` are secondary consistency aliases
+    only. Run2 frozen config may differ from current live Step3 config; that
+    drift is labeled historical-vs-live and must not be used to recompute run2
+    checkpoint architecture truth. CPU preview tuning and gradient
+    accumulation remain inactive.
 
 ## Codex Long-Term Governance Constraints
 

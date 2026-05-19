@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
@@ -14,18 +13,13 @@ CODE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = CODE_DIR.parent
 sys.path.insert(0, str(CODE_DIR))
 
-from tools.odcr_post_edit_check import SCOPES, build_plan, suggest_scope_for_paths  # noqa: E402
+from tools.odcr_post_edit_check import SCOPES, build_plan, scope_reason, suggest_scope_for_paths  # noqa: E402
 
 
 def _hook_module():
-    path = REPO_ROOT / ".codex" / "hooks" / "odcr_post_edit_stop.py"
-    spec = importlib.util.spec_from_file_location("_odcr_stop_hook_test", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    from odcr_core.aux.governance import hook_scope
+
+    return hook_scope
 
 
 def _fake_transcript(path: Path, touched_files: list[str]) -> None:
@@ -53,7 +47,7 @@ def _display_commands(scope: str) -> list[str]:
 
 def _is_real_stage_run(command: str) -> bool:
     stage_tokens = ("./odcr step3 ", "./odcr step4 ", "./odcr step5 ", "./odcr eval ")
-    return command.startswith(stage_tokens) and "--dry-run" not in command
+    return command.startswith(stage_tokens) and "--dry-run" not in command and "--help" not in command
 
 
 class TestPostEditCheck(unittest.TestCase):
@@ -95,7 +89,9 @@ class TestPostEditCheck(unittest.TestCase):
         self.assertIn("python code/tools/check_one_control_guardrails.py --strict", proc.stdout)
         self.assertIn("./odcr step3 --task 2 --dry-run", proc.stdout)
         self.assertIn("./odcr show --stage step3", proc.stdout)
+        self.assertIn("scope_reason:", proc.stdout)
         self.assertIn("Result: DRY-RUN", proc.stdout)
+        self.assertIn("Step3 dry-run", scope_reason("step3"))
 
     def test_unknown_scope_fails_fast(self) -> None:
         proc = subprocess.run(
@@ -140,8 +136,10 @@ class TestPostEditCheck(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, joined)
         self.assertFalse([command for command in commands if _is_real_stage_run(command)])
-        self.assertIn("./odcr step4 --task 2 --dry-run", commands)
+        self.assertIn("./odcr step4 --help", commands)
+        self.assertIn("python code/tests/test_step4_export_validator.py -v", joined)
         self.assertIn("step5 resolver dry-run", "\n".join(commands))
+        self.assertIn("python code/tests/test_step5_cache_manifest.py -v", joined)
 
     def test_governance_fast_dry_run_is_minimal(self) -> None:
         commands = _display_commands("governance-fast")
@@ -232,6 +230,19 @@ class TestPostEditCheck(unittest.TestCase):
         self.assertEqual(inference.selected_scope, "skip")
         self.assertTrue(inference.skipped)
         self.assertEqual(inference.skip_reason, "audit_runtime_only")
+        self.assertEqual(inference.effective_scope_files, ())
+
+    def test_stop_hook_test_artifacts_runtime_only_skips(self) -> None:
+        module = _hook_module()
+        inference = module.infer_scope_for_payload(
+            {"touched_files": ["test_artifacts/runs_like/step4/task2/unit/meta/run_summary.json"]},
+            repo_root=REPO_ROOT,
+            cwd=REPO_ROOT,
+            workspace_changed_files_func=lambda _root: [],
+        )
+        self.assertEqual(inference.selected_scope, "skip")
+        self.assertTrue(inference.skipped)
+        self.assertEqual(inference.skip_reason, "ignored_only")
         self.assertEqual(inference.effective_scope_files, ())
 
     def test_stop_hook_audit_log_and_ai_analysis_only_skips(self) -> None:

@@ -1,4 +1,4 @@
-"""preprocess_b：BF16 / TF32 config, preset, runtime command regression."""
+"""preprocess_b: BF16 / TF32 config and runtime command regression."""
 import os
 import sys
 from dataclasses import replace
@@ -13,7 +13,7 @@ sys.path.insert(0, _CODE_DIR)
 import compute_embeddings as ce  # noqa: E402
 from configs.preprocess.preprocess_b import build_preprocess_b_stage  # noqa: E402
 from odcr_core.config_resolver import build_preprocess_config  # noqa: E402
-from odcr_core.preprocess_registry import render_preprocess_preset  # noqa: E402
+from odcr_core.preprocess_registry import render_internal_preprocess_config  # noqa: E402
 from odcr_core.preprocess_runtime import PreprocessRuntime  # noqa: E402
 from odcr_core.preprocess_schema import apply_preprocess_cli_overrides  # noqa: E402
 
@@ -152,8 +152,8 @@ class TestPreprocessBPrecision(unittest.TestCase):
         self.assertIn("preprocess.a.canonical_asset_chunk_size", keys)
         self.assertIn("preprocess.a.csv_header_hash", keys)
 
-    def test_show_preset_includes_preprocess_b_precision_defaults(self) -> None:
-        rendered = render_preprocess_preset("preprocess_b_a100_2gpu")
+    def test_internal_config_includes_preprocess_b_precision_defaults(self) -> None:
+        rendered = render_internal_preprocess_config("preprocess_b_a100_2gpu")
         config = rendered["config"]
         self.assertTrue(config["bf16_enabled"])
         self.assertTrue(config["tf32_enabled"])

@@ -57,7 +57,7 @@ Warm cache hits report that tokenization workers are not used, while preserving
 ## Checkpoint Write Preflight
 
 Before a formal rerun, run the checkpoint-write preflight. It must create only
-validation evidence under `AI_analysis/06_probe_evidence`, write a fake
+validation evidence under `AI_analysis/01_raw_logs`, write a fake
 checkpoint sidecar, call `checkpoint_event_from_sidecar` with explicit
 `reason` and `replaced_previous`, write a temporary checkpoint lineage event,
 and verify the required event fields. It must not write formal latest pointers

@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from odcr_core.aux.evidence.ai_analysis_writer import get_writer
+from odcr_core.file_atomic import atomic_write_json
+
 
 MACHINE_VERDICT_SCHEMA_VERSION = "odcr_machine_verdict/1"
 TASK_SLUG = "stage_truth_antiforgery_rebuild"
@@ -100,8 +103,28 @@ def build_machine_verdict(fields: Mapping[str, Any]) -> dict[str, Any]:
 def write_machine_verdict(path: str | Path, fields: Mapping[str, Any]) -> dict[str, Any]:
     payload = build_machine_verdict(fields)
     out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        rel = out.resolve().relative_to(Path.cwd().resolve() / "AI_analysis")
+    except ValueError:
+        atomic_write_json(out, payload)
+    else:
+        bucket = rel.parts[0] if rel.parts else "05_final_reports"
+        name = rel.name
+        bucket_map = {
+            "01_raw_logs": "raw_log",
+            "02_search_hits": "search_hit",
+            "03_evidence_ledgers": "ledger",
+            "04_phase_summaries": "phase_summary",
+            "05_final_reports": "final_report",
+        }
+        writer = get_writer(Path.cwd())
+        getattr(writer, bucket_map.get(bucket, "final_report"))(
+            name,
+            "```json\n" + json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n```",
+            source="stage_truth_machine_verdict",
+            stage="governance",
+            validation_result=payload.get("verdict"),
+        )
     return payload
 
 

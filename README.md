@@ -103,13 +103,20 @@ Codex still must not manage GPU allocation: it must not execute
 switch, or attach tmux sessions. The user creates or enters the admin tmux with
 `tmux -L odcr_gpu new-session -A -s odcr`, then manually runs
 `odcr-enter-gpu <JOBID>` inside that same tmux to enter the GPU node.
+`odcr-enter-gpu` owns the two-phase handoff: before `srun` it captures
+admin-side tmux socket and pane metadata, and after `srun` it captures GPU-side
+CUDA metadata without calling tmux on the GPU node. It atomically refreshes
+`AI_analysis/runtime/current_gpu_pane.json`; if handoff writing fails, it warns,
+deletes stale active handoff state, and still continues into the GPU shell.
+Users do not run `write_current_gpu_pane.py`, copy `$TMUX`, or write JSON by
+hand.
 
 The only allowed admin-to-GPU-pane automation is the controlled tmux GPU bridge:
 
 ```bash
-python code/tools/odcr_tmux_gpu_bridge.py discover
-python code/tools/odcr_tmux_gpu_bridge.py validate-only
-python code/tools/odcr_tmux_gpu_bridge.py cuda-probe
+./odcr runtime bridge discover
+./odcr runtime bridge validate-only
+./odcr runtime bridge cuda-probe
 ```
 
 The bridge validates socket path, session, pane, child Slurm step, node, and

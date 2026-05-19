@@ -1313,6 +1313,17 @@ class FinalTrainingConfig:
     evidence_max_length: int
     valid_batch_size: int
     valid_micro_batch_size: int
+    valid_per_gpu_batch_size: int
+    valid_global_batch_size: int
+    valid_forward_micro_batch_size: int
+    test_per_gpu_batch_size: int
+    test_forward_micro_batch_size: int
+    validation_microbatch_accumulation: bool
+    validation_memory_policy: str
+    step5A_validation_mode: str
+    formal_entry_E4_validation_required: bool
+    old_eval_batch_2048_retired: bool
+    valid_loss_components_json: str
 
     train_batch_size: int
     global_batch_size: int
@@ -1456,7 +1467,33 @@ class FinalTrainingConfig:
     # Step5A/Step5B：LCI 与 FCA 权重来自 step5.lci / step5.fca。
     step5_lci_weight: float = 0.12
     step5_fca_weight: float = 0.08
+    step5_head: str = "combined"
+    lora_target_policy_id: str = ""
+    head_specific_lora_allowlist_id: str = ""
+    final_lora_target_modules: Tuple[str, ...] = ()
+    forbidden_lora_targets: Tuple[str, ...] = ()
+    deleted_legacy_modules: Tuple[str, ...] = ()
+    combined_formal_enabled: bool = False
+    all_trainable_grad_required: bool = False
+    head_specific_trainable_policy: str = ""
+    head_gated_loss_contract_json: str = "{}"
+    step5_selected_tuning_candidate: str = ""
+    step5_fallback_tuning_candidate: str = ""
+    step5_effective_samples_json: str = "{}"
+    step5_optimizer_steps_json: str = "{}"
     step5_innovation_config_json: str = ""
+    step5_task_decoupled_policy_config_json: str = "{}"
+    step5_export_loader_config_json: str = "{}"
+    step5_sampler_config_json: str = "{}"
+    step5_batch_candidates_config_json: str = "{}"
+    step5_tuning_config_json: str = "{}"
+    step5_lifecycle_config_json: str = "{}"
+    step5_lifecycle_phase: str = "train_only"
+    step5_allow_embedded_final_eval: bool = False
+    step5_memory_truth_config_json: str = "{}"
+    step5_gradient_checkpointing_enabled: bool = True
+    step5_gradient_checkpointing_reentrant_policy: str = "non_reentrant"
+    step5_use_cache_training_disabled: bool = True
     step3_structured_loss_weights_json: str = ""
     step3_loss_semantics_json: str = ""
     step3_upstream_evidence_json: str = ""
@@ -1500,8 +1537,8 @@ class FinalTrainingConfig:
     ddp_world_size: int = 1
     # True：DDP 安全默认（扫描未参与本步 loss 的参数，避免多分支图报错）。
     # False：吞吐向（降低 DDP 固定开销）；仅建议在计算图各步稳定、常开对抗等场景用预设显式关闭。
-    ddp_find_unused_parameters: bool = True
-    ddp_find_unused_false_preflight: str = "synthetic_one_batch"
+    ddp_find_unused_parameters: bool = False
+    ddp_find_unused_false_preflight: str = "real_sample_plan_one_batch"
     ddp_static_graph: bool = False
     ddp_graph_safety_preflight: bool = True
     # True：Step5 在首包上对 train/valid 再做一次 collate 后索引 min/max 审计（CPU fail-fast）
@@ -1946,16 +1983,23 @@ def build_resolved_training_config(
         if rp_rt and "dataloader_prefetch_factor_test" in rp_rt
         else "derived"
     )
-    if preset_nm == "step3":
-        for _hw_req in ("pin_memory", "persistent_workers", "non_blocking_h2d"):
-            if _hw_req not in rp_rt:
-                raise RuntimeError(f"ODCR_HARDWARE_PROFILE_JSON missing {_hw_req}; Step3 v0 hardware transfer is One-Control.")
-    pin_memory_v = bool(rp_rt.get("pin_memory", True))
-    persistent_workers_v = bool(rp_rt.get("persistent_workers", True))
-    non_blocking_h2d_v = bool(rp_rt.get("non_blocking_h2d", True))
-    src["pin_memory"] = "hardware_profile_json" if "pin_memory" in rp_rt else "derived"
-    src["persistent_workers"] = "hardware_profile_json" if "persistent_workers" in rp_rt else "derived"
-    src["non_blocking_h2d"] = "hardware_profile_json" if "non_blocking_h2d" in rp_rt else "derived"
+    def _required_hardware_bool(key: str) -> bool:
+        if key not in rp_rt:
+            raise RuntimeError(
+                f"ODCR_HARDWARE_PROFILE_JSON missing {key}; "
+                "Step3/Step5 runtime transfer knobs are One-Control and must be resolver-injected."
+            )
+        value = rp_rt[key]
+        if not isinstance(value, bool):
+            raise RuntimeError(
+                f"ODCR_HARDWARE_PROFILE_JSON.{key} must be a JSON boolean from configs/odcr.yaml, got {value!r}."
+            )
+        src[key] = "hardware_profile_json"
+        return bool(value)
+
+    pin_memory_v = _required_hardware_bool("pin_memory")
+    persistent_workers_v = _required_hardware_bool("persistent_workers")
+    non_blocking_h2d_v = _required_hardware_bool("non_blocking_h2d")
 
     _tlm_base = int(max(8, min(512, int(BASE_TRAINING_DEFAULTS.train_label_max_length))))
     src["train_label_max_length"] = "base"
@@ -2069,16 +2113,155 @@ def build_resolved_training_config(
         src["step3_loss_semantics"] = "step3.loss_semantics"
 
     step5_innovation_config_json_v = ""
+    step5_task_decoupled_policy_config_json_v = "{}"
+    step5_export_loader_config_json_v = "{}"
+    step5_sampler_config_json_v = "{}"
+    step5_batch_candidates_config_json_v = "{}"
+    step5_tuning_config_json_v = "{}"
+    step5_lifecycle_config_json_v = "{}"
+    step5_lifecycle_phase_v = "train_only"
+    step5_allow_embedded_final_eval_v = False
+    step5_memory_truth_config_json_v = "{}"
+    step5_head_v = "combined"
+    lora_target_policy_id_v = ""
+    head_specific_lora_allowlist_id_v = ""
+    final_lora_target_modules_v: Tuple[str, ...] = ()
+    forbidden_lora_targets_v: Tuple[str, ...] = ()
+    deleted_legacy_modules_v: Tuple[str, ...] = ()
+    combined_formal_enabled_v = False
+    all_trainable_grad_required_v = False
+    head_specific_trainable_policy_v = ""
+    head_gated_loss_contract_json_v = "{}"
+    step5_selected_tuning_candidate_v = ""
+    step5_fallback_tuning_candidate_v = ""
+    step5_effective_samples_json_v = "{}"
+    step5_optimizer_steps_json_v = "{}"
+    step5_gradient_checkpointing_enabled_v = True
+    step5_gradient_checkpointing_reentrant_policy_v = "non_reentrant"
+    step5_use_cache_training_disabled_v = True
     src["step5_innovation"] = "inactive"
+    src["step5_task_decoupled_policy"] = "inactive"
+    src["step5_export_loader"] = "inactive"
+    src["step5_sampler"] = "inactive"
+    src["step5_batch_candidates"] = "inactive"
+    src["step5_tuning"] = "inactive"
+    src["step5_lifecycle"] = "inactive"
+    src["step5_lifecycle_phase"] = "inactive"
+    src["step5_allow_embedded_final_eval"] = "inactive"
+    src["step5_memory_truth"] = "inactive"
     if preset_nm == "step5":
+        step5_head_v = str(row.get("step5_head") or _payload.get("step5_head") or "combined").strip()
+        if step5_head_v not in {"step5A", "step5B", "combined"}:
+            raise RuntimeError(f"invalid Step5 head in resolved payload: {step5_head_v!r}")
+        lora_target_policy_id_v = str(row.get("lora_target_policy_id") or _payload.get("lora_target_policy_id") or "")
+        head_specific_lora_allowlist_id_v = str(
+            row.get("head_specific_lora_allowlist_id") or _payload.get("head_specific_lora_allowlist_id") or ""
+        )
+        final_lora_target_modules_v = tuple(
+            str(x).strip()
+            for x in (row.get("final_lora_target_modules") or _payload.get("final_lora_target_modules") or [])
+            if str(x).strip()
+        )
+        forbidden_lora_targets_v = tuple(
+            str(x).strip()
+            for x in (row.get("forbidden_lora_targets") or _payload.get("forbidden_lora_targets") or [])
+            if str(x).strip()
+        )
+        deleted_legacy_modules_v = tuple(
+            str(x).strip()
+            for x in (row.get("deleted_legacy_modules") or _payload.get("deleted_legacy_modules") or [])
+            if str(x).strip()
+        )
+        combined_formal_enabled_v = bool(row.get("combined_formal_enabled", _payload.get("combined_formal_enabled", False)))
+        all_trainable_grad_required_v = bool(
+            row.get("all_trainable_grad_required", _payload.get("all_trainable_grad_required", False))
+        )
+        head_specific_trainable_policy_v = str(
+            row.get("head_specific_trainable_policy") or _payload.get("head_specific_trainable_policy") or ""
+        )
+        head_gated_loss_contract_json_v = json.dumps(
+            row.get("head_gated_loss_contract") or _payload.get("head_gated_loss_contract") or {},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
         st5_innov = _payload.get("step5_innovation")
         if not isinstance(st5_innov, dict):
             raise RuntimeError(
                 "effective payload missing step5_innovation; Step5 LCI/UCI/CCV/FCA must come from configs/odcr.yaml."
             )
+        st5_policy = _payload.get("step5_task_decoupled_policy")
+        if not isinstance(st5_policy, dict):
+            raise RuntimeError(
+                "effective payload missing step5_task_decoupled_policy; "
+                "Step5A/Step5B separation must come from configs/odcr.yaml."
+            )
+        st5_loader = _payload.get("step5_export_loader")
+        if not isinstance(st5_loader, dict):
+            raise RuntimeError(
+                "effective payload missing step5_export_loader; "
+                "Step5 export/cache loader controls must come from configs/odcr.yaml."
+            )
+        st5_sampler = _payload.get("step5_sampler")
+        if not isinstance(st5_sampler, dict):
+            raise RuntimeError(
+                "effective payload missing step5_sampler; "
+                "Step5 pool sampling controls must come from configs/odcr.yaml."
+            )
+        st5_batch_candidates = _payload.get("step5_batch_candidates")
+        if not isinstance(st5_batch_candidates, dict):
+            raise RuntimeError(
+                "effective payload missing step5_batch_candidates; "
+                "Step5 bounded batch controls must come from configs/odcr.yaml."
+            )
+        st5_tuning = _payload.get("step5_tuning")
+        if not isinstance(st5_tuning, dict):
+            raise RuntimeError(
+                "effective payload missing step5_tuning; "
+                "Step5 bounded tuning controls must come from configs/odcr.yaml."
+            )
+        st5_lifecycle = _payload.get("step5_lifecycle")
+        if not isinstance(st5_lifecycle, dict):
+            raise RuntimeError(
+                "effective payload missing step5_lifecycle; "
+                "Step5 train/eval lifecycle controls must come from configs/odcr.yaml."
+            )
+        st5_memory_truth = _payload.get("step5_memory_truth")
+        if not isinstance(st5_memory_truth, dict):
+            raise RuntimeError(
+                "effective payload missing step5_memory_truth; "
+                "Step5 memory admission controls must come from configs/odcr.yaml."
+            )
         step5_innovation_config_json_v = json.dumps(st5_innov, ensure_ascii=False, sort_keys=True)
+        step5_task_decoupled_policy_config_json_v = json.dumps(st5_policy, ensure_ascii=False, sort_keys=True)
+        step5_export_loader_config_json_v = json.dumps(st5_loader, ensure_ascii=False, sort_keys=True)
+        step5_sampler_config_json_v = json.dumps(st5_sampler, ensure_ascii=False, sort_keys=True)
+        step5_batch_candidates_config_json_v = json.dumps(st5_batch_candidates, ensure_ascii=False, sort_keys=True)
+        step5_tuning_config_json_v = json.dumps(st5_tuning, ensure_ascii=False, sort_keys=True)
+        step5_lifecycle_config_json_v = json.dumps(st5_lifecycle, ensure_ascii=False, sort_keys=True)
+        step5_lifecycle_phase_v = str(row.get("step5_lifecycle_phase") or st5_lifecycle.get("formal_default_phase") or "train_only")
+        step5_allow_embedded_final_eval_v = bool(row.get("step5_allow_embedded_final_eval", False))
+        step5_selected_tuning_candidate_v = str(st5_tuning.get("selected_tuning_candidate") or "")
+        step5_fallback_tuning_candidate_v = str(st5_tuning.get("fallback_tuning_candidate") or "")
+        step5_effective_samples_json_v = json.dumps(st5_tuning.get("effective_samples") or {}, ensure_ascii=False, sort_keys=True)
+        step5_optimizer_steps_json_v = json.dumps(st5_tuning.get("optimizer_steps") or {}, ensure_ascii=False, sort_keys=True)
+        step5_memory_truth_config_json_v = json.dumps(st5_memory_truth, ensure_ascii=False, sort_keys=True)
+        step5_gradient_checkpointing_enabled_v = bool(st5_memory_truth.get("gradient_checkpointing_enabled", True))
+        step5_gradient_checkpointing_reentrant_policy_v = str(
+            st5_memory_truth.get("gradient_checkpointing_reentrant_policy") or "non_reentrant"
+        )
+        step5_use_cache_training_disabled_v = bool(st5_memory_truth.get("disable_use_cache_during_training", True))
         step5_lci_weight_v = float(st5_innov.get("lci", {}).get("weight", 0.0))
         step5_fca_weight_v = float(st5_innov.get("fca", {}).get("weight", 0.0))
+        src["step5_export_loader"] = "step5.export_loader"
+        src["step5_sampler"] = "step5.sampler"
+        src["step5_batch_candidates"] = "step5.batch_candidates"
+        src["step5_tuning"] = "step5.tuning"
+        src["step5_lifecycle"] = "step5.lifecycle"
+        src["step5_lifecycle_phase"] = "step5.lifecycle.formal_default_phase"
+        src["step5_allow_embedded_final_eval"] = "step5.lifecycle embedded-final-eval diagnostic gates"
+        src["step5_memory_truth"] = "step5.memory_truth"
+        src["step5_gradient_checkpointing_reentrant_policy"] = "step5.memory_truth.gradient_checkpointing_reentrant_policy"
+        src["step5_head"] = "resolved payload step5_head"
         if not math.isfinite(step5_lci_weight_v) or step5_lci_weight_v < 0.0:
             raise ValueError("step5.lci.weight 须为有限非负数")
         if not math.isfinite(step5_fca_weight_v) or step5_fca_weight_v < 0.0:
@@ -2222,25 +2405,41 @@ def build_resolved_training_config(
         cw_dirty = float(row["checkpoint_composite_w_dirty"])
         src["checkpoint_composite_w_dirty"] = "effective_payload"
 
-    ddp_find_unused_v = False if preset_nm == "step3" else True
+    ddp_find_unused_v = False
     src["ddp_find_unused_parameters"] = "base"
     if "ddp_find_unused_parameters" in row:
         ddp_find_unused_v = bool(row["ddp_find_unused_parameters"])
         src["ddp_find_unused_parameters"] = "effective_payload"
-    ddp_find_unused_false_preflight_v = "synthetic_one_batch"
+    ddp_find_unused_false_preflight_v = "real_sample_plan_one_batch"
     src["ddp_find_unused_false_preflight"] = "base"
     if "ddp_find_unused_false_preflight" in row:
         ddp_find_unused_false_preflight_v = str(row["ddp_find_unused_false_preflight"]).strip().lower()
-        if ddp_find_unused_false_preflight_v not in ("synthetic_one_batch", "fail_fast"):
-            raise ValueError("ddp_find_unused_false_preflight 须为 synthetic_one_batch 或 fail_fast")
-        if not ddp_find_unused_v and ddp_find_unused_false_preflight_v != "synthetic_one_batch":
-            raise ValueError("ddp_find_unused_parameters=false 需要 synthetic_one_batch preflight")
+        if ddp_find_unused_false_preflight_v not in (
+            "real_sample_plan_one_batch",
+            "real_batch_one_step",
+            "fail_fast",
+        ):
+            raise ValueError(
+                "ddp_find_unused_false_preflight 须为 real_sample_plan_one_batch、"
+                "real_batch_one_step 或 fail_fast"
+            )
+        if (
+            not ddp_find_unused_v
+            and ddp_find_unused_false_preflight_v
+            not in ("real_sample_plan_one_batch", "real_batch_one_step")
+        ):
+            raise ValueError(
+                "ddp_find_unused_parameters=false 需要 real_sample_plan_one_batch 或 "
+                "real_batch_one_step"
+            )
         src["ddp_find_unused_false_preflight"] = "effective_payload"
     ddp_static_graph_v = False
     src["ddp_static_graph"] = "base"
     if "ddp_static_graph" in row:
         ddp_static_graph_v = bool(row["ddp_static_graph"])
         src["ddp_static_graph"] = "effective_payload"
+    if ddp_find_unused_v and ddp_static_graph_v:
+        raise ValueError("ddp_static_graph=true requires ddp_find_unused_parameters=false")
     ddp_graph_safety_preflight_v = True if preset_nm == "step3" else False
     src["ddp_graph_safety_preflight"] = "base"
     if "ddp_graph_safety_preflight" in row:
@@ -2418,6 +2617,19 @@ def build_resolved_training_config(
     validate_every_epochs_v = int(row.get("validate_every_epochs", 1))
     valid_batch_size_v = int(row.get("valid_batch_size", eval_bs))
     valid_micro_batch_size_v = int(row.get("valid_micro_batch_size", max(1, eval_bs // max(1, world_size))))
+    valid_per_gpu_batch_size_v = int(
+        row.get("valid_per_gpu_batch_size", max(1, valid_batch_size_v // max(1, world_size)))
+    )
+    valid_global_batch_size_v = int(row.get("valid_global_batch_size", valid_batch_size_v))
+    valid_forward_micro_batch_size_v = int(row.get("valid_forward_micro_batch_size", valid_micro_batch_size_v))
+    test_per_gpu_batch_size_v = int(row.get("test_per_gpu_batch_size", valid_per_gpu_batch_size_v))
+    test_forward_micro_batch_size_v = int(row.get("test_forward_micro_batch_size", valid_forward_micro_batch_size_v))
+    validation_microbatch_accumulation_v = bool(row.get("validation_microbatch_accumulation", False))
+    validation_memory_policy_v = str(row.get("validation_memory_policy", ""))
+    step5a_validation_mode_v = str(row.get("step5A_validation_mode", ""))
+    formal_entry_e4_validation_required_v = bool(row.get("formal_entry_E4_validation_required", False))
+    old_eval_batch_2048_retired_v = bool(row.get("old_eval_batch_2048_retired", False))
+    valid_loss_components_v = row.get("valid_loss_components", {})
     src["optimizer"] = "step3.optimizer" if preset_nm == "step3" else "inactive"
     src["tokenizer_max_length"] = "effective_payload" if "tokenizer_max_length" in row else "inactive"
     src["evidence_max_length"] = "effective_payload" if "evidence_max_length" in row else "inactive"
@@ -2425,6 +2637,15 @@ def build_resolved_training_config(
     src["validate_every_epochs"] = "effective_payload" if "validate_every_epochs" in row else "inactive"
     src["valid_batch_size"] = "effective_payload" if "valid_batch_size" in row else "inactive"
     src["valid_micro_batch_size"] = "effective_payload" if "valid_micro_batch_size" in row else "inactive"
+    src["valid_per_gpu_batch_size"] = "step5.eval" if preset_nm == "step5" and "valid_per_gpu_batch_size" in row else "inactive"
+    src["valid_global_batch_size"] = "step5.eval" if preset_nm == "step5" and "valid_global_batch_size" in row else "inactive"
+    src["valid_forward_micro_batch_size"] = "step5.eval" if preset_nm == "step5" and "valid_forward_micro_batch_size" in row else "inactive"
+    src["validation_microbatch_accumulation"] = "step5.eval" if preset_nm == "step5" and "validation_microbatch_accumulation" in row else "inactive"
+    src["validation_memory_policy"] = "step5.eval" if preset_nm == "step5" and "validation_memory_policy" in row else "inactive"
+    src["step5A_validation_mode"] = "step5.eval" if preset_nm == "step5" and "step5A_validation_mode" in row else "inactive"
+    src["formal_entry_E4_validation_required"] = "step5.eval" if preset_nm == "step5" and "formal_entry_E4_validation_required" in row else "inactive"
+    src["old_eval_batch_2048_retired"] = "step5.eval" if preset_nm == "step5" and "old_eval_batch_2048_retired" in row else "inactive"
+    src["valid_loss_components"] = "step5.eval" if preset_nm == "step5" and "valid_loss_components" in row else "inactive"
     if preset_nm == "step3":
         for key in (
             "optimizer",
@@ -2485,6 +2706,17 @@ def build_resolved_training_config(
         evidence_max_length=int(evidence_max_length_v),
         valid_batch_size=int(valid_batch_size_v),
         valid_micro_batch_size=int(valid_micro_batch_size_v),
+        valid_per_gpu_batch_size=int(valid_per_gpu_batch_size_v),
+        valid_global_batch_size=int(valid_global_batch_size_v),
+        valid_forward_micro_batch_size=int(valid_forward_micro_batch_size_v),
+        test_per_gpu_batch_size=int(test_per_gpu_batch_size_v),
+        test_forward_micro_batch_size=int(test_forward_micro_batch_size_v),
+        validation_microbatch_accumulation=bool(validation_microbatch_accumulation_v),
+        validation_memory_policy=str(validation_memory_policy_v),
+        step5A_validation_mode=str(step5a_validation_mode_v),
+        formal_entry_E4_validation_required=bool(formal_entry_e4_validation_required_v),
+        old_eval_batch_2048_retired=bool(old_eval_batch_2048_retired_v),
+        valid_loss_components_json=json.dumps(valid_loss_components_v, ensure_ascii=False, sort_keys=True),
         train_batch_size=G,
         global_batch_size=G,
         batch_size_global=G,
@@ -2584,7 +2816,33 @@ def build_resolved_training_config(
         lambda_ortho_step5=float(lambda_ortho_step5_v),
         step5_lci_weight=float(step5_lci_weight_v),
         step5_fca_weight=float(step5_fca_weight_v),
+        step5_head=str(step5_head_v),
+        lora_target_policy_id=str(lora_target_policy_id_v),
+        head_specific_lora_allowlist_id=str(head_specific_lora_allowlist_id_v),
+        final_lora_target_modules=final_lora_target_modules_v,
+        forbidden_lora_targets=forbidden_lora_targets_v,
+        deleted_legacy_modules=deleted_legacy_modules_v,
+        combined_formal_enabled=bool(combined_formal_enabled_v),
+        all_trainable_grad_required=bool(all_trainable_grad_required_v),
+        head_specific_trainable_policy=str(head_specific_trainable_policy_v),
+        head_gated_loss_contract_json=str(head_gated_loss_contract_json_v),
+        step5_selected_tuning_candidate=str(step5_selected_tuning_candidate_v),
+        step5_fallback_tuning_candidate=str(step5_fallback_tuning_candidate_v),
+        step5_effective_samples_json=str(step5_effective_samples_json_v),
+        step5_optimizer_steps_json=str(step5_optimizer_steps_json_v),
         step5_innovation_config_json=str(step5_innovation_config_json_v),
+        step5_task_decoupled_policy_config_json=str(step5_task_decoupled_policy_config_json_v),
+        step5_export_loader_config_json=str(step5_export_loader_config_json_v),
+        step5_sampler_config_json=str(step5_sampler_config_json_v),
+        step5_batch_candidates_config_json=str(step5_batch_candidates_config_json_v),
+        step5_tuning_config_json=str(step5_tuning_config_json_v),
+        step5_lifecycle_config_json=str(step5_lifecycle_config_json_v),
+        step5_lifecycle_phase=str(step5_lifecycle_phase_v),
+        step5_allow_embedded_final_eval=bool(step5_allow_embedded_final_eval_v),
+        step5_memory_truth_config_json=str(step5_memory_truth_config_json_v),
+        step5_gradient_checkpointing_enabled=bool(step5_gradient_checkpointing_enabled_v),
+        step5_gradient_checkpointing_reentrant_policy=str(step5_gradient_checkpointing_reentrant_policy_v),
+        step5_use_cache_training_disabled=bool(step5_use_cache_training_disabled_v),
         step3_structured_loss_weights_json=str(step3_structured_loss_weights_json_v),
         step3_loss_semantics_json=str(step3_loss_semantics_json_v),
         uncertainty_entropy_eps=float(uncertainty_entropy_eps_v),

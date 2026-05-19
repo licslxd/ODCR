@@ -6,6 +6,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CODE_DIR = REPO_ROOT / "code"
@@ -19,6 +21,7 @@ MESSAGE = (
     "grad_accum has been removed in ODCR no-accum architecture; use per_gpu_batch_size "
     "and global_batch_size = per_gpu_batch_size * ddp_world_size."
 )
+pytestmark = pytest.mark.slow
 
 
 class GradAccumRemovedTest(unittest.TestCase):

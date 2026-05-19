@@ -82,6 +82,23 @@ Stage truth is finalized per run at `meta/stage_status.json`, and formal
 downstream handoff must pass through `odcr_core.upstream_resolver`. Historical
 docs and `AI_analysis/` reports are not live state sources.
 
+Current code-state governance after the run2 repair is:
+
+- Active runtime tree: `code/`
+- Reference baseline only: `code2/`
+- Paper-original reference only: `code1/`
+- Current Step3 task2 truth source: `runs/step3/task2/2`
+- Step4 upstream checkpoint binding:
+  `stage_status.selected_checkpoint`
+
+`code2/` must not be used as a direct overwrite source or runtime fallback.
+`code1/` must not be used as a recovery target. For Step4 admission,
+`best.pth` and `latest.pth` are secondary consistency aliases only; the primary
+checkpoint is the selected checkpoint in stage status or accepted eval handoff.
+Run2 frozen training config may differ from the current live Step3 config for
+future runs. This is recorded as live-vs-frozen drift and must not cause current
+config hashes to masquerade as run2 checkpoint architecture truth.
+
 Default run console output is intentionally compact and mirrored to
 `meta/console.log`. Detailed launcher and training diagnostics live in
 `meta/full.log`, warnings/errors in `meta/errors.log`, raw captured child output
@@ -249,14 +266,21 @@ allocation. The shared session is created or entered on admin with
 `odcr-enter-gpu <JOBID>` inside that same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions; and must not manage GPU allocation. Codex trusts
-only the current tmux session's real-time CUDA environment. GPU use is allowed
-by default for repo-local validation, probe, and bounded runtime after fast
-sanity and current-pane validation. The controlled tmux GPU bridge at
+only the current tmux session's real-time CUDA environment. The `odcr-enter-gpu`
+handoff is automatic and two-phase: admin-side tmux metadata is captured before
+`srun`, GPU-side CUDA metadata is captured after `srun`, and the GPU-side phase
+does not call tmux. The active bridge handoff is only
+`AI_analysis/runtime/current_gpu_pane.json` with schema
+`odcr_current_gpu_pane_handoff/2`; stale or invalid handoff state fails fast
+instead of falling back to admin, and `AI_analysis/runtime/gpu_pane.json` is
+historical hint material only. GPU use is allowed by default for repo-local
+validation, probe, and bounded runtime after fast sanity and current-pane
+validation. The controlled tmux GPU bridge at
 `python code/tools/odcr_tmux_gpu_bridge.py` may target only a user-created,
 already-entered, uniquely validated GPU pane and may send one bridge-generated
 command file. It is not arbitrary send-keys and is no longer limited by a GPU
 whitelist hard blocker. Bridge output stays under
-`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default, with a
+`AI_analysis/01_raw_logs` or `AI_analysis/05_final_reports` by default, with a
 mandatory formal namespace guard. post-edit full is not a GPU prerequisite, and
 runtime evidence takes priority over static full-suite instability. A normal
 admin shell without `nvidia-smi`, a
@@ -361,3 +385,16 @@ affect Step3, or `all`, not for every user-facing change. Real training still
 requires explicit user authorization.
 
 Also confirm legacy shell entrypoints remain absent.
+## Active Aux Runtime
+
+`code/odcr_core/aux/` is the active auxiliary infrastructure tree. It owns
+runtime/tmux/GPU bridge dispatch, governance registries, AI_analysis writing,
+artifact path policy, and runtime CLI facades. `./odcr` remains the only user
+entrypoint; `./odcr runtime ...` is a subcommand, not a second control plane.
+
+Codex/tmux/GPU validation must use `./odcr runtime bridge discover`,
+`validate-only`, `marker-probe`, `cuda-probe`, or registered bounded probes
+such as `./odcr runtime probe --stage step5A --task 2 --bounded`. The bridge
+records current-pane hostname, TMUX, SLURM_JOB_ID, CUDA_VISIBLE_DEVICES,
+nvidia-smi, and torch CUDA evidence under AI_analysis. Tests write run-like
+artifacts under `test_artifacts/`, not formal `runs/`.

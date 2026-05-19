@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 CODE_DIR = Path(__file__).resolve().parents[1]
@@ -264,6 +265,8 @@ class Step3UpstreamGateTests(unittest.TestCase):
             embed_dim=EMBED_DIM,
         )
 
+    @pytest.mark.artifact
+    @pytest.mark.slow
     def test_current_preprocess_latest_artifacts_pass_gate(self) -> None:
         summary = validate_step3_preprocess_upstream_gate(
             repo_root=REPO_ROOT,

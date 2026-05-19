@@ -1,3 +1,10 @@
+"""Internal preprocess config fixtures for tests and schema checks.
+
+These registrations are not a user-visible entrypoint. Operators run the
+current preprocess stages through ./odcr preprocess a, ./odcr preprocess b, or
+./odcr preprocess c; this module only materializes internal config examples.
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -8,7 +15,7 @@ from odcr_core.preprocess_schema import PreprocessConfig, validate_preprocess_co
 
 
 @dataclass(frozen=True)
-class PreprocessPresetRegistration:
+class InternalPreprocessConfigRegistration:
     name: str
     stage: str
     description: str
@@ -19,60 +26,60 @@ class PreprocessPresetRegistration:
         return asdict(self)
 
 
-_PREPROCESS_PRESET_REGISTRY: dict[str, PreprocessPresetRegistration] = {
-    "preprocess_a_default": PreprocessPresetRegistration(
+_INTERNAL_PREPROCESS_CONFIG_REGISTRY: dict[str, InternalPreprocessConfigRegistration] = {
+    "preprocess_a_default": InternalPreprocessConfigRegistration(
         name="preprocess_a_default",
         stage="preprocess_a",
-        description="Canonical CPU preprocess preset for materializing the preprocess CSV asset contract.",
+        description="Internal CPU preprocess config fixture for materializing the preprocess CSV asset contract.",
         entry_module="configs.experiments.preprocess_a_default",
     ),
-    "preprocess_b_a100_2gpu": PreprocessPresetRegistration(
+    "preprocess_b_a100_2gpu": InternalPreprocessConfigRegistration(
         name="preprocess_b_a100_2gpu",
         stage="preprocess_b",
         description=(
-            "Canonical A100 2-GPU preprocess_b preset. Builds dual-channel user/item profiles from canonical assets."
+            "Internal A100 2-GPU preprocess_b config fixture. Builds dual-channel user/item profiles from canonical assets."
         ),
         entry_module="configs.experiments.preprocess_b_a100_2gpu",
     ),
-    "preprocess_c_a100_2gpu": PreprocessPresetRegistration(
+    "preprocess_c_a100_2gpu": InternalPreprocessConfigRegistration(
         name="preprocess_c_a100_2gpu",
         stage="preprocess_c",
         description=(
-            "Canonical A100 2-GPU preprocess_c preset. Builds dual-channel domain semantics from canonical assets."
+            "Internal A100 2-GPU preprocess_c config fixture. Builds dual-channel domain semantics from canonical assets."
         ),
         entry_module="configs.experiments.preprocess_c_a100_2gpu",
     ),
 }
 
 
-def list_preprocess_presets() -> list[PreprocessPresetRegistration]:
-    return [_PREPROCESS_PRESET_REGISTRY[name] for name in sorted(_PREPROCESS_PRESET_REGISTRY)]
+def list_internal_preprocess_configs() -> list[InternalPreprocessConfigRegistration]:
+    return [_INTERNAL_PREPROCESS_CONFIG_REGISTRY[name] for name in sorted(_INTERNAL_PREPROCESS_CONFIG_REGISTRY)]
 
 
-def get_preprocess_preset_registration(name: str) -> PreprocessPresetRegistration:
+def get_internal_preprocess_config_registration(name: str) -> InternalPreprocessConfigRegistration:
     try:
-        return _PREPROCESS_PRESET_REGISTRY[name]
+        return _INTERNAL_PREPROCESS_CONFIG_REGISTRY[name]
     except KeyError as exc:
-        known = ", ".join(sorted(_PREPROCESS_PRESET_REGISTRY))
-        raise KeyError(f"Unknown preprocess preset {name!r}. Known presets: {known}") from exc
+        known = ", ".join(sorted(_INTERNAL_PREPROCESS_CONFIG_REGISTRY))
+        raise KeyError(f"Unknown internal preprocess config {name!r}. Known configs: {known}") from exc
 
 
-def instantiate_preprocess_preset(name: str) -> PreprocessConfig:
-    reg = get_preprocess_preset_registration(name)
+def instantiate_internal_preprocess_config(name: str) -> PreprocessConfig:
+    reg = get_internal_preprocess_config_registration(name)
     module = importlib.import_module(reg.entry_module)
     try:
         build_fn = getattr(module, reg.entry_function)
     except AttributeError as exc:
         raise AttributeError(
-            f"Preprocess preset module {reg.entry_module!r} is missing {reg.entry_function!r}"
+            f"Internal preprocess config module {reg.entry_module!r} is missing {reg.entry_function!r}"
         ) from exc
     config = build_fn()
     return validate_preprocess_config(config)
 
 
-def render_preprocess_preset(name: str) -> dict[str, Any]:
-    reg = get_preprocess_preset_registration(name)
-    config = instantiate_preprocess_preset(name)
+def render_internal_preprocess_config(name: str) -> dict[str, Any]:
+    reg = get_internal_preprocess_config_registration(name)
+    config = instantiate_internal_preprocess_config(name)
     return {
         "name": reg.name,
         "stage": reg.stage,

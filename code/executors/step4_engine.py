@@ -57,22 +57,18 @@ from odcr_core.step4_training_export import (
 )
 from odcr_core.odcr_cf_routing import ODCFRoutingConfig, attach_odcr_cf_routing
 from odcr_core.file_atomic import atomic_write_json
+from odcr_core.aux.artifacts.path_policy import load_json_file
 from odcr_core.training_checkpoint import (
     CheckpointLineageError,
-    STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
-    current_effective_payload,
-    current_resolved_config_lineage,
     current_one_control_resolved_config_hash,
-    current_source_table_lineage,
     file_fingerprint,
     model_artifact_fingerprint,
-    read_checkpoint_lineage,
-    step3_resolved_config_compatibility_payload,
-    step3_source_table_compatibility_payload,
     stable_hash,
-    validate_step3_checkpoint_lineage,
 )
-from odcr_core.step3_upstream_gate import validate_step3_preprocess_upstream_gate
+from odcr_core.step4_checkpoint_lineage import (
+    require_step4_lineage_field,
+    validate_step4_prelaunch_checkpoint_lineage,
+)
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -110,40 +106,6 @@ _STEP4_ENCODE_CACHE_REQUIRED_FIELDS = (
     "evidence_quality_prior",
 )
 
-
-def _step3_preprocess_lineage_expected_for_step4(upstream_evidence: Mapping[str, Any]) -> dict[str, Any]:
-    preprocess = upstream_evidence.get("preprocess")
-    if not isinstance(preprocess, Mapping):
-        raise CheckpointLineageError("Step4 refused Step3 checkpoint: current preprocess gate evidence missing.")
-    latest_run_ids: dict[str, str] = {}
-    run_summary_fps: dict[str, Any] = {}
-    stage_status_fps: dict[str, Any] = {}
-    stage_manifest_fps: dict[str, Any] = {}
-    source_table_fps: dict[str, Any] = {}
-    metrics_fps: dict[str, Any] = {}
-    verify_fps: dict[str, Any] = {}
-    for unit in ("a", "b", "c"):
-        item = preprocess.get(unit)
-        if not isinstance(item, Mapping):
-            raise CheckpointLineageError(f"Step4 refused Step3 checkpoint: preprocess_{unit} evidence missing.")
-        latest_run_ids[unit] = str(item.get("run_id") or "")
-        run_summary_fps[unit] = item.get("run_summary_fingerprint")
-        stage_status_fps[unit] = item.get("stage_status_fingerprint")
-        stage_manifest_fps[unit] = item.get("stage_manifest_fingerprint")
-        source_table_fps[unit] = item.get("source_table_fingerprint")
-        metrics_fps[unit] = item.get("metrics_fingerprint")
-        verify_fps[unit] = item.get("verify_report_fingerprint")
-    return {
-        "preprocess_latest_run_ids": latest_run_ids,
-        "preprocess_run_summary_fingerprints_hash": stable_hash(run_summary_fps),
-        "preprocess_stage_status_fingerprints_hash": stable_hash(stage_status_fps),
-        "preprocess_stage_manifest_fingerprints_hash": stable_hash(stage_manifest_fps),
-        "preprocess_source_table_fingerprints_hash": stable_hash(source_table_fps),
-        "preprocess_metrics_fingerprints_hash": stable_hash(metrics_fps),
-        "preprocess_verify_report_fingerprints_hash": stable_hash(verify_fps),
-    }
-
-
 def _validate_step3_checkpoint_lineage_for_step4(
     *,
     checkpoint_path: str,
@@ -152,14 +114,7 @@ def _validate_step3_checkpoint_lineage_for_step4(
     target: str,
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    payload = current_effective_payload(required=True)
-    train_path = os.path.join(get_merged_data_dir(), str(task_idx), "aug_train.csv")
-    valid_path = os.path.join(get_merged_data_dir(), str(task_idx), "aug_valid.csv")
-    data_fps = {
-        "aug_train_csv": file_fingerprint(train_path),
-        "aug_valid_csv": file_fingerprint(valid_path),
-    }
-    current_arch = {
+    observed_loader_arch = {
         "nuser": int(config["nuser"]),
         "nitem": int(config["nitem"]),
         "ntoken": int(config["ntoken"]),
@@ -169,98 +124,21 @@ def _validate_step3_checkpoint_lineage_for_step4(
         "nhid": int(config["nhid"]),
         "dropout": float(config["dropout"]),
     }
-    upstream_evidence = validate_step3_preprocess_upstream_gate(
-        repo_root=get_odcr_root(),
-        task_id=int(task_idx),
-        auxiliary_domain=str(auxiliary),
-        target_domain=str(target),
-        data_dir=get_data_dir(),
-        merged_dir=get_merged_data_dir(),
-        runs_dir=os.environ.get("ODCR_RESOLVED_RUNS_DIR") or os.path.join(get_odcr_root(), "runs"),
-        embed_dim=int(get_odcr_embed_dim()),
-    )
-    resolved_compatibility = step3_resolved_config_compatibility_payload(
-        payload=payload,
-        task_id=int(task_idx),
-        source_domain=str(auxiliary),
-        target_domain=str(target),
-        embed_dim=int(get_odcr_embed_dim()),
-        structured_losses=payload.get("step3_structured_losses") or {},
-        loss_semantics=payload.get("step3_loss_semantics") or {},
-        architecture_hash=stable_hash(current_arch),
-    )
-    source_table = current_source_table_lineage(required_file=bool((os.environ.get("ODCR_MANIFEST_DIR") or "").strip()))
-    source_table_compatibility = step3_source_table_compatibility_payload(source_table)
-    data_contract_payload = {
-        "preprocess_contract_version": PREPROCESS_CONTRACT_VERSION,
-        "source_task": {
-            "task_id": int(task_idx),
-            "auxiliary": str(auxiliary),
-            "target": str(target),
-        },
-        "source_csv_fingerprints": upstream_evidence.get("source_csv_artifacts"),
-        "merged_csv_fingerprints": upstream_evidence.get("merged_artifacts") or data_fps,
-    }
-    artifact_lineage_payload = {
-        "data_merged_artifact_fingerprint": stable_hash(data_fps),
-        "preprocess": _step3_preprocess_lineage_expected_for_step4(upstream_evidence),
-        "profile_artifact_fingerprints": upstream_evidence.get("profile_artifact_fingerprints"),
-        "domain_artifact_fingerprints": upstream_evidence.get("domain_artifact_fingerprints"),
-        "sentence_embed_model_identity": {
-            "identity": os.path.abspath(os.environ.get("ODCR_RESOLVED_SENTENCE_EMBED_MODEL") or get_sentence_embed_model_dir()),
-            "resolved_env_key": "ODCR_RESOLVED_SENTENCE_EMBED_MODEL",
-            "model_artifact_fingerprint": model_artifact_fingerprint(
-                os.environ.get("ODCR_RESOLVED_SENTENCE_EMBED_MODEL") or get_sentence_embed_model_dir()
-            ),
-        },
-    }
-    semantic_model_payload = {
-        "resolved_config_compatibility": resolved_compatibility,
-        "source_table_compatibility": source_table_compatibility,
-        "embed_dim": int(get_odcr_embed_dim()),
-        "model_architecture_config_hash": stable_hash(current_arch),
-        "representation_output_contract_hash": stable_hash(
-            {
-                "Step3ForwardOutput": "odcr_step3_forward_output/structured_shared_specific_v1",
-                "Step3LossBundle": "odcr_step3_loss_bundle/structured_shared_specific_v1",
-            }
-        ),
-        "structured_losses_hash": stable_hash(payload.get("step3_structured_losses") or {}),
-        "loss_semantics_hash": stable_hash(payload.get("step3_loss_semantics") or {}),
-        "profile_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("profile_artifact_fingerprints") or {}),
-        "domain_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("domain_artifact_fingerprints") or {}),
-    }
-    expected = {
-        "sidecar_schema_version": STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
-        "task_id": int(task_idx),
-        "source_domain": str(auxiliary),
-        "target_domain": str(target),
-        "preprocess_contract_version": PREPROCESS_CONTRACT_VERSION,
-        "data_merged_artifact_fingerprint": stable_hash(data_fps),
-        "embed_dim": int(get_odcr_embed_dim()),
-        "step3_structured_losses_config_hash": stable_hash(payload.get("step3_structured_losses") or {}),
-        "model_architecture_config_hash": stable_hash(current_arch),
-        "resolved_config_compatibility_hash": stable_hash(resolved_compatibility),
-        "source_table_compatibility_hash": stable_hash(source_table_compatibility),
-        "semantic_model_compat_hash": stable_hash(semantic_model_payload),
-        "data_contract_hash": stable_hash(data_contract_payload),
-        "artifact_lineage_hash": stable_hash(artifact_lineage_payload),
-        **_step3_preprocess_lineage_expected_for_step4(upstream_evidence),
-        "profile_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("profile_artifact_fingerprints") or {}),
-        "domain_artifact_fingerprints_hash": stable_hash(upstream_evidence.get("domain_artifact_fingerprints") or {}),
-        "source_csv_fingerprints_hash": stable_hash(upstream_evidence.get("source_csv_artifacts") or {}),
-        "merged_csv_fingerprints_hash": stable_hash(upstream_evidence.get("merged_artifacts") or data_fps),
-        "source_task": {
-            "task_id": int(task_idx),
-            "auxiliary": str(auxiliary),
-            "target": str(target),
-            "scenario": str(payload.get("scenario") or ""),
-            "direction": str(payload.get("direction") or ""),
-        },
-    }
     try:
         # Includes the checkpoint_file_hash hard gate before torch.load.
-        return validate_step3_checkpoint_lineage(checkpoint_path, expected=expected)
+        return validate_step4_prelaunch_checkpoint_lineage(
+            checkpoint_path=checkpoint_path,
+            task_id=int(task_idx),
+            auxiliary_domain=str(auxiliary),
+            target_domain=str(target),
+            data_dir=get_data_dir(),
+            merged_dir=get_merged_data_dir(),
+            runs_dir=os.environ.get("ODCR_RESOLVED_RUNS_DIR") or os.path.join(get_odcr_root(), "runs"),
+            sentence_embed_model=os.environ.get("ODCR_RESOLVED_SENTENCE_EMBED_MODEL") or get_sentence_embed_model_dir(),
+            embed_dim=int(get_odcr_embed_dim()),
+            observed_loader_architecture=observed_loader_arch,
+            phase=str(os.environ.get("ODCR_STEP4_MODE") or "formal_child"),
+        )
     except CheckpointLineageError as exc:
         raise CheckpointLineageError(f"Step4 refused Step3 checkpoint: {exc}") from exc
 
@@ -304,6 +182,16 @@ def _step4_encoded_cache_fingerprint(
     resolved_config_hash = current_one_control_resolved_config_hash(
         extra={"stage": "step4", "task_id": int(task_idx), "artifact": "encoded_cache"}
     )
+    selected_checkpoint_raw = (os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT") or "").strip()
+    if not selected_checkpoint_raw:
+        raise RuntimeError(
+            "Step4 encoded cache fingerprint requires ODCR_STEP3_SELECTED_CHECKPOINT "
+            "from stage_status.selected_checkpoint; best.pth alias is secondary only."
+        )
+    selected_checkpoint = os.path.abspath(selected_checkpoint_raw)
+    selected_checkpoint_hash = str(os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT_HASH") or "").strip()
+    if not selected_checkpoint_hash:
+        selected_checkpoint_hash = _step4_file_sha256(selected_checkpoint)
     payload: dict[str, Any] = {
         "schema_version": _STEP4_ENCODE_CACHE_SCHEMA_VERSION,
         "cache_version": _STEP4_ENCODE_CACHE_VERSION,
@@ -337,12 +225,9 @@ def _step4_encoded_cache_fingerprint(
             json.loads(os.environ.get("ODCR_STEP4_RCR_CONFIG_JSON") or "{}")
         ),
         "upstream_step3_run_id": str(os.path.basename(os.path.abspath(os.environ.get("ODCR_STEP3_RUN_DIR") or ""))),
-        "step3_checkpoint_hash": _step4_file_sha256(
-            os.path.join(os.environ.get("ODCR_STEP3_RUN_DIR") or "", "model", "best.pth")
-        )
-        if os.environ.get("ODCR_STEP3_RUN_DIR")
-        and os.path.isfile(os.path.join(os.environ.get("ODCR_STEP3_RUN_DIR") or "", "model", "best.pth"))
-        else "",
+        "step3_checkpoint_source": os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT_SOURCE") or "stage_status.selected_checkpoint",
+        "step3_selected_checkpoint_path": selected_checkpoint,
+        "step3_checkpoint_hash": selected_checkpoint_hash,
         "step3_checkpoint_lineage_hash": str(step3_checkpoint_lineage_hash),
         "index_contract_or_required_fields_hash": required_fields_hash,
         "producer_code_version": _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION,
@@ -604,8 +489,7 @@ def _step4_wait_for_partial_manifests(partial_dir: str, *, world_size: int, time
         if len(manifests) >= int(world_size):
             out = []
             for path in manifests:
-                with open(path, "r", encoding="utf-8") as handle:
-                    out.append(json.load(handle))
+                out.append(load_json_file(path))
             ranks = {int(item.get("rank", -1)) for item in out}
             if ranks == set(range(int(world_size))):
                 return out
@@ -899,6 +783,7 @@ def _run_one_task(
     world_size: int,
     local_rank: int,
     log_file: str,
+    run_id: str | None = None,
 ):
     _reject_step4_formal_bare_runtime_env()
     step4_e2e_start = time.perf_counter()
@@ -906,10 +791,25 @@ def _run_one_task(
     auxiliary = task_config["auxiliary"]
     target = task_config["target"]
     _task_ckpt_dir = get_stage_run_dir(task_idx)
-    _step3_stage = (os.environ.get("ODCR_STEP3_RUN_DIR") or "").strip()
-    _model_root = _step3_stage if _step3_stage else _task_ckpt_dir
-
-    save_file = os.path.join(_model_root, "model", "best.pth")
+    _expected_run_id = os.path.basename(os.path.abspath(_task_ckpt_dir)).strip()
+    if run_id is not None and str(run_id).strip() != _expected_run_id:
+        raise RuntimeError(
+            "Step4 child run-id propagation mismatch: "
+            f"--run-id={run_id!r} stage_run_dir_run_id={_expected_run_id!r} stage_run_dir={_task_ckpt_dir}"
+        )
+    _expected_full_log = os.path.abspath(os.path.join(_task_ckpt_dir, "meta", "full.log"))
+    if os.path.abspath(log_file) != _expected_full_log:
+        raise RuntimeError(
+            "Step4 child log_file/run_dir propagation mismatch: "
+            f"log_file={os.path.abspath(log_file)} expected={_expected_full_log}"
+        )
+    _selected_checkpoint = (os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT") or "").strip()
+    if not _selected_checkpoint:
+        raise RuntimeError(
+            "Step4 runtime requires ODCR_STEP3_SELECTED_CHECKPOINT from stage_status.selected_checkpoint; "
+            "best.pth alias is not a primary upstream binding."
+        )
+    save_file = os.path.abspath(_selected_checkpoint)
 
     device = f"cuda:{local_rank}"
     if batch_size % world_size != 0:
@@ -992,6 +892,32 @@ def _run_one_task(
         )
     config["nuser"] = nuser
     config["nitem"] = nitem
+    step3_lineage = _validate_step3_checkpoint_lineage_for_step4(
+        checkpoint_path=str(config.get("save_file")),
+        task_idx=int(task_idx),
+        auxiliary=str(auxiliary),
+        target=str(target),
+        config=config,
+    )
+    step3_lineage_hash = str(
+        require_step4_lineage_field(
+            step3_lineage,
+            "lineage_hash",
+            source_paths=step3_lineage.get("source_paths") if isinstance(step3_lineage, Mapping) else None,
+        )
+    )
+    step3_checkpoint_sha256 = str(
+        require_step4_lineage_field(
+            step3_lineage,
+            "checkpoint_sha256",
+            source_paths=step3_lineage.get("source_paths") if isinstance(step3_lineage, Mapping) else None,
+        )
+    )
+    frozen_arch = step3_lineage.get("expected_model_architecture_payload") or {}
+    if isinstance(frozen_arch, Mapping):
+        for key in ("nuser", "nitem", "ntoken", "emsize", "nlayers", "nhead", "nhid", "dropout"):
+            if key in frozen_arch:
+                config[key] = frozen_arch[key]
     model = Model(
         config.get("nuser"),
         config.get("nitem"),
@@ -1008,13 +934,6 @@ def _run_one_task(
         dc,
         ds,
     ).to(device)
-    step3_lineage = _validate_step3_checkpoint_lineage_for_step4(
-        checkpoint_path=str(config.get("save_file")),
-        task_idx=int(task_idx),
-        auxiliary=str(auxiliary),
-        target=str(target),
-        config=config,
-    )
     _map = device if isinstance(device, str) else f"cuda:{device}"
     model.load_state_dict(torch.load(config.get("save_file"), map_location=_map, weights_only=True))
     _raw_dp = (os.environ.get("ODCR_DECODE_PROFILE_JSON") or "").strip()
@@ -1063,7 +982,7 @@ def _run_one_task(
         target,
         require_step5_text_model_dir(),
         proc_max_len,
-        str(step3_lineage["lineage_hash"]),
+        step3_lineage_hash,
     )
     cache_dir = _step4_encoded_cache_dir(task_idx, cache_fingerprint)
     plog.line(
@@ -1525,14 +1444,17 @@ def _run_one_task(
             task_id=_tid,
             auxiliary_domain=auxiliary,
             target_domain=target,
-            step3_checkpoint_lineage_hash=str(step3_lineage["lineage_hash"]),
+            step3_checkpoint_lineage_hash=step3_lineage_hash,
             step4_rcr_config=rcr_config.to_dict(),
             step4_run=_slug,
             frozen_step3_lineage={
-                "upstream_step3_run_id": str(os.path.basename(os.path.abspath(_model_root))),
+                "upstream_step3_run_id": str(
+                    step3_lineage.get("step3_run_id")
+                    or os.path.basename(os.path.abspath(os.environ.get("ODCR_STEP3_RUN_DIR") or ""))
+                ),
                 "step3_checkpoint_path": os.path.abspath(str(config.get("save_file"))),
-                "step3_checkpoint_hash": _step4_file_sha256(str(config.get("save_file"))),
-                "step3_checkpoint_lineage_hash": str(step3_lineage["lineage_hash"]),
+                "step3_checkpoint_hash": step3_checkpoint_sha256,
+                "step3_checkpoint_lineage_hash": step3_lineage_hash,
                 "step3_stage_status_hash": _step4_upstream_artifact_hash("status_path") or _step4_upstream_artifact_hash("stage_status"),
                 "step3_eval_handoff_hash": _step4_upstream_artifact_hash("eval_handoff"),
             },

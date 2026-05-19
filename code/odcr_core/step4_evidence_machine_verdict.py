@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from odcr_core.aux.evidence.ai_analysis_writer import get_writer
 from odcr_core.evidence_level import (
     E4_GPU_SHARD_FORWARD_BOUNDED,
     EvidenceLevelError,
     evidence_level_rank,
     parse_evidence_level,
 )
+from odcr_core.file_atomic import atomic_write_json
 
 
 MACHINE_VERDICT_SCHEMA_VERSION = "odcr_machine_verdict/1"
@@ -93,8 +95,27 @@ def build_step4_evidence_machine_verdict(fields: Mapping[str, Any]) -> dict[str,
 def write_step4_evidence_machine_verdict(path: str | Path, fields: Mapping[str, Any]) -> dict[str, Any]:
     payload = build_step4_evidence_machine_verdict(fields)
     out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        rel = out.resolve().relative_to(Path.cwd().resolve() / "AI_analysis")
+    except ValueError:
+        atomic_write_json(out, payload)
+    else:
+        bucket = rel.parts[0] if rel.parts else "05_final_reports"
+        writer = get_writer(Path.cwd())
+        method = {
+            "01_raw_logs": "raw_log",
+            "02_search_hits": "search_hit",
+            "03_evidence_ledgers": "ledger",
+            "04_phase_summaries": "phase_summary",
+            "05_final_reports": "final_report",
+        }.get(bucket, "final_report")
+        getattr(writer, method)(
+            rel.name,
+            "```json\n" + json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n```",
+            source="step4_evidence_machine_verdict",
+            stage="step4",
+            validation_result=payload.get("verdict"),
+        )
     return payload
 
 

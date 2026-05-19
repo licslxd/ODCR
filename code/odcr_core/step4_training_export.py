@@ -20,6 +20,7 @@ from odcr_core.index_contract import (
     STEP4_RCR_REQUIRED_COLUMNS,
     STEP4_RCR_SCORE_COLUMNS,
     STEP4_ROUTE_POSTERIOR_CONTRACT_VERSION,
+    refresh_index_contract_train_csv_fingerprint,
     remap_step4_train_df_to_global_columns,
     step4_prior_boundary_contract,
     step4_rcr_required_fields_hash,
@@ -419,7 +420,8 @@ def write_step4_training_artifacts(
     export_df.to_csv(csv_path, index=False, encoding="utf-8")
     contract_path: str | None = None
     if index_contract is not None:
-        contract_path = write_index_contract(index_contract, os.path.join(out_dir, INDEX_CONTRACT_FILENAME))
+        refreshed_contract = refresh_index_contract_train_csv_fingerprint(index_contract, csv_path)
+        contract_path = write_index_contract(refreshed_contract, os.path.join(out_dir, INDEX_CONTRACT_FILENAME))
     with open(man_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
         f.write("\n")

@@ -415,7 +415,7 @@ def step3_tokenizer_cache_entry_dir(
 
 def get_step3_validation_root(repo_root: Path, validation_slug: str) -> Path:
     slug = _safe_namespace_component(str(validation_slug), label="step3 validation slug")
-    return runs_root(repo_root) / "step3_validation" / slug
+    return repo_root / "test_artifacts" / "runs_like" / "step3_validation" / slug
 
 
 def get_step3_validation_run_root(repo_root: Path, validation_slug: str, run_id: str) -> Path:
@@ -430,7 +430,7 @@ def get_step3_validation_meta_dir(repo_root: Path, validation_slug: str, run_id:
 def step3_validation_evidence_root(repo_root: Path, validation_slug: str, run_id: str) -> Path:
     slug = _safe_namespace_component(str(validation_slug), label="step3 validation slug")
     rid = _safe_namespace_component(str(run_id), label="step3 validation run_id")
-    return (repo_root / "AI_analysis" / "06_probe_evidence" / slug / rid).resolve()
+    return (repo_root / "AI_analysis" / "01_raw_logs" / slug / rid).resolve()
 
 
 def step3_validation_tokenizer_cache_entry_dir(

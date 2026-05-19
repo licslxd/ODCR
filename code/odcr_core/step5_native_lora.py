@@ -1,43 +1,52 @@
-"""
-Step5 文本栈原生 LoRA（不依赖 HuggingFace peft 包，避免与旧版 transformers 的导入链冲突）。
+"""Head-aware native LoRA injection for Step5.
 
-对 ``executors.step5_engine.Model`` 中「解释/语言建模」相关 ``nn.Linear`` 注入低秩旁路；
-显式排除 ``recommender``、``odcr_scorer`` 评分支路。
+The active Step5 path is allowlist-only: an empty ``target_modules`` list no
+longer means "scan the model".  The resolver should pass the policy sentinel,
+or a non-empty explicit subset of the head allowlist.
 """
+
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
-_TEXT_LORA_PREFIXES: Tuple[str, ...] = (
-    "transformer_encoder",
-    "hidden2token",
-    "domain_cross_attn",
+from odcr_core.step5_grad_contract import (
+    DELETED_STEP5_LEGACY_MODULES,
+    STEP5_LORA_TARGET_POLICY_ID,
+    head_specific_lora_allowlist_id,
+    normalize_step5_head_for_contract,
+)
+
+
+HEAD_AWARE_LORA_TARGET_SENTINEL = "__HEAD_AWARE_STEP5_DEFAULT__"
+
+_STEP5A_PREFIXES: tuple[str, ...] = (
     "domain_gate",
-    "odcr_explainer_bridge",
-    "flan_explainer",
-    "flan_soft_prompt_stack",
+    "transformer_encoder",
+)
+
+_STEP5B_PREFIXES: tuple[str, ...] = (
+    "domain_gate",
+    "transformer_encoder",
     "ccv_numeric_adapter",
     "ccv_control_adapter",
     "fca_score_align",
     "fca_explain_align",
+    "flan_explainer",
 )
 
-_SKIP_PREFIXES: Tuple[str, ...] = (
-    "recommender",
-    "odcr_scorer",
-)
+_COMBINED_PREFIXES: tuple[str, ...] = tuple(dict.fromkeys(_STEP5A_PREFIXES + _STEP5B_PREFIXES))
 
 
 class LoRALinear(nn.Module):
-    """在冻结的 ``nn.Linear`` 旁叠加 LoRA：output = base(x) + scaling * B @ A @ dropout(x)（与常见实现等价）。"""
+    """Frozen ``nn.Linear`` plus trainable low-rank residual."""
 
     def __init__(self, base: nn.Linear, *, r: int, alpha: float, dropout: float) -> None:
         super().__init__()
         if r <= 0:
-            raise ValueError(f"LoRA r 须为正整数，当前为 {r}")
+            raise ValueError(f"LoRA r must be positive, got {r}")
         self.base = base
         self.r = int(r)
         self.scaling = float(alpha) / float(self.r)
@@ -56,7 +65,6 @@ class LoRALinear(nn.Module):
 
     @property
     def weight(self) -> torch.Tensor:
-        """兼容 ``nn.MultiheadAttention`` 等对 ``out_proj.weight`` 的直接读取。"""
         return self.base.weight
 
     @property
@@ -69,31 +77,120 @@ class LoRALinear(nn.Module):
         return y0 + (xd @ self.lora_A.T @ self.lora_B.T) * self.scaling
 
 
-def discover_step5_text_linear_targets(model: nn.Module) -> List[str]:
-    """按 ``Model`` 实际 ``named_modules`` 枚举可注入的 ``nn.Linear`` 全名（排除评分器）。"""
-    out: List[str] = []
+def _parent_and_child(model: nn.Module, dotted: str) -> Tuple[nn.Module, str]:
+    parts = dotted.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    return parent, parts[-1]
+
+
+def _prefixes_for_head(head: str) -> tuple[str, ...]:
+    norm = normalize_step5_head_for_contract(head)
+    if norm == "step5A":
+        return _STEP5A_PREFIXES
+    if norm == "step5B":
+        return _STEP5B_PREFIXES
+    return _COMBINED_PREFIXES
+
+
+def _legacy_target_hit(name: str) -> str | None:
+    for legacy in DELETED_STEP5_LEGACY_MODULES:
+        if name == legacy or name.startswith(legacy + "."):
+            return legacy
+    return None
+
+
+def _forbidden_reason(model: nn.Module, dotted: str) -> str | None:
+    legacy = _legacy_target_hit(dotted)
+    if legacy:
+        return f"deleted legacy module {legacy}"
+    try:
+        parent, child = _parent_and_child(model, dotted)
+    except AttributeError:
+        return "module path does not exist"
+    if isinstance(parent, nn.MultiheadAttention) and child == "out_proj":
+        return "nn.MultiheadAttention.out_proj is read functionally by PyTorch and must not be LoRA-wrapped"
+    return None
+
+
+def forbidden_lora_targets_for_model(model: nn.Module) -> list[str]:
+    out: list[str] = []
     for name, mod in model.named_modules():
-        if not isinstance(mod, nn.Linear):
+        if not isinstance(mod, nn.Linear) or not name:
             continue
-        if not name:
-            continue
-        if ".lm_head." in name or name.endswith(".lm_head"):
-            continue
-        if ".shared." in name:
-            continue
-        if any(name == p or name.startswith(p + ".") for p in _SKIP_PREFIXES):
-            continue
-        if any(name == p or name.startswith(p + ".") for p in _TEXT_LORA_PREFIXES):
+        reason = _forbidden_reason(model, name)
+        if reason:
             out.append(name)
     return out
 
 
-def _parent_and_child(model: nn.Module, dotted: str) -> Tuple[nn.Module, str]:
-    parts = dotted.split(".")
-    parent = model
-    for p in parts[:-1]:
-        parent = getattr(parent, p)
-    return parent, parts[-1]
+def _is_allowed_linear(model: nn.Module, name: str, *, head: str) -> bool:
+    if _forbidden_reason(model, name):
+        return False
+    if ".lm_head." in name or name.endswith(".lm_head"):
+        return False
+    if ".shared." in name:
+        return False
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in _prefixes_for_head(head))
+
+
+def head_aware_step5_lora_targets(model: nn.Module, *, head: str) -> list[str]:
+    targets: list[str] = []
+    for name, mod in model.named_modules():
+        if not isinstance(mod, nn.Linear) or not name:
+            continue
+        if _is_allowed_linear(model, name, head=head):
+            targets.append(name)
+    if not targets:
+        raise RuntimeError(f"Step5 {head} LoRA allowlist resolved to no Linear targets.")
+    return targets
+
+
+def resolve_step5_lora_targets(
+    model: nn.Module,
+    *,
+    head: str,
+    configured_target_modules: Sequence[str] | None,
+) -> dict[str, Any]:
+    configured = [str(item).strip() for item in (configured_target_modules or ()) if str(item).strip()]
+    allowlist = head_aware_step5_lora_targets(model, head=head)
+    allowset = set(allowlist)
+    if not configured:
+        raise RuntimeError(
+            "step5.ccv.native_lora.target_modules=[] is retired; use "
+            f"[{HEAD_AWARE_LORA_TARGET_SENTINEL!r}] for the head-aware allowlist."
+        )
+    if configured == [HEAD_AWARE_LORA_TARGET_SENTINEL]:
+        final_targets = allowlist
+        requested_policy = "head_aware_default_sentinel"
+    else:
+        forbidden = []
+        for target in configured:
+            reason = _forbidden_reason(model, target)
+            if reason:
+                forbidden.append({"target": target, "reason": reason})
+            elif target not in allowset:
+                forbidden.append({"target": target, "reason": "target is outside the head-aware allowlist"})
+        if forbidden:
+            detail = "; ".join(f"{item['target']} ({item['reason']})" for item in forbidden[:20])
+            raise RuntimeError(f"LoRA target policy violation for Step5 {head}: {detail}")
+        final_targets = list(dict.fromkeys(configured))
+        requested_policy = "explicit_subset_of_head_aware_allowlist"
+    return {
+        "target_policy_id": STEP5_LORA_TARGET_POLICY_ID,
+        "head_specific_lora_allowlist_id": head_specific_lora_allowlist_id(head),
+        "configured_target_modules": configured,
+        "allowlist_target_modules": allowlist,
+        "final_lora_target_modules": final_targets,
+        "forbidden_lora_targets": forbidden_lora_targets_for_model(model),
+        "requested_policy": requested_policy,
+    }
+
+
+def discover_step5_text_linear_targets(model: nn.Module, *, head: str = "combined") -> List[str]:
+    """Compatibility helper returning the explicit head-aware allowlist."""
+    return head_aware_step5_lora_targets(model, head=head)
 
 
 def apply_native_lora_to_step5_model(
@@ -102,55 +199,48 @@ def apply_native_lora_to_step5_model(
     r: int,
     alpha: float,
     dropout: float,
+    head: str,
     target_modules_override: Sequence[str] | None = None,
 ) -> Dict[str, Any]:
-    """
-    将文本栈 ``nn.Linear`` 替换为 :class:`LoRALinear`；失败时抛 ``RuntimeError``（fail-fast）。
-
-    若提供 ``target_modules_override``，则须为 ``named_modules()`` 中出现的 **完整** 子模块名列表，
-    且每个名须对应 ``nn.Linear``；否则报错（避免静默跳过）。
-    """
-    discovered = discover_step5_text_linear_targets(model)
-    if target_modules_override is not None:
-        want = [str(x).strip() for x in target_modules_override if str(x).strip()]
-        if not want:
-            raise RuntimeError("LoRA 注入失败：lora_target_modules 覆盖为非空列表，但解析后为空。")
-        disc_set = set(discovered)
-        missing = [n for n in want if n not in disc_set]
-        if missing:
-            raise RuntimeError(
-                "LoRA 注入失败：lora_target_modules 与当前 Step5 Model 线性层不匹配；以下名在模型中不存在或非 Linear：\n"
-                + "\n".join(f"  - {m}" for m in missing[:50])
-                + ("\n  ..." if len(missing) > 50 else "")
-                + f"\n当前可注入候选（节选前 40）：{discovered[:40]}"
-            )
-        targets = list(want)
-    else:
-        targets = list(discovered)
-    if not targets:
-        raise RuntimeError(
-            "LoRA 注入失败：未发现可注入的文本栈 Linear（target_modules 探测为空）；"
-            "请检查 Model 结构是否与 ODCR Step5 主线一致。"
-        )
+    target_policy = resolve_step5_lora_targets(
+        model,
+        head=head,
+        configured_target_modules=target_modules_override,
+    )
+    targets = list(target_policy["final_lora_target_modules"])
     for dotted in targets:
         parent, child = _parent_and_child(model, dotted)
         cur = getattr(parent, child)
         if not isinstance(cur, nn.Linear):
-            raise RuntimeError(f"LoRA 注入失败：{dotted!r} 不是 nn.Linear（实际为 {type(cur).__name__}）。")
+            raise RuntimeError(f"LoRA injection failed: {dotted!r} is {type(cur).__name__}, not nn.Linear.")
+        reason = _forbidden_reason(model, dotted)
+        if reason:
+            raise RuntimeError(f"LoRA injection refused forbidden target {dotted!r}: {reason}.")
         setattr(parent, child, LoRALinear(cur, r=int(r), alpha=float(alpha), dropout=float(dropout)))
     return {
         "enabled": True,
         "type": "lora",
-        "implementation": "odcr_native_linear",
+        "implementation": "odcr_native_linear_head_aware",
         "r": int(r),
         "alpha": float(alpha),
         "dropout": float(dropout),
         "target_modules": list(targets),
+        "target_policy_id": target_policy["target_policy_id"],
+        "head_specific_lora_allowlist_id": target_policy["head_specific_lora_allowlist_id"],
+        "forbidden_lora_targets": list(target_policy["forbidden_lora_targets"]),
+        "deleted_legacy_modules": list(DELETED_STEP5_LEGACY_MODULES),
+        "configured_target_modules": list(target_policy["configured_target_modules"]),
+        "allowlist_target_modules": list(target_policy["allowlist_target_modules"]),
+        "requested_policy": target_policy["requested_policy"],
     }
 
 
 __all__ = [
+    "HEAD_AWARE_LORA_TARGET_SENTINEL",
     "LoRALinear",
     "apply_native_lora_to_step5_model",
     "discover_step5_text_linear_targets",
+    "forbidden_lora_targets_for_model",
+    "head_aware_step5_lora_targets",
+    "resolve_step5_lora_targets",
 ]

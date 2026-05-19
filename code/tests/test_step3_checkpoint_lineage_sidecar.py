@@ -26,6 +26,7 @@ from odcr_core.training_checkpoint import (  # noqa: E402
     checkpoint_file_sha256,
     file_fingerprint,
     stable_hash,
+    step3_source_table_compatibility_payload,
     validate_step3_checkpoint_lineage,
     write_checkpoint_lineage,
 )
@@ -131,6 +132,21 @@ class Step3CheckpointLineageSidecarTest(unittest.TestCase):
             "step3_loss_semantics": loss_semantics_config,
             "cross_rank_structured_gather": {"enabled": True, "mode": "local_gradient_context"},
         }
+        source_table_lineage = {
+            "field_sources": {
+                "task": "tasks.4",
+                "step3_structured_losses": "step3.structured_losses",
+                "step3_loss_semantics": "step3.loss_semantics",
+                "step3_tokenizer": "step3.tokenizer",
+                "step3_evidence": "step3.evidence",
+                "step3_scenario_profile": "step3.scenario_profiles.legacy",
+                "step3_task_profile": "step3.task_profiles.task4",
+                "profile_isolation_hash": "resolver-derived",
+                "step3_cross_rank_structured_gather": "step3.cross_rank_structured_gather",
+                "embed_dim": "env.embed_dim",
+            }
+        }
+        source_table_compatibility_hash = stable_hash(step3_source_table_compatibility_payload(source_table_lineage))
         payload = {
             "sidecar_schema_version": schema,
             "stage": "step3",
@@ -175,8 +191,8 @@ class Step3CheckpointLineageSidecarTest(unittest.TestCase):
             "resolved_config_compatibility_hash": "resolved-compatible",
             "source_table_path": str(root / "runs" / "step3" / "task4" / "unit" / "meta" / "source_table.json"),
             "source_table_hash": "source-table-hash",
-            "source_table": {"hash": "source-table-hash"},
-            "source_table_compatibility_hash": "source-table-compatible",
+            "source_table": source_table_lineage,
+            "source_table_compatibility_hash": source_table_compatibility_hash,
             "source_table_payload_summary": {"field_source_count": 3},
             "full_run_config_hash": "resolved-hash",
             "train_runtime_config_hash": stable_hash(train_runtime),

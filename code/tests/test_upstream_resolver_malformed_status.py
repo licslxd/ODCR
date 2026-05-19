@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 CODE_DIR = Path(__file__).resolve().parents[1]
@@ -11,6 +13,7 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from odcr_core.stage_truth_antiforgery import mutate_status, write_step3_fixture  # noqa: E402
+from odcr_core.step4_runtime import step3_selected_checkpoint_binding  # noqa: E402
 from odcr_core.upstream_resolver import UpstreamResolutionError, resolve_upstream  # noqa: E402
 
 
@@ -47,6 +50,24 @@ class UpstreamResolverMalformedStatusTest(unittest.TestCase):
                 with self.subTest(mode=mode):
                     with self.assertRaisesRegex(UpstreamResolutionError, "not implemented yet"):
                         resolve_upstream(repo_root=repo, stage="step3", task=2, mode=mode, consumer_stage="step4")
+
+    def test_best_alias_mismatch_does_not_override_selected_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_step3_fixture(repo, task=2, run_id="2", active=True, eligible=True)
+            best_alias = repo / "runs" / "step3" / "task2" / "2" / "model" / "best.pth"
+            best_alias.write_bytes(b"different-alias")
+            upstream = resolve_upstream(repo_root=repo, stage="step3", task=2, consumer_stage="step4")
+            cfg = SimpleNamespace(
+                repo_root=repo,
+                step3_checkpoint_dir=str(repo / "runs" / "step3" / "task2" / "2"),
+                upstream_resolution_json=json.dumps(upstream.to_payload(repo), sort_keys=True),
+            )
+            binding = step3_selected_checkpoint_binding(cfg)
+            self.assertTrue(binding["selected_checkpoint_path"].endswith("best_observed.pth"))
+            self.assertFalse(binding["best_pth_alias"]["alias_consistent"])
+            self.assertFalse(binding["best_pth_alias"]["used_as_primary"])
+            self.assertEqual(binding["checkpoint_source"], "stage_status.selected_checkpoint")
 
 
 if __name__ == "__main__":

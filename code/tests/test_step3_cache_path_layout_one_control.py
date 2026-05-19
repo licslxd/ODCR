@@ -79,7 +79,7 @@ class Step3CachePathLayoutOneControlTest(unittest.TestCase):
             target_domain="AM_CDs",
             compatibility_key="compat_key",
         )
-        self.assertIn("AI_analysis/06_probe_evidence", validation.as_posix())
+        self.assertIn("AI_analysis/01_raw_logs", validation.as_posix())
         self.assertIn("/cache/step3/tokenizer/task2/AM_Movies_to_AM_CDs/compat_key", validation.as_posix())
         self.assertNotEqual(formal.resolve(), validation.resolve())
         self.assertNotIn("runs/step3/task2", validation.as_posix())
@@ -112,10 +112,15 @@ class Step3CachePathLayoutOneControlTest(unittest.TestCase):
                 self.assertIn(token, source)
 
     def test_guardrail_contains_old_path_regression_checks(self) -> None:
-        guardrail = (CODE_DIR / "tools" / "check_one_control_guardrails.py").read_text(encoding="utf-8")
-        self.assertIn("test_step3_cache_path_layout_one_control.py", guardrail)
-        self.assertIn("get_hf_cache_root(task_idx)", guardrail)
-        self.assertIn("cache/task{", guardrail)
+        guardrail = (
+            CODE_DIR / "odcr_core" / "aux" / "governance" / "guardrail_runner.py"
+        ).read_text(encoding="utf-8")
+        registry = (
+            CODE_DIR / "odcr_core" / "aux" / "governance" / "rule_registry.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("R119", registry)
+        self.assertIn("R126", registry)
+        self.assertIn("run_checks", guardrail)
 
 
 if __name__ == "__main__":

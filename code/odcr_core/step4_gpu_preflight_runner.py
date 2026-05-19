@@ -210,6 +210,12 @@ def _apply_train_keep_policy(df: pd.DataFrame, conf: ODCFRoutingConfig) -> pd.Da
 def _build_model(*, payload: Mapping[str, Any], device: str) -> torch.nn.Module:
     from executors.step3_train_core import Model, get_odcr_text_tokenizer
     from odcr_core.index_contract import load_profile_tensors_dual_first
+    from odcr_core.training_checkpoint import (
+        CheckpointLineageError,
+        extract_checkpoint_model_architecture_payload,
+        extract_checkpoint_state_dict_architecture_payload,
+        read_checkpoint_lineage,
+    )
     from config import get_odcr_embed_dim
     from paths_config import get_data_dir
 
@@ -222,15 +228,30 @@ def _build_model(*, payload: Mapping[str, Any], device: str) -> torch.nn.Module:
     emsize = int(uc.shape[-1])
     if emsize != int(get_odcr_embed_dim()):
         raise RuntimeError(f"embed dim mismatch: profile={emsize} resolved={get_odcr_embed_dim()}")
+    checkpoint_lineage = read_checkpoint_lineage(str(payload["checkpoint_path"]), expected_stage="step3")
+    sidecar_arch = extract_checkpoint_model_architecture_payload(checkpoint_lineage)
+    frozen_arch = extract_checkpoint_state_dict_architecture_payload(
+        str(payload["checkpoint_path"]),
+        fallback_payload=sidecar_arch,
+    )
+    hard_mismatches = []
+    for key, observed in (("nuser", int(uc.shape[0])), ("nitem", int(ic.shape[0])), ("emsize", emsize)):
+        if int(frozen_arch[key]) != int(observed):
+            hard_mismatches.append(f"{key} checkpoint={frozen_arch[key]!r} observed={observed!r}")
+    if hard_mismatches:
+        raise CheckpointLineageError(
+            "Step4 gpu-shard preflight refused Step3 checkpoint architecture: "
+            + ", ".join(hard_mismatches)
+        )
     model = Model(
-        int(uc.shape[0]),
-        int(ic.shape[0]),
-        len(get_odcr_text_tokenizer()),
-        emsize,
-        int(payload.get("nhead") or 2),
-        int(payload.get("nhid") or 2048),
-        int(payload.get("nlayers") or 2),
-        float(payload.get("dropout") or 0.2),
+        int(frozen_arch["nuser"]),
+        int(frozen_arch["nitem"]),
+        int(frozen_arch["ntoken"]),
+        int(frozen_arch["emsize"]),
+        int(frozen_arch["nhead"]),
+        int(frozen_arch["nhid"]),
+        int(frozen_arch["nlayers"]),
+        float(frozen_arch["dropout"]),
         uc,
         us,
         ic,

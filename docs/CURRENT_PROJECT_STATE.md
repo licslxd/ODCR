@@ -16,6 +16,15 @@ reports, `completed.stamp` files, or Step3 `quality_audit.json`.
 formal gate after `stage_status.json` and referenced artifacts are verified.
 Historical docs and AI_analysis are not live truth.
 
+## Code Repair Status
+
+Current `code/` is repaired to the task2 run2 evidence line. The live truth for
+Step3 task2 remains `runs/step3/task2/2`, resolved through `latest.json` and
+strict `stage_status.json` validation. `code2/` is a reference baseline for
+diff review only, not a direct runtime source or overwrite source. `code1/` is
+paper-original reference material only. Active execution must not read either
+tree as a fallback for ODCR runtime behavior.
+
 ## Active Batch Semantics
 
 ODCR active training uses `batch_semantics_version=odcr_no_accum/1`.
@@ -49,6 +58,19 @@ Current accepted status:
 - eval handoff: `runs/step3/task2/2/meta/eval_handoff.json`
 - old post-train eval failure: preserved in `failure_history`, not an active
   downstream block
+
+Step4 consumes the checkpoint selected by `stage_status.selected_checkpoint`.
+For run2 that checkpoint is `runs/step3/task2/2/model/best_observed.pth`.
+`best.pth` and `latest.pth` may be checked as secondary aliases only; they are
+not the primary binding for Step4 admission, cache fingerprints, or formal
+runtime payloads.
+
+The frozen run2 training configuration is historical evidence for checkpoint
+compatibility. The current live Step3 config in `configs/odcr.yaml` may evolve
+for future runs and may differ from run2. This live-vs-frozen drift is recorded
+as a downstream compatibility note, not used to recompute run2 architecture
+truth, and it does not block Step4 consumption unless the frozen checkpoint
+tensor shape or lineage gate is incompatible.
 
 `runs/step3/task2/2/meta/quality_audit.json` is a preserved training
 diagnostic. It has a superseded sidecar and must not be used as the final

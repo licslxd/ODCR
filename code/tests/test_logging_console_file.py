@@ -243,6 +243,8 @@ class TestLoggingConsoleFile(unittest.TestCase):
         base_args = odcr.build_parser().parse_args(["show", "--stage", "step3", "--task", "2"])
         verbose_args = odcr.build_parser().parse_args(["show", "--stage", "step3", "--task", "2", "--verbose"])
         debug_args = odcr.build_parser().parse_args(["show", "--stage", "step3", "--task", "2", "--debug"])
+        for args in (base_args, verbose_args, debug_args):
+            args.dry_run = True
         cfg_base, _, snap_base = odcr._resolve_for_args(base_args, "step3")
         cfg_verbose, _, snap_verbose = odcr._resolve_for_args(verbose_args, "step3")
         cfg_debug, _, snap_debug = odcr._resolve_for_args(debug_args, "step3")

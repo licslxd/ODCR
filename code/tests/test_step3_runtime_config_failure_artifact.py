@@ -66,6 +66,40 @@ class Step3RuntimeConfigFailureArtifactTest(unittest.TestCase):
             self.assertEqual(payload["cache_status"], "not_started")
             self.assertFalse(payload["training_loop_started"])
 
+    def test_ready_hook_failure_maps_to_train_backward_even_with_tokenize_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            run_dir = repo / "runs" / "step5" / "task2" / "1"
+            meta = run_dir / "meta"
+            meta.mkdir(parents=True)
+            (meta / "errors.log").write_text(
+                "[Tokenize] step5 cache key | fingerprint=abc | cache_dir=/tmp/cache-y\n"
+                "RuntimeError: Expected to mark a variable ready only once\n"
+                "parameter: flan_explainer.decoder.block.23.layer.2.DenseReluDense.wo.lora_B\n"
+                "code/executors/step5_engine.py line 3121 loss.backward()\n",
+                encoding="utf-8",
+            )
+            summary = build_run_summary(
+                repo_root=repo,
+                run_dir=run_dir,
+                meta_dir=meta,
+                run_id="1",
+                stage="step5",
+                status="failed",
+                started_at="2026-05-16T00:00:00Z",
+                finished_at="2026-05-16T00:01:00Z",
+                task_id=2,
+                key_artifacts={},
+                latest_error="torchrun failed",
+            )
+            self.assertEqual(summary["failure_phase"], "train_backward")
+            self.assertEqual(summary["failure_type"], "ddp_parameter_ready_twice")
+            self.assertEqual(summary["root_cause"], "ddp_lora_checkpointing_ready_hook_conflict")
+            self.assertEqual(
+                summary["failure_root_signature"]["parameter"],
+                "flan_explainer.decoder.block.23.layer.2.DenseReluDense.wo.lora_B",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

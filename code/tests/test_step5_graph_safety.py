@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import sys
@@ -17,14 +16,7 @@ sys.path.insert(0, _CODE_DIR)
 import odcr_core.config_resolver as config_resolver  # noqa: E402
 from odcr_core.config_resolver import OneControlConfigError, resolve_config  # noqa: E402
 from odcr_core.gather_schema import GatheredBatch  # noqa: E402
-from odcr_core.index_contract import (  # noqa: E402
-    INDEX_CONTRACT_FILENAME,
-    INDEX_CONTRACT_SCHEMA_VERSION,
-    ODCR_ROUTING_TRAIN_CSV,
-    STEP4_RCR_REQUIRED_COLUMNS,
-    build_step4_export_lineage,
-)
-from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST  # noqa: E402
+from odcr_core.manifests import build_formal_source_table_snapshot  # noqa: E402
 from odcr_core.step5_innovation import (  # noqa: E402
     STEP5_EVIDENCE_FEATURE_DIM,
     build_ccv_control_packet,
@@ -36,120 +28,7 @@ from odcr_core.step5_innovation import (  # noqa: E402
 )
 from odcr_core.step5_word_losses import route_weighted_mean  # noqa: E402
 from executors.step5_engine import compose_step5_total_loss  # noqa: E402
-
-
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-
-
-def _write_step4_upstream_fixture(repo: Path, *, task_id: int = 4, run_id: str = "1") -> None:
-    run = repo / "runs" / "step4" / f"task{task_id}" / run_id
-    meta = run / "meta"
-    meta.mkdir(parents=True, exist_ok=True)
-    export_name = ODCR_ROUTING_TRAIN_CSV
-    export = run / export_name
-    row = {col: 1 for col in STEP4_RCR_REQUIRED_COLUMNS}
-    row.update(
-        {
-            "route_reason_scorer": "rcr_scorer_clean",
-            "route_reason_explainer": "rcr_explainer_rich",
-            "confidence_bucket": 2,
-            "preprocess_route_scorer_prior": 0,
-            "preprocess_route_explainer_prior": 0,
-        }
-    )
-    headers = list(STEP4_RCR_REQUIRED_COLUMNS)
-    export.write_text(
-        ",".join(headers) + "\n" + ",".join(str(row[col]) for col in headers) + "\n",
-        encoding="utf-8",
-    )
-    lineage = build_step4_export_lineage(
-        task_id=task_id,
-        auxiliary_domain="A",
-        target_domain="T",
-        step3_checkpoint_lineage_hash="lineage",
-        step4_rcr_config={"fixture": True},
-        step4_run=run_id,
-        frozen_step3_lineage={
-            "upstream_step3_run_id": "2",
-            "step3_checkpoint_path": f"runs/step3/task{task_id}/2/model/best_observed.pth",
-            "step3_checkpoint_hash": "fixture_checkpoint_hash",
-            "step3_stage_status_hash": "fixture_stage_status_hash",
-            "step3_eval_handoff_hash": "fixture_eval_handoff_hash",
-        },
-    )
-    _write_json(
-        run / INDEX_CONTRACT_FILENAME,
-        {
-            "schema_version": INDEX_CONTRACT_SCHEMA_VERSION,
-            "embed_dim": 1024,
-            "backbones": {
-                "sentence_embed": {
-                    "model_id": "fixture",
-                    "local_dir": "/tmp/fixture",
-                    "family": "bge_large_en",
-                    "hidden_size": 1024,
-                    "dual_channel": True,
-                }
-            },
-            "step4_export_lineage": lineage,
-        },
-    )
-    _write_json(run / STEP4_EXPORT_MANIFEST, {"schema_version": "odcr_step4_train_table/1.2", "step4_export_lineage": lineage})
-    _write_json(meta / "source_table.json", {"records": []})
-    _write_json(meta / "resolved_config.json", {"task": {"id": task_id}})
-    _write_json(meta / "run_summary.json", {"run_id": run_id, "stage": "step4", "task_id": task_id, "status": "ok"})
-    _write_json(
-        meta / "stage_status.json",
-        {
-            "schema_version": "odcr_stage_status/1",
-            "stage": "step4",
-            "task": task_id,
-            "task_id": task_id,
-            "run_id": run_id,
-            "run_dir": f"runs/step4/task{task_id}/{run_id}",
-            "final_status": "completed",
-            "downstream_ready": True,
-            "ready_for": ["step5"],
-            "status_source": "test_fixture",
-            "rejection_reasons": [],
-            "selected_export": f"runs/step4/task{task_id}/{run_id}/{export_name}",
-            "export_manifest": f"runs/step4/task{task_id}/{run_id}/{STEP4_EXPORT_MANIFEST}",
-            "index_contract": f"runs/step4/task{task_id}/{run_id}/{INDEX_CONTRACT_FILENAME}",
-            "artifacts": {
-                "run_summary": {
-                    "path": f"runs/step4/task{task_id}/{run_id}/meta/run_summary.json",
-                    "exists": True,
-                    "is_file": True,
-                },
-                "selected_export": {
-                    "path": f"runs/step4/task{task_id}/{run_id}/{export_name}",
-                    "exists": True,
-                    "is_file": True,
-                },
-                "export_manifest": {
-                    "path": f"runs/step4/task{task_id}/{run_id}/{STEP4_EXPORT_MANIFEST}",
-                    "exists": True,
-                    "is_file": True,
-                },
-                "index_contract": {
-                    "path": f"runs/step4/task{task_id}/{run_id}/{INDEX_CONTRACT_FILENAME}",
-                    "exists": True,
-                    "is_file": True,
-                },
-            },
-        },
-    )
-    _write_json(
-        repo / "runs" / "step4" / f"task{task_id}" / "latest.json",
-        {
-            "latest_run_id": run_id,
-            "latest_run_dir": f"runs/step4/task{task_id}/{run_id}",
-            "latest_summary_path": f"runs/step4/task{task_id}/{run_id}/meta/run_summary.json",
-            "latest_status": "ok",
-        },
-    )
+from helpers.fixtures import write_step4_upstream_fixture  # noqa: E402
 
 
 def _batch(route_scorer: torch.Tensor, route_explainer: torch.Tensor, domain: torch.Tensor) -> GatheredBatch:
@@ -184,7 +63,7 @@ def _batch(route_scorer: torch.Tensor, route_explainer: torch.Tensor, domain: to
         style_evidence_ids=ids,
         domain_style_anchor_ids=ids,
         local_style_hint_ids=ids,
-        polarity_ids=torch.tensor([2, 1, 0, 2])[:bsz],
+        polarity_ids=torch.tensor([[2], [1], [0], [2]])[:bsz],
     )
 
 
@@ -267,10 +146,10 @@ class TestStep5GraphSafety(unittest.TestCase):
         out.backward()
         self.assertIsNotNone(values.grad)
 
-    def test_find_unused_false_requires_synthetic_preflight_policy(self) -> None:
+    def test_find_unused_false_requires_real_sample_plan_preflight_policy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            _write_step4_upstream_fixture(repo, task_id=4, run_id="1")
+            write_step4_upstream_fixture(repo, task_id=4, run_id="1")
             old_root = config_resolver._REPO_ROOT
             try:
                 config_resolver._REPO_ROOT = repo
@@ -278,20 +157,47 @@ class TestStep5GraphSafety(unittest.TestCase):
                     config_path=_REPO_ROOT / "configs" / "odcr.yaml",
                     command="step5",
                     task_id=4,
-                    set_overrides=["step5.ddp.find_unused_parameters=false"],
+                    set_overrides=[],
                     dry_run=True,
                     from_step4="1",
                     eval_profile="balanced_2gpu",
-                    mode="full",
+                    mode="train_only",
                 )
             finally:
                 config_resolver._REPO_ROOT = old_root
         self.assertFalse(cfg.ddp_find_unused_parameters)
-        self.assertEqual(cfg.ddp_find_unused_false_preflight, "synthetic_one_batch")
+        self.assertEqual(cfg.ddp_find_unused_false_preflight, "real_sample_plan_one_batch")
+        self.assertFalse(cfg.ddp_static_graph)
+        self.assertEqual(cfg.step5_gradient_checkpointing_reentrant_policy, "non_reentrant")
         self.assertFalse(snapshot["step5_ddp"]["ddp_find_unused_parameters"])
+        self.assertFalse(snapshot["step5_ddp"]["ddp_static_graph"])
+        self.assertEqual(
+            snapshot["step5_memory_truth"]["gradient_checkpointing_reentrant_policy"],
+            "non_reentrant",
+        )
+        source_table = build_formal_source_table_snapshot(snapshot)
+        records = {row["key"]: row for row in source_table["records"]}
+        self.assertEqual(records["step5_ddp_find_unused_parameters"]["value"], False)
+        self.assertEqual(records["step5_ddp_static_graph"]["value"], False)
+        self.assertEqual(records["step5_ddp_find_unused_false_preflight"]["value"], "real_sample_plan_one_batch")
+        self.assertEqual(
+            records["step5_ddp_find_unused_false_preflight"]["source"],
+            "configs/odcr.yaml:step5.ddp.find_unused_false_preflight",
+        )
+        self.assertNotIn("synthetic_preflight_role", records)
+        self.assertEqual(records["formal_preflight_uses_real_data"]["value"], True)
+        control_fields = records["step5_ccv.control_fields"]["value"]
+        self.assertIn("polarity_anchor", control_fields)
+        self.assertIn("content_anchor_score", control_fields)
+        self.assertIn("style_anchor_score", control_fields)
+        self.assertIn("evidence_quality_prior", control_fields)
+        self.assertEqual(
+            records["step5_ccv.derived_control_input.polarity_ids"]["value"],
+            "polarity_anchor -> Processor._control_text_to_ids -> CCVControlPacket.polarity_ids",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            _write_step4_upstream_fixture(repo, task_id=4, run_id="1")
+            write_step4_upstream_fixture(repo, task_id=4, run_id="1")
             old_root = config_resolver._REPO_ROOT
             try:
                 config_resolver._REPO_ROOT = repo
@@ -302,15 +208,20 @@ class TestStep5GraphSafety(unittest.TestCase):
                         task_id=4,
                         set_overrides=[
                             "step5.ddp.find_unused_parameters=false",
-                            "step5.ddp.find_unused_false_preflight=fail_fast",
+                            "step5.ddp.find_unused_false_preflight=synthetic_one_batch",
                         ],
                         dry_run=True,
                         from_step4="1",
                         eval_profile="balanced_2gpu",
-                        mode="full",
+                        mode="train_only",
                     )
             finally:
                 config_resolver._REPO_ROOT = old_root
+
+    def test_step5_ddp_wrapper_uses_resolved_find_unused_and_static_graph(self) -> None:
+        source = (_REPO_ROOT / "code" / "executors" / "step5_engine.py").read_text(encoding="utf-8")
+        self.assertIn("find_unused_parameters=bool(final_cfg.ddp_find_unused_parameters)", source)
+        self.assertIn("static_graph=bool(getattr(final_cfg, \"ddp_static_graph\", False))", source)
 
     def test_flan_forward_has_no_hf_labels_and_lci_fca_are_not_repeated(self) -> None:
         source = (_REPO_ROOT / "code" / "executors" / "step5_engine.py").read_text(encoding="utf-8")

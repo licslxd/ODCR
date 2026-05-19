@@ -158,7 +158,7 @@ def resolve_latest(*, repo_root: str | Path, stage: str, task: int, repair: bool
             f"latest.json pointer is incomplete for {stage_name} task {int(task)}: {latest_path}; "
             "expected latest_run_id and latest_summary_path"
         )
-    run_id = run_naming.parse_run_id(latest_run_id)
+    run_id = run_naming.parse_stage_run_id(stage_name, latest_run_id)
     summary = _repo_path(root, latest_summary_path)
     expected_summary = parent / run_id / "meta" / "run_summary.json"
     if summary is None or summary.resolve() != expected_summary.resolve():
@@ -204,7 +204,7 @@ def resolve_run(
 ) -> UpstreamResolution:
     root = Path(repo_root).expanduser().resolve()
     stage_name = _canonical_stage(stage)
-    rid = run_naming.parse_run_id(str(run_id))
+    rid = run_naming.parse_stage_run_id(stage_name, str(run_id))
     run_dir = path_layout.get_stage_run_root(root, int(task), "v1", stage_name, rid).resolve()
     status_path = run_dir / "meta" / "stage_status.json"
     if repair and not status_path.is_file():
@@ -226,7 +226,7 @@ def resolve_run(
             latest_payload = {}
     if isinstance(latest_payload, Mapping):
         raw_latest = str(latest_payload.get("active_run_id") or latest_payload.get("latest_run_id") or "").strip()
-        latest_run_id = run_naming.parse_run_id(raw_latest) if raw_latest else None
+        latest_run_id = run_naming.parse_stage_run_id(stage_name, raw_latest) if raw_latest else None
     return UpstreamResolution(
         producer_stage=stage_name,
         consumer_stage=_consumer_for(stage_name),
@@ -264,6 +264,31 @@ def _artifact_missing_reasons(repo_root: Path, status: Mapping[str, Any], *, con
                 reasons.append(f"{key}_missing")
             elif item.get("exists") is not True:
                 reasons.append(f"{key}_missing")
+        if status.get("step5_train_input_role") == "pool_manifest_sampling_contract":
+            for key in (
+                "step5_pool_manifest",
+                "step5_sampling_contract",
+                "step5_pool_distribution_report",
+                "step5_pool_exports_status",
+            ):
+                item = artifacts.get(key)
+                if not isinstance(item, Mapping) or not item.get("path"):
+                    reasons.append(f"{key}_missing")
+                elif item.get("exists") is not True:
+                    reasons.append(f"{key}_missing")
+        elif status.get("step5_train_input_role") == "dedicated_split_exports":
+            for key in (
+                "step5A_scorer_train_export",
+                "step5B_explainer_train_export",
+                "step5_train_manifest",
+                "route_intersection_report",
+                "step5_dedicated_exports_status",
+            ):
+                item = artifacts.get(key)
+                if not isinstance(item, Mapping) or not item.get("path"):
+                    reasons.append(f"{key}_missing")
+                elif item.get("exists") is not True:
+                    reasons.append(f"{key}_missing")
     return reasons
 
 
@@ -382,7 +407,7 @@ def resolve_upstream(
             repo_root=root,
             stage=stage,
             task=int(task),
-            run_id=run_naming.parse_run_id(requested),
+            run_id=run_naming.parse_stage_run_id(_canonical_stage(stage), requested),
             repair=repair,
             latest_payload=latest_payload,
             latest_path=latest_path,

@@ -181,6 +181,77 @@ class CCVControlPacket:
         )
 
 
+_CCV_TEXT_CONTROL_ID_FIELDS: tuple[str, ...] = (
+    "content_evidence_ids",
+    "style_evidence_ids",
+    "domain_style_anchor_ids",
+    "local_style_hint_ids",
+    "polarity_ids",
+)
+
+
+def _packet_batch_size(packet: Any) -> int | None:
+    for name in (
+        "route_scorer_mask",
+        "route_explainer_mask",
+        "sample_weight_hint",
+        "content_anchor_score",
+        "style_anchor_score",
+    ):
+        value = getattr(packet, name, None)
+        if isinstance(value, torch.Tensor) and value.dim() >= 1:
+            return int(value.shape[0])
+    return None
+
+
+def validate_ccv_control_packet_shapes(
+    packet: Any,
+    *,
+    producer: str,
+    head: str,
+    strict: bool = True,
+) -> None:
+    """Fail fast on malformed CCV text-control tensors before model embedding."""
+
+    batch_size = _packet_batch_size(packet)
+    missing: list[str] = []
+    for name in _CCV_TEXT_CONTROL_ID_FIELDS:
+        ids = getattr(packet, name, None)
+        if ids is None:
+            missing.append(name)
+            continue
+        if not isinstance(ids, torch.Tensor):
+            raise RuntimeError(
+                f"producer={producer} head={head} field={name} "
+                f"CCV control ids must be tensor [B,T], got {type(ids).__name__}."
+            )
+        if ids.dim() != 2:
+            raise RuntimeError(
+                f"producer={producer} head={head} field={name} "
+                f"CCV control ids must be [B,T], got {tuple(ids.shape)}"
+            )
+        if batch_size is not None and int(ids.shape[0]) != int(batch_size):
+            raise RuntimeError(
+                f"producer={producer} head={head} field={name} "
+                f"CCV control ids batch dim must be B={int(batch_size)}, got {tuple(ids.shape)}"
+            )
+        if int(ids.shape[1]) <= 0:
+            raise RuntimeError(
+                f"producer={producer} head={head} field={name} "
+                f"CCV control ids must have non-empty token length T, got {tuple(ids.shape)}"
+            )
+        if ids.dtype not in (torch.long, torch.int64, torch.int32):
+            raise RuntimeError(
+                f"producer={producer} head={head} field={name} "
+                f"CCV control ids must use integer token dtype, got {ids.dtype}"
+            )
+    if strict and missing:
+        raise RuntimeError(
+            f"producer={producer} head={head} CCV control packet missing text-control fields: "
+            + ", ".join(missing)
+        )
+
+
 def _bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
@@ -234,12 +305,19 @@ def _step5_test_default_mapping() -> dict[str, Any]:
                 "style_evidence",
                 "domain_style_anchor",
                 "local_style_residual_hint",
+                "polarity_anchor",
                 "cf_reliability_score",
+                "content_retention_score",
+                "style_shift_score",
+                "rating_stability_score",
                 "uncertainty_score",
                 "confidence_bucket",
                 "route_explainer",
                 "route_scorer",
                 "sample_weight_hint",
+                "content_anchor_score",
+                "style_anchor_score",
+                "evidence_quality_prior",
             ),
             "uncertainty_tone_control": True,
             "route_conditioning": True,
@@ -456,7 +534,11 @@ def _feature(batch: GatheredBatch, index: int, name: str) -> torch.Tensor:
 def _required_vec(batch: GatheredBatch, attr: str) -> torch.Tensor:
     val = getattr(batch, attr)
     if val is None:
-        raise RuntimeError(f"Step5 batch missing required posterior/control tensor: {attr}")
+        raise RuntimeError(
+            f"Step5 batch missing required posterior/control tensor: {attr}. "
+            "This field must be produced by Step4 RCR export, converted by Step5 Processor, "
+            "and preserved by collate; do not bypass the Step4 resolver or use a hand-written CSV."
+        )
     return val.view(-1)
 
 
@@ -546,7 +628,13 @@ def build_step5b_explainer_gate(batch: GatheredBatch, cfg: Step5InnovationConfig
     )
 
 
-def build_ccv_control_packet(batch: GatheredBatch, cfg: Step5InnovationConfig) -> CCVControlPacket:
+def build_ccv_control_packet(
+    batch: GatheredBatch,
+    cfg: Step5InnovationConfig,
+    *,
+    producer: str = "build_ccv_control_packet",
+    head: str = "unknown",
+) -> CCVControlPacket:
     if not cfg.ccv.enabled:
         raise RuntimeError("CCV control packet requested while step5.ccv.enabled=false.")
     if cfg.ccv.control_packet_field_policy != "strict_required":
@@ -564,7 +652,7 @@ def build_ccv_control_packet(batch: GatheredBatch, cfg: Step5InnovationConfig) -
     missing = [name for name in required if getattr(batch, name) is None]
     if missing:
         raise RuntimeError("Step5B CCV control packet missing tensor fields: " + ", ".join(missing))
-    return CCVControlPacket(
+    packet = CCVControlPacket(
         content_evidence_ids=batch.content_evidence_ids,  # type: ignore[arg-type]
         style_evidence_ids=batch.style_evidence_ids,  # type: ignore[arg-type]
         domain_style_anchor_ids=batch.domain_style_anchor_ids,  # type: ignore[arg-type]
@@ -583,6 +671,8 @@ def build_ccv_control_packet(batch: GatheredBatch, cfg: Step5InnovationConfig) -
         content_anchor_score=_required_vec(batch, "content_anchor_score"),
         style_anchor_score=_required_vec(batch, "style_anchor_score"),
     )
+    validate_ccv_control_packet_shapes(packet, producer=producer, head=head, strict=True)
+    return packet
 
 
 def lci_score_invariance_loss(
@@ -679,4 +769,5 @@ __all__ = [
     "for_test_default_step5_innovation_config",
     "lci_score_invariance_loss",
     "parse_step5_innovation_config_json",
+    "validate_ccv_control_packet_shapes",
 ]

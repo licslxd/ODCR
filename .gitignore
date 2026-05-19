@@ -1,31 +1,57 @@
-# 排除大型模型权重
+# Large local model artifacts
 artifacts/models/
 
-# 排除海量运行日志
-AI_analysis/01_raw_logs/
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+.netrc
+id_rsa
+id_ed25519
+
+# Local runtime artifacts
 runs/
+cache/
+test_artifacts/
+test/
 test/*.log
 *.log
 slurm-*.out
-
-# 排除 Python 缓存
-__pycache__/
-*.pyc
-
-# 排除根目录下的系统误生成的临时文件
---gres=*
---wrap=*
--J
-
-# 忽略文件夹下的所有内容
+AI_analysis/01_raw_logs/
+AI_analysis/02_search_hits/
+AI_analysis/03_evidence_ledgers/
+AI_analysis/04_phase_summaries/
+AI_analysis/05_final_reports/
 AI_analysis/*
+
+# Dataset artifacts are local evidence contracts.
 data/*
 merged/*
 
-# 但不要忽略 .gitkeep 文件本身，这样文件夹结构就能传上去
+# Keep directory sentinels.
 !AI_analysis/.gitkeep
 !data/.gitkeep
 !merged/.gitkeep
-cache/
-test/
-__pycache__/
+
+# Local editor/system
+.vscode/
+.idea/
+.DS_Store
+
+# Root-level scheduler flag fragments sometimes produced by failed copy/paste.
+--gres=*
+--wrap=*
+-J

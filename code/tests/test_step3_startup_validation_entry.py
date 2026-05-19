@@ -31,9 +31,12 @@ class Step3StartupValidationEntryTest(unittest.TestCase):
 
     def test_validation_paths_are_isolated_from_formal_namespace(self) -> None:
         paths = startup._validation_paths(startup.REPO_ROOT, startup.DEFAULT_SLUG, "bridge_test")
-        self.assertIn("runs/step3_validation/step3_tmux_gpu_bridge_startup_validation_closeout/bridge_test", paths["run_root"].as_posix())
         self.assertIn(
-            "AI_analysis/06_probe_evidence/step3_tmux_gpu_bridge_startup_validation_closeout/bridge_test",
+            "test_artifacts/runs_like/step3_validation/step3_tmux_gpu_bridge_startup_validation_closeout/bridge_test",
+            paths["run_root"].as_posix(),
+        )
+        self.assertIn(
+            "AI_analysis/01_raw_logs/step3_tmux_gpu_bridge_startup_validation_closeout/bridge_test",
             paths["evidence"].as_posix(),
         )
         formal_root = path_layout.get_stage_task_root(startup.REPO_ROOT, "step3", 2)

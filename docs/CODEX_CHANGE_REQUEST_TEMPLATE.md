@@ -42,8 +42,8 @@ classification and impact rows before asking Codex to edit files.
 - The controlled tmux GPU bridge `python code/tools/odcr_tmux_gpu_bridge.py`
   may send exactly one bridge-generated command file to that pane. This is not
   arbitrary send-keys and is no longer limited by a GPU whitelist hard blocker.
-- Controlled bridge outputs must stay under `AI_analysis/06_probe_evidence` or
-  `runs/step3_validation` unless a future request explicitly confirms a formal
+- Controlled bridge outputs must stay under `AI_analysis/01_raw_logs` or
+  `AI_analysis/05_final_reports` unless a future request explicitly confirms a formal
   run. The formal namespace guard remains mandatory.
 - post-edit full is not a GPU prerequisite; fast sanity and current-pane
   validation are the GPU preflight, and runtime evidence takes priority over
@@ -104,7 +104,7 @@ preprocess_b, preprocess_c, BGE-large, or embedding/domain probes.
 | User GPU-node entry | User manually runs `odcr-enter-gpu <JOBID>` inside the same tmux |
 | Codex forbidden GPU-management commands | Codex must not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create, kill, or switch tmux |
 | Controlled bridge exception | `python code/tools/odcr_tmux_gpu_bridge.py`; user-created, already-entered, uniquely validated GPU pane; repo-local validation/probe/bounded runtime command files; not arbitrary send-keys |
-| Bridge output/timeout | `AI_analysis/06_probe_evidence` or `runs/step3_validation` by default; formal namespace guard required |
+| Bridge output/timeout | `AI_analysis/01_raw_logs` or `AI_analysis/05_final_reports` by default; formal namespace guard required |
 | CUDA evidence source | Current tmux session real-time CUDA only; not admin shell or old probe output |
 | If CUDA is unavailable | Fail fast and ask the user to manually enter the GPU node in the same tmux, then rerun probe |
 | Runtime-first policy | GPU use is allowed by default after fast sanity; post-edit full is not a GPU prerequisite |
@@ -296,3 +296,25 @@ Validation block required by `AGENTS.md`.
 8. Write the `AI_analysis` ledger/summary/report.
 9. Final response must include changed files, verification results, rerun
    decision, and whether training/runtime logic was untouched.
+## Aux Runtime Registry Source
+
+ODCR auxiliary infrastructure is now active under `code/odcr_core/aux/`.
+Guardrail rule groups come from
+`code/odcr_core/aux/governance/rule_registry.py`; post-edit scopes come from
+`code/odcr_core/aux/governance/post_edit_registry.py`; Codex/tmux/GPU runtime
+commands come from `code/odcr_core/aux/runtime/command_registry.py`.
+
+The only Codex GPU protocol is:
+
+```bash
+./odcr runtime bridge discover
+./odcr runtime bridge validate-only
+./odcr runtime bridge marker-probe
+./odcr runtime bridge cuda-probe
+./odcr runtime probe --stage step5A --task 2 --bounded
+./odcr runtime probe --stage step5B --task 2 --bounded
+```
+
+Codex does not allocate GPU resources. The user prepares the tmux GPU pane.
+Legacy `repo-command`, `repo-script`, `repo-module`, `command-file`, arbitrary
+shell, and allocation commands are forbidden fail-fast modes.

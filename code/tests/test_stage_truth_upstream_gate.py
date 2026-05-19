@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 
 CODE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = CODE_DIR.parent
@@ -19,7 +21,9 @@ from odcr_core.index_contract import (  # noqa: E402
     ODCR_ROUTING_TRAIN_CSV,
     STEP4_RCR_REQUIRED_COLUMNS,
     build_step4_export_lineage,
+    refresh_index_contract_train_csv_fingerprint,
 )
+from odcr_core.manifests import write_latest_pointer_json  # noqa: E402
 from odcr_core.stage_promotion import promote_upstream  # noqa: E402
 from odcr_core.stage_status import build_and_write_stage_status, mark_superseded, read_stage_status  # noqa: E402
 from odcr_core.stage_truth_antiforgery import write_step3_fixture  # noqa: E402
@@ -86,8 +90,7 @@ def _write_step4_run(repo: Path, *, task: int, run_id: str, from_step3: str, act
             "step3_eval_handoff_hash": "fixture_eval_handoff_hash",
         },
     )
-    _write_json(
-        run / INDEX_CONTRACT_FILENAME,
+    contract = refresh_index_contract_train_csv_fingerprint(
         {
             "schema_version": INDEX_CONTRACT_SCHEMA_VERSION,
             "embed_dim": 1024,
@@ -102,8 +105,17 @@ def _write_step4_run(repo: Path, *, task: int, run_id: str, from_step3: str, act
             },
             "step4_export_lineage": lineage,
         },
+        str(run / ODCR_ROUTING_TRAIN_CSV),
     )
-    _write_json(run / STEP4_EXPORT_MANIFEST, {"schema_version": "odcr_step4_train_table/1.2", "step4_export_lineage": lineage})
+    _write_json(run / INDEX_CONTRACT_FILENAME, contract)
+    _write_json(
+        run / STEP4_EXPORT_MANIFEST,
+        {
+            "schema_version": "odcr_step4_train_table/1.2",
+            "row_counts": {"total_rows": 1, "by_sample_origin": {"aux_cf": 1}},
+            "step4_export_lineage": lineage,
+        },
+    )
     _write_json(meta / "source_table.json", {"records": []})
     _write_json(meta / "resolved_config.json", {"task": {"id": task}})
     _write_json(
@@ -120,14 +132,13 @@ def _write_step4_run(repo: Path, *, task: int, run_id: str, from_step3: str, act
     )
     build_and_write_stage_status(repo_root=repo, stage="step4", task=task, run_id=run_id)
     if active:
-        _write_json(
-            repo / "runs" / "step4" / f"task{task}" / "latest.json",
-            {
-                "latest_run_id": run_id,
-                "latest_run_dir": f"runs/step4/task{task}/{run_id}",
-                "latest_summary_path": f"runs/step4/task{task}/{run_id}/meta/run_summary.json",
-                "latest_status": "ok",
-            },
+        write_latest_pointer_json(
+            repo_root=repo,
+            stage_unit_dir=repo / "runs" / "step4" / f"task{task}",
+            run_id=run_id,
+            run_dir=run,
+            summary_path=meta / "run_summary.json",
+            status="ok",
         )
     return run
 
@@ -228,6 +239,52 @@ class StageTruthUpstreamGateTest(unittest.TestCase):
             self.assertEqual(snapshot["upstream_resolution"]["producer_stage"], "step4")
             self.assertEqual(snapshot["upstream_resolution"]["run_id"], "2_1")
 
+    def test_step4_ready_writes_rich_latest_pointer_for_step5(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_step3_run(repo, task=2, run_id="2", active=True, eligible=True, quality_blocked=True)
+            _write_step4_run(repo, task=2, run_id="2_1", from_step3="2", active=True)
+            latest = json.loads((repo / "runs" / "step4" / "task2" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest["latest_run_id"], "2_1")
+            self.assertTrue(latest["downstream_ready"])
+            self.assertIn("step5", latest["ready_for"])
+            self.assertEqual(
+                latest["selected_export"],
+                "/".join(["runs", "step4", "task2", "2_1", "odcr_routing_train.csv"]),
+            )
+            self.assertIn("selected_export", latest["sha256s"])
+            self.assertIn("stage_status", latest["sha256s"])
+
+    def test_step5_rejects_step4_run_summary_ok_when_stage_status_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_step3_run(repo, task=2, run_id="2", active=True, eligible=True, quality_blocked=True)
+            run = _write_step4_run(repo, task=2, run_id="2_1", from_step3="2", active=False)
+            (run / STEP4_EXPORT_MANIFEST).unlink()
+            build_and_write_stage_status(repo_root=repo, stage="step4", task=2, run_id="2_1")
+            write_latest_pointer_json(
+                repo_root=repo,
+                stage_unit_dir=repo / "runs" / "step4" / "task2",
+                run_id="2_1",
+                run_dir=run,
+                summary_path=run / "meta" / "run_summary.json",
+                status="ok",
+            )
+            old_root = config_resolver._REPO_ROOT
+            try:
+                config_resolver._REPO_ROOT = repo
+                with self.assertRaisesRegex(config_resolver.OneControlConfigError, "not eligible for Step5 formal upstream"):
+                    config_resolver.resolve_config(
+                        config_path=REPO_ROOT / "configs" / "odcr.yaml",
+                        command="step5",
+                        task_id=2,
+                        set_overrides=[],
+                        dry_run=True,
+                        from_step4="latest",
+                    )
+            finally:
+                config_resolver._REPO_ROOT = old_root
+
     def test_generic_paths_task2_runs_and_task5_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -237,6 +294,7 @@ class StageTruthUpstreamGateTest(unittest.TestCase):
             self.assertEqual(resolve_upstream(repo_root=repo, stage="step3", task=2, consumer_stage="step4").run_id, "4")
             self.assertEqual(resolve_upstream(repo_root=repo, stage="step3", task=5, consumer_stage="step4").run_id, "1")
 
+    @pytest.mark.slow
     def test_docs_active_truth_guardrail(self) -> None:
         report = run_checks(repo_root=REPO_ROOT, strict=True)
         statuses = {item.rule_id: item.status for item in report.results}

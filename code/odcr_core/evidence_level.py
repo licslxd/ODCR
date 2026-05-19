@@ -10,6 +10,11 @@ E1_SCHEMA_PREVIEW = "E1_schema_preview"
 E2_CPU_REAL_DATA_NO_MODEL = "E2_cpu_real_data_no_model"
 E3_GPU_TRANSPORT = "E3_gpu_transport"
 E4_GPU_SHARD_FORWARD_BOUNDED = "E4_gpu_shard_forward_bounded"
+E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY = "E4_gpu_shard_forward_bounded_formal_entry"
+E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION = (
+    "E4_gpu_shard_forward_bounded_formal_entry_with_validation"
+)
+E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE = "E5_step5A_post_train_eval_lifecycle"
 E5_FORMAL_FULL_RUN = "E5_formal_full_run"
 
 MIN_TUNING_EVIDENCE_LEVEL = E4_GPU_SHARD_FORWARD_BOUNDED
@@ -47,11 +52,37 @@ EVIDENCE_LEVEL_SPECS: tuple[EvidenceLevelSpec, ...] = (
         True,
         False,
     ),
+    EvidenceLevelSpec(
+        E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY,
+        4,
+        "historical bounded Step5 formal-entry lifecycle without epoch-end validation; no longer sufficient for Step5 formal readiness",
+        True,
+        False,
+        False,
+    ),
+    EvidenceLevelSpec(
+        E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION,
+        4,
+        "bounded Step5 formal-entry lifecycle with first train step and epoch-end validation pass",
+        True,
+        True,
+        False,
+    ),
+    EvidenceLevelSpec(
+        E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE,
+        5,
+        "bounded Step5A post-train checkpoint save, training teardown, CPU-staged reload, and eval-forward lifecycle",
+        True,
+        True,
+        False,
+    ),
     EvidenceLevelSpec(E5_FORMAL_FULL_RUN, 5, "formal full Step4 export", True, True, True),
 )
 
 _SPEC_BY_LEVEL = {spec.level: spec for spec in EVIDENCE_LEVEL_SPECS}
-_LEVEL_BY_PREFIX = {spec.level.split("_", 1)[0]: spec.level for spec in EVIDENCE_LEVEL_SPECS}
+_LEVEL_BY_PREFIX: dict[str, str] = {}
+for _spec in EVIDENCE_LEVEL_SPECS:
+    _LEVEL_BY_PREFIX.setdefault(_spec.level.split("_", 1)[0], _spec.level)
 
 
 class EvidenceLevelError(ValueError):
@@ -236,6 +267,9 @@ __all__ = [
     "E2_CPU_REAL_DATA_NO_MODEL",
     "E3_GPU_TRANSPORT",
     "E4_GPU_SHARD_FORWARD_BOUNDED",
+    "E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY",
+    "E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION",
+    "E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE",
     "E5_FORMAL_FULL_RUN",
     "EvidenceLevelError",
     "evidence_level_policy",

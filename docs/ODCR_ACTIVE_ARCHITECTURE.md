@@ -79,6 +79,12 @@ runtime admission must use `odcr_core.upstream_resolver`; they must not infer
 live state from `quality_audit.json`, historical docs, or historical
 `AI_analysis` material.
 
+`code/` is the active runtime tree. `code2/` is a reference baseline for review
+and diffing only, never a direct runtime source or bulk overwrite source.
+`code1/` is paper-original reference material only. Active ODCR code must not
+fall back to either tree, and historical `AI_analysis` material must not become
+runtime truth.
+
 Step3 formal runs use logging policy `odcr_step3_logging/2`.
 `console.log` is a compact human status stream only: stage/task/profile,
 domain pair, run id, compact train config, key artifact paths, epoch/final
@@ -147,13 +153,25 @@ is not itself a GPU allocation: it is created or entered on the admin node with
 `odcr-enter-gpu <JOBID>` inside that same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions. Codex does not manage GPU allocation.
+The `odcr-enter-gpu` helper performs the handoff in two phases without adding a
+third user command. Before `srun`, on the admin side, it records the tmux socket,
+pane, session, target, pane path, pane command, cwd, repo root, and selected
+Slurm job metadata. After `srun`, on the GPU side, it records hostname,
+`SLURM_JOB_ID`, `CUDA_VISIBLE_DEVICES`, `nvidia-smi`, and torch CUDA metadata
+without requiring tmux to run on the GPU node. The merged
+`AI_analysis/runtime/current_gpu_pane.json` uses
+`odcr_current_gpu_pane_handoff/2`, is written atomically, selects only by tmux
+socket plus pane, and treats the tmux server PID as diagnostic-only. Handoff
+failure must delete stale active handoff state, print a warning, and continue
+into the GPU shell. The old `AI_analysis/runtime/gpu_pane.json` is historical
+hint material only and cannot select Step5/E4/formal targets.
 GPU use is allowed by default for repo-local validation, probe, and bounded
 runtime once the current pane is a user-created, already-entered, uniquely
 validated GPU pane. The controlled tmux GPU bridge,
 `python code/tools/odcr_tmux_gpu_bridge.py`, may send one bridge-generated
 command file to that pane. It is not arbitrary send-keys, and it is no longer
 limited by a GPU whitelist hard blocker. Bridge output stays under
-`AI_analysis/06_probe_evidence` or `runs/step3_validation` by default. The
+`AI_analysis/01_raw_logs` or `AI_analysis/05_final_reports` by default. The
 formal namespace guard remains mandatory: validation must not write formal
 latest pointers, formal checkpoints, Step4/Step5/eval/rerank outputs, or paper
 metrics unless a future request explicitly confirms a formal run. post-edit
@@ -211,6 +229,14 @@ status is `completed_with_eval_handoff`; the old failed state remains in
 `failure_history`, and `downstream_ready=true` means ready for Step4
 preparation, not a completed Step4/Step5 pipeline.
 
+For task2, the current Step3 run2 truth source is
+`runs/step3/task2/2`. Its frozen resolved config and checkpoint lineage are the
+compatibility boundary for downstream consumers. The current live Step3 config
+may differ for future runs; that drift is labeled as historical-vs-live and is
+not used to recompute run2 architecture hashes. Tensor shapes in the checkpoint
+state dict are the hard model-load truth. Tokenizer/vocab sidecars are
+compatibility metadata and must not override checkpoint tensor shape.
+
 ## Active Step4
 
 Step4 is the RCR posterior routing stage.
@@ -229,6 +255,21 @@ eligibility. The old `C9_balanced_quantile` and `C9_bucket_balanced`
 CPU-preview candidates are superseded. formal Step4 remains blocked until a
 real GPU `E4_gpu_shard_forward_bounded` candidate completes required
 validation.
+
+Step4 binds its upstream checkpoint from `stage_status.selected_checkpoint` or
+the equivalent accepted eval-handoff selection produced by the upstream
+resolver. For task2 run2 this is
+`runs/step3/task2/2/model/best_observed.pth`. `best.pth` and `latest.pth` are
+secondary alias consistency checks only. If an alias hash matches the selected
+checkpoint it may be reported as consistent; if it differs, Step4 must still use
+the selected checkpoint or fail fast rather than silently using the alias.
+
+Step4 source-table hashes are scoped. Frozen Step3 run hashes, checkpoint
+architecture hashes, Step3 training semantic hashes, Step4 live config hashes,
+Step4 RCR hashes, and Step4 runtime hashes are recorded separately. A Step4
+runtime or RCR change must not be compared as a Step3 checkpoint architecture
+hash, and display-only drift must be labeled separately from blocking lineage
+drift.
 
 Active Step4 controls live under:
 
@@ -297,12 +338,22 @@ Active Step5 controls live under:
 - `step5.ccv.native_lora`
 - `step5.fca`
 - `step5.model`
+- `step5.memory_truth`
 - `step5.train.explainer_loss_weight`
 
 The active Step5B verbalizer receives explicit structured control, not prompt
 concatenation. Step4 `sample_weight_hint` remains the posterior base sample
 weight; `step5.explainer_gate.explainer_only_multiplier` is only a Step5B
 training scheduling multiplier.
+
+Step5 GPU admission uses the `step5.memory_truth` contract. Candidate rejection
+may use real OOM, CUDA allocator failure, forward/backward failure, non-finite
+loss, DDP graph failure, rank imbalance, configured allocated-memory ratio,
+long-window allocated-memory creep, nvidia-smi instability, formal namespace
+pollution, resolver bypass, or missing required fields. PyTorch reserved memory
+is a caching-allocator diagnostic only. `max_memory_reserved_gb`,
+`reserved_minus_allocated_gb`, and fragmentation hints may be reported for
+debugging, but they must not select, skip, reject, or block a candidate.
 
 ## Active Lineage, Cache, And DDP Guards
 
@@ -367,6 +418,7 @@ the fixed Validation block from `AGENTS.md`.
 The following are retired and must not become active control surfaces:
 
 - `code1`
+- `code2`
 - `presets`
 - old shell entrypoints
 - shared YAML side channels
@@ -432,3 +484,19 @@ performance recommendation. Governed bridge modes
 `step3-performance-probe` and `step3-short-pilot` write evidence under
 `AI_analysis` only, forbid formal latest/checkpoint/cache writes, and do not
 produce downstream-consumable checkpoints.
+## Active Aux Layer
+
+The auxiliary layer is active source code under `code/odcr_core/aux/`:
+
+- `runtime/`: current tmux pane discovery, GPU handshake, command registry,
+  bounded probe reports, and `./odcr runtime ...` dispatch.
+- `governance/`: rule registry, post-edit registry, hook scope inference, and
+  fail-close timeout policy.
+- `evidence/`: the only writer API for AI_analysis artifacts.
+- `artifacts/`: formal run, test_artifacts, cache, log, latest, and path
+  boundary helpers.
+- `control/` and `templates/`: thin CLI facades and runtime contracts.
+
+Docs describe these registries; they do not maintain independent rule or scope
+lists. Legacy bridge generic modes (`repo-command`, `repo-script`,
+`repo-module`, `command-file`) are retired fail-fast paths.
