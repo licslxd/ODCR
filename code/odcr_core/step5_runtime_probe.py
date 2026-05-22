@@ -44,7 +44,7 @@ from odcr_core.config_schema import as_plain_dict, fingerprint
 from odcr_core.evidence_level import (
     E3_GPU_TRANSPORT,
     E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION,
-    E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE,
+    E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE,
     mark_gpu_shard_forward,
 )
 from odcr_core.file_atomic import atomic_write_json
@@ -69,10 +69,9 @@ from odcr_core.step5_pool_sampler import (
 )
 from odcr_core.step5_innovation import (
     build_ccv_control_packet,
-    build_step5a_scorer_gate,
-    build_step5b_explainer_gate,
+    build_rating_stability_control_gate,
+    build_step5_explanation_gate,
     evidence_basis_fca_loss,
-    lci_score_invariance_loss,
     parse_step5_innovation_config_json,
     validate_ccv_control_packet_shapes,
 )
@@ -109,8 +108,8 @@ def _json_default(value: Any) -> str:
 
 def _normalize_evidence_level(value: Any) -> str:
     raw = str(value or "").strip()
-    if raw in {"E5", E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE}:
-        return E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
+    if raw in {"E5", E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE}:
+        return E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
     return E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION
 
 
@@ -705,9 +704,9 @@ def _patch_candidate_resolution_contract(
         "validation_forward_pass": result.get("validation_forward_pass"),
         "validation_loss_finite": result.get("validation_loss_finite"),
         "validation_oom": result.get("validation_oom"),
-        "step5A_validation_scorer_only": result.get("step5A_validation_scorer_only"),
-        "flan_explainer_called_in_step5A_validation": result.get("flan_explainer_called_in_step5A_validation"),
-        "out_logits_materialized_in_step5A_validation": result.get("out_logits_materialized_in_step5A_validation"),
+        "rating_stability_control_validation_control_only": result.get("rating_stability_control_validation_control_only"),
+        "flan_explainer_called_in_rating_stability_control_validation": result.get("flan_explainer_called_in_rating_stability_control_validation"),
+        "out_logits_materialized_in_rating_stability_control_validation": result.get("out_logits_materialized_in_rating_stability_control_validation"),
         "valid_per_gpu_batch_size": result.get("valid_per_gpu_batch_size"),
         "valid_forward_micro_batch_size": result.get("valid_forward_micro_batch_size"),
         "train_per_gpu_batch_size": result.get("train_per_gpu_batch_size"),
@@ -763,8 +762,8 @@ def _patch_candidate_resolution_contract(
             upsert("validation_forward_pass", result.get("validation_forward_pass"), "Step5 formal-entry validation E4")
             upsert("validation_loss_finite", result.get("validation_loss_finite"), "Step5 formal-entry validation E4")
             upsert("validation_oom", result.get("validation_oom"), "Step5 formal-entry validation E4")
-            upsert("step5A_validation_scorer_only", result.get("step5A_validation_scorer_only"), "Step5 validation contract")
-            upsert("out_logits_materialized_in_step5A_validation", result.get("out_logits_materialized_in_step5A_validation"), "Step5 validation contract")
+            upsert("rating_stability_control_validation_control_only", result.get("rating_stability_control_validation_control_only"), "Step5 validation contract")
+            upsert("out_logits_materialized_in_rating_stability_control_validation", result.get("out_logits_materialized_in_rating_stability_control_validation"), "Step5 validation contract")
             upsert("valid_per_gpu_batch_size", result.get("valid_per_gpu_batch_size"), "Step5 validation memory policy")
             upsert("valid_forward_micro_batch_size", result.get("valid_forward_micro_batch_size"), "Step5 validation memory policy")
             upsert("train_per_gpu_batch_size", result.get("train_per_gpu_batch_size"), "Step5 train batch policy")
@@ -776,7 +775,7 @@ def _patch_candidate_resolution_contract(
             _write_json(source_path, source)
 
 
-class _Step5BoundedDataset(Dataset):
+class _Step5ExplanationBoundedDataset(Dataset):
     def __init__(self, df: Any, processor: Any) -> None:
         self.df = df.reset_index(drop=True)
         self.processor = processor
@@ -1432,14 +1431,14 @@ def _validate_existing_probe_result(
         "validation_forward": result.get("validation_forward_pass") is True,
         "validation_loss_finite": result.get("validation_loss_finite") is True,
         "validation_oom_absent": result.get("validation_oom") is False,
-        "step5A_scorer_only_validation": (
-            str(stage) != "step5A" or result.get("step5A_validation_scorer_only") is True
+        "rating_stability_control_control_only_validation": (
+            str(stage) != "rating_stability_control" or result.get("rating_stability_control_validation_control_only") is True
         ),
-        "step5A_no_flan_validation": (
-            str(stage) != "step5A" or result.get("flan_explainer_called_in_step5A_validation") is False
+        "rating_stability_control_no_flan_validation": (
+            str(stage) != "rating_stability_control" or result.get("flan_explainer_called_in_rating_stability_control_validation") is False
         ),
-        "step5A_no_logits_validation": (
-            str(stage) != "step5A" or result.get("out_logits_materialized_in_step5A_validation") is False
+        "rating_stability_control_no_logits_validation": (
+            str(stage) != "rating_stability_control" or result.get("out_logits_materialized_in_rating_stability_control_validation") is False
         ),
         "valid_micro_lte_train": int(result.get("valid_forward_micro_batch_size") or 10**9)
         <= int(result.get("train_per_gpu_batch_size") or -1),
@@ -1451,7 +1450,7 @@ def _validate_existing_probe_result(
         "finite": result.get("finite_loss_sync_ok", True) is True,
         "graph_safe": result.get("graph_safe_backward_ok", True) is True,
         "rank_balance": result.get("rank_sample_balance_ok", True) is True,
-        "rank_loss_keys": result.get("loss_component_keys_per_rank_identical", True) is True,
+        "rank_component_keys": result.get("loss_component_keys_per_rank_identical", True) is True,
         "formal_clean": result.get("formal_namespace_pollution") is False,
         "latest_clean": result.get("latest_json_created") is False,
         "checkpoint_clean": result.get("checkpoint_written") is False,
@@ -2018,11 +2017,11 @@ def candidate_decision_from_result(
         and result.get("validation_loss_finite") is True
         and result.get("validation_oom") is False
         and (
-            str(result.get("stage") or "") != "step5A"
+            str(result.get("stage") or "") != "rating_stability_control"
             or (
-                result.get("step5A_validation_scorer_only") is True
-                and result.get("flan_explainer_called_in_step5A_validation") is False
-                and result.get("out_logits_materialized_in_step5A_validation") is False
+                result.get("rating_stability_control_validation_control_only") is True
+                and result.get("flan_explainer_called_in_rating_stability_control_validation") is False
+                and result.get("out_logits_materialized_in_rating_stability_control_validation") is False
             )
         )
         and int(result.get("valid_forward_micro_batch_size") or 10**9)
@@ -2143,7 +2142,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
         initial_signature = dict(rank_payload.get("runtime_transformers_signature") or {})
         if not bool(initial_signature.get("gradient_checkpointing_kwargs_supported")):
             raise RuntimeError(
-                "transformers_runtime_api_mismatch: Step5A non-reentrant checkpointing requires "
+                "transformers_runtime_api_mismatch: RatingStabilityControl non-reentrant checkpointing requires "
                 "gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False}) "
                 f"in torchrun worker, got transformers={initial_signature.get('transformers_version')!r} "
                 f"path={initial_signature.get('transformers_module_path')!r}."
@@ -2170,12 +2169,12 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             validModel,
         )
         from odcr_core.odcr_losses import build_orthogonal_losses
-        from odcr_core.step5b_flan_bridge import per_sample_decoder_ce_from_logits
+        from odcr_core.step5_explanation_flan_bridge import per_sample_decoder_ce_from_logits
 
         request = _load_json(Path(args.request_path))
         requested_evidence_level = _normalize_evidence_level(request.get("evidence_level") or getattr(args, "evidence_level", None))
-        if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE and str(args.stage) != "step5A":
-            raise RuntimeError("E5_step5A_post_train_eval_lifecycle probe only supports --stage step5A.")
+        if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE and str(args.stage) != "rating_stability_control":
+            raise RuntimeError("E5_rating_stability_control_post_train_eval_lifecycle probe only supports --stage rating_stability_control.")
         rank_payload["requested_evidence_level"] = requested_evidence_level
         set_overrides = list(request.get("set_overrides") or [])
         cfg, snapshot, source_table = _resolve_candidate(
@@ -2300,9 +2299,9 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     validation_ctx={"task_id": int(cfg.task_id), "csv_path": str(export_path), "step4_run": str(cfg.step4_run)},
                 )
                 plan_df = train_table.train_df
-                if str(args.stage) == "step5A":
+                if str(args.stage) == "rating_stability_control":
                     plan_df = plan_df.loc[plan_df["route_scorer"].astype(int) == 1].reset_index(drop=True)
-                elif str(args.stage) == "step5B":
+                elif str(args.stage) == "explanation":
                     plan_df = plan_df.loc[plan_df["route_explainer"].astype(int) == 1].reset_index(drop=True)
                 sample_plan_manifest = write_step5_sample_plan(
                     output_dir,
@@ -2342,9 +2341,9 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             )
             data_load_s = time.perf_counter() - load_t0
             train_df = train_table.train_df
-            if str(args.stage) == "step5A":
+            if str(args.stage) == "rating_stability_control":
                 train_df = train_df.loc[train_df["route_scorer"].astype(int) == 1].reset_index(drop=True)
-            elif str(args.stage) == "step5B":
+            elif str(args.stage) == "explanation":
                 train_df = train_df.loc[train_df["route_explainer"].astype(int) == 1].reset_index(drop=True)
             train_table_stats = dict(train_table.stats)
             train_table_source_summary = train_table.source.to_summary()
@@ -2382,7 +2381,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             dataset = _Step5EncodedDataset(encoded_rows)
             hot_path_tokenize_removed = True
         else:
-            dataset = _Step5BoundedDataset(train_df, processor)
+            dataset = _Step5ExplanationBoundedDataset(train_df, processor)
         if sample_plan_enabled:
             sampler = None
         else:
@@ -2537,13 +2536,13 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
         precision = str(cfg.train_precision).lower()
         autocast_enabled = precision == "bf16"
         dtype = torch.bfloat16 if precision == "bf16" else torch.float16
-        is_step5a_probe = str(args.stage) == "step5A"
+        is_rating_stability_control_probe = str(args.stage) == "rating_stability_control"
         with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
             fwd_s.record()
-            gate_a = build_step5a_scorer_gate(gb, innov_cfg)
-            gate_b = build_step5b_explainer_gate(gb, innov_cfg)
+            gate_a = build_rating_stability_control_gate(gb, innov_cfg)
+            gate_b = build_step5_explanation_gate(gb, innov_cfg)
             ccv_packet = None
-            if not is_step5a_probe:
+            if not is_rating_stability_control_probe:
                 ccv_packet = build_ccv_control_packet(
                     gb,
                     innov_cfg,
@@ -2562,32 +2561,31 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     "lci_graph_retention_ok": True,
                     "fca_graph_retention_ok": True,
                     "ccv_control_packet_shape": {},
-                    "step5A_scorer_clean_no_ccv_packet": True,
+                    "rating_stability_control_probe_no_ccv_packet": True,
                     "unnecessary_logits_retained": False,
                     "tensors_retained_after_step": False,
                     "empty_cache_called_for_measurement_only": False,
                 }
-                if is_step5a_probe
+                if is_rating_stability_control_probe
                 else _graph_memory_audit(ccv_packet)
             )
-            pred_rating, _context_dist, word_dist = ddp(
+            control_score, _context_dist, word_dist = ddp(
                 user_idx,
                 item_idx,
                 tgt_input,
                 domain_idx,
-                target_tokens=None if is_step5a_probe else tgt_output,
+                target_tokens=None if is_rating_stability_control_probe else tgt_output,
                 evidence_features=gb.evidence_features,
                 content_anchor_score=gb.content_anchor_score,
                 style_anchor_score=gb.style_anchor_score,
                 ccv_control_packet=ccv_packet,
-                scorer_only=is_step5a_probe,
-                return_explainer_logits=not is_step5a_probe,
+                return_explainer_logits=not is_rating_stability_control_probe,
             )
             fwd_e.record()
             rank_payload["forward_success"] = True
-            loss_r_ps = F.mse_loss(pred_rating, rating, reduction="none")
-            if is_step5a_probe:
-                loss_flan_ps = graph_tied_zero_like(pred_rating).expand_as(loss_r_ps).to(dtype=loss_r_ps.dtype)
+            control_zero_ps = graph_tied_zero_like(control_score).expand_as(control_score).to(dtype=control_score.dtype)
+            if is_rating_stability_control_probe:
+                loss_flan_ps = control_zero_ps
             else:
                 loss_flan_ps = per_sample_decoder_ce_from_logits(
                     word_dist,
@@ -2595,18 +2593,13 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     ignore_index=0,
                     label_smoothing=float(cfg.label_smoothing),
                 )
-            loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
-            scorer_only = loss_r_ps
-            explainer_only = float(cfg.coef) * loss_c_ps + loss_flan_ps
+            control_only = control_zero_ps.to(dtype=loss_flan_ps.dtype)
+            explainer_only = loss_flan_ps
             dom = domain_idx.view(-1)
-            loss_factual = route_weighted_mean(
-                scorer_only,
-                gate_a.scorer_weight.to(dtype=scorer_only.dtype),
-                (dom == 1).to(dtype=scorer_only.dtype),
-            )
+            loss_factual = graph_tied_zero_like(control_score)
             loss_counterfactual = (
-                graph_tied_zero_like(pred_rating)
-                if is_step5a_probe
+                graph_tied_zero_like(control_score)
+                if is_rating_stability_control_probe
                 else float(cfg.explainer_loss_weight)
                 * route_weighted_mean(
                     explainer_only,
@@ -2617,23 +2610,10 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             _model = ddp.module
             spec_lat = _model._last_specific_latent
             shared_lat = _model._last_shared_latent
-            noise = float(innov_cfg.lci.perturb_std) * torch.randn_like(spec_lat)
-            score_pert = _model.odcr_scorer(shared_lat, _model.user_content_profiles[user_idx], spec_lat + noise)
-            score_robust = _model.odcr_scorer(
-                shared_lat.detach() + 0.0 * shared_lat,
-                _model.user_content_profiles[user_idx],
-                spec_lat + noise.flip(0),
-            )
-            lci_bundle = lci_score_invariance_loss(
-                factual_score=pred_rating,
-                cf_score=score_pert,
-                robust_score=score_robust,
-                target_rating=rating,
-                gate=gate_a,
-                cfg=innov_cfg,
-            )
+            lci_weighted_zero = graph_tied_zero_like(control_score)
+            lci_raw_zero = control_zero_ps
             fca_bundle = None
-            if not is_step5a_probe:
+            if not is_rating_stability_control_probe:
                 fca_bundle = evidence_basis_fca_loss(
                     scorer_hidden=_model._last_h_score,
                     explainer_hidden=_model._last_h_explain_aligned,
@@ -2653,24 +2633,17 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 l_fca,
             ) = _head_gated_step5_loss_terms(
                 task_head=str(args.stage),
-                zero_like=pred_rating if is_step5a_probe else word_dist,
+                zero_like=control_score if is_rating_stability_control_probe else word_dist,
                 loss_factual=loss_factual,
                 loss_counterfactual=loss_counterfactual,
-                lci_weighted_loss=lci_bundle.lci_weighted_loss,
-                fca_weighted_loss=graph_tied_zero_like(pred_rating) if is_step5a_probe else fca_bundle.fca_weighted_loss,
-                l_lci=lci_bundle.lci_loss,
-                l_fca=graph_tied_zero_like(pred_rating) if is_step5a_probe else fca_bundle.fca_loss,
+                lci_weighted_loss=lci_weighted_zero,
+                fca_weighted_loss=graph_tied_zero_like(control_score) if is_rating_stability_control_probe else fca_bundle.fca_weighted_loss,
+                l_lci=None,
+                l_fca=graph_tied_zero_like(control_score) if is_rating_stability_control_probe else fca_bundle.fca_loss,
             )
-            lci_raw_ps, lci_weighted_ps = _lci_per_sample_losses(
-                factual_score=pred_rating,
-                cf_score=score_pert,
-                robust_score=score_robust,
-                target_rating=rating,
-                gate=gate_a,
-                cfg=innov_cfg,
-            )
-            if is_step5a_probe:
-                fca_raw_ps = graph_tied_zero_like(pred_rating).expand_as(loss_r_ps).to(dtype=loss_r_ps.dtype)
+            lci_raw_ps, lci_weighted_ps = lci_raw_zero, lci_raw_zero
+            if is_rating_stability_control_probe:
+                fca_raw_ps = control_zero_ps
                 fca_weighted_ps = fca_raw_ps
             else:
                 fca_raw_ps, fca_weighted_ps = _fca_per_sample_losses(
@@ -2678,7 +2651,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     gate=gate_b,
                     cfg=innov_cfg,
                 )
-            scorer_weighted_ps = scorer_only * gate_a.scorer_weight.to(dtype=scorer_only.dtype) * (dom == 1).to(dtype=scorer_only.dtype)
+            control_weighted_ps = control_only * gate_a.scorer_weight.to(dtype=control_only.dtype) * (dom == 1).to(dtype=control_only.dtype)
             explainer_weighted_ps = (
                 explainer_only
                 * gate_b.explainer_weight.to(dtype=explainer_only.dtype)
@@ -2688,8 +2661,8 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             _accumulate_per_tier_loss(
                 per_tier_acc,
                 gb,
-                scorer_raw=scorer_only,
-                scorer_weighted=scorer_weighted_ps,
+                scorer_raw=control_only,
+                scorer_weighted=control_weighted_ps,
                 lci_raw=lci_raw_ps,
                 lci_weighted=lci_weighted_ps,
                 uci_weight=gate_a.uci_weight,
@@ -2703,7 +2676,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 ccv_confidence=gate_b.confidence_bucket,
                 ccv_reliability=gate_b.reliability,
             )
-            loss_ortho_keep = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
+            loss_ortho_keep = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
             lambda_ortho = float(getattr(final_cfg, "lambda_ortho_step5", 0.0) or 0.0)
             if lambda_ortho > 0.0:
                 loss_ortho_keep = build_orthogonal_losses(
@@ -2712,16 +2685,16 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     w_xcov=float(getattr(final_cfg, "lambda_ortho_xcov", 1.0)),
                     w_cos=float(getattr(final_cfg, "lambda_ortho_cos", 0.25)),
                 ).loss_ortho_total
-            loss_ul = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
-            if (not is_step5a_probe) and float(getattr(final_cfg, "loss_weight_repeat_ul", 0.0) or 0.0) > 0.0:
+            loss_ul = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
+            if (not is_rating_stability_control_probe) and float(getattr(final_cfg, "loss_weight_repeat_ul", 0.0) or 0.0) > 0.0:
                 word_logp = F.log_softmax(word_dist, dim=-1)
                 loss_ul = odcr_anti_repeat_unlikelihood_loss_from_logp(word_logp, tgt_output)
-            loss_tc = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
-            loss_bd = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
+            loss_tc = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
+            loss_bd = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
             total_loss = compose_step5_total_loss(
                 loss_factual=loss_factual,
                 loss_counterfactual=loss_counterfactual,
-                loss_repeat_ul=loss_ul,
+                retired_repeat_ul_zero_guard=loss_ul,
                 loss_terminal_clean=loss_tc,
                 loss_batch_diversity=loss_bd,
                 repeat_ul_weight=float(getattr(final_cfg, "loss_weight_repeat_ul", 0.0) or 0.0),
@@ -2748,7 +2721,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 "evidence_level": E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION,
                 "real_sample_plan_used": True,
                 "real_collate_executed": True,
-                "real_ccv_packet_used": not is_step5a_probe,
+                "real_ccv_packet_used": not is_rating_stability_control_probe,
                 "ema_init_executed": True,
                 "ddp_wrap_executed": True,
                 "first_train_step_executed": True,
@@ -2798,7 +2771,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
         )
         validation_pass_executed = True
         try:
-            v_loss_sum, v_n, v_lr_sum, v_lc_sum, v_le_sum = validModel(
+            v_loss_sum, v_n, v_le_sum = validModel(
                 ddp,
                 valid_loader,
                 device,
@@ -2829,7 +2802,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 }
             )
             raise RuntimeError("Step5 formal-entry E4 validation_forward_oom" if oom else "Step5 formal-entry E4 validation failed") from exc
-        v_stat = torch.tensor([v_loss_sum, float(v_n), v_lr_sum, v_lc_sum, v_le_sum], dtype=torch.double, device=device)
+        v_stat = torch.tensor([v_loss_sum, float(v_n), v_le_sum], dtype=torch.double, device=device)
         dist.all_reduce(v_stat, op=dist.ReduceOp.SUM)
         v_den = float(v_stat[1].item())
         validation_loss = float(v_stat[0].item() / v_den) if v_den > 0.0 else 0.0
@@ -2843,31 +2816,31 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 "validation_oom": False,
                 "validation_loss": validation_loss,
                 "validation_sample_count_global": v_den,
-                "validation_loss_r": float(v_stat[2].item() / v_den) if v_den > 0.0 else 0.0,
-                "validation_loss_c": float(v_stat[3].item() / v_den) if v_den > 0.0 else 0.0,
-                "validation_loss_e": float(v_stat[4].item() / v_den) if v_den > 0.0 else 0.0,
+                "validation_retired_prediction_zero": 0.0,
+                "validation_retired_counterfactual_zero": 0.0,
+                "validation_loss_e": float(v_stat[2].item() / v_den) if v_den > 0.0 else 0.0,
                 "validation_microbatch_accumulation": bool(getattr(final_cfg, "validation_microbatch_accumulation", False)),
                 "validation_memory_policy": str(getattr(final_cfg, "validation_memory_policy", "")),
                 "valid_per_gpu_batch_size": int(getattr(final_cfg, "valid_per_gpu_batch_size", 0)),
                 "valid_forward_micro_batch_size": int(getattr(final_cfg, "valid_forward_micro_batch_size", 0)),
                 "train_per_gpu_batch_size": int(getattr(final_cfg, "per_gpu_batch_size", 0)),
-                "step5A_validation_scorer_only": bool(validation_contract.get("step5A_validation_scorer_only"))
-                if str(args.stage) == "step5A"
+                "rating_stability_control_validation_control_only": bool(validation_contract.get("rating_stability_control_validation_control_only"))
+                if str(args.stage) == "rating_stability_control"
                 else False,
-                "flan_explainer_called_in_step5A_validation": bool(
-                    validation_contract.get("flan_explainer_called_in_step5A_validation")
+                "flan_explainer_called_in_rating_stability_control_validation": bool(
+                    validation_contract.get("flan_explainer_called_in_rating_stability_control_validation")
                 )
-                if str(args.stage) == "step5A"
+                if str(args.stage) == "rating_stability_control"
                 else None,
-                "out_logits_materialized_in_step5A_validation": bool(
-                    validation_contract.get("out_logits_materialized_in_step5A_validation")
+                "out_logits_materialized_in_rating_stability_control_validation": bool(
+                    validation_contract.get("out_logits_materialized_in_rating_stability_control_validation")
                 )
-                if str(args.stage) == "step5A"
+                if str(args.stage) == "rating_stability_control"
                 else None,
-                "word_dist_returned_in_step5A_validation": bool(
-                    validation_contract.get("word_dist_returned_in_step5A_validation")
+                "word_dist_returned_in_rating_stability_control_validation": bool(
+                    validation_contract.get("word_dist_returned_in_rating_stability_control_validation")
                 )
-                if str(args.stage) == "step5A"
+                if str(args.stage) == "rating_stability_control"
                 else None,
                 "validation_collate": valid_collate_timer.summary_ms(),
                 "scratch_cleanup_before_validation": cleanup_before_validation,
@@ -2899,7 +2872,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
         rank_payload["scratch_cleanup_after_first_train_step"] = cleanup_after_step
         loss_components = {
             "total_loss": total_loss,
-            "main_scorer_loss": loss_factual,
+            "main_control_loss": loss_factual,
             "explainer_loss": loss_counterfactual,
             "lci_raw_loss": l_lci,
             "lci_weighted_loss": lci_weighted_loss,
@@ -2907,7 +2880,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             "scorer_weight_mean": lci_bundle.scorer_weight_mean,
             "fca_raw_loss": l_fca,
             "fca_weighted_loss": fca_weighted_loss,
-            "fca_weight_mean": 0.0 if is_step5a_probe else fca_bundle.fca_weight_mean,
+            "fca_weight_mean": 0.0 if is_rating_stability_control_probe else fca_bundle.fca_weight_mean,
             "repeat_ul_loss": loss_ul,
             "terminal_clean_loss": loss_tc,
             "batch_diversity_loss": loss_bd,
@@ -2938,7 +2911,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 "real_forward_backward_executed": True,
                 "real_sample_plan_used": True,
                 "real_collate_executed": True,
-                "real_ccv_packet_used": not is_step5a_probe,
+                "real_ccv_packet_used": not is_rating_stability_control_probe,
                 "sample_count": sample_count,
                 "route_scorer_count": scorer_count,
                 "route_explainer_count": explainer_count,
@@ -2963,8 +2936,8 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 "training_memory_policy": memory_policy_meta,
                 "lora_parameter_participation": lora_participation,
                 "ccv_control_packet": (
-                    {"present": False, "step5A_scorer_clean_no_ccv_packet": True}
-                    if is_step5a_probe
+                    {"present": False, "rating_stability_control_probe_no_ccv_packet": True}
+                    if is_rating_stability_control_probe
                     else {
                         "present": True,
                         "numeric_shape": list(ccv_packet.numeric_controls().shape),
@@ -3116,10 +3089,10 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast("cuda", dtype=dtype, enabled=autocast_enabled):
                     fwd_s.record()
-                    gate_a = build_step5a_scorer_gate(gb, innov_cfg)
-                    gate_b = build_step5b_explainer_gate(gb, innov_cfg)
+                    gate_a = build_rating_stability_control_gate(gb, innov_cfg)
+                    gate_b = build_step5_explanation_gate(gb, innov_cfg)
                     ccv_packet = None
-                    if not is_step5a_probe:
+                    if not is_rating_stability_control_probe:
                         ccv_packet = build_ccv_control_packet(
                             gb,
                             innov_cfg,
@@ -3138,31 +3111,30 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                             "lci_graph_retention_ok": True,
                             "fca_graph_retention_ok": True,
                             "ccv_control_packet_shape": {},
-                            "step5A_scorer_clean_no_ccv_packet": True,
+                            "rating_stability_control_probe_no_ccv_packet": True,
                             "unnecessary_logits_retained": False,
                             "tensors_retained_after_step": False,
                             "empty_cache_called_for_measurement_only": False,
                         }
-                        if is_step5a_probe
+                        if is_rating_stability_control_probe
                         else _graph_memory_audit(ccv_packet)
                     )
-                    pred_rating, _context_dist, word_dist = ddp(
+                    control_score, _context_dist, word_dist = ddp(
                         user_idx,
                         item_idx,
                         tgt_input,
                         domain_idx,
-                        target_tokens=None if is_step5a_probe else tgt_output,
+                        target_tokens=None if is_rating_stability_control_probe else tgt_output,
                         evidence_features=gb.evidence_features,
                         content_anchor_score=gb.content_anchor_score,
                         style_anchor_score=gb.style_anchor_score,
                         ccv_control_packet=ccv_packet,
-                        scorer_only=is_step5a_probe,
-                        return_explainer_logits=not is_step5a_probe,
+                        return_explainer_logits=not is_rating_stability_control_probe,
                     )
                     fwd_e.record()
-                    loss_r_ps = F.mse_loss(pred_rating, rating, reduction="none")
-                    if is_step5a_probe:
-                        loss_flan_ps = graph_tied_zero_like(pred_rating).expand_as(loss_r_ps).to(dtype=loss_r_ps.dtype)
+                    control_zero_ps = graph_tied_zero_like(control_score).expand_as(control_score).to(dtype=control_score.dtype)
+                    if is_rating_stability_control_probe:
+                        loss_flan_ps = control_zero_ps
                     else:
                         loss_flan_ps = per_sample_decoder_ce_from_logits(
                             word_dist,
@@ -3170,18 +3142,13 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                             ignore_index=0,
                             label_smoothing=float(cfg.label_smoothing),
                         )
-                    loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
-                    scorer_only = loss_r_ps
-                    explainer_only = float(cfg.coef) * loss_c_ps + loss_flan_ps
+                    control_only = control_zero_ps.to(dtype=loss_flan_ps.dtype)
+                    explainer_only = loss_flan_ps
                     dom = domain_idx.view(-1)
-                    loss_factual = route_weighted_mean(
-                        scorer_only,
-                        gate_a.scorer_weight.to(dtype=scorer_only.dtype),
-                        (dom == 1).to(dtype=scorer_only.dtype),
-                    )
+                    loss_factual = graph_tied_zero_like(control_score)
                     loss_counterfactual = (
-                        graph_tied_zero_like(pred_rating)
-                        if is_step5a_probe
+                        graph_tied_zero_like(control_score)
+                        if is_rating_stability_control_probe
                         else float(cfg.explainer_loss_weight)
                         * route_weighted_mean(
                             explainer_only,
@@ -3192,23 +3159,10 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     _model = ddp.module
                     spec_lat = _model._last_specific_latent
                     shared_lat = _model._last_shared_latent
-                    noise = float(innov_cfg.lci.perturb_std) * torch.randn_like(spec_lat)
-                    score_pert = _model.odcr_scorer(shared_lat, _model.user_content_profiles[user_idx], spec_lat + noise)
-                    score_robust = _model.odcr_scorer(
-                        shared_lat.detach() + 0.0 * shared_lat,
-                        _model.user_content_profiles[user_idx],
-                        spec_lat + noise.flip(0),
-                    )
-                    lci_bundle = lci_score_invariance_loss(
-                        factual_score=pred_rating,
-                        cf_score=score_pert,
-                        robust_score=score_robust,
-                        target_rating=rating,
-                        gate=gate_a,
-                        cfg=innov_cfg,
-                    )
+                    lci_weighted_zero = graph_tied_zero_like(control_score)
+                    lci_raw_zero = control_zero_ps
                     fca_bundle = None
-                    if not is_step5a_probe:
+                    if not is_rating_stability_control_probe:
                         fca_bundle = evidence_basis_fca_loss(
                             scorer_hidden=_model._last_h_score,
                             explainer_hidden=_model._last_h_explain_aligned,
@@ -3228,24 +3182,17 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                         _l_fca,
                     ) = _head_gated_step5_loss_terms(
                         task_head=str(args.stage),
-                        zero_like=pred_rating if is_step5a_probe else word_dist,
+                        zero_like=control_score if is_rating_stability_control_probe else word_dist,
                         loss_factual=loss_factual,
                         loss_counterfactual=loss_counterfactual,
-                        lci_weighted_loss=lci_bundle.lci_weighted_loss,
-                        fca_weighted_loss=graph_tied_zero_like(pred_rating) if is_step5a_probe else fca_bundle.fca_weighted_loss,
-                        l_lci=lci_bundle.lci_loss,
-                        l_fca=graph_tied_zero_like(pred_rating) if is_step5a_probe else fca_bundle.fca_loss,
+                        lci_weighted_loss=lci_weighted_zero,
+                        fca_weighted_loss=graph_tied_zero_like(control_score) if is_rating_stability_control_probe else fca_bundle.fca_weighted_loss,
+                        l_lci=None,
+                        l_fca=graph_tied_zero_like(control_score) if is_rating_stability_control_probe else fca_bundle.fca_loss,
                     )
-                    lci_raw_ps, lci_weighted_ps = _lci_per_sample_losses(
-                        factual_score=pred_rating,
-                        cf_score=score_pert,
-                        robust_score=score_robust,
-                        target_rating=rating,
-                        gate=gate_a,
-                        cfg=innov_cfg,
-                    )
-                    if is_step5a_probe:
-                        fca_raw_ps = graph_tied_zero_like(pred_rating).expand_as(loss_r_ps).to(dtype=loss_r_ps.dtype)
+                    lci_raw_ps, lci_weighted_ps = lci_raw_zero, lci_raw_zero
+                    if is_rating_stability_control_probe:
+                        fca_raw_ps = control_zero_ps
                         fca_weighted_ps = fca_raw_ps
                     else:
                         fca_raw_ps, fca_weighted_ps = _fca_per_sample_losses(
@@ -3253,7 +3200,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                             gate=gate_b,
                             cfg=innov_cfg,
                         )
-                    scorer_weighted_ps = scorer_only * gate_a.scorer_weight.to(dtype=scorer_only.dtype) * (dom == 1).to(dtype=scorer_only.dtype)
+                    control_weighted_ps = control_only * gate_a.scorer_weight.to(dtype=control_only.dtype) * (dom == 1).to(dtype=control_only.dtype)
                     explainer_weighted_ps = (
                         explainer_only
                         * gate_b.explainer_weight.to(dtype=explainer_only.dtype)
@@ -3263,8 +3210,8 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     _accumulate_per_tier_loss(
                         per_tier_acc,
                         gb,
-                        scorer_raw=scorer_only,
-                        scorer_weighted=scorer_weighted_ps,
+                        scorer_raw=control_only,
+                        scorer_weighted=control_weighted_ps,
                         lci_raw=lci_raw_ps,
                         lci_weighted=lci_weighted_ps,
                         uci_weight=gate_a.uci_weight,
@@ -3278,7 +3225,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                         ccv_confidence=gate_b.confidence_bucket,
                         ccv_reliability=gate_b.reliability,
                     )
-                    loss_ortho_keep = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
+                    loss_ortho_keep = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
                     lambda_ortho = float(getattr(final_cfg, "lambda_ortho_step5", 0.0) or 0.0)
                     if lambda_ortho > 0.0:
                         loss_ortho_keep = build_orthogonal_losses(
@@ -3287,16 +3234,16 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                             w_xcov=float(getattr(final_cfg, "lambda_ortho_xcov", 1.0)),
                             w_cos=float(getattr(final_cfg, "lambda_ortho_cos", 0.25)),
                         ).loss_ortho_total
-                    loss_ul = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
-                    if (not is_step5a_probe) and float(getattr(final_cfg, "loss_weight_repeat_ul", 0.0) or 0.0) > 0.0:
+                    loss_ul = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
+                    if (not is_rating_stability_control_probe) and float(getattr(final_cfg, "loss_weight_repeat_ul", 0.0) or 0.0) > 0.0:
                         word_logp = F.log_softmax(word_dist, dim=-1)
                         loss_ul = odcr_anti_repeat_unlikelihood_loss_from_logp(word_logp, tgt_output)
-                    loss_tc = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
-                    loss_bd = graph_tied_zero(pred_rating if is_step5a_probe else word_dist)
+                    loss_tc = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
+                    loss_bd = graph_tied_zero(control_score if is_rating_stability_control_probe else word_dist)
                     total_loss = compose_step5_total_loss(
                         loss_factual=loss_factual,
                         loss_counterfactual=loss_counterfactual,
-                        loss_repeat_ul=loss_ul,
+                        retired_repeat_ul_zero_guard=loss_ul,
                         loss_terminal_clean=loss_tc,
                         loss_batch_diversity=loss_bd,
                         repeat_ul_weight=float(getattr(final_cfg, "loss_weight_repeat_ul", 0.0) or 0.0),
@@ -3323,7 +3270,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                         "evidence_level": E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION,
                         "real_sample_plan_used": True,
                         "real_collate_executed": True,
-                        "real_ccv_packet_used": not is_step5a_probe,
+                        "real_ccv_packet_used": not is_rating_stability_control_probe,
                     },
                     fail_on_missing=True,
                 )
@@ -3335,7 +3282,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 torch.cuda.synchronize(device)
                 loss_components = {
                     "total_loss": total_loss,
-                    "main_scorer_loss": loss_factual,
+                    "main_control_loss": loss_factual,
                     "explainer_loss": loss_counterfactual,
                     "lci_raw_loss": _l_lci,
                     "lci_weighted_loss": lci_weighted_loss,
@@ -3343,7 +3290,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     "scorer_weight_mean": lci_bundle.scorer_weight_mean,
                     "fca_raw_loss": _l_fca,
                     "fca_weighted_loss": fca_weighted_loss,
-                    "fca_weight_mean": 0.0 if is_step5a_probe else fca_bundle.fca_weight_mean,
+                    "fca_weight_mean": 0.0 if is_rating_stability_control_probe else fca_bundle.fca_weight_mean,
                     "repeat_ul_loss": loss_ul,
                     "terminal_clean_loss": loss_tc,
                     "batch_diversity_loss": loss_bd,
@@ -3491,7 +3438,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             "memory_used_mib_max": None,
             "snapshots": [],
         }
-        if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE:
+        if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE:
             e5_dir = output_dir / "e5_lifecycle" / f"rank{int(rank)}"
             e5_dir.mkdir(parents=True, exist_ok=True)
             e5_checkpoint = e5_dir / "best.pth"
@@ -3578,9 +3525,9 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                 "reserved_bytes": int(torch.cuda.memory_reserved(device)),
             }
             rank_payload["e5_lifecycle"] = {
-                "schema_version": "odcr_step5A_e5_post_train_eval_lifecycle_rank/1",
+                "schema_version": "odcr_rating_stability_control_e5_post_train_eval_lifecycle_rank/1",
                 "success": True,
-                "evidence_level": E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE,
+                "evidence_level": E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE,
                 "checkpoint_saved": True,
                 "checkpoint_path": str(e5_checkpoint),
                 "checkpoint_fingerprint": checkpoint_fp,
@@ -3750,26 +3697,26 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                         (float((payload or {}).get("validation_sample_count_global") or 0.0) for payload in all_payloads),
                         default=0.0,
                     ),
-                    "step5A_validation_scorer_only": (
-                        str(args.stage) == "step5A"
-                        and all(bool((payload or {}).get("step5A_validation_scorer_only")) for payload in all_payloads)
+                    "rating_stability_control_validation_control_only": (
+                        str(args.stage) == "rating_stability_control"
+                        and all(bool((payload or {}).get("rating_stability_control_validation_control_only")) for payload in all_payloads)
                     ),
-                    "flan_explainer_called_in_step5A_validation": (
+                    "flan_explainer_called_in_rating_stability_control_validation": (
                         False
-                        if str(args.stage) == "step5A"
-                        and all((payload or {}).get("flan_explainer_called_in_step5A_validation") is False for payload in all_payloads)
+                        if str(args.stage) == "rating_stability_control"
+                        and all((payload or {}).get("flan_explainer_called_in_rating_stability_control_validation") is False for payload in all_payloads)
                         else None
                     ),
-                    "out_logits_materialized_in_step5A_validation": (
+                    "out_logits_materialized_in_rating_stability_control_validation": (
                         False
-                        if str(args.stage) == "step5A"
-                        and all((payload or {}).get("out_logits_materialized_in_step5A_validation") is False for payload in all_payloads)
+                        if str(args.stage) == "rating_stability_control"
+                        and all((payload or {}).get("out_logits_materialized_in_rating_stability_control_validation") is False for payload in all_payloads)
                         else None
                     ),
-                    "word_dist_returned_in_step5A_validation": (
+                    "word_dist_returned_in_rating_stability_control_validation": (
                         False
-                        if str(args.stage) == "step5A"
-                        and all((payload or {}).get("word_dist_returned_in_step5A_validation") is False for payload in all_payloads)
+                        if str(args.stage) == "rating_stability_control"
+                        and all((payload or {}).get("word_dist_returned_in_rating_stability_control_validation") is False for payload in all_payloads)
                         else None
                     ),
                     "validation_microbatch_accumulation": all(
@@ -3796,7 +3743,7 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     ),
                     "real_ccv_packet_used": (
                         False
-                        if str(args.stage) == "step5A"
+                        if str(args.stage) == "rating_stability_control"
                         else all(bool((payload or {}).get("real_ccv_packet_used")) for payload in all_payloads)
                     ),
                     "real_checkpoint_used": False,
@@ -3877,12 +3824,12 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     "formal_run_id": None,
                     "full_csv_parse_in_bounded": any(bool(((p or {}).get("loader") or {}).get("full_csv_parse")) for p in all_payloads),
                 }
-            if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE:
+            if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE:
                 e5_success = bool(e5_lifecycle_reports) and all(bool(item.get("success")) for item in e5_lifecycle_reports)
                 final_payload.update(
                     {
-                        "evidence_level": E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE,
-                        "evidence_level_family": "E5_step5A_post_train_eval_lifecycle",
+                        "evidence_level": E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE,
+                        "evidence_level_family": "E5_rating_stability_control_post_train_eval_lifecycle",
                         "success": e5_success,
                         "post_train_eval_lifecycle": True,
                         "checkpoint_saved": all(bool(item.get("checkpoint_saved")) for item in e5_lifecycle_reports),
@@ -3902,15 +3849,15 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                         "e5_lifecycle_rank_results": e5_lifecycle_reports,
                         "formal_namespace_pollution": False,
                         "formal_train_command_emitted": False,
-                        "step5B_command_emitted": False,
+                        "explanation_command_emitted": False,
                         "synthetic_batch_used_for_formal_gate": False,
                     }
                 )
             final_payload["candidate_decision"] = candidate_decision_from_result(final_payload, memory_cfg)
             final = mark_gpu_shard_forward(final_payload)
-            if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE:
-                final["evidence_level"] = E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
-                final["evidence_level_family"] = "E5_step5A_post_train_eval_lifecycle"
+            if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE:
+                final["evidence_level"] = E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
+                final["evidence_level_family"] = "E5_rating_stability_control_post_train_eval_lifecycle"
                 final["post_train_eval_lifecycle"] = True
             else:
                 final["evidence_level"] = E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION
@@ -4033,10 +3980,10 @@ def launch_probe(
 ) -> dict[str, Any]:
     stage_norm = str(stage)
     requested_evidence_level = _normalize_evidence_level(evidence_level)
-    if stage_norm not in {"step5A", "step5B"}:
-        raise RuntimeError(f"Step5 E4/E5 launcher supports step5A/step5B, got {stage!r}")
-    if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE and stage_norm != "step5A":
-        raise RuntimeError("E5_step5A_post_train_eval_lifecycle launcher only supports step5A.")
+    if stage_norm not in {"rating_stability_control", "explanation"}:
+        raise RuntimeError(f"Step5 E4/E5 launcher supports rating_stability_control/explanation, got {stage!r}")
+    if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE and stage_norm != "rating_stability_control":
+        raise RuntimeError("E5_rating_stability_control_post_train_eval_lifecycle launcher only supports rating_stability_control.")
     cfg, snapshot, source_table = _resolve_candidate(
         stage=stage_norm,
         task=int(task),
@@ -4069,11 +4016,11 @@ def launch_probe(
             "fresh_required": True,
             "reason": (
                 "e5_post_train_lifecycle_requires_fresh_ddp_child"
-                if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
+                if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
                 else "artifact_build_preflight_requires_fresh_ddp_child"
             ),
         }
-        if artifact_build_requested or requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
+        if artifact_build_requested or requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
         else _validate_existing_probe_result(
             result_path,
             stage=stage_norm,
@@ -4179,7 +4126,7 @@ def launch_probe(
     proc_returncode: int | None = None
     timeout_limit = int(timeout_s or e4_cfg.get("max_runtime_seconds", 900))
     command_id = (
-        f"step5_{'e5' if requested_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE else 'e4'}_probe:"
+        f"step5_{'e5' if requested_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE else 'e4'}_probe:"
         f"{stage_norm}:{int(task)}:{stable_hash([candidate_id, set_overrides, requested_evidence_level], length=12)}:{int(time.time())}"
     )
     process_state_path = out_dir / "process_state.json"

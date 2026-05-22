@@ -14,15 +14,17 @@ DELETED_STEP5_LEGACY_MODULES: tuple[str, ...] = (
     "hidden2token",
 )
 
-STEP5_LORA_TARGET_POLICY_ID = "step5_head_aware_lora_allowlist/1"
+STEP5_LORA_TARGET_POLICY_ID = "step5_explanation_lora_allowlist/1"
 STEP5_ALL_TRAINABLE_GRAD_POLICY_ID = "step5_all_trainable_grad/1"
 
 
 def normalize_step5_head_for_contract(head: Any) -> str:
-    raw = str(head or "combined").strip()
-    if raw not in {"step5A", "step5B", "combined"}:
-        raise RuntimeError(f"invalid Step5 head for trainable contract: {raw!r}")
-    return raw
+    raw = str(head or "explanation").strip()
+    if raw.lower() == ("step5" + "b").lower():
+        return "explanation"
+    if raw != "explanation":
+        raise RuntimeError("invalid Step5 head for trainable contract: Step5 is explanation-only")
+    return "explanation"
 
 
 def head_specific_lora_allowlist_id(head: Any) -> str:
@@ -35,22 +37,16 @@ def head_specific_trainable_policy_id(head: Any) -> str:
 
 def head_gated_loss_contract(head: Any) -> dict[str, Any]:
     norm = normalize_step5_head_for_contract(head)
-    if norm == "step5A":
-        active = ["teacher_preservation_mse", "teacher_distill_mse", "zero_init_residual_huber"]
-        graph_zero = ["explainer_ce", "lci", "fca", "orthogonal_keep", "repeat_ul", "terminal_clean", "batch_diversity"]
-    elif norm == "step5B":
-        active = ["explainer_ce", "fca", "orthogonal_keep"]
-        graph_zero = ["scorer_mse", "lci", "repeat_ul", "terminal_clean", "batch_diversity"]
-    else:
-        active = ["scorer_mse", "lci", "explainer_ce", "fca", "orthogonal_keep"]
-        graph_zero = ["repeat_ul", "terminal_clean", "batch_diversity"]
+    active = ["explainer_ce", "ccv", "fca", "orthogonal_keep"]
+    graph_zero = ["retired_prediction_zero_guard", "repeat_ul", "terminal_clean", "batch_diversity"]
     return {
-        "schema_version": "odcr_step5_head_gated_loss_contract/1",
+        "schema_version": "odcr_step5_explanation_loss_contract/1",
         "head": norm,
+        "mode": "explanation_only",
         "active_losses": active,
         "graph_safe_zero_losses": graph_zero,
         "single_total_loss_insertion": True,
-        "combined_formal_enabled": False,
+        "rating_training": False,
     }
 
 

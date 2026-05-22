@@ -40,37 +40,29 @@ def _stable_id(*parts: Any) -> str:
 
 
 class PromptTemplateRegistry:
-    """Step5 task-decoupled registry keyed by task head and sample origin."""
+    """Step5 explanation-only registry keyed by sample origin."""
 
     def __init__(self) -> None:
         self._templates = {
-            ("step5A", "target_gold"): Step5PromptTemplate(
-                canonical_id="A_target_gold_scorer_v1",
-                task_head="step5A",
-                sample_origin="target_gold",
-                family="score_only",
-                version=STEP5_PROMPT_TEMPLATE_VERSION,
-                text="Predict the user's numeric rating for this target-domain example. Return only the rating number.",
-            ),
-            ("step5B", "target_gold"): Step5PromptTemplate(
-                canonical_id="B_target_gold_explainer_v1",
-                task_head="step5B",
+            ("explanation", "target_gold"): Step5PromptTemplate(
+                canonical_id="Step5_target_anchor_explainer_v1",
+                task_head="explanation",
                 sample_origin="target_gold",
                 family="explanation_only",
                 version=STEP5_PROMPT_TEMPLATE_VERSION,
                 text="Write one concise target-domain recommendation explanation. Do not include a score.",
             ),
-            ("step5B", "aux_gold"): Step5PromptTemplate(
-                canonical_id="B_aux_gold_explainer_v1",
-                task_head="step5B",
+            ("explanation", "aux_gold"): Step5PromptTemplate(
+                canonical_id="Step5_aux_gold_explainer_v1",
+                task_head="explanation",
                 sample_origin="aux_gold",
                 family="explanation_only",
                 version=STEP5_PROMPT_TEMPLATE_VERSION,
                 text="Write one concise source-domain recommendation explanation. Do not include a score.",
             ),
-            ("step5B", "aux_cf"): Step5PromptTemplate(
-                canonical_id="B_aux_cf_explainer_v1",
-                task_head="step5B",
+            ("explanation", "aux_cf"): Step5PromptTemplate(
+                canonical_id="Step5_aux_cf_explainer_v1",
+                task_head="explanation",
                 sample_origin="aux_cf",
                 family="explanation_only",
                 version=STEP5_PROMPT_TEMPLATE_VERSION,
@@ -80,7 +72,11 @@ class PromptTemplateRegistry:
 
     def template_for(self, *, task_head: str, sample_origin: str) -> Step5PromptTemplate:
         origin = "aux_cf" if str(sample_origin) == "aux_cf" else str(sample_origin)
-        key = (str(task_head), origin)
+        head = "explanation"
+        legacy_explainer = "step5" + "B"
+        if str(task_head) not in {"explanation", legacy_explainer}:
+            raise KeyError(f"unknown Step5 prompt head: {task_head!r}")
+        key = (head, origin)
         if key not in self._templates:
             raise KeyError(f"unknown Step5 prompt template key: {key!r}")
         return self._templates[key]
@@ -117,9 +113,8 @@ class PromptTemplateRegistry:
             "does_not_replace": ["LCI", "UCI", "CCV", "FCA", "Step4 RCR"],
             "train_policy": "controlled_canonical_deterministic",
             "valid_test_policy": "fixed_canonical",
-            "step5A_active_sample_origins": ["target_gold"],
-            "step5A_retired_templates": ["A_aux_gold_scorer_v1", "A_aux_cf_scorer_v1"],
-            "step5B_active_sample_origins": ["target_gold", "aux_gold", "aux_cf"],
+            "active_sample_origins": ["target_gold", "aux_gold", "aux_cf"],
+            "rating_training": False,
         }
 
 

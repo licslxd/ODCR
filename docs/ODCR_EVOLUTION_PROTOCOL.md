@@ -587,10 +587,15 @@ changes must preserve the S2-R split:
 Auxiliary changes must extend the active aux registries instead of adding new
 side tables. Static guardrail rules live in
 `code/odcr_core/aux/governance/rule_registry.py`; post-edit scopes and reasons
-live in `code/odcr_core/aux/governance/post_edit_registry.py`; runtime/tmux/GPU
-allowlist entries live in `code/odcr_core/aux/runtime/command_registry.py`.
+live in `code/odcr_core/aux/governance/post_edit_registry.py`; fixed
+runtime/tmux/GPU metadata and the formal-training blocker live in
+`code/odcr_core/aux/runtime/command_registry.py`.
 
-Any new runtime command needs a `RuntimeCommandSpec`, tests, AI_analysis output
-through `code/odcr_core/aux/evidence/ai_analysis_writer.py`, and an explicit
-formal namespace policy. It must not reintroduce arbitrary shell, repo-command,
-repo-script, repo-module, command-file, or allocation paths.
+The bridge is no longer a closed whitelist for GPU execution. Non-formal GPU
+work may use `./odcr runtime bridge exec -- ...` after fresh pane validation.
+Any new fixed runtime command still needs a `RuntimeCommandSpec`, tests,
+AI_analysis output through `code/odcr_core/aux/evidence/ai_analysis_writer.py`,
+and an explicit formal namespace policy. The remaining hard blocker is ODCR
+formal model training; legacy mode names `repo-command`, `repo-script`,
+`repo-module`, and `command-file` remain retired rather than restored as public
+entrypoints.

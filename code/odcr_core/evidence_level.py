@@ -14,7 +14,7 @@ E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY = "E4_gpu_shard_forward_bounded_formal
 E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION = (
     "E4_gpu_shard_forward_bounded_formal_entry_with_validation"
 )
-E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE = "E5_step5A_post_train_eval_lifecycle"
+E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE = "E5_rating_stability_control_post_train_eval_lifecycle"
 E5_FORMAL_FULL_RUN = "E5_formal_full_run"
 
 MIN_TUNING_EVIDENCE_LEVEL = E4_GPU_SHARD_FORWARD_BOUNDED
@@ -69,9 +69,9 @@ EVIDENCE_LEVEL_SPECS: tuple[EvidenceLevelSpec, ...] = (
         False,
     ),
     EvidenceLevelSpec(
-        E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE,
+        E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE,
         5,
-        "bounded Step5A post-train checkpoint save, training teardown, CPU-staged reload, and eval-forward lifecycle",
+        "bounded RatingStabilityControl post-train checkpoint save, training teardown, CPU-staged reload, and eval-forward lifecycle",
         True,
         True,
         False,
@@ -269,7 +269,7 @@ __all__ = [
     "E4_GPU_SHARD_FORWARD_BOUNDED",
     "E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY",
     "E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION",
-    "E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE",
+    "E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE",
     "E5_FORMAL_FULL_RUN",
     "EvidenceLevelError",
     "evidence_level_policy",

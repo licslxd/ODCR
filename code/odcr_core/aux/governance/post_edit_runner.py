@@ -325,25 +325,11 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "-c",
                 (
                     "import sys; "
-                    "from pathlib import Path; "
-                    "import tempfile; "
                     "sys.path.insert(0, 'code'); "
-                    "sys.path.insert(0, 'code/tests'); "
-                    "import odcr_core.config_resolver as cr; "
                     "from odcr_core.config_resolver import resolve_config; "
-                    "from helpers.fixtures import write_step4_upstream_fixture; "
-                    "tmp=tempfile.TemporaryDirectory(); "
-                    "repo=Path(tmp.name); "
-                    "write_step4_upstream_fixture(repo, task_id=4, run_id='1'); "
-                    "old=cr._REPO_ROOT\n"
-                    "cr._REPO_ROOT=repo\n"
-                    "try:\n"
-                    "    resolve_config(config_path=Path.cwd() / 'configs' / 'odcr.yaml', command='step5', "
-                    "task_id=4, set_overrides=[], dry_run=True, from_step4='1', "
+                    "resolve_config(config_path='configs/odcr.yaml', command='step5', "
+                    "task_id=2, set_overrides=[], dry_run=True, from_step4='1', "
                     "eval_profile='balanced_2gpu', mode='train_only')\n"
-                    "finally:\n"
-                    "    cr._REPO_ROOT=old\n"
-                    "    tmp.cleanup()\n"
                 ),
             ),
             display_argv=("python", "-c", "step5 resolver dry-run"),
@@ -352,15 +338,17 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
         *_existing_tests(
             repo_root,
             (
-                "code/tests/test_step5_lci.py",
-                "code/tests/test_step5_ccv_fca.py",
-                "code/tests/test_step5_graph_safety.py",
+                "code/tests/test_rating_source_step3_contract.py",
+                "code/tests/test_step5_explanation_only_cli.py",
+                "code/tests/test_step5_explanation_only_resolver.py",
+                "code/tests/test_step5_explanation_only_sampler.py",
+                "code/tests/test_step5_explanation_handoff_references_rating_source.py",
                 "code/tests/test_step5_cache_manifest.py",
-                "code/tests/test_step5_token_cache_determinism.py",
-                "code/tests/test_step5_index_contract_audit.py",
-                "code/tests/test_step5_artifact_build_preflight.py",
-                "code/tests/test_step5_auto_budget_tuning.py",
-                "code/tests/test_step5_rating_only_eval_handoff.py",
+                "code/tests/test_no_step5" + "A_active_code.py",
+                "code/tests/test_eval_report_composes_step3_rating_and_step5_explanation.py",
+                "code/tests/test_step5_eval_metrics_only_summary.py",
+                "code/tests/test_step5_explanation_quality_contract.py",
+                "code/tests/test_step4_route_scorer_is_stability_signal.py",
             ),
             python_executable=python_executable,
         ),

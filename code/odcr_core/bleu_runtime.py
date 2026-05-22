@@ -14,12 +14,13 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data._utils.collate import default_collate
 
-from base_utils import compute_bleu1234_only, get_underlying_model
+from base_utils import build_paper_metric_inputs, compute_bleu1234_only, get_underlying_model
 from odcr_core.gather_schema import GatheredBatch, require_gathered_batch
 from odcr_core.mainline_monitor import (
     build_mainline_monitor_bundle_from_merged_rows,
     safe_summarize_uncertainty_decode_aggregate,
 )
+from odcr_core.step5_innovation import build_ccv_control_packet
 from executors.decode_controller import (
     empty_uncertainty_decode_aggregate,
     merge_uncertainty_run_into_aggregate,
@@ -60,7 +61,16 @@ def _quick_bleu_safe_collate(batch: List[Any]) -> Any:
 
     if all("exp_sample_weight" in x for x in batch):
         exp_sample_weight = _stack_scalar("exp_sample_weight", dtype=torch.float32)
-        return (user_idx, item_idx, rating, tgt_output, domain_idx, sample_id, exp_sample_weight)
+        return (
+            user_idx,
+            item_idx,
+            rating,
+            tgt_output,
+            domain_idx,
+            sample_id,
+            exp_sample_weight,
+            [str(x["raw_ref_text"]) for x in batch],
+        )
     return (user_idx, item_idx, rating, tgt_output, domain_idx, sample_id)
 
 
@@ -100,6 +110,8 @@ def build_explanation_bleu_rows_for_indices(
     cfg_override: Optional[Mapping[str, Any]] = None,
     include_ratings_for_monitor: bool = False,
     uncertainty_acc: Optional[MutableMapping[str, Any]] = None,
+    step5_innov_cfg: Any = None,
+    non_blocking_h2d: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """
     在 valid_dataset 上取给定全局 indices，逐批 gather（须为 GatheredBatch）、generate，产出 BLEU 评估行。
@@ -128,18 +140,27 @@ def build_explanation_bleu_rows_for_indices(
     underlying_model.eval()
     with torch.inference_mode():
         for batch in dl:
-            g = require_gathered_batch(underlying_model.gather(batch, device))
+            if non_blocking_h2d is None:
+                raise RuntimeError("official Step5 monitor generation requires non_blocking_h2d from resolved config.")
+            g = require_gathered_batch(underlying_model.gather(batch, device, non_blocking_h2d=bool(non_blocking_h2d)))
             user_idx = g.user_idx
             item_idx = g.item_idx
             domain_idx = g.domain_idx
             tgt_output = g.tgt_output
             sample_id = g.sample_id
+            if step5_innov_cfg is None:
+                raise RuntimeError("official Step5 monitor generation requires resolved step5_innov_cfg.")
+            ccv_packet = build_ccv_control_packet(g, step5_innov_cfg)
             with odcr_cuda_bf16_autocast():
                 pred_rating_t = None
                 if include_ratings_for_monitor:
                     pred_rating_t = underlying_model.recommend(user_idx, item_idx, domain_idx)
                 gen_pack = underlying_model.generate(
-                    user_idx, item_idx, domain_idx, cfg_override=cfg_override
+                    user_idx,
+                    item_idx,
+                    domain_idx,
+                    cfg_override=cfg_override,
+                    ccv_control_packet=ccv_packet,
                 )
                 gen_ids = gen_pack[0]
                 if uncertainty_acc is not None:
@@ -148,15 +169,27 @@ def build_explanation_bleu_rows_for_indices(
                         getattr(underlying_model, "_last_uncertainty_decode_stats", None),
                     )
             pred_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-            ref_texts = tokenizer.batch_decode(tgt_output, skip_special_tokens=True)
+            raw_refs = list(g.raw_ref_text or [])
+            ref_texts = raw_refs if len(raw_refs) == int(user_idx.size(0)) else tokenizer.batch_decode(tgt_output, skip_special_tokens=True)
             gt_rating = g.rating
             bsz = int(user_idx.size(0))
             for i in range(bsz):
                 sid = int(sample_id[i].item())
+                metric_input = build_paper_metric_inputs(
+                    pred_texts[i],
+                    ref_texts[i],
+                    tokenizer,
+                    max_len=25,
+                )
                 row: Dict[str, Any] = {
                     "sample_id": sid,
                     "pred_text": pred_texts[i],
                     "ref_text": ref_texts[i],
+                    "raw_ref_text": ref_texts[i],
+                    "metric_pred_text": metric_input["metric_pred"],
+                    "metric_ref_text": metric_input["metric_ref"],
+                    "paper_metric_input_schema_version": metric_input["schema_version"],
+                    "paper_metric_token_max_len": int(metric_input["max_len"]),
                 }
                 if include_ratings_for_monitor and pred_rating_t is not None:
                     row["pred_rating"] = float(pred_rating_t[i].item())
@@ -196,6 +229,8 @@ def explanation_bleu4_quick_score(
     dataloader_num_workers: int,
     dataloader_prefetch_factor: Optional[int],
     collate_fn: Optional[Callable[[List[Any]], Any]] = None,
+    step5_innov_cfg: Any = None,
+    non_blocking_h2d: Optional[bool] = None,
 ) -> float:
     """验证集前 max_samples 条上的 quick BLEU-4（仅 rank0 调用）。"""
     _m = get_underlying_model(model)
@@ -215,6 +250,8 @@ def explanation_bleu4_quick_score(
         dataloader_num_workers=dataloader_num_workers,
         dataloader_prefetch_factor=dataloader_prefetch_factor,
         collate_fn=collate_fn,
+        step5_innov_cfg=step5_innov_cfg,
+        non_blocking_h2d=non_blocking_h2d,
     )
     if not rows:
         return 0.0
@@ -235,6 +272,8 @@ def bleu4_explanation_full_valid_ddp(
     logger: Optional[logging.Logger] = None,
     collate_fn: Optional[Callable[[List[Any]], Any]] = None,
     cfg_override: Optional[Mapping[str, Any]] = None,
+    step5_innov_cfg: Any = None,
+    non_blocking_h2d: Optional[bool] = None,
 ) -> float:
     """
     完整 valid 上 explanation BLEU-4；各 rank 连续分片，all_gather_object 后 rank0 按 sample_id 合并。
@@ -259,6 +298,8 @@ def bleu4_explanation_full_valid_ddp(
             dataloader_prefetch_factor=dataloader_prefetch_factor,
             collate_fn=collate_fn,
             cfg_override=cfg_override,
+            step5_innov_cfg=step5_innov_cfg,
+            non_blocking_h2d=non_blocking_h2d,
         )
         return explanation_bleu4_score_from_local_rows(rows, n)
 
@@ -280,6 +321,8 @@ def bleu4_explanation_full_valid_ddp(
         dataloader_prefetch_factor=dataloader_prefetch_factor,
         collate_fn=collate_fn,
         cfg_override=cfg_override,
+        step5_innov_cfg=step5_innov_cfg,
+        non_blocking_h2d=non_blocking_h2d,
     )
     gathered: List[Any] = [None] * world_size
     dist.all_gather_object(gathered, rows)
@@ -311,6 +354,8 @@ def mainline_monitor_full_valid_ddp(
     cfg_override: Optional[Mapping[str, Any]] = None,
     composite_weights: Optional[Mapping[str, float]] = None,
     uncertainty_high_entropy_threshold: float = 1.0,
+    step5_innov_cfg: Any = None,
+    non_blocking_h2d: Optional[bool] = None,
 ) -> Tuple[float, Optional[Dict[str, Any]]]:
     """
     完整 valid：主路径 decode（与 cfg_override / 模型默认一致）下的指标包 + guarded 复合分。
@@ -338,6 +383,8 @@ def mainline_monitor_full_valid_ddp(
             cfg_override=cfg_override,
             include_ratings_for_monitor=True,
             uncertainty_acc=unc_acc,
+            step5_innov_cfg=step5_innov_cfg,
+            non_blocking_h2d=non_blocking_h2d,
         )
         merged = merge_eval_rows_by_sample_id([rows], n)
         bundle = build_mainline_monitor_bundle_from_merged_rows(
@@ -372,6 +419,8 @@ def mainline_monitor_full_valid_ddp(
         cfg_override=cfg_override,
         include_ratings_for_monitor=True,
         uncertainty_acc=unc_acc,
+        step5_innov_cfg=step5_innov_cfg,
+        non_blocking_h2d=non_blocking_h2d,
     )
     gathered: List[Any] = [None] * world_size
     dist.all_gather_object(gathered, rows)

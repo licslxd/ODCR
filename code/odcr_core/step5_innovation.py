@@ -96,7 +96,7 @@ class Step5InnovationConfig:
 
 
 @dataclass(frozen=True)
-class Step5AScorerGate:
+class RatingStabilityControlGate:
     scorer_weight: torch.Tensor
     lci_weight: torch.Tensor
     uci_weight: torch.Tensor
@@ -108,7 +108,7 @@ class Step5AScorerGate:
 
 
 @dataclass(frozen=True)
-class Step5BExplainerGate:
+class Step5ExplanationGate:
     explainer_weight: torch.Tensor
     fca_weight: torch.Tensor
     route_mask: torch.Tensor
@@ -119,7 +119,7 @@ class Step5BExplainerGate:
 
 
 @dataclass(frozen=True)
-class Step5ALCILoss:
+class RatingStabilityControlLCILoss:
     lci_loss: torch.Tensor
     lci_weighted_loss: torch.Tensor
     lci_consistency_loss: torch.Tensor
@@ -130,7 +130,7 @@ class Step5ALCILoss:
 
 
 @dataclass(frozen=True)
-class Step5BFCALoss:
+class Step5ExplanationFCALoss:
     fca_loss: torch.Tensor
     fca_weighted_loss: torch.Tensor
     fca_weight_mean: torch.Tensor
@@ -552,7 +552,7 @@ def _bucket_scale(confidence_bucket: torch.Tensor, weights: Mapping[str, float])
     return out
 
 
-def build_step5a_scorer_gate(batch: GatheredBatch, cfg: Step5InnovationConfig) -> Step5AScorerGate:
+def build_rating_stability_control_gate(batch: GatheredBatch, cfg: Step5InnovationConfig) -> RatingStabilityControlGate:
     sample_weight = _required_vec(batch, "exp_sample_weight")
     route = _required_vec(batch, "route_scorer_mask").clamp(0.0, 1.0)
     uncertainty = _required_vec(batch, "uncertainty_score").clamp(0.0, 1.0)
@@ -579,7 +579,7 @@ def build_step5a_scorer_gate(batch: GatheredBatch, cfg: Step5InnovationConfig) -
         floor = scorer_weight.new_tensor(float(cfg.uci.low_confidence_floor))
         uci_weight = torch.where((route > 0.0) & (confidence >= 1.0), uci_weight.clamp_min(floor), uci_weight)
     lci_weight = sample_weight * uci_weight
-    return Step5AScorerGate(
+    return RatingStabilityControlGate(
         scorer_weight=scorer_weight,
         lci_weight=lci_weight,
         uci_weight=uci_weight,
@@ -591,7 +591,7 @@ def build_step5a_scorer_gate(batch: GatheredBatch, cfg: Step5InnovationConfig) -
     )
 
 
-def build_step5b_explainer_gate(batch: GatheredBatch, cfg: Step5InnovationConfig) -> Step5BExplainerGate:
+def build_step5_explanation_gate(batch: GatheredBatch, cfg: Step5InnovationConfig) -> Step5ExplanationGate:
     sample_weight = _required_vec(batch, "exp_sample_weight")
     route = _required_vec(batch, "route_explainer_mask").clamp(0.0, 1.0)
     uncertainty = _required_vec(batch, "uncertainty_score").clamp(0.0, 1.0)
@@ -617,7 +617,7 @@ def build_step5b_explainer_gate(batch: GatheredBatch, cfg: Step5InnovationConfig
     fca_weight = sample_weight * fca_route * reliability * content_retention * uncertainty_scale
     if not cfg.fca.enabled:
         fca_weight = torch.zeros_like(fca_weight)
-    return Step5BExplainerGate(
+    return Step5ExplanationGate(
         explainer_weight=explainer_weight,
         fca_weight=fca_weight,
         route_mask=route,
@@ -639,7 +639,7 @@ def build_ccv_control_packet(
         raise RuntimeError("CCV control packet requested while step5.ccv.enabled=false.")
     if cfg.ccv.control_packet_field_policy != "strict_required":
         raise RuntimeError(
-            "Unsupported Step5B CCV control packet policy "
+            "Unsupported Step5 explanation CCV control packet policy "
             f"{cfg.ccv.control_packet_field_policy!r}; active path requires strict_required."
         )
     required = (
@@ -651,7 +651,7 @@ def build_ccv_control_packet(
     )
     missing = [name for name in required if getattr(batch, name) is None]
     if missing:
-        raise RuntimeError("Step5B CCV control packet missing tensor fields: " + ", ".join(missing))
+        raise RuntimeError("Step5 explanation CCV control packet missing tensor fields: " + ", ".join(missing))
     packet = CCVControlPacket(
         content_evidence_ids=batch.content_evidence_ids,  # type: ignore[arg-type]
         style_evidence_ids=batch.style_evidence_ids,  # type: ignore[arg-type]
@@ -681,12 +681,12 @@ def lci_score_invariance_loss(
     cf_score: torch.Tensor,
     robust_score: torch.Tensor,
     target_rating: torch.Tensor,
-    gate: Step5AScorerGate,
+    gate: RatingStabilityControlGate,
     cfg: Step5InnovationConfig,
-) -> Step5ALCILoss:
+) -> RatingStabilityControlLCILoss:
     if not cfg.lci.enabled or cfg.lci.weight <= 0.0:
         z = factual_score.sum() * 0.0
-        return Step5ALCILoss(z, z, z, z, z, z, gate.scorer_weight.mean())
+        return RatingStabilityControlLCILoss(z, z, z, z, z, z, gate.scorer_weight.mean())
     w = gate.lci_weight.to(dtype=factual_score.dtype)
     consistency_ps = (factual_score - cf_score).pow(2)
     cf_score_ps = (cf_score - target_rating.to(dtype=cf_score.dtype)).pow(2)
@@ -696,7 +696,7 @@ def lci_score_invariance_loss(
     l_rob = route_weighted_mean(robust_ps, w, gate.route_mask)
     raw = l_cons + float(cfg.lci.counterfactual_label_weight) * l_cf + float(cfg.lci.robustness_weight) * l_rob
     weighted = float(cfg.lci.weight) * raw
-    return Step5ALCILoss(
+    return RatingStabilityControlLCILoss(
         lci_loss=raw,
         lci_weighted_loss=weighted,
         lci_consistency_loss=l_cons,
@@ -715,12 +715,12 @@ def evidence_basis_fca_loss(
     content_profile: torch.Tensor,
     content_evidence_latent: torch.Tensor,
     packet: CCVControlPacket,
-    gate: Step5BExplainerGate,
+    gate: Step5ExplanationGate,
     cfg: Step5InnovationConfig,
-) -> Step5BFCALoss:
+) -> Step5ExplanationFCALoss:
     if not cfg.fca.enabled or cfg.fca.weight <= 0.0:
         z = scorer_hidden.sum() * 0.0
-        return Step5BFCALoss(z, z, z, scorer_hidden, explainer_hidden)
+        return Step5ExplanationFCALoss(z, z, z, scorer_hidden, explainer_hidden)
     eps = 1e-8
     c_ret = packet.content_retention_score.to(dtype=scorer_hidden.dtype).view(-1, 1).clamp(0.0, 1.0)
     c_anchor = packet.content_anchor_score.to(dtype=scorer_hidden.dtype).view(-1, 1).clamp(0.0, 1.0)
@@ -739,7 +739,7 @@ def evidence_basis_fca_loss(
     one_minus = 1.0 - (score_n * explain_n).sum(dim=-1).clamp(-1.0 + eps, 1.0 - eps)
     raw = route_weighted_mean(one_minus, gate.fca_weight.to(dtype=one_minus.dtype), gate.route_mask)
     weighted = float(cfg.fca.weight) * raw
-    return Step5BFCALoss(
+    return Step5ExplanationFCALoss(
         fca_loss=raw,
         fca_weighted_loss=weighted,
         fca_weight_mean=gate.fca_weight.detach().mean(),
@@ -763,8 +763,8 @@ __all__ = [
     "Step5ExplainerGateConfig",
     "Step5NativeLoRAConfig",
     "build_ccv_control_packet",
-    "build_step5a_scorer_gate",
-    "build_step5b_explainer_gate",
+    "build_rating_stability_control_gate",
+    "build_step5_explanation_gate",
     "evidence_basis_fca_loss",
     "for_test_default_step5_innovation_config",
     "lci_score_invariance_loss",

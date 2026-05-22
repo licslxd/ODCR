@@ -294,24 +294,19 @@ preprocess_b/c, complete stage experiments, Step3/Step4/Step5, eval/rerank, and
 long benchmarks are outside Codex's GPU work boundary unless explicitly
 authorized.
 
-Step5 is split into two active innovation paths. Step5A is the scorer stability
-path: it consumes Step4 posterior `route_scorer` rows through a scorer-clean
-gate and applies LCI under UCI weights from `cf_reliability_score`,
-`rating_stability_score`, `content_retention_score`, `uncertainty_score`,
-`confidence_bucket`, and `sample_weight_hint`. Step5B is the explainer
-verbalization path: it consumes `route_explainer` rows through a structured CCV
-control packet built from content/style evidence, route decisions, reliability,
-uncertainty, confidence, and sample weights. FCA aligns the scorer evidence
-basis with the explainer evidence basis. Step5 parameters live under
-`configs/odcr.yaml`: `step5.lci`, `step5.uci`, `step5.explainer_gate`,
-`step5.ccv`, `step5.fca`, `step5.model`, and
-`step5.train.explainer_loss_weight`. Step4 `sample_weight_hint` remains the
-posterior base sample weight; `step5.explainer_gate.explainer_only_multiplier`
-is only a Step5B training scheduling multiplier for explainer-only rows. CCV
-control adapter dimensions and native LoRA controls are owned by `step5.ccv`,
-including `step5.ccv.native_lora`. Retired `adv`, `eta`, `lambda_lci` /
-`lambda_fca`, and prompt-concat controls are fail-fast legacy names, not active
-Step5 configuration.
+Step5 is explanation-only. Rating metrics come from the Step3 accepted scorer
+declared in `configs/odcr.yaml: rating_source`; Step5 does not train or
+evaluate a rating scorer. Step5 consumes `route_explainer` rows through a
+structured CCV control packet built from content/style evidence, route
+decisions, reliability, uncertainty, confidence, and sample weights. FCA aligns
+evidence bases for the explanation objective. Step5 parameters live under
+`configs/odcr.yaml`: `step5.explainer_gate`, `step5.ccv`, `step5.fca`,
+`step5.model`, `step5.train.explainer_loss_weight`, and `rating_source`. Step4
+`sample_weight_hint` remains the posterior base sample weight. CCV control
+adapter dimensions and native LoRA controls are owned by `step5.ccv`, including
+`step5.ccv.native_lora`. Retired `adv`, `eta`, `lambda_lci` / `lambda_fca`,
+and prompt-concat controls are fail-fast legacy names, not active Step5
+configuration.
 
 Step5 valid/test factual controls are separately labeled
 `mode=factual_eval_default` under
@@ -392,9 +387,9 @@ runtime/tmux/GPU bridge dispatch, governance registries, AI_analysis writing,
 artifact path policy, and runtime CLI facades. `./odcr` remains the only user
 entrypoint; `./odcr runtime ...` is a subcommand, not a second control plane.
 
-Codex/tmux/GPU validation must use `./odcr runtime bridge discover`,
-`validate-only`, `marker-probe`, `cuda-probe`, or registered bounded probes
-such as `./odcr runtime probe --stage step5A --task 2 --bounded`. The bridge
+Codex/tmux/GPU validation and user-authorized GPU dispatch must use
+`./odcr runtime bridge discover`, `validate-only`, `marker-probe`,
+`cuda-probe`, `bridge exec -- ...`, or registered bounded probes. The bridge
 records current-pane hostname, TMUX, SLURM_JOB_ID, CUDA_VISIBLE_DEVICES,
-nvidia-smi, and torch CUDA evidence under AI_analysis. Tests write run-like
-artifacts under `test_artifacts/`, not formal `runs/`.
+nvidia-smi, torch CUDA evidence, and exec status under AI_analysis.
+Tests write run-like artifacts under `test_artifacts/`, not formal `runs/`.

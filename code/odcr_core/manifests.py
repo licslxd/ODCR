@@ -316,7 +316,7 @@ def _extract_failure_root_signature(
             {
                 "failure_phase": "epoch_end_validation",
                 "failure_type": "validation_forward_oom",
-                "root_cause": "step5A_validation_materialized_explainer_logits_with_oversized_valid_batch",
+                "root_cause": "rating_stability_control_validation_materialized_explainer_logits_with_oversized_valid_batch",
                 "fatal_source": "logs" if text else "latest_error",
                 "fatal_signature": "validModel Step5 forward out.logits.float CUDA OOM",
             }
@@ -502,13 +502,6 @@ def latest_pointer_path(stage_unit_dir: str | Path) -> Path:
     return Path(stage_unit_dir).expanduser().resolve() / LATEST_FILENAME
 
 
-def latest_head_pointer_path(stage_unit_dir: str | Path, head: str) -> Path:
-    safe_head = str(head or "").strip()
-    if safe_head not in {"step5A", "step5B"}:
-        raise ValueError(f"head-specific latest pointer requires step5A/step5B, got {head!r}")
-    return Path(stage_unit_dir).expanduser().resolve() / f"latest_{safe_head}.json"
-
-
 def _is_step3_snapshot(snapshot: Mapping[str, Any]) -> bool:
     train = snapshot.get("train")
     if not isinstance(train, Mapping):
@@ -554,7 +547,7 @@ def _source_table_record_value(snapshot: Mapping[str, Any], key: str) -> Any:
             "valid_forward_micro_batch_size": step5_eval.get("valid_forward_micro_batch_size"),
             "validation_microbatch_accumulation": step5_eval.get("validation_microbatch_accumulation"),
             "validation_memory_policy": step5_eval.get("validation_memory_policy"),
-            "step5A_validation_scorer_only": step5_eval.get("step5A_validation_mode") == "scorer_only",
+            "rating_stability_control_validation_scorer_only": step5_eval.get("rating_stability_control_validation_mode") == "scorer_only",
             "validation_flans_logits_materialized": False,
             "validation_e4_evidence_id": "pending_E4_gpu_shard_forward_bounded_formal_entry_with_validation",
             "valid_loss_components": step5_eval.get("valid_loss_components"),
@@ -636,10 +629,10 @@ def _source_table_record_value(snapshot: Mapping[str, Any], key: str) -> Any:
     if isinstance(formal_candidate, Mapping):
         value_keys = {
             "step5_formal_active_candidate": formal_candidate,
-            "step5_formal_active_candidate.step5A_cf_mix_id": formal_candidate.get("step5A_cf_mix_id"),
-            "step5_formal_active_candidate.step5A_cf_mix": formal_candidate.get("step5A_cf_mix"),
-            "step5_formal_active_candidate.step5B_cf_mix_id": formal_candidate.get("step5B_cf_mix_id"),
-            "step5_formal_active_candidate.step5B_cf_mix": formal_candidate.get("step5B_cf_mix"),
+            "step5_formal_active_candidate.rating_stability_control_cf_mix_id": formal_candidate.get("rating_stability_control_cf_mix_id"),
+            "step5_formal_active_candidate.rating_stability_control_cf_mix": formal_candidate.get("rating_stability_control_cf_mix"),
+            "step5_formal_active_candidate.step5_explanation_cf_mix_id": formal_candidate.get("step5_explanation_cf_mix_id"),
+            "step5_formal_active_candidate.step5_explanation_cf_mix": formal_candidate.get("step5_explanation_cf_mix"),
             "step5_formal_active_candidate.active_sampler_source": formal_candidate.get("active_sampler_source"),
             "step5_formal_active_candidate.step4_sampling_contract_role": formal_candidate.get("step4_sampling_contract_role"),
             "selected_tuning_candidate": formal_candidate.get("selected_tuning_candidate"),
@@ -1105,52 +1098,6 @@ def write_latest_pointer_json(
     return atomic_write_json(latest_pointer_path(stage_unit_dir), payload)
 
 
-def write_step5_head_latest_pointer_json(
-    *,
-    repo_root: str | Path,
-    stage_unit_dir: str | Path,
-    run_id: str,
-    run_dir: str | Path,
-    summary_path: str | Path,
-    head: str,
-    status: str,
-    updated_at: str | None = None,
-) -> Path:
-    root = Path(repo_root).expanduser().resolve()
-    updated = updated_at or _utc_now()
-    status_path = Path(run_dir).expanduser()
-    if not status_path.is_absolute():
-        status_path = (root / status_path).resolve()
-    status_path = status_path / "meta" / "stage_status.json"
-    stage_status = _load_json_mapping(status_path)
-    payload = {
-        "schema_version": "odcr_latest_pointer/step5_head_status/1",
-        "active_run_id": str(run_id),
-        "latest_run_id": str(run_id),
-        "latest_run_dir": _repo_relative(root, run_dir),
-        "latest_summary_path": _repo_relative(root, summary_path),
-        "latest_stage_status_path": _repo_relative(root, status_path),
-        "stage": "step5",
-        "task_id": stage_status.get("task_id") or stage_status.get("task"),
-        "step5_head": str(head),
-        "head_complete": stage_status.get("final_status") in {"completed", "completed_with_eval_handoff"},
-        "complete_step5_latest": False,
-        "downstream_ready": False,
-        "ready_for": [],
-        "downstream_ready_for_merge": bool(stage_status.get("downstream_ready_for_merge")),
-        "merge_gate": stage_status.get("merge_gate"),
-        "generated_at": updated,
-        "updated_at": updated,
-        "sha256s": {
-            "run_summary": _artifact_hash(root, summary_path),
-            "stage_status": _artifact_hash(root, status_path),
-        },
-        "status_claim_source": "stage_status_head_strict_verifier",
-        "status": str(status or ""),
-    }
-    return atomic_write_json(latest_head_pointer_path(stage_unit_dir, str(head)), payload)
-
-
 def write_run_summary_json(
     summary: Mapping[str, Any],
     *,
@@ -1185,18 +1132,6 @@ def write_run_summary_json(
         )
         if stage == "step4" and stage_status_payload.get("downstream_ready") is not True:
             update_latest = False
-        if stage == "step5" and str(stage_status_payload.get("step5_head") or "") in {"step5A", "step5B"}:
-            update_latest = False
-            if str(stage_status_payload.get("final_status") or "") in {"completed", "completed_with_eval_handoff"}:
-                write_step5_head_latest_pointer_json(
-                    repo_root=root,
-                    stage_unit_dir=run_dir.parent,
-                    run_id=str(summary.get("run_id") or run_dir.name),
-                    run_dir=run_dir,
-                    summary_path=out,
-                    head=str(stage_status_payload.get("step5_head")),
-                    status=str(summary.get("status") or "pending"),
-                )
     if update_latest:
         if run_dir is None:
             raise ValueError("run_summary requires run_dir to update latest.json")
@@ -1328,7 +1263,7 @@ def build_run_summary_for_config(
         if cfg.step5_run is not None:
             payload["from_step5"] = cfg.step5_run
         if cfg.command == "step5":
-            head = str(getattr(cfg, "step5_head", "combined") or "combined")
+            head = str(getattr(cfg, "step5_head", "explanation") or "explanation")
             status_norm = str(status).strip().lower()
             train_phase_completed = status_norm in {
                 "ok",
@@ -1341,7 +1276,7 @@ def build_run_summary_for_config(
             needs_eval_handoff = status_norm == "train_completed_no_eval"
             payload["step5_head"] = head
             payload["head"] = head
-            payload["formal_namespace"] = "head" if head in {"step5A", "step5B"} else "combined"
+            payload["formal_namespace"] = "explanation"
             payload["selected_tuning_candidate"] = str(getattr(cfg, "step5_selected_tuning_candidate", "") or "")
             payload["fallback_tuning_candidate"] = str(getattr(cfg, "step5_fallback_tuning_candidate", "") or "")
             payload["step5_effective_samples"] = _load_json_string(getattr(cfg, "step5_effective_samples_json", "{}") or "{}")
@@ -1361,7 +1296,7 @@ def build_run_summary_for_config(
             )
             payload["needs_eval_handoff"] = needs_eval_handoff
             payload["downstream_ready"] = (
-                head == "combined" and status_norm in {"ok", "completed", "success", "completed_with_eval_handoff", "eval_handoff_accepted"} and not needs_eval_handoff
+                status_norm in {"ok", "completed", "success", "completed_with_eval_handoff", "eval_handoff_accepted"} and not needs_eval_handoff
             )
             payload["ready_for"] = ["eval", "rerank"] if payload["downstream_ready"] else []
         upstream_resolution = getattr(cfg, "upstream_resolution_json", "") or ""
@@ -1628,7 +1563,7 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         "repo_root": str(cfg.repo_root.resolve()),
         "mainline_command": cfg.command,
         "stage": _stage_label(cfg.command),
-        "step5_head": str(getattr(cfg, "step5_head", "combined") or "combined") if cfg.command == "step5" else None,
+        "step5_head": str(getattr(cfg, "step5_head", "explanation") or "explanation") if cfg.command == "step5" else None,
         "step5_selected_tuning_candidate": str(getattr(cfg, "step5_selected_tuning_candidate", "") or "") if cfg.command == "step5" else None,
         "step5_fallback_tuning_candidate": str(getattr(cfg, "step5_fallback_tuning_candidate", "") or "") if cfg.command == "step5" else None,
         "step5_effective_samples": _load_json_string(getattr(cfg, "step5_effective_samples_json", "{}") or "{}") if cfg.command == "step5" else None,
@@ -1810,7 +1745,7 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         "step_modes": {
             "step3_mode": cfg.step3_mode,
             "step5_train_only": cfg.step5_train_only,
-            "step5_head": str(getattr(cfg, "step5_head", "combined") or "combined") if cfg.command == "step5" else None,
+            "step5_head": str(getattr(cfg, "step5_head", "explanation") or "explanation") if cfg.command == "step5" else None,
         },
         "training_diagnostics": training_diagnostics_snapshot(
             diagnostics_scope="parent",

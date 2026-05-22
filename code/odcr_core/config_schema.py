@@ -15,6 +15,7 @@ TOP_LEVEL_BLOCKS: tuple[str, ...] = (
     "preprocess",
     "step3",
     "step4",
+    "rating_source",
     "step5",
     "eval",
 )
@@ -155,10 +156,13 @@ class ResolvedConfig:
     test_forward_micro_batch_size: int
     validation_microbatch_accumulation: bool
     validation_memory_policy: str
-    step5A_validation_mode: str
+    step5_validation_mode: str
     formal_entry_E4_validation_required: bool
     old_eval_batch_2048_retired: bool
     valid_loss_components_json: str
+    valid_loss_label_max_length: int
+    final_eval_prediction_max_length: int
+    final_eval_reference_max_length: int
     num_proc: int
     ddp_world_size: int
     seed: int
@@ -249,6 +253,7 @@ class ResolvedConfig:
     global_eval_batch_size: Optional[int]
     eval_per_gpu_batch_size: Optional[int]
     eval_profile_id: str
+    eval_split: str
 
     consumed_presets_json: str
     config_before_cli_json: str
@@ -273,7 +278,9 @@ class ResolvedConfig:
     step4_cf_tiers_config_json: str = "{}"
     step5_innovation_config_json: str = ""
     step5_task_decoupled_policy_config_json: str = "{}"
-    step5_head: str = "combined"
+    rating_source_config_json: str = "{}"
+    step5_mode: str = "explanation_only"
+    step5_head: str = "explanation"
     lora_target_policy_id: str = ""
     head_specific_lora_allowlist_id: str = ""
     final_lora_target_modules: Tuple[str, ...] = ()

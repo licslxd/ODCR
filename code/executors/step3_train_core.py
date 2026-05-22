@@ -3867,7 +3867,12 @@ def load_completed_step3_tokenizer_cache_for_rank(
         expected_fingerprint=expected_fingerprint,
     )
     load0 = time.perf_counter()
-    encoded_data = load_from_disk(cache_dir)
+    try:
+        encoded_data = load_from_disk(cache_dir)
+    except ValueError as exc:
+        if "Protocol not known" not in str(exc) or not Path(cache_dir).exists():
+            raise
+        encoded_data = load_from_disk(Path(cache_dir).expanduser().resolve().as_uri())
     if timing_sink is not None:
         timing_sink["cache_load_time_s"] = round(time.perf_counter() - load0, 6)
     return encoded_data

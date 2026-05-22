@@ -198,7 +198,7 @@ def default_cf_tier_config(raw: Mapping[str, Any] | None = None) -> dict[str, An
         },
     )
     cfg.setdefault(
-        "step5A",
+        "rating_stability_control",
         {
             "high": {
                 "require_route_scorer": True,
@@ -227,7 +227,7 @@ def default_cf_tier_config(raw: Mapping[str, Any] | None = None) -> dict[str, An
         },
     )
     cfg.setdefault(
-        "step5B",
+        "step5_explanation",
         {
             "high": {
                 "require_route_explainer": True,
@@ -255,8 +255,8 @@ def default_cf_tier_config(raw: Mapping[str, Any] | None = None) -> dict[str, An
     cfg.setdefault(
         "sampling_weight",
         {
-            "step5A": {"high": 1.20, "medium": 0.80, "low_weighted": 0.20, "reject": 0.0},
-            "step5B": {"high": 1.20, "medium": 0.90, "low_weighted": 0.30, "reject": 0.0},
+            "rating_stability_control": {"high": 1.20, "medium": 0.80, "low_weighted": 0.20, "reject": 0.0},
+            "step5_explanation": {"high": 1.20, "medium": 0.90, "low_weighted": 0.30, "reject": 0.0},
         },
     )
     return cfg
@@ -511,7 +511,7 @@ def assign_cf_tiers(chunk: pd.DataFrame, cfg: Mapping[str, Any] | None = None) -
         high_cfg = dict(head_cfg["high"])
         medium_cfg = dict(head_cfg["medium"])
         low_cfg = dict(head_cfg["low_weighted"])
-        if head == "step5A":
+        if head == "rating_stability_control":
             high = (
                 (~hard_bad)
                 & route
@@ -588,33 +588,33 @@ def assign_cf_tiers(chunk: pd.DataFrame, cfg: Mapping[str, Any] | None = None) -
             )
         return _clip01(score), high.fillna(False), medium.fillna(False), low.fillna(False)
 
-    score_a, high_a, med_a, low_a = _tier("step5A", rs)
-    score_b, high_b, med_b, low_b = _tier("step5B", re)
+    score_a, high_a, med_a, low_a = _tier("rating_stability_control", rs)
+    score_b, high_b, med_b, low_b = _tier("step5_explanation", re)
     hard = hard_bad.fillna(False).astype(bool)
-    out["cf_quality_score_step5A"] = score_a.astype(float)
-    out["cf_quality_score_step5B"] = score_b.astype(float)
-    out["cf_tier_step5A"] = np.select(
+    out["cf_quality_score_rating_stability_control"] = score_a.astype(float)
+    out["cf_quality_score_step5_explanation"] = score_b.astype(float)
+    out["cf_tier_rating_stability_control"] = np.select(
         [hard.to_numpy(), high_a.to_numpy(), med_a.to_numpy(), low_a.to_numpy()],
         ["reject", "high", "medium", "low_weighted"],
         default="reject",
     )
-    out["cf_tier_step5B"] = np.select(
+    out["cf_tier_step5_explanation"] = np.select(
         [hard.to_numpy(), high_b.to_numpy(), med_b.to_numpy(), low_b.to_numpy()],
         ["reject", "high", "medium", "low_weighted"],
         default="reject",
     )
-    out["cf_tier_reason_step5A"] = np.select(
+    out["cf_tier_reason_rating_stability_control"] = np.select(
         [hard.to_numpy(), high_a.to_numpy(), med_a.to_numpy(), low_a.to_numpy()],
         ["hard_quality_reject", "scorer_high_quality_route", "scorer_medium_quality", "scorer_low_weighted_quality"],
         default="scorer_reject_low_quality",
     )
-    out["cf_tier_reason_step5B"] = np.select(
+    out["cf_tier_reason_step5_explanation"] = np.select(
         [hard.to_numpy(), high_b.to_numpy(), med_b.to_numpy(), low_b.to_numpy()],
         ["hard_quality_reject", "explainer_high_quality_route", "explainer_medium_quality", "explainer_low_weighted_quality"],
         default="explainer_reject_low_quality",
     )
     weights = dict(cfg["sampling_weight"])
-    for head, col in (("step5A", "cf_tier_step5A"), ("step5B", "cf_tier_step5B")):
+    for head, col in (("rating_stability_control", "cf_tier_rating_stability_control"), ("step5_explanation", "cf_tier_step5_explanation")):
         mapping = {k: float(v) for k, v in dict(weights[head]).items()}
         out[f"recommended_sampling_weight_{head}"] = out[col].astype(str).map(mapping).fillna(0.0).astype(float)
     out["cf_tier"] = ""

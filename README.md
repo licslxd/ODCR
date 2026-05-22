@@ -9,6 +9,13 @@ ODCR is now operated through a One-Control architecture.
 Before future Codex/AI or developer code changes, read `AGENTS.md` and
 `docs/ODCR_ARCHITECTURE_CONTRACT.md`.
 
+ODCR reusable skills:
+
+- `docs/skills/ODCR_GPU_SKILL.md`
+- `docs/skills/ODCR_AUDIT_DELIVERY_SKILL.md`
+
+Future Codex tasks must read these two skills before the task-specific prompt.
+
 For future Codex code-change tasks, start from
 `docs/CODEX_CHANGE_REQUEST_TEMPLATE.md`; do not ask Codex to freely modify ODCR
 before the change is classified and the integration checklist is filled or

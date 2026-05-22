@@ -278,8 +278,8 @@ def _artifact_missing_reasons(repo_root: Path, status: Mapping[str, Any], *, con
                     reasons.append(f"{key}_missing")
         elif status.get("step5_train_input_role") == "dedicated_split_exports":
             for key in (
-                "step5A_scorer_train_export",
-                "step5B_explainer_train_export",
+                "rating_stability_control_scorer_train_export",
+                "step5_explanation_explainer_train_export",
                 "step5_train_manifest",
                 "route_intersection_report",
                 "step5_dedicated_exports_status",

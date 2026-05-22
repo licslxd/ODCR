@@ -96,14 +96,14 @@ RULE_GROUP_BY_ID = {rule_id: group for group, rule_ids in GUARDRAIL_GROUPS for r
 
 AUX_RULE_DESCRIPTIONS: dict[str, str] = {
     "R119": "active odcr_core.aux architecture required",
-    "R120": "runtime bridge command allowlist required",
-    "R121": "no arbitrary repo-command/repo-script/repo-module/command-file",
+    "R120": "runtime bridge open dispatch requires formal-train blocker",
+    "R121": "legacy repo-command/repo-script/repo-module/command-file modes stay retired",
     "R122": "unified AI_analysis writer required",
     "R123": "no direct AI_analysis writes outside aux evidence writer",
     "R124": "post-edit/hook/guardrail registry single source required",
     "R125": "runtime tmux GPU handshake must be current-pane evidence",
     "R126": "no active-tree Python bytecode/cache artifacts",
-    "R127": "Step5A/Step5B runtime probes registered",
+    "R127": "RatingStabilityControl/Step5 explanation runtime probes registered",
     "R128": "old bridge wrapper must not execute legacy commands",
     "R129": "no retired preprocess --stage/--preset user-facing wording",
     "R130": "local secret/cache ignore policy required",
@@ -112,13 +112,13 @@ AUX_RULE_DESCRIPTIONS: dict[str, str] = {
     "R133": "evidence levels must not overclaim E4/E5 gates",
     "R134": "runtime bridge target selection must use handoff v2 or CLI explicit",
     "R135": "legacy code and bridge branches must be purged from active runtime",
-    "R136": "Step5A formal contract must remain high-only B224 190646 LR_1e-3+W0",
+    "R136": "Step5 explanation-only One-Control contract must include Step3 rating_source",
     "R137": "Step5 production model must delete retired recommender/hidden2token/soft-prompt fallback modules",
     "R138": "Step5 native LoRA must be head-aware allowlist-only",
     "R139": "Step5 native LoRA must never wrap nn.MultiheadAttention.out_proj",
     "R140": "Step5 E4/formal preflight must require all trainable parameters to receive gradients",
-    "R141": "Step5 combined formal training remains disabled until combined all-grad E4 is audited",
-    "R142": "Step5A validation must be scorer-only and formal-entry E4 must include validation",
+    "R141": "retired Step5 rating/paired-head strings must be absent from active source",
+    "R142": "Step5 final/eval handoff must compose Step3 rating_source with Step5 explanation",
 }
 
 

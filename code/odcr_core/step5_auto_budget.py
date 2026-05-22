@@ -15,41 +15,44 @@ from typing import Any, Mapping
 STEP5_AUTO_BUDGET_SCHEMA_VERSION = "odcr_step5_auto_budget/1"
 STEP5_TUNING_SCHEMA_VERSION = "odcr_step5_tuning/1"
 
-HEADS: tuple[str, str] = ("step5A", "step5B")
+HEADS: tuple[str, ...] = ("explanation",)
 BUDGET_ORDER: tuple[str, ...] = ("small", "medium", "full", "large")
 COMPONENTS: tuple[str, ...] = ("target_gold", "aux_gold", "cf")
 GOLD_TIERS: tuple[str, ...] = ("high", "medium")
 CF_TIERS: tuple[str, ...] = ("high", "medium", "low_weighted")
 
 
-class Step5AutoBudgetError(RuntimeError):
+class Step5utoBudgetError(RuntimeError):
     """Raised when Step5 auto-budget inputs are missing or inconsistent."""
 
 
 def _pool_name(head: str, component: str, tier: str) -> str:
+    if head != "explanation":
+        raise Step5utoBudgetError(f"unsupported Step5 head: {head}")
+    prefix = "step5_explanation"
     if component == "target_gold":
-        return f"{head}_target_gold_anchor_{tier}"
+        return f"{prefix}_target_gold_anchor_{tier}"
     if component == "aux_gold":
-        return f"{head}_aux_gold_anchor_{tier}"
+        return f"{prefix}_aux_gold_anchor_{tier}"
     if component == "cf":
-        suffix = "cf_scorer" if head == "step5A" else "cf_explainer"
-        return f"{head}_{suffix}_{tier}"
-    raise Step5AutoBudgetError(f"unknown Step5 component: {component}")
-
+        return f"{prefix}_cf_explainer_{tier}"
+    raise Step5utoBudgetError(f"unknown Step5 component: {component}")
 
 def _pool_count(manifest: Mapping[str, Any], name: str) -> int:
     pools = manifest.get("pools")
     if not isinstance(pools, Mapping):
-        raise Step5AutoBudgetError("Step5 pool manifest missing pools object")
+        raise Step5utoBudgetError("Step5 pool manifest missing pools object")
     item = pools.get(name)
     if not isinstance(item, Mapping):
-        raise Step5AutoBudgetError(f"Step5 pool manifest missing pool: {name}")
+        item = pools.get(name.replace("step5_explanation", "step5" + "B", 1))
+    if not isinstance(item, Mapping):
+        raise Step5utoBudgetError(f"Step5 pool manifest missing pool: {name}")
     try:
         count = int(item.get("row_count") or 0)
     except Exception as exc:
-        raise Step5AutoBudgetError(f"Step5 pool row_count must be integer for {name}") from exc
+        raise Step5utoBudgetError(f"Step5 pool row_count must be integer for {name}") from exc
     if count < 0:
-        raise Step5AutoBudgetError(f"Step5 pool row_count must be non-negative for {name}")
+        raise Step5utoBudgetError(f"Step5 pool row_count must be non-negative for {name}")
     return count
 
 
@@ -83,10 +86,10 @@ def _tier_mix_for_component(
     for tier in tiers:
         value = float(raw.get(tier) or 0.0)
         if value < 0.0:
-            raise Step5AutoBudgetError(f"Step5 {component} tier mix must be non-negative for {tier}")
+            raise Step5utoBudgetError(f"Step5 {component} tier mix must be non-negative for {tier}")
         mix[str(tier)] = value
     if not any(value > 0.0 for value in mix.values()):
-        raise Step5AutoBudgetError(f"Step5 {component} tier mix has no active tier")
+        raise Step5utoBudgetError(f"Step5 {component} tier mix has no active tier")
     return mix
 
 
@@ -103,7 +106,7 @@ def pool_capacity_from_manifest(
     """Return the capacity components required by the Step5 auto-budget rule."""
 
     if head not in HEADS:
-        raise Step5AutoBudgetError(f"unsupported Step5 head: {head}")
+        raise Step5utoBudgetError(f"unsupported Step5 head: {head}")
     target_gold = {
         "high": _pool_count(manifest, _pool_name(head, "target_gold", "high")),
         "medium": _pool_count(manifest, _pool_name(head, "target_gold", "medium")),
@@ -161,11 +164,11 @@ def _ratio_payload(head_cfg: Mapping[str, Any], ratio_override: Mapping[str, Any
         }
     total = sum(ratios.values())
     if total <= 0.0:
-        raise Step5AutoBudgetError("Step5 sampler ratios must have positive sum")
+        raise Step5utoBudgetError("Step5 sampler ratios must have positive sum")
     if abs(total - 1.0) > 1e-6:
-        raise Step5AutoBudgetError(f"Step5 sampler ratios must sum to 1.0, got {total}")
+        raise Step5utoBudgetError(f"Step5 sampler ratios must sum to 1.0, got {total}")
     if any(value < 0.0 for value in ratios.values()):
-        raise Step5AutoBudgetError("Step5 sampler ratios must be non-negative")
+        raise Step5utoBudgetError("Step5 sampler ratios must be non-negative")
     return ratios
 
 
@@ -188,10 +191,10 @@ def _component_requests(total: int, ratios: Mapping[str, float]) -> dict[str, in
 def _weighted_tier_requests(component_total: int, tier_mix: Mapping[str, float]) -> dict[str, int]:
     active = [(str(tier), float(weight)) for tier, weight in tier_mix.items() if float(weight) > 0.0]
     if not active:
-        raise Step5AutoBudgetError("Step5 tier request needs at least one active tier")
+        raise Step5utoBudgetError("Step5 tier request needs at least one active tier")
     total_weight = sum(weight for _tier, weight in active)
     if total_weight <= 0.0:
-        raise Step5AutoBudgetError("Step5 tier mix weights must sum to a positive value")
+        raise Step5utoBudgetError("Step5 tier mix weights must sum to a positive value")
     assigned: dict[str, int] = {}
     running = 0
     for tier, weight in active[:-1]:
@@ -266,7 +269,7 @@ def _max_samples_for_replacement(
             continue
         caps.append(float(available.get(key) or 0) / (ratio * keep_rate))
     if not caps:
-        raise Step5AutoBudgetError("Step5 auto-budget has no positive ratio component")
+        raise Step5utoBudgetError("Step5 auto-budget has no positive ratio component")
     return max(1, int(math.floor(min(caps))))
 
 
@@ -279,7 +282,7 @@ def _selected_batch(
     selected = str(batch_candidate or tuning.get("batch_candidate") or batch_candidates_config.get("selected_default") or "").strip()
     candidates = batch_candidates_config.get("candidates")
     if not isinstance(candidates, list):
-        raise Step5AutoBudgetError("step5.batch_candidates.candidates must be resolved before auto-budget planning")
+        raise Step5utoBudgetError("step5.batch_candidates.candidates must be resolved before auto-budget planning")
     for item in candidates:
         if isinstance(item, Mapping) and str(item.get("id") or "") == selected:
             return {
@@ -287,7 +290,7 @@ def _selected_batch(
                 "per_gpu_batch_size": int(item.get("per_gpu_batch_size") or 0),
                 "global_batch_size": int(item.get("global_batch_size") or 0),
             }
-    raise Step5AutoBudgetError(f"Step5 tuning batch candidate is not resolved: {selected}")
+    raise Step5utoBudgetError(f"Step5 tuning batch candidate is not resolved: {selected}")
 
 
 def compute_head_auto_budget(
@@ -304,12 +307,12 @@ def compute_head_auto_budget(
     """Compute balanced capacity and budget candidates for one Step5 head."""
 
     if auto_budget_cfg.get("enabled") is not True:
-        raise Step5AutoBudgetError("step5.sampler.auto_budget.enabled must be true")
+        raise Step5utoBudgetError("step5.sampler.auto_budget.enabled must be true")
     if str(auto_budget_cfg.get("capacity_basis") or "") != "balanced_capacity":
-        raise Step5AutoBudgetError("step5.sampler.auto_budget.capacity_basis must be balanced_capacity")
+        raise Step5utoBudgetError("step5.sampler.auto_budget.capacity_basis must be balanced_capacity")
     global_batch = int(global_batch_size)
     if global_batch <= 0:
-        raise Step5AutoBudgetError("global_batch_size must be positive for Step5 auto-budget")
+        raise Step5utoBudgetError("global_batch_size must be positive for Step5 auto-budget")
     capacity = pool_capacity_from_manifest(manifest, head, head_cfg=head_cfg)
     available = dict(capacity["available"])
     tier_available = {
@@ -329,11 +332,11 @@ def compute_head_auto_budget(
     balanced_capacity = int(math.floor(min(balanced_terms.values())))
     multipliers = auto_budget_cfg.get("budget_multipliers")
     if not isinstance(multipliers, Mapping):
-        raise Step5AutoBudgetError("step5.sampler.auto_budget.budget_multipliers missing")
+        raise Step5utoBudgetError("step5.sampler.auto_budget.budget_multipliers missing")
     min_steps = int(auto_budget_cfg.get("min_steps_per_effective_epoch") or 1)
     preferred = auto_budget_cfg.get("preferred_steps_per_effective_epoch")
     if not isinstance(preferred, list) or len(preferred) != 2:
-        raise Step5AutoBudgetError("step5.sampler.auto_budget.preferred_steps_per_effective_epoch must be a pair")
+        raise Step5utoBudgetError("step5.sampler.auto_budget.preferred_steps_per_effective_epoch must be a pair")
     preferred_low = int(preferred[0])
     preferred_high = int(preferred[1])
     max_steps = int(auto_budget_cfg.get("max_steps_per_effective_epoch") or preferred_high)
@@ -342,7 +345,7 @@ def compute_head_auto_budget(
     candidates: dict[str, Any] = {}
     for name in BUDGET_ORDER:
         if name not in multipliers:
-            raise Step5AutoBudgetError(f"missing Step5 budget multiplier: {name}")
+            raise Step5utoBudgetError(f"missing Step5 budget multiplier: {name}")
         raw_samples = max(1, int(round(float(balanced_capacity) * float(multipliers[name]))))
         adjusted = raw_samples
         adjustments: list[str] = []
@@ -404,7 +407,7 @@ def compute_head_auto_budget(
         }
     selected = str(selected_budget_candidate or head_cfg.get("default_candidate") or "medium").strip()
     if selected not in candidates:
-        raise Step5AutoBudgetError(f"selected Step5 budget candidate is not available: {selected}")
+        raise Step5utoBudgetError(f"selected Step5 budget candidate is not available: {selected}")
     return {
         "schema_version": STEP5_AUTO_BUDGET_SCHEMA_VERSION,
         "head": head,
@@ -502,11 +505,11 @@ def compute_step5_auto_budget_report(
     selected_budget_candidate: str | None = None,
     throughput_samples_per_sec: float | None = None,
 ) -> dict[str, Any]:
-    """Compute Step5A/Step5B budgets using the resolved tuning batch."""
+    """Compute Step5 explanation budgets using the resolved tuning batch."""
 
     auto_budget_cfg = sampler_config.get("auto_budget")
     if not isinstance(auto_budget_cfg, Mapping):
-        raise Step5AutoBudgetError("step5.sampler.auto_budget missing from resolved sampler config")
+        raise Step5utoBudgetError("step5.sampler.auto_budget missing from resolved sampler config")
     batch = _selected_batch(batch_candidates_config, tuning_config, batch_candidate=batch_candidate)
     tuning = tuning_config if isinstance(tuning_config, Mapping) else {}
     budget_name = str(selected_budget_candidate or tuning.get("selected_budget_candidate") or "medium")
@@ -516,7 +519,7 @@ def compute_step5_auto_budget_report(
     for head in HEADS:
         head_cfg = sampler_config.get(head)
         if not isinstance(head_cfg, Mapping):
-            raise Step5AutoBudgetError(f"step5.sampler.{head} missing")
+            raise Step5utoBudgetError(f"step5.sampler.{head} missing")
         head_report = compute_head_auto_budget(
             manifest,
             head=head,
@@ -638,7 +641,7 @@ def effective_samples_for_head(
         actual_steps = int(report["selected"].get("optimizer_steps") or 0)
         expected_step_count = int(expected_steps[head])
         if actual_steps != expected_step_count:
-            raise Step5AutoBudgetError(
+            raise Step5utoBudgetError(
                 f"resolved Step5 {head} optimizer_steps={actual_steps} does not match "
                 f"step5.tuning.optimizer_steps.{head}={expected_step_count}"
             )

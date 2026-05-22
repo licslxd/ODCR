@@ -10,5 +10,5 @@ def aux_doctor_lines() -> list[str]:
     return [
         "aux architecture: active",
         f"runtime registered commands: {len(names)}",
-        "runtime bridge: allowlist only",
+        "runtime bridge: open GPU dispatch; formal training blocker removed, fresh CUDA guard required",
     ]

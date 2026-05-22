@@ -10,10 +10,13 @@ GPU whitelist hard blocker and the post-edit full pre-GPU gate.
 ## Runtime-First Rule
 
 There is no GPU whitelist hard blocker and no closed-choice-only runtime
-restriction. The tmux bridge may execute repo-local Python modules, repo-local
-scripts, generated command files under validation directories, and direct
-repo-local commands. The bridge still sends one generated command file to the
-validated pane; arbitrary send-keys remain forbidden.
+restriction. The tmux bridge may execute non-formal GPU commands through
+`./odcr runtime bridge exec -- ...`, including repo-local Python modules,
+repo-local scripts, generated command files under validation directories,
+direct repo-local commands, eval, rerank, and diagnostics. The only hard
+runtime blocker is ODCR formal model training. The bridge still sends a
+generated command file to the validated pane; direct manual tmux control is not
+the execution contract.
 
 No GPU whitelist hard blocker is allowed in the active execution path; formal
 full train still requires user confirmation; runtime evidence takes priority
@@ -77,13 +80,16 @@ The first execution protocol is now registry-driven:
 ./odcr runtime bridge validate-only
 ./odcr runtime bridge marker-probe
 ./odcr runtime bridge cuda-probe
+./odcr runtime bridge exec -- <command> [args...]
 ```
 
 The user must already be inside the GPU allocation in the same tmux pane. Codex
-must not run `odcr-enter-gpu`, `srun`, `sbatch`, `scancel`, arbitrary shell, or
-generic repo execution modes. GPU evidence is current-pane evidence only and is
-written to `AI_analysis/01_raw_logs/aux_runtime_gpu_handshake.log` and
-`AI_analysis/05_final_reports/aux_runtime_gpu_validation_report.md`.
+must not run ODCR formal model training through the bridge. GPU evidence is
+current-pane evidence only and is written to
+`AI_analysis/01_raw_logs/aux_runtime_gpu_handshake.log` and
+`AI_analysis/05_final_reports/aux_runtime_gpu_validation_report.md`; bridge exec
+driver/status logs are written under `AI_analysis/01_raw_logs/runtime_bridge_exec`
+unless the caller supplies explicit stdout/status/pid paths.
 
 The user workflow remains exactly two commands:
 

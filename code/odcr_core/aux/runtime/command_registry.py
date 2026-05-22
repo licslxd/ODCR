@@ -1,4 +1,4 @@
-"""Closed allowlist for ODCR auxiliary runtime commands."""
+"""Runtime command metadata for ODCR auxiliary work."""
 
 from __future__ import annotations
 
@@ -76,6 +76,33 @@ class RuntimeCommandError(RuntimeError):
     pass
 
 
+FORMAL_TRAIN_DETECTOR_VERSION = "odcr_bridge_formal_train_audit/2"
+
+
+def _clean_argv(argv: Sequence[str]) -> list[str]:
+    return [str(item) for item in argv if str(item).strip()]
+
+
+def formal_training_command_reason(argv: Sequence[str]) -> str | None:
+    """Historical audit hook; bridge exec no longer blocks ODCR training.
+
+    GPU safety now lives in fresh pane discovery, CUDA probe, audit-only
+    compute-app evidence, run namespace validation, and stage-level One-Control
+    checks. User-authorized fixed-run/reclosure training must be dispatched to
+    the validated GPU pane instead of being stopped by a string detector.
+    """
+
+    args = _clean_argv(argv)
+    if not args:
+        return "empty command"
+    return None
+
+
+def assert_not_formal_training(argv: Sequence[str]) -> None:
+    del argv
+    return None
+
+
 class RuntimeCommandRegistry:
     def __init__(self) -> None:
         self._specs: dict[str, RuntimeCommandSpec] = {}
@@ -113,8 +140,8 @@ def _build_registry() -> RuntimeCommandRegistry:
         RuntimeCommandSpec("probe.step3.bounded", "step3", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded"), timeout_s=180),
         RuntimeCommandSpec("probe.step4.bounded", "step4", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded"), timeout_s=240),
         RuntimeCommandSpec("probe.step5.bounded", "step5", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded", "--set", "--candidate-id", "--timeout", "--from-step4-run", "--evidence-level", "--scan", "--global", "--socket", "--target"), timeout_s=900),
-        RuntimeCommandSpec("probe.step5A.bounded", "step5A", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded", "--set", "--candidate-id", "--timeout", "--from-step4-run", "--evidence-level", "--global", "--socket", "--target"), timeout_s=900),
-        RuntimeCommandSpec("probe.step5B.bounded", "step5B", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded", "--set", "--candidate-id", "--timeout", "--from-step4-run", "--evidence-level", "--global", "--socket", "--target"), timeout_s=900),
+        RuntimeCommandSpec("probe.rating_stability_control.bounded", "rating_stability_control", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded", "--set", "--candidate-id", "--timeout", "--from-step4-run", "--evidence-level", "--global", "--socket", "--target"), timeout_s=900),
+        RuntimeCommandSpec("probe.step5_explanation.bounded", "step5_explanation", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded", "--set", "--candidate-id", "--timeout", "--from-step4-run", "--evidence-level", "--global", "--socket", "--target"), timeout_s=900),
         RuntimeCommandSpec("bridge.probe_child", None, "bridge", "internal", True, False, False, allowed_args=("--stage", "--task", "--bounded", "--probe-child", "--status-path", "--config", "--set", "--candidate-id", "--timeout", "--from-step4-run", "--evidence-level"), timeout_s=900, internal_child=True),
         RuntimeCommandSpec("step5.admission.dry_run", "step5", "admission", "dry-run", False, False, False, allowed_args=("--task",), timeout_s=60),
         RuntimeCommandSpec("bridge.handshake_child", None, "bridge", "internal", False, False, False, allowed_args=("--kind", "--stage", "--task", "--run-id", "--status-path", "--log-path", "--report-path", "--repo-root", "--require-cuda"), timeout_s=120, internal_child=True),

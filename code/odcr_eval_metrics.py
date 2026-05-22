@@ -23,6 +23,53 @@ if _NLTK_LOCAL not in nltk.data.path:
 from nltk import word_tokenize
 
 CODE1_COMPATIBLE_RATING_PROTOCOL_ID = "code1_compatible_rating_v1"
+STEP5_EXPLANATION_REPORT_PROTOCOL_ID = "odcr_step3_rating_step5_explanation_report/1"
+
+
+def compose_step3_rating_step5_explanation_report(
+    *,
+    rating_source: Mapping[str, Any],
+    explanation_handoff: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Compose final paper status without recomputing rating metrics in Step5."""
+
+    metrics = rating_source.get("metrics") if isinstance(rating_source.get("metrics"), Mapping) else {}
+    valid = metrics.get("valid") if isinstance(metrics.get("valid"), Mapping) else {}
+    test = metrics.get("test") if isinstance(metrics.get("test"), Mapping) else {}
+    if not valid:
+        valid = {
+            "mae": rating_source.get("valid_mae"),
+            "rmse": rating_source.get("valid_rmse"),
+        }
+    if not test:
+        test = {
+            "mae": rating_source.get("test_mae"),
+            "rmse": rating_source.get("test_rmse"),
+        }
+    explanation_ready = bool(
+        explanation_handoff
+        and str(explanation_handoff.get("mode") or "") == "explanation_only"
+        and explanation_handoff.get("rating_source")
+    )
+    return {
+        "schema_version": STEP5_EXPLANATION_REPORT_PROTOCOL_ID,
+        "rating_source": "step3_accepted_scorer",
+        "rating_source_checkpoint": rating_source.get("checkpoint"),
+        "rating_source_eval_handoff": rating_source.get("eval_handoff"),
+        "rating_metrics_source": "step3_eval_handoff",
+        "rating_metrics": {
+            "valid": {"mae": valid.get("mae"), "rmse": valid.get("rmse")},
+            "test": {"mae": test.get("mae"), "rmse": test.get("rmse")},
+        },
+        "explanation_source": "step5_explanation_only",
+        "explanation_metrics": dict(explanation_handoff.get("explanation_metrics") or {}) if explanation_handoff else {},
+        "paper_rating_ready": bool(rating_source.get("valid") is True and valid and test),
+        "paper_explanation_ready": explanation_ready,
+        "paper_mean_std_ready": False,
+        "step5_trains_rating": False,
+        "step5_rating_metrics_written": False,
+        "join_protocol": "task_run_protocol",
+    }
 
 
 def code1_compatible_rating_protocol() -> Dict[str, Any]:
@@ -413,9 +460,9 @@ def write_eval_digest_log(
         _kv("metrics.explanation.meteor", _digest_label_missing(expl.get("meteor")))
         _kv(
             "metrics.explanation.dist_note",
-            "DIST-1/DIST-2 = evaluate_text corpus-level (paper-compatible); not the ext bundle below",
+            "DIST-1/DIST-2 = official_paper_metrics corpus-level; not the diagnostic bundle below",
         )
-        dist = expl.get("dist")
+        dist = (expl.get("distinct_corpus") or {}).get("scale_percent_0_100") or expl.get("dist")
         if isinstance(dist, dict):
             for k in sorted(dist.keys(), key=lambda x: str(x)):
                 _kv(f"metrics.explanation.dist.{k}", _digest_label_missing(dist.get(k)))
@@ -446,12 +493,12 @@ def write_eval_digest_log(
                 _kv("paper_metrics.distinct.corpus.percent.2", _digest_label_missing(sp.get("2")))
         lines.append("")
 
-    tmc = mf.get("text_metrics_corpus_and_sentence")
+    tmc = (mf.get("diagnostic_metrics") or {}).get("text_metrics_corpus_and_sentence") or mf.get("text_metrics_corpus_and_sentence")
     if isinstance(tmc, dict):
         _emit("[Metrics secondary — debug / non-paper]")
         _kv(
             "metrics.text_metrics.ext_note",
-            "extended_text_metrics_bundle：诊断专用；论文主表 DIST-1/DIST-2 仅见上文 metrics.explanation.dist（evaluate_text 语料级）",
+            "extended_text_metrics_bundle：诊断专用；论文主表 DIST-1/DIST-2 仅见上文 metrics.explanation.dist（official_paper_metrics）",
         )
         corp = tmc.get("corpus_level")
         if isinstance(corp, dict):
@@ -704,7 +751,15 @@ def log_sample_id_alignment_snippet(
         gr = r.get("gt_rating", "")
         pt = (r.get("pred_text", "") or "")[:80]
         rt = (r.get("ref_text", "") or "")[:80]
-        lines.append(f"  [{sid}] pred_r={pr:.4g} gt_r={gr:.4g} | pred={pt!r} | ref={rt!r}")
+        def _fmt_rating(value: Any) -> str:
+            try:
+                if value is None or value == "":
+                    return "n/a"
+                return f"{float(value):.4g}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        lines.append(f"  [{sid}] pred_r={_fmt_rating(pr)} gt_r={_fmt_rating(gr)} | pred={pt!r} | ref={rt!r}")
     msg = "[Eval sanity] sample_id 对齐抽样 (前 %d 条):\n" % n + "\n".join(lines)
     if logger:
         logger.info(msg)

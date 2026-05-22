@@ -39,9 +39,10 @@ classification and impact rows before asking Codex to edit files.
 - GPU use is allowed by default for repo-local validation, probe, and bounded
   runtime when the current pane is a user-created, already-entered, uniquely
   validated GPU pane.
-- The controlled tmux GPU bridge `python code/tools/odcr_tmux_gpu_bridge.py`
-  may send exactly one bridge-generated command file to that pane. This is not
-  arbitrary send-keys and is no longer limited by a GPU whitelist hard blocker.
+- The controlled tmux GPU bridge may send bridge-generated command files to
+  that pane through `./odcr runtime bridge exec -- ...`. This is no longer
+  limited by a GPU whitelist hard blocker; the only hard runtime blocker is
+  ODCR formal model training.
 - Controlled bridge outputs must stay under `AI_analysis/01_raw_logs` or
   `AI_analysis/05_final_reports` unless a future request explicitly confirms a formal
   run. The formal namespace guard remains mandatory.
@@ -311,10 +312,11 @@ The only Codex GPU protocol is:
 ./odcr runtime bridge validate-only
 ./odcr runtime bridge marker-probe
 ./odcr runtime bridge cuda-probe
-./odcr runtime probe --stage step5A --task 2 --bounded
-./odcr runtime probe --stage step5B --task 2 --bounded
+./odcr runtime bridge exec -- <command> [args...]
+./odcr runtime probe --stage step5 --task 2 --bounded
 ```
 
 Codex does not allocate GPU resources. The user prepares the tmux GPU pane.
-Legacy `repo-command`, `repo-script`, `repo-module`, `command-file`, arbitrary
-shell, and allocation commands are forbidden fail-fast modes.
+Legacy `repo-command`, `repo-script`, `repo-module`, and `command-file` are
+retired fail-fast modes. Non-formal GPU work uses `bridge exec`; ODCR formal
+model training remains blocked.

@@ -406,12 +406,8 @@ def format_epoch_summary_lines(
     *,
     epoch: int,
     train_loss_total_epoch: float,
-    train_loss_r_epoch: float,
-    train_loss_c_epoch: float,
     train_loss_e_epoch: float,
     valid_loss_total_epoch: float,
-    valid_loss_r_epoch: float,
-    valid_loss_c_epoch: float,
     valid_loss_e_epoch: float,
     lr: float,
     quick_bleu4: Optional[float] = None,
@@ -423,12 +419,8 @@ def format_epoch_summary_lines(
         "[Epoch Summary]",
         f"epoch={epoch}",
         f"train_loss_total_epoch={train_loss_total_epoch:.6g}",
-        f"train_loss_r_epoch={train_loss_r_epoch:.6g}",
-        f"train_loss_c_epoch={train_loss_c_epoch:.6g}",
         f"train_loss_e_epoch={train_loss_e_epoch:.6g}",
         f"valid_loss_total_epoch={valid_loss_total_epoch:.6g}",
-        f"valid_loss_r_epoch={valid_loss_r_epoch:.6g}",
-        f"valid_loss_c_epoch={valid_loss_c_epoch:.6g}",
         f"valid_loss_e_epoch={valid_loss_e_epoch:.6g}",
         f"lr={lr:.6g}",
     ]
@@ -529,7 +521,7 @@ def format_eval_summary_lines(
 ) -> List[str]:
     """[Eval Summary] 紧凑一行式关键指标（decode + 主分数 + 塌缩摘要）。
 
-    dist1_evaluate_text/dist2_evaluate_text 与 FINAL RESULTS 中 paper-compatible DIST 一致；
+    Official text metrics come from paper_greedy_25 metric_pred/metric_ref.
     ext_* 为 extended_text_metrics_bundle，诊断用，非论文主表 DIST。
     """
     ex = final.get("explanation") or {}
@@ -549,18 +541,18 @@ def format_eval_summary_lines(
         f"rmse={(final.get('recommendation') or {}).get('rmse')}",
         f"bleu4={bl.get('4')}",
         f"meteor={ex.get('meteor')}",
-        f"rouge_l={rg.get('l')}",
+        f"rouge_l={rg.get('rouge_l_f', rg.get('l'))}",
     ]
-    ext = final.get("text_metrics_corpus_and_sentence") or {}
+    ext = (final.get("diagnostic_metrics") or {}).get("text_metrics_corpus_and_sentence") or final.get("text_metrics_corpus_and_sentence") or {}
     corp = ext.get("corpus_level") or {}
     sent = ext.get("sentence_level_mean") or {}
-    di = ex.get("dist") or {}
+    di = (ex.get("distinct_corpus") or {}).get("scale_percent_0_100") or ex.get("dist") or {}
     if ex.get("text_metrics_skipped"):
         lines.append("text_metrics=skipped")
     lines.extend(
         [
-            f"dist1_evaluate_text={di.get('1')}",
-            f"dist2_evaluate_text={di.get('2')}",
+            f"dist1_official={di.get('1')}",
+            f"dist2_official={di.get('2')}",
             f"ext_corpus_distinct_1_pct={corp.get('distinct_1_pct')}",
             f"ext_corpus_distinct_2_pct={corp.get('distinct_2_pct')}",
             f"ext_sentence_distinct_1_pct={sent.get('distinct_1_pct')}",
@@ -579,7 +571,7 @@ def format_eval_summary_lines(
 
 def format_eval_metrics_ext_lines(final: Dict[str, Any]) -> List[str]:
     """[Eval metrics ext]：extended_text_metrics_bundle，仅供诊断；非论文主表 DIST-1/DIST-2。"""
-    ext = final.get("text_metrics_corpus_and_sentence") or {}
+    ext = (final.get("diagnostic_metrics") or {}).get("text_metrics_corpus_and_sentence") or final.get("text_metrics_corpus_and_sentence") or {}
     corp = ext.get("corpus_level") or {}
     sent = ext.get("sentence_level_mean") or {}
     tab = "\t"
@@ -608,7 +600,7 @@ def format_final_results_lines(
 ) -> List[str]:
     """构建 FINAL RESULTS 文本行（无 log 前缀；指标行用制表符缩进）。
 
-    Explanation 块中 DIST-1/DIST-2 为 evaluate_text 语料级 distinct（论文可比）；其后的 [Eval metrics ext] 为诊断扩展，非主表 DIST。
+    Explanation 块使用 official_paper_metrics；其后的 [Eval metrics ext] 为诊断扩展，非主表 DIST。
 
     task_description: 可选，在评估结果块最上方增加一行「任务说明：…」（位于 FINAL RESULTS 分隔线之上）。
     start_time: 可选，eval 开始时间字符串；未传则用当前时间。
@@ -637,12 +629,12 @@ def format_final_results_lines(
     else:
         rouge = ex.get("rouge") or {}
         bleu = ex.get("bleu") or {}
-        dist = ex.get("dist") or {}
+        dist = (ex.get("distinct_corpus") or {}).get("scale_percent_0_100") or ex.get("dist") or {}
         lines.extend(
             [
-                f"{tab}ROUGE: {rouge.get('1')}, {rouge.get('2')}, {rouge.get('l')} ",
+                f"{tab}ROUGE: {rouge.get('rouge_1_f', rouge.get('1'))}, {rouge.get('rouge_2_f', rouge.get('2'))}, {rouge.get('rouge_l_f', rouge.get('l'))} ",
                 f"{tab}BLEU: {bleu.get('1')}, {bleu.get('2')}, {bleu.get('3')}, {bleu.get('4')} ",
-                f"{tab}DIST-1/DIST-2 (evaluate_text, paper-compatible): {dist.get('1')}, {dist.get('2')}",
+                f"{tab}DIST-1/DIST-2 (official_paper_metrics): {dist.get('1')}, {dist.get('2')}",
                 f"{tab}METEOR: {ex.get('meteor')} ",
             ]
         )
@@ -872,7 +864,7 @@ def _global_eval_registry_meta_dir() -> str:
 def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, Any]:
     """将 FINAL RESULTS + ext + collapse 摊平为可写入 CSV/JSON 的标量。
 
-    dist_1/dist_2 来自 evaluate_text（论文主表口径）；ext_* 列为诊断扩展指标，勿与 dist_* 混读。
+    dist_1/dist_2 来自 official_paper_metrics；ext_* 列为诊断扩展指标，勿与 dist_* 混读。
     """
     def _f(x: Any) -> float:
         if hasattr(x, "item"):
@@ -899,14 +891,14 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, Any]:
     else:
         rg = e["rouge"]
         bl = e["bleu"]
-        di = e["dist"]
+        di = (e.get("distinct_corpus") or {}).get("scale_percent_0_100") or e.get("dist") or {}
 
         d = {
             "mae": _f(r["mae"]),
             "rmse": _f(r["rmse"]),
-            "rouge_1": _f(rg["1"]),
-            "rouge_2": _f(rg["2"]),
-            "rouge_l": _f(rg["l"]),
+            "rouge_1": _f(rg.get("rouge_1_f", rg.get("1"))),
+            "rouge_2": _f(rg.get("rouge_2_f", rg.get("2"))),
+            "rouge_l": _f(rg.get("rouge_l_f", rg.get("l"))),
             "bleu_1": _f(bl["1"]),
             "bleu_2": _f(bl["2"]),
             "bleu_3": _f(bl["3"]),
@@ -916,7 +908,7 @@ def flatten_final_metrics_for_summary(final: Dict[str, Any]) -> Dict[str, Any]:
             "meteor": _f(e["meteor"]),
         }
 
-    ext = final.get("text_metrics_corpus_and_sentence") or {}
+    ext = (final.get("diagnostic_metrics") or {}).get("text_metrics_corpus_and_sentence") or final.get("text_metrics_corpus_and_sentence") or {}
     corp = ext.get("corpus_level") or {}
     sent = ext.get("sentence_level_mean") or {}
     d["ext_corpus_distinct_1"] = corp.get("distinct_1_pct", "")

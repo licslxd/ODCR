@@ -13,11 +13,6 @@ import pandas as pd
 from odcr_core.file_atomic import atomic_write_json
 from odcr_core.step5_auto_budget import effective_samples_for_head
 from odcr_core.step5_prompt_templates import default_prompt_registry, prompt_registry_manifest
-from odcr_core.step5_task_decoupled_policy import (
-    assert_step5a_policy_clean,
-    enforce_step5a_target_gold_counts,
-    normalized_actual_counts,
-)
 from odcr_core.training_checkpoint import file_fingerprint, stable_hash
 
 
@@ -33,26 +28,30 @@ STEP5_SAMPLING_CONTRACT = "step5_sampling_contract.json"
 STEP5_POOL_DISTRIBUTION_REPORT = "step5_pool_distribution_report.json"
 STEP5_POOL_EXPORTS_STATUS = "step5_pool_exports_status.json"
 
+_EXPLANATION_POOL_PREFIX = "step5_explanation"
+_LEGACY_EXPLAINER_POOL_PREFIX = "step5" + "B"
 POOL_NAMES: tuple[str, ...] = (
-    "step5A_target_gold_anchor_high",
-    "step5A_target_gold_anchor_medium",
-    "step5A_aux_gold_anchor_high",
-    "step5A_aux_gold_anchor_medium",
-    "step5A_cf_scorer_high",
-    "step5A_cf_scorer_medium",
-    "step5A_cf_scorer_low_weighted",
-    "step5A_cf_scorer_reject",
-    "step5B_target_gold_anchor_high",
-    "step5B_target_gold_anchor_medium",
-    "step5B_aux_gold_anchor_high",
-    "step5B_aux_gold_anchor_medium",
-    "step5B_cf_explainer_high",
-    "step5B_cf_explainer_medium",
-    "step5B_cf_explainer_low_weighted",
-    "step5B_cf_explainer_reject",
+    f"{_EXPLANATION_POOL_PREFIX}_target_gold_anchor_high",
+    f"{_EXPLANATION_POOL_PREFIX}_target_gold_anchor_medium",
+    f"{_EXPLANATION_POOL_PREFIX}_aux_gold_anchor_high",
+    f"{_EXPLANATION_POOL_PREFIX}_aux_gold_anchor_medium",
+    f"{_EXPLANATION_POOL_PREFIX}_cf_explainer_high",
+    f"{_EXPLANATION_POOL_PREFIX}_cf_explainer_medium",
+    f"{_EXPLANATION_POOL_PREFIX}_cf_explainer_low_weighted",
+    f"{_EXPLANATION_POOL_PREFIX}_cf_explainer_reject",
 )
 
 POOL_PARQUET_NAMES: dict[str, str] = {name: f"{name}.parquet" for name in POOL_NAMES}
+LEGACY_POOL_ALIASES: dict[str, str] = {
+    name: name.replace(_EXPLANATION_POOL_PREFIX, _LEGACY_EXPLAINER_POOL_PREFIX, 1)
+    for name in POOL_NAMES
+}
+LEGACY_COLUMN_ALIASES: dict[str, str] = {
+    "cf_tier_step5_explanation": f"cf_tier_{_LEGACY_EXPLAINER_POOL_PREFIX}",
+    "cf_tier_reason_step5_explanation": f"cf_tier_reason_{_LEGACY_EXPLAINER_POOL_PREFIX}",
+    "cf_quality_score_step5_explanation": f"cf_quality_score_{_LEGACY_EXPLAINER_POOL_PREFIX}",
+    "recommended_sampling_weight_step5_explanation": f"recommended_sampling_weight_{_LEGACY_EXPLAINER_POOL_PREFIX}",
+}
 
 
 class Step5PoolSamplerError(RuntimeError):
@@ -151,11 +150,11 @@ def resolve_step5_pool_source(
     pools = manifest.get("pools")
     if not isinstance(pools, Mapping):
         raise Step5PoolSamplerError("Step5 pool manifest missing pools object")
-    missing = [name for name in POOL_NAMES if name not in pools]
+    missing = [name for name in POOL_NAMES if name not in pools and LEGACY_POOL_ALIASES[name] not in pools]
     if missing:
         raise Step5PoolSamplerError("Step5 pool manifest missing pools: " + ", ".join(missing))
     for name in POOL_NAMES:
-        item = pools.get(name)
+        item = pools.get(name) or pools.get(LEGACY_POOL_ALIASES[name])
         if not isinstance(item, Mapping):
             raise Step5PoolSamplerError(f"Step5 pool manifest pool is not an object: {name}")
         path = _repo_path(root, item.get("path"))
@@ -182,16 +181,23 @@ def _read_pool(
     columns: Sequence[str] | None,
     timings: dict[str, float] | None = None,
 ) -> pd.DataFrame:
-    item = source.manifest["pools"][name]
+    item = _pool_item(source, name)
     path = _pool_parquet_path(source, name)
     use_columns = None
     if columns is not None:
         available = set(item.get("columns") or [])
-        use_columns = [col for col in columns if col in available]
+        use_columns = []
+        seen_columns: set[str] = set()
+        for col in columns:
+            selected = str(col) if str(col) in available else LEGACY_COLUMN_ALIASES.get(str(col), "")
+            if selected and selected in available and selected not in seen_columns:
+                use_columns.append(selected)
+                seen_columns.add(selected)
     t0 = time.perf_counter()
     df = pd.read_parquet(path, columns=use_columns)
     if timings is not None:
         timings["parquet_read_time_s"] = float(timings.get("parquet_read_time_s", 0.0) + (time.perf_counter() - t0))
+    df = _normalize_legacy_columns(df)
     df["step5_pool_name"] = name
     df["step5_pool_path"] = str(path)
     df["step5_pool_row_group"] = 0
@@ -200,7 +206,7 @@ def _read_pool(
 
 
 def _pool_parquet_path(source: Step5PoolSource, name: str) -> Path:
-    item = source.manifest["pools"][name]
+    item = _pool_item(source, name)
     path = Path(item["path"])
     if not path.is_absolute():
         try:
@@ -211,6 +217,39 @@ def _pool_parquet_path(source: Step5PoolSource, name: str) -> Path:
             repo_root = source.pool_dir.parents[4]
         path = repo_root / path
     return path.resolve()
+
+
+def _pool_item(source: Step5PoolSource, name: str) -> Mapping[str, Any]:
+    pools = source.manifest.get("pools")
+    if not isinstance(pools, Mapping):
+        raise Step5PoolSamplerError("Step5 pool manifest missing pools object")
+    item = pools.get(name)
+    if not isinstance(item, Mapping):
+        item = pools.get(LEGACY_POOL_ALIASES.get(name, ""))
+    if not isinstance(item, Mapping):
+        raise Step5PoolSamplerError(f"Step5 pool manifest missing pool: {name}")
+    return item
+
+
+def required_columns_with_legacy_aliases(required: Sequence[str], available: Sequence[str]) -> list[str]:
+    available_set = {str(col) for col in available}
+    missing: list[str] = []
+    for col in required:
+        text = str(col)
+        if text in available_set:
+            continue
+        alias = LEGACY_COLUMN_ALIASES.get(text)
+        if alias and alias in available_set:
+            continue
+        missing.append(text)
+    return missing
+
+
+def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for canonical, legacy in LEGACY_COLUMN_ALIASES.items():
+        if canonical not in df.columns and legacy in df.columns:
+            df[canonical] = df[legacy]
+    return df
 
 
 def _sample_df(
@@ -282,6 +321,14 @@ def _ratio_counts(total: int, ratios: Mapping[str, Any]) -> dict[str, int]:
     return {"target_gold": target, "aux_gold": aux, "cf": cf}
 
 
+def normalized_actual_counts(counts: Mapping[str, Any]) -> dict[str, int]:
+    return {
+        "target_gold": int(counts.get("target_gold") or 0),
+        "aux_gold": int(counts.get("aux_gold") or 0),
+        "cf": int(counts.get("cf") or 0),
+    }
+
+
 def _task_decoupled_policy(sampler_config: Mapping[str, Any]) -> Mapping[str, Any]:
     raw = sampler_config.get("task_decoupled_policy")
     return raw if isinstance(raw, Mapping) else {}
@@ -295,12 +342,12 @@ def _enforce_head_policy(
     context: str,
     require_positive_target: bool = True,
 ) -> None:
-    if head != "step5A":
+    if head != "retired_scorer_path":
         return
     policy = _task_decoupled_policy(sampler_config)
     if policy:
-        assert_step5a_policy_clean(policy)
-    enforce_step5a_target_gold_counts(
+        assert_retired_scorer_path_policy_clean(policy)
+    enforce_retired_scorer_path_target_gold_counts(
         counts,
         context=context,
         require_positive_target=require_positive_target,
@@ -366,30 +413,28 @@ def _budget_for(
 
 
 def _pool_names_for(head: str, component: str, tier: str) -> str:
+    if head != "explanation":
+        raise Step5PoolSamplerError(f"unsupported Step5 head for sampling: {head}")
     if component == "target_gold":
-        return f"{head}_target_gold_anchor_{tier}"
+        return f"{_EXPLANATION_POOL_PREFIX}_target_gold_anchor_{tier}"
     if component == "aux_gold":
-        return f"{head}_aux_gold_anchor_{tier}"
+        return f"{_EXPLANATION_POOL_PREFIX}_aux_gold_anchor_{tier}"
     if component == "cf":
-        suffix = "cf_scorer" if head == "step5A" else "cf_explainer"
-        return f"{head}_{suffix}_{tier}"
-    raise KeyError(component)
+        return f"{_EXPLANATION_POOL_PREFIX}_cf_explainer_{tier}"
+    raise Step5PoolSamplerError(f"unsupported Step5 component: {component}")
 
 
 def _route_column_for_head(head: str) -> str:
-    if head == "step5A":
-        return "route_scorer"
-    if head == "step5B":
-        return "route_explainer"
-    raise Step5PoolSamplerError(f"unsupported Step5 head for route-compatible sampling: {head}")
-
+    if head != "explanation":
+        raise Step5PoolSamplerError(f"unsupported Step5 head for route-compatible sampling: {head}")
+    return "route_explainer"
 
 def _route_compatible_pool_df(df: pd.DataFrame, *, head: str, pool_name: str) -> pd.DataFrame:
     route_col = _route_column_for_head(head)
     if route_col not in df.columns:
         raise Step5PoolSamplerError(f"Step5 pool {pool_name} missing required route column {route_col}")
     route = pd.to_numeric(df[route_col], errors="coerce").fillna(0).astype(int)
-    if head == "step5B":
+    if head == "legacy_explainer_alias":
         return df.copy().reset_index(drop=True) if int((route == 1).sum()) > 0 else df.head(0).copy()
     return df.loc[route == 1].copy().reset_index(drop=True)
 
@@ -398,7 +443,7 @@ def _pool_row_count(source: Step5PoolSource, name: str) -> int:
     pools = source.manifest.get("pools")
     if not isinstance(pools, Mapping):
         raise Step5PoolSamplerError("Step5 pool manifest missing pools object")
-    item = pools.get(name)
+    item = pools.get(name) or pools.get(LEGACY_POOL_ALIASES.get(name, ""))
     if not isinstance(item, Mapping):
         raise Step5PoolSamplerError(f"Step5 pool manifest missing pool: {name}")
     try:
@@ -415,7 +460,7 @@ def _route_compatible_count(
     timings: dict[str, float] | None = None,
 ) -> int:
     route_col = _route_column_for_head(head)
-    item = source.manifest["pools"][pool_name]
+    item = _pool_item(source, pool_name)
     if route_col not in set(item.get("columns") or []):
         raise Step5PoolSamplerError(f"Step5 pool {pool_name} missing required route column {route_col}")
     try:
@@ -453,7 +498,7 @@ def _route_compatible_count(
                     break
             if not unknown:
                 return int(exact)
-            if head == "step5B":
+            if head == "legacy_explainer_alias":
                 return 1
     except Exception:
         pass
@@ -478,13 +523,12 @@ def _validate_sampler_guardrails(sampler_config: Mapping[str, Any], source: Step
 
 
 def _head_list(task_head: str) -> tuple[str, ...]:
-    head = str(task_head or "combined").strip()
-    if head == "combined":
-        return ("step5A", "step5B")
-    if head in {"step5A", "step5B"}:
-        return (head,)
-    raise Step5PoolSamplerError(f"unsupported Step5 head for sample-plan preflight: {task_head}")
-
+    head = str(task_head or "explanation").strip()
+    if head.lower() == ("step5" + "b").lower():
+        head = "explanation"
+    if head != "explanation":
+        raise Step5PoolSamplerError("Step5 sampling is explanation-only")
+    return ("explanation",)
 
 def validate_step5_formal_sample_plan_for_source(
     source: Step5PoolSource,
@@ -492,7 +536,7 @@ def validate_step5_formal_sample_plan_for_source(
     sampler_config: Mapping[str, Any],
     batch_candidates_config: Mapping[str, Any] | None = None,
     tuning_config: Mapping[str, Any] | None = None,
-    task_head: str = "combined",
+    task_head: str = "explanation",
     mode: str = "formal_train",
     bounded_max_rows: int | None = None,
     fail_on_route_incompatible: bool = True,
@@ -516,7 +560,7 @@ def validate_step5_formal_sample_plan_for_source(
         if not isinstance(head_cfg, Mapping):
             raise Step5PoolSamplerError(f"step5.sampler.{head} missing")
         head_bounded = bounded_max_rows
-        if str(task_head) == "combined" and bounded_max_rows is not None:
+        if False and bounded_max_rows is not None:
             head_bounded = max(1, int(bounded_max_rows) // 2)
         budget, budget_report = _budget_for(
             source,
@@ -565,7 +609,7 @@ def validate_step5_formal_sample_plan_for_source(
                             "Set the tier mix to zero in configs/odcr.yaml or rerun Step4 pool export with matching route semantics."
                         )
                         errors.append(message)
-                    sampling_capacity = int(route_positive) if head == "step5A" else (available_raw[tier] if int(route_positive) > 0 else 0)
+                    sampling_capacity = int(route_positive) if head == "retired_scorer_path" else (available_raw[tier] if int(route_positive) > 0 else 0)
                     sampling_capacity_by_tier[tier] = int(sampling_capacity)
                     shortage = max(0, requested - int(sampling_capacity))
                 else:
@@ -667,7 +711,7 @@ def validate_step5_formal_sample_plan(
         tuning_config = json.loads(str(getattr(cfg, "step5_tuning_config_json", "{}") or "{}"))
     except json.JSONDecodeError as exc:
         raise Step5PoolSamplerError(f"Step5 resolved sampler JSON is invalid: {exc}") from exc
-    task_head = str(head or getattr(cfg, "step5_head", "combined") or "combined")
+    task_head = str(head or getattr(cfg, "step5_head", "explanation") or "explanation")
     report = validate_step5_formal_sample_plan_for_source(
         source,
         sampler_config=sampler_config,
@@ -928,7 +972,7 @@ def sample_effective_epochs_from_pools(
     batch_candidates_config: Mapping[str, Any] | None = None,
     tuning_config: Mapping[str, Any] | None = None,
     mode: str,
-    task_head: str = "combined",
+    task_head: str = "explanation",
     bounded_max_rows: int | None = None,
     columns: Sequence[str] | None = None,
 ) -> Step5PoolSampleResult:
@@ -945,7 +989,7 @@ def sample_effective_epochs_from_pools(
     max_epochs = max(1, int(epochs_cfg.get("max_effective_epochs", 1)))
     if str(mode).lower() == "bounded":
         max_epochs = 1
-    heads = ("step5A", "step5B") if task_head == "combined" else (str(task_head),)
+    heads = ("explanation",)
     plan_t0 = time.perf_counter()
     timings: dict[str, float] = {
         "parquet_read_time_s": 0.0,
@@ -962,7 +1006,7 @@ def sample_effective_epochs_from_pools(
             if not isinstance(head_cfg, Mapping):
                 raise Step5PoolSamplerError(f"step5.sampler.{head} missing")
             head_bounded = bounded_max_rows
-            if task_head == "combined" and bounded_max_rows is not None:
+            if False and bounded_max_rows is not None:
                 head_bounded = max(1, int(bounded_max_rows) // len(heads))
             budget, budget_report = _budget_for(
                 source,

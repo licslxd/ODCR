@@ -98,6 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
     s3.add_argument("--expect-num-proc", type=int, default=None)
     s3.add_argument("--accept-eval-only", action="store_true")
 
+    s3_rating = sub.add_parser(
+        "step3-rating",
+        parents=[common],
+        help="run Step3 rating paper eval seeds: single seed or fixed five-seed multi",
+        description=(
+            "Run Step3 rating paper eval workflows against an existing Step3 checkpoint. "
+            "Modes: single or multi. Outputs overwrite runs/step3/task<T>/eval/1 or eval/5."
+        ),
+    )
+    s3_rating.add_argument("--task", type=int, required=True)
+    s3_rating.add_argument("--mode", required=True, metavar="{single,multi}")
+    s3_rating.add_argument("--seed", type=int, default=None)
+    s3_rating.add_argument("--run-id", default=None)
+    s3_rating.add_argument("--run-id-start", type=int, default=None)
+
     s4 = sub.add_parser("step4", parents=[common])
     s4.add_argument("--task", type=int, required=False)
     s4.add_argument("--from-step3", dest="from_step3", default=None)
@@ -122,36 +137,13 @@ def build_parser() -> argparse.ArgumentParser:
     s5.add_argument("--task", type=int, required=False)
     s5.add_argument("--from-step4", dest="from_step4", default=None)
     s5.add_argument("--from-step4-run", dest="from_step4_run", default=None)
-    s5.add_argument("--from-step5-run", dest="from_step5", default=None)
     s5.add_argument("--run-id", default="auto")
-    s5.add_argument("--head", choices=("step5A", "step5B", "combined"), default="combined")
+    s5.add_argument("--head", default="explanation", help=argparse.SUPPRESS)
     s5.add_argument("--profile", dest="eval_profile", default=None)
     lifecycle = s5.add_mutually_exclusive_group()
-    lifecycle.add_argument("--train-only", action="store_true", help="Step5 formal train phase only; fresh eval/handoff is a separate phase")
-    lifecycle.add_argument("--eval-only", action="store_true", help="Step5 eval/handoff phase from an existing Step5 run/checkpoint")
-    lifecycle.add_argument("--allow-embedded-final-eval", action="store_true", help="diagnostic opt-in for same-process embedded final eval")
-    s5.add_argument("--no-embedded-final-eval", action="store_true", help="explicitly keep Step5 formal on the train-only lifecycle")
-    s5.add_argument("--checkpoint", default=None, help="checkpoint path for eval-only/recovery validation")
-    s5.add_argument("--recovery-eval", action="store_true", help="validate failed-run checkpoint salvage/recovery handoff instead of launching formal train")
-    s5.add_argument(
-        "--finalize-handoff",
-        "--finalize-rating-handoff",
-        dest="finalize_rating_handoff",
-        action="store_true",
-        help="CPU-only Step5A rating handoff finalizer from existing valid/test artifacts",
-    )
-    s5.add_argument(
-        "--rating-quality-diagnostic",
-        action="store_true",
-        help="write Step5A rating quality diagnostic and single-run summary from existing prediction artifacts",
-    )
-    s5_sub = s5.add_subparsers(dest="step5_action")
-    s5_ms = s5_sub.add_parser("multiseed-rating", parents=[common])
-    s5_ms.add_argument("--task", type=int, required=True)
-    s5_ms.add_argument("--head", choices=("step5A",), default="step5A")
-    s5_ms.add_argument("--from-step4-run", dest="from_step4_run", default="1")
-    s5_ms.add_argument("--seeds", default="3407,1337,1234,5678,9012")
-    s5_ms.add_argument("--mode", choices=("reuse_seed3407", "strict_rerun_all"), required=True)
+    lifecycle.add_argument("--train-only", action="store_true", help="Step5 explanation-only train phase")
+    lifecycle.add_argument("--allow-embedded-final-eval", action="store_true", help=argparse.SUPPRESS)
+    s5.add_argument("--no-embedded-final-eval", action="store_true", help="keep Step5 on the train-only lifecycle")
 
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--task", type=int, required=True)
@@ -176,9 +168,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", parents=[common])
 
-    rt = sub.add_parser("runtime", help="allowlisted aux runtime/tmux/GPU validation")
+    rt = sub.add_parser("runtime", help="aux runtime/tmux/GPU validation and dispatch")
     rt_sub = rt.add_subparsers(dest="runtime_command", required=True)
-    rt_bridge = rt_sub.add_parser("bridge", help="discover and validate current tmux GPU pane")
+    rt_bridge = rt_sub.add_parser("bridge", help="discover, validate, or dispatch to current tmux GPU pane")
     rt_bridge_sub = rt_bridge.add_subparsers(dest="bridge_command", required=True)
     for bridge_name in ("discover", "validate-only", "marker-probe", "cuda-probe"):
         rb = rt_bridge_sub.add_parser(bridge_name)
@@ -191,6 +183,27 @@ def build_parser() -> argparse.ArgumentParser:
         rb.add_argument("--dry-run", action="store_true")
         rb.add_argument("--no-send", action="store_true")
         rb.add_argument("--timeout", type=int, default=None)
+    rb_exec = rt_bridge_sub.add_parser(
+        "exec",
+        help="dispatch a command to the validated GPU pane",
+        description="dispatch a command to the validated GPU pane",
+    )
+    rb_exec.add_argument("--socket", default=None)
+    rb_exec.add_argument("--target", default=None)
+    rb_exec.add_argument("--json", dest="json_output", action="store_true")
+    rb_exec.add_argument("--dry-run", action="store_true")
+    rb_exec.add_argument("--no-send", action="store_true")
+    rb_exec.add_argument("--timeout", type=int, default=None)
+    rb_exec.add_argument("--background", action="store_true")
+    rb_exec.add_argument("--require-cuda", dest="require_cuda", action="store_true", default=True)
+    rb_exec.add_argument("--no-require-cuda", dest="require_cuda", action="store_false")
+    rb_exec.add_argument("--stdout", dest="stdout_path", default=None)
+    rb_exec.add_argument("--stderr", dest="stderr_path", default=None)
+    rb_exec.add_argument("--stderr-to-stdout", dest="stderr_to_stdout", action="store_true", default=True)
+    rb_exec.add_argument("--split-stderr", dest="stderr_to_stdout", action="store_false")
+    rb_exec.add_argument("--pid-file", default=None)
+    rb_exec.add_argument("--status-path", default=None)
+    rb_exec.add_argument("exec_argv", nargs=argparse.REMAINDER)
     rb_child = rt_bridge_sub.add_parser("_handshake-child", help=argparse.SUPPRESS)
     rb_child.add_argument("--kind", required=True)
     rb_child.add_argument("--status-path", required=True)
@@ -200,8 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
     rb_child.add_argument("--stage", default=None)
     rb_child.add_argument("--task", default=None)
     rb_child.add_argument("--require-cuda", action="store_true")
-    rt_probe = rt_sub.add_parser("probe", help="run a bounded allowlisted runtime probe")
-    rt_probe.add_argument("--stage", choices=("step3", "step4", "step5", "step5A", "step5B"), required=True)
+    rt_probe = rt_sub.add_parser("probe", help="run a bounded runtime probe")
+    rt_probe.add_argument("--stage", choices=("step3", "step4", "step5"), required=True)
     rt_probe.add_argument("--task", type=int, required=True)
     rt_probe.add_argument("--bounded", action="store_true", required=True)
     rt_probe.add_argument("--socket", default=None)
@@ -213,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     rt_probe.add_argument("--from-step4-run", dest="from_step4", default=None)
     rt_probe.add_argument(
         "--evidence-level",
-        choices=("E4", "E5", "E4_gpu_shard_forward_bounded_formal_entry_with_validation", "E5_step5A_post_train_eval_lifecycle"),
+        choices=("E4", "E5", "E4_gpu_shard_forward_bounded_formal_entry_with_validation"),
         default="E4",
     )
     rt_probe.add_argument("--scan", action="store_true")
@@ -360,184 +373,6 @@ def _assert_step3_expected_profile(snapshot: dict[str, Any], expected: str | Non
 
 def _step3_expected_profile_arg(args: argparse.Namespace) -> str | None:
     return str(getattr(args, "expect_profile", None) or getattr(args, "profile", None) or "").strip() or None
-
-
-def _step5b_formal_guard(cfg: Any) -> dict[str, Any]:
-    parent = REPO_ROOT / "runs" / "step5" / f"task{int(cfg.task_id)}"
-    pointer = parent / "latest_step5A.json"
-    out: dict[str, Any] = {
-        "schema_version": "odcr_step5b_formal_guard/1",
-        "head": str(getattr(cfg, "step5_head", "")),
-        "allow_formal": False,
-        "step5A_pointer": str(pointer),
-        "step5A_pointer_exists": pointer.is_file(),
-        "step5B_must_not_inherit_step5A_evidence": True,
-        "step5B_independent_E4_E5_required": True,
-    }
-    if str(getattr(cfg, "step5_head", "")) != "step5B":
-        out.update({"allow_formal": True, "reason": "not_step5B"})
-        return out
-    if not pointer.is_file():
-        out["reason"] = "missing_step5A_eval_handoff_pointer"
-        return out
-    try:
-        payload = json.loads(pointer.read_text(encoding="utf-8"))
-        status_path = REPO_ROOT / str(payload.get("latest_stage_status_path") or "")
-        status_payload = json.loads(status_path.read_text(encoding="utf-8")) if status_path.is_file() else {}
-    except Exception as exc:
-        out.update({"reason": "unreadable_step5A_pointer", "error": str(exc)})
-        return out
-    final_status = str(status_payload.get("final_status") or "").strip()
-    eval_handoff = status_payload.get("eval_handoff_status") if isinstance(status_payload, dict) else None
-    if not isinstance(eval_handoff, dict):
-        handoff_ref = status_payload.get("eval_handoff") if isinstance(status_payload, dict) else None
-        handoff_path = REPO_ROOT / str(handoff_ref or "")
-        if handoff_path.is_file():
-            try:
-                eval_handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
-            except Exception:
-                eval_handoff = None
-    handoff_ok = isinstance(eval_handoff, dict) and str(eval_handoff.get("status") or "").lower() in {
-        "ok",
-        "completed",
-        "accepted",
-    }
-    out.update(
-        {
-            "step5A_run_id": payload.get("latest_run_id"),
-            "step5A_final_status": final_status,
-            "step5A_eval_handoff_present": isinstance(eval_handoff, dict),
-            "step5A_eval_handoff_ok": handoff_ok,
-        }
-    )
-    if final_status in {"completed_with_eval_handoff", "completed"} and handoff_ok:
-        out.update({"allow_formal": True, "reason": "step5A_eval_handoff_ready"})
-    else:
-        out["reason"] = "step5A_unresolved_needs_eval_handoff"
-    return out
-
-
-def _step5_eval_only_head_guard(args: argparse.Namespace) -> dict[str, Any]:
-    head = str(getattr(args, "head", "") or "combined")
-    return {
-        "schema_version": "odcr_step5_eval_only_head_guard/1",
-        "head": head,
-        "allow_eval_handoff": head == "step5A",
-        "reason": (
-            "step5A_rating_only_eval_handoff"
-            if head == "step5A"
-            else "step5B_independent_eval_only_not_implemented" if head == "step5B" else "combined_eval_uses_odcr_eval_entrypoint"
-        ),
-        "step5A_handoff_entrypoint": (
-            "./odcr step5 --task <task> --head step5A --from-step5-run <run> "
-            "--eval-only --checkpoint <checkpoint>"
-        ),
-        "combined_eval_entrypoint": "./odcr eval --task <task> --from-step5 <combined-run>",
-        "step5B_must_not_inherit_step5A_evidence": True,
-        "step5B_independent_E4_E5_required": head == "step5B",
-    }
-
-
-def _run_step5_recovery_eval_guard(args: argparse.Namespace) -> None:
-    from tools.odcr_step5_checkpoint_salvage import validate_step5_checkpoint_salvage
-
-    run_id = str(getattr(args, "from_step5", "") or "").strip()
-    checkpoint = str(getattr(args, "checkpoint", "") or "").strip()
-    if not checkpoint:
-        if not run_id:
-            raise OneControlConfigError("--recovery-eval requires --from-step5-run or --checkpoint")
-        checkpoint = str(REPO_ROOT / "runs" / "step5" / f"task{int(args.task)}" / run_id / "model" / "best.pth")
-    result = validate_step5_checkpoint_salvage(
-        repo_root=REPO_ROOT,
-        task=int(args.task),
-        run_id=run_id or None,
-        checkpoint=Path(checkpoint),
-        attempt_gpu_eval=False,
-    )
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-
-
-def _run_step5_finalize_rating_handoff(cfg: Any, args: argparse.Namespace) -> dict[str, Any]:
-    from odcr_core.step5_rating_handoff import Step5RatingHandoffError, finalize_step5A_rating_eval_handoff
-
-    checkpoint = (
-        Path(cfg.model_path).expanduser().resolve()
-        if getattr(cfg, "model_path", None)
-        else REPO_ROOT / "runs" / "step5" / f"task{int(cfg.task_id)}" / str(cfg.step5_run) / "model" / "best.pth"
-    )
-    eval_dir = (
-        Path(cfg.eval_run_dir).expanduser().resolve()
-        if getattr(cfg, "eval_run_dir", None)
-        else checkpoint.parent.parent / "eval"
-    )
-    target_dir = Path(cfg.data_dir).resolve() / str(cfg.target)
-    try:
-        return finalize_step5A_rating_eval_handoff(
-            repo_root=REPO_ROOT,
-            task=int(cfg.task_id),
-            source_run_id=str(cfg.step5_run),
-            checkpoint=checkpoint,
-            valid_metrics_path=eval_dir / "rating_valid_metrics.json",
-            test_metrics_path=eval_dir / "rating_test_metrics.json",
-            valid_file=target_dir / "valid.csv",
-            test_file=target_dir / "test.csv",
-            expected_valid_count=109732 if int(cfg.task_id) == 2 and str(cfg.target) == "AM_CDs" else None,
-            expected_test_count=109720 if int(cfg.task_id) == 2 and str(cfg.target) == "AM_CDs" else None,
-            dry_run=_dry_run(args),
-        )
-    except Step5RatingHandoffError as exc:
-        raise OneControlConfigError(str(exc)) from exc
-
-
-def _run_step5_rating_quality_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
-    from odcr_core.step5_rating_quality import (
-        Step5RatingQualityError,
-        build_step5A_rating_quality_diagnostic,
-        write_step5A_single_run_summary,
-    )
-
-    run_id = str(getattr(args, "from_step5", "") or "").strip()
-    if not run_id:
-        raise OneControlConfigError("--rating-quality-diagnostic requires --from-step5-run")
-    try:
-        diagnostic = build_step5A_rating_quality_diagnostic(
-            repo_root=REPO_ROOT,
-            task=int(args.task),
-            source_run_id=run_id,
-            dry_run=_dry_run(args),
-        )
-        summary = write_step5A_single_run_summary(
-            repo_root=REPO_ROOT,
-            task=int(args.task),
-            source_run_id=run_id,
-            seed=3407,
-            dry_run=_dry_run(args),
-        )
-    except Step5RatingQualityError as exc:
-        raise OneControlConfigError(str(exc)) from exc
-    return {"diagnostic": diagnostic, "single_run_summary": summary}
-
-
-def cmd_step5_multiseed_rating(args: argparse.Namespace) -> None:
-    from odcr_core.step5_multiseed_rating import (
-        Step5MultiseedRatingError,
-        build_step5A_multiseed_rating_plan,
-        parse_seed_list,
-    )
-
-    try:
-        result = build_step5A_multiseed_rating_plan(
-            repo_root=REPO_ROOT,
-            task=int(args.task),
-            head=str(args.head),
-            from_step4_run=str(args.from_step4_run),
-            seeds=parse_seed_list(args.seeds),
-            mode=str(args.mode),
-            dry_run=_dry_run(args),
-        )
-    except Step5MultiseedRatingError as exc:
-        raise OneControlConfigError(str(exc)) from exc
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
 
 
 def _run_resolved(cfg, snapshot: dict[str, Any], *, dry_run: bool, console_level: str = "summary") -> None:
@@ -724,9 +559,6 @@ def cmd_step4_export_step5_dedicated(args: argparse.Namespace) -> None:
 def cmd_stage(args: argparse.Namespace, command: str) -> None:
     if command == "step4" and getattr(args, "step4_action", None):
         raise OneControlConfigError(f"unsupported step4 action: {getattr(args, 'step4_action', None)}")
-    if command == "step5" and getattr(args, "step5_action", None) == "multiseed-rating":
-        cmd_step5_multiseed_rating(args)
-        return
     if command == "step4" and getattr(args, "task", None) is None:
         raise OneControlConfigError("step4 requires --task")
     if command == "step5" and getattr(args, "task", None) is None:
@@ -737,20 +569,6 @@ def cmd_stage(args: argparse.Namespace, command: str) -> None:
         raise OneControlConfigError("use only one of --prepare-cache or --preflight")
     if command == "step5" and getattr(args, "from_step4", None) and getattr(args, "from_step4_run", None):
         raise OneControlConfigError("use only one of --from-step4 or --from-step4-run")
-    if command == "step5" and bool(getattr(args, "recovery_eval", False)):
-        _run_step5_recovery_eval_guard(args)
-        return
-    if command == "step5" and (
-        bool(getattr(args, "finalize_rating_handoff", False))
-        or bool(getattr(args, "rating_quality_diagnostic", False))
-    ) and str(getattr(args, "head", "") or "") != "step5A":
-        raise OneControlConfigError("Step5A rating finalize/diagnostic requires --head step5A")
-    if command == "step5" and bool(getattr(args, "eval_only", False)) and str(getattr(args, "head", "") or "") != "step5A":
-        guard = _step5_eval_only_head_guard(args)
-        if _dry_run(args):
-            print(json.dumps(guard, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-            return
-        raise OneControlConfigError(f"Step5 eval-only blocked: {guard['reason']}")
     if command == "step3" and bool(getattr(args, "accept_eval_only", False)):
         run_id = str(getattr(args, "run_id", "") or "").strip()
         if run_id in {"", "auto"}:
@@ -783,26 +601,6 @@ def cmd_stage(args: argparse.Namespace, command: str) -> None:
         resolve_args = argparse.Namespace(**vars(args))
         resolve_args.dry_run = True
     cfg, sources, snapshot = _resolve_for_args(resolve_args, command)
-    if command == "step5" and (
-        bool(getattr(args, "finalize_rating_handoff", False))
-        or bool(getattr(args, "rating_quality_diagnostic", False))
-    ):
-        result: dict[str, Any] = {}
-        if bool(getattr(args, "finalize_rating_handoff", False)):
-            result["finalize_rating_handoff"] = _run_step5_finalize_rating_handoff(cfg, args)
-        if bool(getattr(args, "rating_quality_diagnostic", False)):
-            result["rating_quality_diagnostic"] = _run_step5_rating_quality_diagnostic(args)
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
-        return
-    if command == "step5" and str(getattr(cfg, "step5_head", "")) == "step5B":
-        guard = _step5b_formal_guard(cfg)
-        snapshot = dict(snapshot)
-        snapshot["step5B_formal_guard"] = guard
-        if not _dry_run(args) and not bool(guard.get("allow_formal")):
-            raise OneControlConfigError(
-                "Step5B formal launch blocked: Step5A has not completed independent eval/handoff; "
-                f"reason={guard.get('reason')}"
-            )
     if command == "step3":
         _assert_step3_expected_profile(snapshot, _step3_expected_profile_arg(args))
         if bool(getattr(args, "cache_check", False)):
@@ -920,7 +718,7 @@ def cmd_pipeline(args: argparse.Namespace) -> None:
             ns = argparse.Namespace(**vars(args))
             ns.from_step4 = step4_run or "latest"
             ns.run_id = "auto"
-            ns.head = "combined"
+            ns.head = "explanation"
             cfg, _, snapshot = _resolve_for_args(ns, "step5")
             step5_run = cfg.step5_run
             _run_resolved(cfg, snapshot, dry_run=False, console_level=_console_level(args))
@@ -1098,11 +896,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             )
         )
         print(
-            "  cf_tiers: schema=%s step5A=%s step5B=%s (source: %s)"
+            "  cf_tiers: schema=%s explanation=%s (source: %s)"
             % (
                 cf_tiers.get("schema_version"),
-                bool(cf_tiers.get("step5A")),
-                bool(cf_tiers.get("step5B")),
+                bool(cf_tiers.get("explanation")),
                 sources.get("step4_cf_tiers"),
             )
         )
@@ -1122,11 +919,15 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         step5_effective_epoch = doctor_snapshot.get("step5_effective_epoch") or {}
         step5_batch_candidates = doctor_snapshot.get("step5_batch_candidates") or {}
         step5_tuning = doctor_snapshot.get("step5_tuning") or {}
+        step5_eval = doctor_snapshot.get("step5_eval") or {}
+        step5_valid_loss = doctor_snapshot.get("step5_valid_loss") or {}
+        step5_final_eval = doctor_snapshot.get("step5_final_eval") or {}
         step5_formal_active_candidate = doctor_snapshot.get("step5_formal_active_candidate") or {}
         step5_sample_plan_preflight = doctor_snapshot.get("step5_sample_plan_preflight") or {}
         step5_e4 = doctor_snapshot.get("step5_e4_bounded") or {}
         step5_lifecycle = doctor_snapshot.get("step5_lifecycle") or {}
         step5_memory_truth = doctor_snapshot.get("step5_memory_truth") or {}
+        rating_source = doctor_snapshot.get("rating_source") or {}
         print("One-Control roots/models/embed_dim:")
         print(f"  runs_dir: {roots.get('runs_dir')} (source: project.run_root)")
         print(f"  cache_dir: {roots.get('cache_dir')} (source: project.cache_dir)")
@@ -1158,15 +959,59 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         )
         print(
             "  lifecycle: default_phase=%s embedded_default=%s checkpoint_load_policy=%s "
-            "eval_handoff_required=%s write_latest_after_train_only=%s"
+            "explanation_handoff_required=%s write_latest_after_train_only=%s"
             % (
                 step5_lifecycle.get("formal_default_phase"),
                 step5_lifecycle.get("embedded_final_eval_default"),
                 step5_lifecycle.get("checkpoint_load_policy"),
-                step5_lifecycle.get("eval_handoff_required_for_downstream"),
+                step5_lifecycle.get("explanation_handoff_required_for_downstream"),
                 step5_lifecycle.get("write_latest_after_train_only"),
             )
         )
+        if step5_final_eval:
+            print("Step5 official eval policy:")
+            print(
+                "  profile=%s prediction_max_length=%s reference_max_length=%s "
+                "builder=%s metrics=%s test_once=%s eval_batch=%s per_gpu=%s"
+                % (
+                    step5_final_eval.get("official_profile"),
+                    step5_final_eval.get("prediction_max_length"),
+                    step5_final_eval.get("reference_max_length"),
+                    step5_final_eval.get("metric_input_builder"),
+                    step5_final_eval.get("metrics_implementation"),
+                    step5_final_eval.get("test_once"),
+                    step5_eval.get("valid_global_batch_size"),
+                    step5_eval.get("valid_per_gpu_batch_size"),
+                )
+            )
+            print(
+                "  valid_loss_label_max_length=%s (source: step5.valid_loss.label_max_length)"
+                % step5_valid_loss.get("label_max_length")
+            )
+            checks.append("step5 official paper_greedy_25 final eval policy resolves from configs/odcr.yaml")
+        if rating_source:
+            print("Step5 rating source:")
+            print(
+                "  type=%s task=%s run=%s protocol=%s checkpoint=%s eval_handoff=%s"
+                % (
+                    rating_source.get("type"),
+                    rating_source.get("task"),
+                    rating_source.get("run"),
+                    rating_source.get("protocol"),
+                    rating_source.get("checkpoint"),
+                    rating_source.get("eval_handoff"),
+                )
+            )
+            print(
+                "  valid_mae=%s valid_rmse=%s test_mae=%s test_rmse=%s hash=%s"
+                % (
+                    rating_source.get("valid_mae"),
+                    rating_source.get("valid_rmse"),
+                    rating_source.get("test_mae"),
+                    rating_source.get("test_rmse"),
+                    rating_source.get("checkpoint_hash"),
+                )
+            )
         print("Step5 DDP policy:")
         print(
             "  find_unused_parameters: "
@@ -1206,29 +1051,22 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             )
         )
         print(
-            "  step5A ratios=%s budget=%s step5B ratios=%s budget=%s"
+            "  explanation ratios=%s budget=%s route_primary=%s"
             % (
                 {
-                    "target_gold": (step5_sampler.get("step5A") or {}).get("target_gold_ratio"),
-                    "aux_gold": (step5_sampler.get("step5A") or {}).get("aux_gold_ratio"),
-                    "cf": (step5_sampler.get("step5A") or {}).get("cf_ratio"),
+                    "target_gold": (step5_sampler.get("explanation") or {}).get("target_gold_ratio"),
+                    "aux_gold": (step5_sampler.get("explanation") or {}).get("aux_gold_ratio"),
+                    "cf": (step5_sampler.get("explanation") or {}).get("cf_ratio"),
                 },
-                (step5_sampler.get("step5A") or {}).get("effective_samples_per_epoch_candidates"),
-                {
-                    "target_gold": (step5_sampler.get("step5B") or {}).get("target_gold_ratio"),
-                    "aux_gold": (step5_sampler.get("step5B") or {}).get("aux_gold_ratio"),
-                    "cf": (step5_sampler.get("step5B") or {}).get("cf_ratio"),
-                },
-                (step5_sampler.get("step5B") or {}).get("effective_samples_per_epoch_candidates"),
+                (step5_sampler.get("explanation") or {}).get("effective_samples_per_epoch_candidates"),
+                step5_sampler.get("route_primary"),
             )
         )
         print(
-            "  formal_candidate: step5A_cf=%s %s step5B_cf=%s %s source=%s"
+            "  formal_candidate: explanation_cf=%s %s source=%s"
             % (
-                step5_formal_active_candidate.get("step5A_cf_mix_id"),
-                step5_formal_active_candidate.get("step5A_cf_mix"),
-                step5_formal_active_candidate.get("step5B_cf_mix_id"),
-                step5_formal_active_candidate.get("step5B_cf_mix"),
+                step5_formal_active_candidate.get("explanation_cf_mix_id"),
+                step5_formal_active_candidate.get("explanation_cf_mix"),
                 step5_formal_active_candidate.get("active_sampler_source"),
             )
         )
@@ -1243,24 +1081,15 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         checks.append("step5 sampler controls resolve from configs/odcr.yaml")
         checks.append("step5 sample-plan preflight validates route-compatible pools before launch")
         if step5_task_policy:
-            a_policy = step5_task_policy.get("step5A") or {}
-            b_policy = step5_task_policy.get("step5B") or {}
+            explanation_policy = step5_task_policy.get("explanation") or {}
             print("Step5 task-decoupled policy:")
             print(
-                "  step5A branch=%s components=%s forbid_big_model=%s forbid_generation=%s"
+                "  explanation branch=%s components=%s use_big_model=%s rating_training=%s"
                 % (
-                    a_policy.get("branch"),
-                    a_policy.get("train_components"),
-                    a_policy.get("forbid_big_model"),
-                    a_policy.get("forbid_generation"),
-                )
-            )
-            print(
-                "  step5B branch=%s components=%s use_big_model=%s"
-                % (
-                    b_policy.get("branch"),
-                    b_policy.get("train_components"),
-                    b_policy.get("use_big_model"),
+                    explanation_policy.get("branch"),
+                    explanation_policy.get("train_components"),
+                    explanation_policy.get("use_big_model"),
+                    (step5_task_policy.get("rating_training") or {}).get("enabled"),
                 )
             )
             checks.append("step5 task-decoupled policy resolves from configs/odcr.yaml")
@@ -1496,6 +1325,29 @@ def cmd_promote_upstream(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
 
 
+def cmd_step3_rating(args: argparse.Namespace) -> None:
+    from odcr_core.step3_rating_seed_runner import (
+        Step3RatingSeedRunnerError,
+        run_step3_rating_seed_runner,
+    )
+
+    try:
+        result = run_step3_rating_seed_runner(
+            REPO_ROOT,
+            task=int(args.task),
+            mode=str(args.mode),
+            config_path=_config_path(args),
+            seed=getattr(args, "seed", None),
+            run_id=getattr(args, "run_id", None),
+            run_id_start=getattr(args, "run_id_start", None),
+            dry_run=_dry_run(args),
+            console_level=_console_level(args),
+        )
+    except Step3RatingSeedRunnerError as exc:
+        raise OneControlConfigError(str(exc)) from exc
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+
+
 def maybe_daemonize(args: argparse.Namespace) -> None:
     if not getattr(args, "daemon", False):
         return
@@ -1519,6 +1371,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd_step4_export_step5_dedicated(args)
         elif args.command in ("step3", "step4", "step5", "eval"):
             cmd_stage(args, args.command)
+        elif args.command == "step3-rating":
+            cmd_step3_rating(args)
         elif args.command == "pipeline":
             cmd_pipeline(args)
         elif args.command == "show":

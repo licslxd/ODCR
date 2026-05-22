@@ -28,7 +28,7 @@ def build_probe_payload(
     name = probe_command_name(stage, bounded=True)
     spec = require_command(name)
     stage_name = str(stage)
-    required_fresh_handoff = stage_name in {"step5", "step5A", "step5B"}
+    required_fresh_handoff = stage_name in {"step5", "rating_stability_control", "step5_explanation"}
     target_source_ok = (not required_fresh_handoff) or str(target_source or "") in {
         "current_gpu_pane_handoff",
         "live_discovery_cuda_probe",
@@ -64,11 +64,11 @@ def build_probe_payload(
         and probe_result.get("validation_loss_finite") is True
         and probe_result.get("validation_oom") is False
         and (
-            stage_name != "step5A"
+            stage_name != "rating_stability_control"
             or (
-                probe_result.get("step5A_validation_scorer_only") is True
-                and probe_result.get("flan_explainer_called_in_step5A_validation") is False
-                and probe_result.get("out_logits_materialized_in_step5A_validation") is False
+                probe_result.get("rating_stability_control_validation_control_only") is True
+                and probe_result.get("flan_explainer_called_in_rating_stability_control_validation") is False
+                and probe_result.get("out_logits_materialized_in_rating_stability_control_validation") is False
             )
         )
         and int(probe_result.get("valid_forward_micro_batch_size") or 10**9)
@@ -98,7 +98,7 @@ def build_probe_payload(
         and probe_result.get("latest_json_created") is False
         and probe_result.get("checkpoint_written") is False
     )
-    success = real_e4 if stage_name in {"step5A", "step5B"} else cuda_ok
+    success = real_e4 if stage_name in {"rating_stability_control", "step5_explanation"} else cuda_ok
     payload = {
         "schema_version": "odcr_runtime_bounded_probe/1",
         "command": spec.name,
@@ -110,13 +110,13 @@ def build_probe_payload(
         "cuda_handshake_ok": cuda_ok,
         "evidence_level": E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION if real_e4 else E3_GPU_TRANSPORT,
         "handshake_only": not bool(probe_result),
-        "forward_backward_required_for_e4": stage_name in {"step5A", "step5B"},
+        "forward_backward_required_for_e4": stage_name in {"rating_stability_control", "step5_explanation"},
         "backward_validation_claimed": bool(real_e4),
         "artifact_build_only_does_not_validate_backward": bool(artifact_build_preflight),
         "artifact_build_preflight_admitted": artifact_build_preflight,
-        "current_real_batch_backward_e4_required": stage_name in {"step5A", "step5B"},
-        "formal_entry_lifecycle_e4_required": stage_name in {"step5A", "step5B"},
-        "formal_entry_validation_e4_required": stage_name in {"step5A", "step5B"},
+        "current_real_batch_backward_e4_required": stage_name in {"rating_stability_control", "step5_explanation"},
+        "formal_entry_lifecycle_e4_required": stage_name in {"rating_stability_control", "step5_explanation"},
+        "formal_entry_validation_e4_required": stage_name in {"rating_stability_control", "step5_explanation"},
         "fresh_gpu_pane_handoff_required": required_fresh_handoff,
         "target_source": target_source,
         "target_source_allowed_for_step5_gate": target_source_ok,

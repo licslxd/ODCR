@@ -19,8 +19,10 @@ from odcr_core.config_schema import (
     fingerprint,
     json_dumps,
 )
-from odcr_core.step5_task_decoupled_policy import (
-    STEP5_TASK_DECOUPLED_POLICY_SCHEMA_VERSION,
+from odcr_core.rating_source import (
+    RATING_SOURCE_TYPE,
+    resolve_rating_source_config,
+    validate_rating_source,
 )
 from odcr_core.training_diagnostics import runtime_diagnostics_fingerprint_source
 from odcr_core.step3_quality import (
@@ -42,12 +44,12 @@ from odcr_core.step3_eval_protocol import (
     normalize_eval_protocol,
     step3_eval_protocol_spec,
 )
-from odcr_core.upstream_resolver import UpstreamResolutionError, resolve_latest, resolve_upstream
+from odcr_core.upstream_resolver import UpstreamResolutionError, resolve_latest, resolve_run, resolve_upstream
 
 _CODE_DIR = Path(__file__).resolve().parent.parent
 _REPO_ROOT = _CODE_DIR.parent
 _STEP5_HEAD_AWARE_LORA_TARGET_SENTINEL = "__HEAD_AWARE_STEP5_DEFAULT__"
-_STEP5_LORA_TARGET_POLICY_ID = "step5_head_aware_lora_allowlist/1"
+_STEP5_LORA_TARGET_POLICY_ID = "step5_explanation_lora_allowlist/1"
 _STEP5_DELETED_LEGACY_MODULES = ("recommender", "flan_soft_prompt_stack", "hidden2token")
 
 
@@ -178,14 +180,10 @@ _RETIRED_ACCUM_ENV = frozenset(
     }
 )
 
-_STEP5_RETIRED_TRAIN_FIELDS = frozenset({"adv", "eta"})
-_STEP5_FORMAL_CF_MIX_IDS = {
-    "step5A": "A_NO_CF",
-    "step5B": "B_CF_MIX_FORMAL_HIGH_MEDIUM",
-}
-_STEP5_HISTORICAL_CF_MIX_SEMANTICS = {
-    ("step5B", "B_CF_MIX_1"): {"high": 0.50, "medium": 0.35, "low_weighted": 0.15},
-}
+_STEP5_RETIRED_TRAIN_FIELDS = frozenset({"adv", "eta", "train_label_max_length"})
+_STEP5_FORMAL_RATIO_ID = "STEP5_RATIO_0"
+_STEP5_FORMAL_CF_MIX_ID = "STEP5_CF_MIX_FORMAL_HIGH_MEDIUM"
+_STEP5_HISTORICAL_CF_MIX_SEMANTICS: dict[tuple[str, str], dict[str, float]] = {}
 
 
 def _reject_retired_accum_name(name: str) -> None:
@@ -427,7 +425,7 @@ def _reject_step5_retired_controls(train: Mapping[str, Any]) -> None:
     if bad:
         raise OneControlConfigError(
             "step5.train contains retired ambiguous controls "
-            f"{bad}; use step5.train.explainer_loss_weight for the Step5B explainer loss multiplier."
+            f"{bad}; use step5.train.explainer_loss_weight and step5.train.label_max_length for active Step5 controls."
         )
 
 
@@ -1060,7 +1058,7 @@ def _resolve_step4_gold_quality_config(cfg: Mapping[str, Any]) -> dict[str, Any]
 
 def _resolve_step4_cf_tiers_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step4.cf_tiers"), "step4.cf_tiers")
-    _reject_unknown_keys(raw, {"schema_version", "hard_reject", "step5A", "step5B", "sampling_weight"}, "step4.cf_tiers")
+    _reject_unknown_keys(raw, {"schema_version", "hard_reject", "explanation", "sampling_weight"}, "step4.cf_tiers")
     if str(raw.get("schema_version") or "") != "odcr_cf_quality_tier/1":
         raise OneControlConfigError("step4.cf_tiers.schema_version must be odcr_cf_quality_tier/1")
     hard = _mapping(raw.get("hard_reject"), "step4.cf_tiers.hard_reject")
@@ -1076,25 +1074,14 @@ def _resolve_step4_cf_tiers_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for tier in ("high", "medium", "low_weighted"):
             item = _mapping(head_raw.get(tier), f"step4.cf_tiers.{head}.{tier}")
-            if head == "step5A":
-                allowed = {
-                    "require_route_scorer",
-                    "min_confidence_bucket",
-                    "min_rating_stability",
-                    "min_content_retention",
-                    "max_uncertainty",
-                    "min_text_quality",
-                    "min_reliability",
-                }
-            else:
-                allowed = {
-                    "require_route_explainer",
-                    "min_confidence_bucket",
-                    "min_style_shift",
-                    "min_reliability",
-                    "max_uncertainty",
-                    "min_text_quality",
-                }
+            allowed = {
+                "require_route_explainer",
+                "min_confidence_bucket",
+                "min_style_shift",
+                "min_reliability",
+                "max_uncertainty",
+                "min_text_quality",
+            }
             _reject_unknown_keys(item, allowed, f"step4.cf_tiers.{head}.{tier}")
             row: dict[str, Any] = {}
             for key, value in item.items():
@@ -1108,7 +1095,7 @@ def _resolve_step4_cf_tiers_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         return out
 
     weights = _mapping(raw.get("sampling_weight"), "step4.cf_tiers.sampling_weight")
-    _reject_unknown_keys(weights, {"step5A", "step5B"}, "step4.cf_tiers.sampling_weight")
+    _reject_unknown_keys(weights, {"explanation"}, "step4.cf_tiers.sampling_weight")
 
     def _weights(head: str) -> dict[str, float]:
         item = _mapping(weights.get(head), f"step4.cf_tiers.sampling_weight.{head}")
@@ -1128,9 +1115,8 @@ def _resolve_step4_cf_tiers_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
             "min_words": _rcr_int(hard.get("min_words"), "step4.cf_tiers.hard_reject.min_words", min_value=1),
             "max_repeat_ngram_ratio": _rcr_float(hard.get("max_repeat_ngram_ratio"), "step4.cf_tiers.hard_reject.max_repeat_ngram_ratio", min_value=0.0, max_value=1.0),
         },
-        "step5A": _tier_block("step5A"),
-        "step5B": _tier_block("step5B"),
-        "sampling_weight": {"step5A": _weights("step5A"), "step5B": _weights("step5B")},
+        "explanation": _tier_block("explanation"),
+        "sampling_weight": {"explanation": _weights("explanation")},
     }
 
 
@@ -1145,8 +1131,7 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "full_audit_default_allowed",
         "legacy_gold_heavy_exports_allowed",
         "auto_budget",
-        "step5A",
-        "step5B",
+        "explanation",
         "epochs",
     }
     _reject_unknown_keys(raw, allowed, "step5.sampler")
@@ -1157,7 +1142,7 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     if _bool(raw.get("legacy_gold_heavy_exports_allowed")):
         raise OneControlConfigError("step5.sampler.legacy_gold_heavy_exports_allowed must be false")
 
-    def _head(name: str, ratio_bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]) -> dict[str, Any]:
+    def _explanation(name: str = "explanation") -> dict[str, Any]:
         obj = _mapping(raw.get(name), f"step5.sampler.{name}")
         _reject_unknown_keys(
             obj,
@@ -1184,7 +1169,11 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         cf = _rcr_float(obj.get("cf_ratio"), f"step5.sampler.{name}.cf_ratio", min_value=0.0, max_value=1.0)
         if abs((tg + ag + cf) - 1.0) > 1e-6:
             raise OneControlConfigError(f"step5.sampler.{name} ratios must sum to 1.0")
-        for value, (lo, hi), key in zip((tg, ag, cf), ratio_bounds, ("target_gold_ratio", "aux_gold_ratio", "cf_ratio")):
+        for value, (lo, hi), key in zip(
+            (tg, ag, cf),
+            ((0.30, 0.45), (0.10, 0.25), (0.34, 0.50)),
+            ("target_gold_ratio", "aux_gold_ratio", "cf_ratio"),
+        ):
             if not (lo <= value <= hi):
                 raise OneControlConfigError(f"step5.sampler.{name}.{key} must be in [{lo}, {hi}]")
         def _gold_mix(mix_name: str) -> dict[str, float]:
@@ -1286,8 +1275,15 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
                 max_value=1.0,
             ),
         },
-        "step5A": _head("step5A", ((1.0, 1.0), (0.0, 0.0), (0.0, 0.0))),
-        "step5B": _head("step5B", ((0.30, 0.45), (0.10, 0.25), (0.34, 0.50))),
+        "mode": "explanation_only",
+        "route_primary": "route_explainer",
+        "components": {
+            "target_anchor": "optional",
+            "aux_gold": "enabled",
+            "cf": "enabled",
+            "aux_cf": "enabled",
+        },
+        "explanation": _explanation(),
         "epochs": {
             "max_effective_epochs": _rcr_int(epochs.get("max_effective_epochs"), "step5.sampler.epochs.max_effective_epochs", min_value=1),
             "early_stopping_patience": _rcr_int(epochs.get("early_stopping_patience"), "step5.sampler.epochs.early_stopping_patience", min_value=0),
@@ -1301,179 +1297,34 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
 
 def _resolve_step5_task_decoupled_policy_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step5.task_decoupled_policy"), "step5.task_decoupled_policy")
-    _reject_unknown_keys(raw, {"schema_version", "enabled", "step5A", "step5B"}, "step5.task_decoupled_policy")
-    step5a = _mapping(raw.get("step5A"), "step5.task_decoupled_policy.step5A")
-    step5b = _mapping(raw.get("step5B"), "step5.task_decoupled_policy.step5B")
+    _reject_unknown_keys(raw, {"schema_version", "enabled", "explanation"}, "step5.task_decoupled_policy")
+    explanation = _mapping(raw.get("explanation"), "step5.task_decoupled_policy.explanation")
     _reject_unknown_keys(
-        step5a,
-        {
-            "branch",
-            "train_components",
-            "forbid_aux_cf_in_scorer_loss",
-            "forbid_generation",
-            "forbid_big_model",
-            "scorer_init_required",
-            "scorer_init_source",
-            "distillation_enabled",
-            "distillation_weight",
-            "teacher",
-            "residual_calibration",
-        },
-        "step5.task_decoupled_policy.step5A",
+        explanation,
+        {"branch", "train_components", "use_big_model", "allow_target_anchor", "target_anchor_role"},
+        "step5.task_decoupled_policy.explanation",
     )
-    teacher = _mapping(step5a.get("teacher"), "step5.task_decoupled_policy.step5A.teacher")
-    _reject_unknown_keys(
-        teacher,
-        {
-            "checkpoint_path",
-            "checkpoint_sha256",
-            "parity_required",
-            "tokenized_evidence_source",
-            "parity_tolerance",
-        },
-        "step5.task_decoupled_policy.step5A.teacher",
-    )
-    residual_calibration = _mapping(
-        step5a.get("residual_calibration"),
-        "step5.task_decoupled_policy.step5A.residual_calibration",
-    )
-    _reject_unknown_keys(
-        residual_calibration,
-        {
-            "enabled",
-            "zero_init",
-            "feature_source",
-            "lambda_gt_initial",
-            "lambda_gt_final",
-            "lambda_distill_initial",
-            "lambda_distill_final",
-            "lambda_residual",
-            "regularizer",
-            "huber_delta",
-        },
-        "step5.task_decoupled_policy.step5A.residual_calibration",
-    )
-    _reject_unknown_keys(
-        step5b,
-        {
-            "branch",
-            "train_components",
-            "use_big_model",
-            "allow_target_anchor",
-            "target_anchor_role",
-        },
-        "step5.task_decoupled_policy.step5B",
-    )
-    ac = _mapping(step5a.get("train_components"), "step5.task_decoupled_policy.step5A.train_components")
-    _reject_unknown_keys(ac, {"target_gold", "aux_gold", "cf"}, "step5.task_decoupled_policy.step5A.train_components")
-    target = _rcr_float(ac.get("target_gold"), "step5.task_decoupled_policy.step5A.train_components.target_gold", min_value=0.0, max_value=1.0)
-    aux = _rcr_float(ac.get("aux_gold"), "step5.task_decoupled_policy.step5A.train_components.aux_gold", min_value=0.0, max_value=1.0)
-    cf = _rcr_float(ac.get("cf"), "step5.task_decoupled_policy.step5A.train_components.cf", min_value=0.0, max_value=1.0)
-    if (target, aux, cf) != (1.0, 0.0, 0.0):
-        raise OneControlConfigError("Step5A task_decoupled_policy must be target_gold=1.0, aux_gold=0.0, cf=0.0")
-    if str(step5a.get("branch") or "") != "scorer_clean":
-        raise OneControlConfigError("step5.task_decoupled_policy.step5A.branch must be scorer_clean")
-    if _bool(step5a.get("forbid_aux_cf_in_scorer_loss")) is not True:
-        raise OneControlConfigError("Step5A must forbid aux/cf in scorer loss")
-    if _bool(step5a.get("forbid_generation")) is not True or _bool(step5a.get("forbid_big_model")) is not True:
-        raise OneControlConfigError("Step5A must forbid generation and big model")
-    bc = _mapping(step5b.get("train_components"), "step5.task_decoupled_policy.step5B.train_components")
-    _reject_unknown_keys(bc, {"target_gold", "aux_gold", "cf"}, "step5.task_decoupled_policy.step5B.train_components")
-    if str(step5b.get("branch") or "") != "explainer_rich":
-        raise OneControlConfigError("step5.task_decoupled_policy.step5B.branch must be explainer_rich")
-    if _bool(step5b.get("use_big_model")) is not True:
-        raise OneControlConfigError("Step5B must use the large explainer model")
-    scorer_source = str(step5a.get("scorer_init_source") or "frozen_step3_teacher")
-    distillation_enabled = _bool(step5a.get("distillation_enabled", False))
-    if (
-        _bool(step5a.get("scorer_init_required", True))
-        and scorer_source != "frozen_step3_teacher"
-        and not distillation_enabled
-    ):
-        raise OneControlConfigError(
-            "Step5A scorer_init_source must be frozen_step3_teacher; partial transplant/random/no-distill is forbidden."
-        )
-    if _bool(teacher.get("parity_required", True)) is not True:
-        raise OneControlConfigError("Step5A frozen teacher parity_required must be true.")
-    if _bool(residual_calibration.get("enabled", True)) is not True:
-        raise OneControlConfigError("Step5A residual_calibration.enabled must be true.")
-    if _bool(residual_calibration.get("zero_init", True)) is not True:
-        raise OneControlConfigError("Step5A residual_calibration.zero_init must be true.")
-    if str(residual_calibration.get("regularizer") or "huber") not in {"huber", "l1"}:
-        raise OneControlConfigError("Step5A residual_calibration.regularizer must be huber or l1.")
+    components = _mapping(explanation.get("train_components"), "step5.task_decoupled_policy.explanation.train_components")
+    _reject_unknown_keys(components, {"target_gold", "aux_gold", "cf"}, "step5.task_decoupled_policy.explanation.train_components")
+    if str(explanation.get("branch") or "") != "explainer_rich":
+        raise OneControlConfigError("step5.task_decoupled_policy.explanation.branch must be explainer_rich")
+    if _bool(explanation.get("use_big_model")) is not True:
+        raise OneControlConfigError("Step5 explanation must use the large explainer model")
     return {
-        "schema_version": str(raw.get("schema_version") or STEP5_TASK_DECOUPLED_POLICY_SCHEMA_VERSION),
+        "schema_version": str(raw.get("schema_version") or "odcr_step5_explanation_policy/1"),
         "enabled": _bool(raw.get("enabled", True)),
-        "step5A": {
-            "branch": "scorer_clean",
-            "train_components": {"target_gold": target, "aux_gold": aux, "cf": cf},
-            "forbid_aux_cf_in_scorer_loss": True,
-            "forbid_generation": True,
-            "forbid_big_model": True,
-            "scorer_init_required": _bool(step5a.get("scorer_init_required", True)),
-            "scorer_init_source": scorer_source,
-            "distillation_enabled": distillation_enabled,
-            "distillation_weight": _rcr_float(step5a.get("distillation_weight", 0.0), "step5.task_decoupled_policy.step5A.distillation_weight", min_value=0.0),
-            "teacher": {
-                "checkpoint_path": str(teacher.get("checkpoint_path") or "runs/step3/task2/2/model/best_observed.pth"),
-                "checkpoint_sha256": str(
-                    teacher.get("checkpoint_sha256")
-                    or "9089ac53b138c12ba1260370aed3d637b305f7f7f6a98a7bcbc7721eb5559017"
-                ),
-                "parity_required": True,
-                "tokenized_evidence_source": str(teacher.get("tokenized_evidence_source") or "step3_tokenizer_cache"),
-                "parity_tolerance": _rcr_float(
-                    teacher.get("parity_tolerance", 1e-6),
-                    "step5.task_decoupled_policy.step5A.teacher.parity_tolerance",
-                    min_value=0.0,
-                ),
-            },
-            "residual_calibration": {
-                "enabled": True,
-                "zero_init": True,
-                "feature_source": str(residual_calibration.get("feature_source") or "teacher_pred"),
-                "lambda_gt_initial": _rcr_float(
-                    residual_calibration.get("lambda_gt_initial", 0.0),
-                    "step5.task_decoupled_policy.step5A.residual_calibration.lambda_gt_initial",
-                    min_value=0.0,
-                ),
-                "lambda_gt_final": _rcr_float(
-                    residual_calibration.get("lambda_gt_final", 1.0),
-                    "step5.task_decoupled_policy.step5A.residual_calibration.lambda_gt_final",
-                    min_value=0.0,
-                ),
-                "lambda_distill_initial": _rcr_float(
-                    residual_calibration.get("lambda_distill_initial", 1.0),
-                    "step5.task_decoupled_policy.step5A.residual_calibration.lambda_distill_initial",
-                    min_value=0.0,
-                ),
-                "lambda_distill_final": _rcr_float(
-                    residual_calibration.get("lambda_distill_final", 0.25),
-                    "step5.task_decoupled_policy.step5A.residual_calibration.lambda_distill_final",
-                    min_value=0.0,
-                ),
-                "lambda_residual": _rcr_float(
-                    residual_calibration.get("lambda_residual", 0.05),
-                    "step5.task_decoupled_policy.step5A.residual_calibration.lambda_residual",
-                    min_value=0.0,
-                ),
-                "regularizer": str(residual_calibration.get("regularizer") or "huber"),
-                "huber_delta": _rcr_float(
-                    residual_calibration.get("huber_delta", 0.1),
-                    "step5.task_decoupled_policy.step5A.residual_calibration.huber_delta",
-                    min_value=1e-12,
-                ),
-            },
-        },
-        "step5B": {
+        "mode": "explanation_only",
+        "explanation": {
             "branch": "explainer_rich",
-            "train_components": dict(bc),
+            "train_components": dict(components),
             "use_big_model": True,
-            "allow_target_anchor": _bool(step5b.get("allow_target_anchor", True)),
-            "target_anchor_role": str(step5b.get("target_anchor_role") or "optional_target_explanation_anchor_not_rating_supervision"),
+            "allow_target_anchor": _bool(explanation.get("allow_target_anchor", True)),
+            "target_anchor_role": str(
+                explanation.get("target_anchor_role") or "optional_target_explanation_anchor_not_rating_supervision"
+            ),
         },
+        "rating_training": {"enabled": False, "source": RATING_SOURCE_TYPE},
     }
-
 
 def resolve_step4_step5_dedicated_exports_config(
     *,
@@ -1675,7 +1526,7 @@ def _resolve_step5_innovation_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     missing_control = [x for x in _STEP5_CCV_REQUIRED_CONTROL_FIELDS if x not in control_fields]
     if missing_control:
         raise OneControlConfigError(
-            "step5.ccv.control_fields missing required Step5B control fields: "
+            "step5.ccv.control_fields missing required Step5 explanation control fields: "
             + ", ".join(missing_control)
         )
     mode = str(fca.get("evidence_alignment_mode", "")).strip().lower()
@@ -1848,12 +1699,11 @@ def _resolve_step5_lifecycle_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "formal_default_phase",
         "embedded_final_eval_default",
         "allow_embedded_final_eval_diagnostic",
-        "eval_handoff_required_for_downstream",
+        "explanation_handoff_required_for_downstream",
         "checkpoint_load_policy",
         "cpu_staged_checkpoint_load_required",
         "write_latest_after_train_only",
         "e5_post_train_lifecycle_required",
-        "step5B_requires_independent_e4_e5",
     }
     _reject_unknown_keys(raw, allowed, "step5.lifecycle")
     phase = str(raw.get("formal_default_phase") or "train_only").strip()
@@ -1867,12 +1717,11 @@ def _resolve_step5_lifecycle_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "formal_default_phase": phase,
         "embedded_final_eval_default": _bool(raw.get("embedded_final_eval_default", False)),
         "allow_embedded_final_eval_diagnostic": _bool(raw.get("allow_embedded_final_eval_diagnostic", False)),
-        "eval_handoff_required_for_downstream": _bool(raw.get("eval_handoff_required_for_downstream", True)),
+        "explanation_handoff_required_for_downstream": _bool(raw.get("explanation_handoff_required_for_downstream", True)),
         "checkpoint_load_policy": policy,
         "cpu_staged_checkpoint_load_required": _bool(raw.get("cpu_staged_checkpoint_load_required", True)),
         "write_latest_after_train_only": _bool(raw.get("write_latest_after_train_only", False)),
         "e5_post_train_lifecycle_required": _bool(raw.get("e5_post_train_lifecycle_required", True)),
-        "step5B_requires_independent_e4_e5": _bool(raw.get("step5B_requires_independent_e4_e5", True)),
     }
 
 
@@ -3012,10 +2861,16 @@ def _training_row(stage: str, train: Mapping[str, Any], task: Mapping[str, Any],
     if stage == "step5":
         _reject_step5_retired_controls(train)
     row = dict(backend or {})
-    public_keys = {"batch_size", "per_gpu_batch_size", "backend", "mode"}
+    public_keys = {"batch_size", "per_gpu_batch_size", "backend", "mode", "label_max_length"}
     for key, value in train.items():
         if key not in public_keys:
             row[key] = deepcopy(value)
+    if stage == "step5":
+        if "label_max_length" not in train:
+            raise OneControlConfigError("step5.train.label_max_length must be configured; train_label_max_length is retired for Step5.")
+        train_label_length = int(train["label_max_length"])
+    else:
+        train_label_length = int(train.get("train_label_max_length", 64))
     row.update(
         {
             "train_batch_size": int(train["batch_size"]),
@@ -3025,7 +2880,7 @@ def _training_row(stage: str, train: Mapping[str, Any], task: Mapping[str, Any],
             "batch_semantics_version": NO_ACCUM_BATCH_SEMANTICS_VERSION,
             "batch_formula": "global_batch_size = per_gpu_batch_size * ddp_world_size",
             "grad_accum_removed": True,
-            "train_label_max_length": int(train.get("train_label_max_length", 64)),
+            "train_label_max_length": train_label_length,
             "lr": float(train.get("lr", task.get("lr", 1e-3))),
         }
     )
@@ -3105,7 +2960,7 @@ def _apply_step5_native_lora_row(row: dict[str, Any], step5_innovation_config: M
     row["lora_target_modules"] = list(native_lora.get("target_modules", []) or [])
     row["lora_target_policy_id"] = str(native_lora.get("target_policy_id") or _STEP5_LORA_TARGET_POLICY_ID)
     row["deleted_legacy_modules"] = list(_STEP5_DELETED_LEGACY_MODULES)
-    row["combined_formal_enabled"] = False
+    row["retired_combined_formal_enabled"] = False
     row["all_trainable_grad_required"] = True
 
 
@@ -3367,82 +3222,133 @@ def _resolve_step5_eval_config(
     train_per_gpu_batch_size: int,
 ) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step5.eval"), "step5.eval")
-    required = {
-        "valid_per_gpu_batch_size",
-        "valid_batch_size",
-        "valid_forward_micro_batch_size",
-        "test_per_gpu_batch_size",
-        "test_forward_micro_batch_size",
-        "metric_accumulation",
-        "validation_memory_policy",
-        "step5A_validation_mode",
-        "formal_entry_E4_validation_required",
-        "old_eval_batch_2048_retired",
-        "valid_loss_components",
-    }
-    _reject_unknown_keys(raw, required, "step5.eval")
-    missing = sorted(key for key in required if key not in raw)
-    if missing:
-        raise OneControlConfigError("step5.eval missing required One-Control keys: " + ", ".join(missing))
-    world_size = _positive_int(ddp_world_size, "hardware.ddp_world_size")
-    train_per_gpu = _positive_int(train_per_gpu_batch_size, "step5.train.per_gpu_batch_size")
-    valid_per_gpu = _positive_int(raw.get("valid_per_gpu_batch_size"), "step5.eval.valid_per_gpu_batch_size")
-    valid_global = _positive_int(raw.get("valid_batch_size"), "step5.eval.valid_batch_size")
-    valid_micro = _positive_int(raw.get("valid_forward_micro_batch_size"), "step5.eval.valid_forward_micro_batch_size")
-    test_per_gpu = _positive_int(raw.get("test_per_gpu_batch_size"), "step5.eval.test_per_gpu_batch_size")
-    test_micro = _positive_int(raw.get("test_forward_micro_batch_size"), "step5.eval.test_forward_micro_batch_size")
-    if valid_global != valid_per_gpu * world_size:
-        raise OneControlConfigError(
-            "step5.eval.valid_batch_size must equal valid_per_gpu_batch_size * ddp_world_size."
-        )
-    if valid_per_gpu > train_per_gpu:
-        raise OneControlConfigError(
-            "step5.eval.valid_per_gpu_batch_size must be <= step5.train.per_gpu_batch_size unless a future "
-            "explicit E4 oversize-proof path is added."
-        )
-    if valid_micro > valid_per_gpu:
-        raise OneControlConfigError("step5.eval.valid_forward_micro_batch_size must be <= valid_per_gpu_batch_size.")
-    if test_micro > test_per_gpu:
-        raise OneControlConfigError("step5.eval.test_forward_micro_batch_size must be <= test_per_gpu_batch_size.")
-    if str(raw.get("validation_memory_policy") or "").strip() != "microbatch_accumulate":
-        raise OneControlConfigError("step5.eval.validation_memory_policy must be microbatch_accumulate.")
-    if _bool(raw.get("metric_accumulation")) is not True:
-        raise OneControlConfigError("step5.eval.metric_accumulation must be true.")
-    if str(raw.get("step5A_validation_mode") or "").strip() != "scorer_only":
-        raise OneControlConfigError("step5.eval.step5A_validation_mode must be scorer_only.")
-    if _bool(raw.get("formal_entry_E4_validation_required")) is not True:
-        raise OneControlConfigError("step5.eval.formal_entry_E4_validation_required must be true.")
-    if _bool(raw.get("old_eval_batch_2048_retired")) is not True:
-        raise OneControlConfigError("step5.eval.old_eval_batch_2048_retired must be true.")
-    components_raw = raw.get("valid_loss_components")
-    if not isinstance(components_raw, Mapping):
-        raise OneControlConfigError("step5.eval.valid_loss_components must be a mapping.")
-    components: dict[str, list[str]] = {}
-    for head in ("step5A", "step5B"):
-        values = components_raw.get(head)
-        if not isinstance(values, list) or not values:
-            raise OneControlConfigError(f"step5.eval.valid_loss_components.{head} must be a non-empty list.")
-        components[head] = [str(item).strip() for item in values if str(item).strip()]
-        if not components[head]:
-            raise OneControlConfigError(f"step5.eval.valid_loss_components.{head} must contain non-empty names.")
-    if "explainer_ce" in set(components["step5A"]):
-        raise OneControlConfigError("Step5A valid_loss_components must not include explainer_ce.")
+    _reject_unknown_keys(
+        raw,
+        {
+            "valid_per_gpu_batch_size",
+            "valid_batch_size",
+            "valid_forward_micro_batch_size",
+            "test_per_gpu_batch_size",
+            "test_forward_micro_batch_size",
+            "metric_accumulation",
+            "validation_memory_policy",
+            "validation_mode",
+            "formal_entry_E4_validation_required",
+            "old_eval_batch_2048_retired",
+            "valid_loss_components",
+        },
+        "step5.eval",
+    )
+    valid_per_gpu = _rcr_int(raw.get("valid_per_gpu_batch_size"), "step5.eval.valid_per_gpu_batch_size", min_value=1)
+    valid_global = _rcr_int(raw.get("valid_batch_size"), "step5.eval.valid_batch_size", min_value=1)
+    valid_forward = _rcr_int(raw.get("valid_forward_micro_batch_size"), "step5.eval.valid_forward_micro_batch_size", min_value=1)
+    test_per_gpu = _rcr_int(raw.get("test_per_gpu_batch_size"), "step5.eval.test_per_gpu_batch_size", min_value=1)
+    test_forward = _rcr_int(raw.get("test_forward_micro_batch_size"), "step5.eval.test_forward_micro_batch_size", min_value=1)
+    if valid_global != valid_per_gpu * ddp_world_size:
+        raise OneControlConfigError("step5.eval.valid_batch_size must equal valid_per_gpu_batch_size * ddp_world_size")
+    if valid_forward > valid_per_gpu:
+        raise OneControlConfigError("step5.eval.valid_forward_micro_batch_size must be <= valid_per_gpu_batch_size")
+    if test_forward > test_per_gpu:
+        raise OneControlConfigError("step5.eval.test_forward_micro_batch_size must be <= test_per_gpu_batch_size")
+    if str(raw.get("validation_memory_policy") or "") != "microbatch_accumulate":
+        raise OneControlConfigError("step5.eval.validation_memory_policy must be microbatch_accumulate")
+    if str(raw.get("validation_mode") or "") != "explanation_only":
+        raise OneControlConfigError("step5.eval.validation_mode must be explanation_only")
+    components = _mapping(raw.get("valid_loss_components"), "step5.eval.valid_loss_components")
+    _reject_unknown_keys(components, {"explanation"}, "step5.eval.valid_loss_components")
+    explanation_components = list(components.get("explanation") or [])
+    if "scorer_rating_mse" in explanation_components:
+        raise OneControlConfigError("Step5 explanation validation must not include rating MSE")
     return {
         "valid_per_gpu_batch_size": valid_per_gpu,
-        "valid_global_batch_size": valid_global,
         "valid_batch_size": valid_global,
-        "valid_forward_micro_batch_size": valid_micro,
-        "valid_micro_batch_size": valid_micro,
+        "valid_global_batch_size": valid_global,
+        "valid_forward_micro_batch_size": valid_forward,
         "test_per_gpu_batch_size": test_per_gpu,
-        "test_forward_micro_batch_size": test_micro,
-        "metric_accumulation": True,
-        "validation_microbatch_accumulation": True,
+        "test_forward_micro_batch_size": test_forward,
+        "validation_microbatch_accumulation": _bool(raw.get("metric_accumulation")),
         "validation_memory_policy": "microbatch_accumulate",
-        "step5A_validation_mode": "scorer_only",
-        "formal_entry_E4_validation_required": True,
-        "old_eval_batch_2048_retired": True,
-        "valid_loss_components": components,
+        "step5_validation_mode": "explanation_only",
+        "formal_entry_E4_validation_required": _bool(raw.get("formal_entry_E4_validation_required")),
+        "old_eval_batch_2048_retired": _bool(raw.get("old_eval_batch_2048_retired")),
+        "valid_loss_components": {"explanation": explanation_components},
+        "valid_loss_components_json": json_dumps({"explanation": explanation_components}),
     }
+
+
+def _resolve_step5_valid_loss_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    raw = _mapping(_get(cfg, "step5.valid_loss"), "step5.valid_loss")
+    _reject_unknown_keys(raw, {"label_max_length"}, "step5.valid_loss")
+    label_max = _rcr_int(raw.get("label_max_length"), "step5.valid_loss.label_max_length", min_value=8)
+    if label_max > 512:
+        raise OneControlConfigError("step5.valid_loss.label_max_length must be <= 512")
+    return {
+        "schema_version": "odcr_step5_valid_loss_config/1",
+        "label_max_length": int(label_max),
+    }
+
+
+def _resolve_step5_final_eval_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    raw = _mapping(_get(cfg, "step5.final_eval"), "step5.final_eval")
+    _reject_unknown_keys(
+        raw,
+        {
+            "prediction_max_length",
+            "reference_max_length",
+            "official_profile",
+            "metric_input_builder",
+            "metrics_implementation",
+            "test_once",
+        },
+        "step5.final_eval",
+    )
+    pred_max = _rcr_int(raw.get("prediction_max_length"), "step5.final_eval.prediction_max_length", min_value=1)
+    ref_max = _rcr_int(raw.get("reference_max_length"), "step5.final_eval.reference_max_length", min_value=1)
+    if pred_max != 25 or ref_max != 25:
+        raise OneControlConfigError("Step5 official final eval requires prediction/reference max length 25")
+    profile = str(raw.get("official_profile") or "").strip()
+    if profile != "paper_greedy_25":
+        raise OneControlConfigError("step5.final_eval.official_profile must be paper_greedy_25")
+    if str(raw.get("metric_input_builder") or "") != "build_paper_metric_inputs":
+        raise OneControlConfigError("step5.final_eval.metric_input_builder must be build_paper_metric_inputs")
+    if str(raw.get("metrics_implementation") or "") != "official_paper_metrics":
+        raise OneControlConfigError("step5.final_eval.metrics_implementation must be official_paper_metrics")
+    return {
+        "schema_version": "odcr_step5_final_eval_config/1",
+        "prediction_max_length": int(pred_max),
+        "reference_max_length": int(ref_max),
+        "official_profile": profile,
+        "metric_input_builder": "build_paper_metric_inputs",
+        "metrics_implementation": "official_paper_metrics",
+        "test_once": _bool(raw.get("test_once", True)),
+    }
+
+
+def _step5_official_eval_batch_layout(
+    step5_eval_config: Mapping[str, Any],
+    *,
+    eval_split: str,
+    ddp_world_size: int,
+) -> tuple[int, int]:
+    split = str(eval_split or "valid").strip().lower()
+    if split == "test":
+        per_gpu = _rcr_int(
+            step5_eval_config.get("test_per_gpu_batch_size"),
+            "step5.eval.test_per_gpu_batch_size",
+            min_value=1,
+        )
+        return per_gpu * int(ddp_world_size), per_gpu
+    per_gpu = _rcr_int(
+        step5_eval_config.get("valid_per_gpu_batch_size"),
+        "step5.eval.valid_per_gpu_batch_size",
+        min_value=1,
+    )
+    global_batch = _rcr_int(
+        step5_eval_config.get("valid_global_batch_size", step5_eval_config.get("valid_batch_size")),
+        "step5.eval.valid_batch_size",
+        min_value=1,
+    )
+    return global_batch, per_gpu
 
 
 def _resolve_step5_prompt_templates_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
@@ -3455,36 +3361,38 @@ def _resolve_step5_prompt_templates_config(cfg: Mapping[str, Any]) -> dict[str, 
             "train_policy",
             "valid_test_policy",
             "input_formatting_only",
-            "score_only_step5A",
-            "explanation_only_step5B",
-            "step5A_active_templates",
-            "step5A_retired_templates",
+            "explanation_only",
+            "active_templates",
         },
         "step5.prompt_templates",
     )
     if str(raw.get("schema_version") or "") != "odcr_step5_prompt_template_registry/1":
         raise OneControlConfigError("step5.prompt_templates.schema_version must be odcr_step5_prompt_template_registry/1")
-    if _rcr_int(raw.get("allowed_template_count"), "step5.prompt_templates.allowed_template_count", min_value=1) != 4:
-        raise OneControlConfigError("step5.prompt_templates.allowed_template_count must be 4")
+    if _rcr_int(raw.get("allowed_template_count"), "step5.prompt_templates.allowed_template_count", min_value=1) != 3:
+        raise OneControlConfigError("step5.prompt_templates.allowed_template_count must be 3")
     if str(raw.get("train_policy") or "") != "controlled_canonical_deterministic":
         raise OneControlConfigError("step5.prompt_templates.train_policy must be controlled_canonical_deterministic")
     if str(raw.get("valid_test_policy") or "") != "fixed_canonical":
         raise OneControlConfigError("step5.prompt_templates.valid_test_policy must be fixed_canonical")
-    for key in ("input_formatting_only", "score_only_step5A", "explanation_only_step5B"):
-        if _bool(raw.get(key)) is not True:
-            raise OneControlConfigError(f"step5.prompt_templates.{key} must be true")
+    if _bool(raw.get("input_formatting_only")) is not True or _bool(raw.get("explanation_only")) is not True:
+        raise OneControlConfigError("step5.prompt_templates must be formatting-only and explanation-only")
+    templates = [str(item) for item in (raw.get("active_templates") or [])]
+    required = {
+        "Step5_target_anchor_explainer_v1",
+        "Step5_aux_gold_explainer_v1",
+        "Step5_aux_cf_explainer_v1",
+    }
+    if set(templates) != required:
+        raise OneControlConfigError("step5.prompt_templates.active_templates must name the three Step5 explanation templates")
     return {
         "schema_version": "odcr_step5_prompt_template_registry/1",
-        "allowed_template_count": 4,
+        "allowed_template_count": 3,
         "train_policy": "controlled_canonical_deterministic",
         "valid_test_policy": "fixed_canonical",
         "input_formatting_only": True,
-        "score_only_step5A": True,
-        "explanation_only_step5B": True,
-        "step5A_active_templates": list(raw.get("step5A_active_templates") or ["A_target_gold_scorer_v1"]),
-        "step5A_retired_templates": list(raw.get("step5A_retired_templates") or ["A_aux_gold_scorer_v1", "A_aux_cf_scorer_v1"]),
+        "explanation_only": True,
+        "active_templates": templates,
     }
-
 
 def _resolve_step5_effective_epoch_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step5.effective_epoch"), "step5.effective_epoch")
@@ -3581,11 +3489,7 @@ def _resolve_step5_tuning_config(
         },
         "step5.tuning",
     )
-    batch_ids = {
-        str(item.get("id"))
-        for item in batch_candidates_config.get("candidates", [])
-        if isinstance(item, Mapping)
-    }
+    batch_ids = {str(item.get("id")) for item in batch_candidates_config.get("candidates", []) if isinstance(item, Mapping)}
     batch_candidate = str(raw.get("batch_candidate") or "").strip()
     fallback_batch_candidate = str(raw.get("fallback_batch_candidate") or "").strip()
     for key, value in (("batch_candidate", batch_candidate), ("fallback_batch_candidate", fallback_batch_candidate)):
@@ -3596,154 +3500,100 @@ def _resolve_step5_tuning_config(
         raise OneControlConfigError("step5.tuning.selected_budget_candidate must be small, medium, full, or large")
     selected_tuning_candidate = str(raw.get("selected_tuning_candidate") or "").strip()
     fallback_tuning_candidate = str(raw.get("fallback_tuning_candidate") or "").strip()
-    if not selected_tuning_candidate:
-        raise OneControlConfigError("step5.tuning.selected_tuning_candidate must be configured")
-    if not fallback_tuning_candidate:
-        raise OneControlConfigError("step5.tuning.fallback_tuning_candidate must be configured")
+    if not selected_tuning_candidate or not fallback_tuning_candidate:
+        raise OneControlConfigError("step5.tuning selected and fallback candidates must be configured")
 
-    def _head_positive_int_map(key: str) -> dict[str, int]:
+    def _single_positive_int_map(key: str) -> dict[str, int]:
         values = _mapping(raw.get(key), f"step5.tuning.{key}")
-        _reject_unknown_keys(values, {"step5A", "step5B"}, f"step5.tuning.{key}")
-        out: dict[str, int] = {}
-        for head in ("step5A", "step5B"):
-            if head not in values:
-                raise OneControlConfigError(f"step5.tuning.{key}.{head} must be configured")
-            out[head] = _rcr_int(values.get(head), f"step5.tuning.{key}.{head}", min_value=1)
-        return out
+        _reject_unknown_keys(values, {"explanation"}, f"step5.tuning.{key}")
+        return {"explanation": _rcr_int(values.get("explanation"), f"step5.tuning.{key}.explanation", min_value=1)}
 
     def _fraction_list(key: str) -> list[float]:
         values = raw.get(key)
         if not isinstance(values, list) or not values:
             raise OneControlConfigError(f"step5.tuning.{key} must be a non-empty list")
-        return [
-            _rcr_float(value, f"step5.tuning.{key}", min_value=0.0, max_value=1.0)
-            for value in values
-        ]
+        return [_rcr_float(value, f"step5.tuning.{key}", min_value=0.0, max_value=1.0) for value in values]
 
-    lr_values = raw.get("lr_candidates")
-    if not isinstance(lr_values, list) or not lr_values:
-        raise OneControlConfigError("step5.tuning.lr_candidates must be a non-empty list")
-    lr_candidates = [_rcr_float(value, "step5.tuning.lr_candidates", min_value=0.0) for value in lr_values]
-
-    def _candidate_id_list(key: str, required: set[str]) -> list[dict[str, Any]]:
-        values = raw.get(key)
-        if not isinstance(values, list) or not values:
-            raise OneControlConfigError(f"step5.tuning.{key} must be a non-empty list")
+    def _ratio_candidates() -> list[dict[str, Any]]:
+        values = _mapping(_mapping(raw.get("ratio_candidates"), "step5.tuning.ratio_candidates").get("explanation"), "step5.tuning.ratio_candidates.explanation")
         out: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for idx, item in enumerate(values):
-            if not isinstance(item, Mapping):
-                raise OneControlConfigError(f"step5.tuning.{key}[{idx}] must be a mapping")
-            _reject_unknown_keys(item, required | {"id"}, f"step5.tuning.{key}[{idx}]")
-            cid = str(item.get("id") or "").strip()
-            if not cid or cid in seen:
-                raise OneControlConfigError(f"step5.tuning.{key}[{idx}].id must be unique and non-empty")
-            seen.add(cid)
-            row = {"id": cid}
-            for field in sorted(required):
-                row[field] = _rcr_float(item.get(field), f"step5.tuning.{key}.{cid}.{field}", min_value=0.0, max_value=1.0)
-            out.append(row)
-        return out
-
-    def _ratio_candidates(head: str, bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]) -> list[dict[str, Any]]:
-        values = _mapping(_mapping(raw.get("ratio_candidates"), "step5.tuning.ratio_candidates").get(head), f"step5.tuning.ratio_candidates.{head}")
-        out: list[dict[str, Any]] = []
-        seen: set[str] = set()
         for cid, item in values.items():
             if not isinstance(item, Mapping):
-                raise OneControlConfigError(f"step5.tuning.ratio_candidates.{head}.{cid} must be a mapping")
-            _reject_unknown_keys(item, {"target_gold", "aux_gold", "cf"}, f"step5.tuning.ratio_candidates.{head}.{cid}")
-            cid_s = str(cid)
-            if cid_s in seen:
-                raise OneControlConfigError(f"duplicate step5.tuning.ratio_candidates.{head} id: {cid_s}")
-            seen.add(cid_s)
-            tg = _rcr_float(item.get("target_gold"), f"step5.tuning.ratio_candidates.{head}.{cid_s}.target_gold", min_value=bounds[0][0], max_value=bounds[0][1])
-            ag = _rcr_float(item.get("aux_gold"), f"step5.tuning.ratio_candidates.{head}.{cid_s}.aux_gold", min_value=bounds[1][0], max_value=bounds[1][1])
-            cf = _rcr_float(item.get("cf"), f"step5.tuning.ratio_candidates.{head}.{cid_s}.cf", min_value=bounds[2][0], max_value=bounds[2][1])
+                raise OneControlConfigError(f"step5.tuning.ratio_candidates.explanation.{cid} must be a mapping")
+            _reject_unknown_keys(item, {"target_gold", "aux_gold", "cf"}, f"step5.tuning.ratio_candidates.explanation.{cid}")
+            tg = _rcr_float(item.get("target_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.target_gold", min_value=0.30, max_value=0.45)
+            ag = _rcr_float(item.get("aux_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.aux_gold", min_value=0.10, max_value=0.25)
+            cf = _rcr_float(item.get("cf"), f"step5.tuning.ratio_candidates.explanation.{cid}.cf", min_value=0.34, max_value=0.50)
             if abs((tg + ag + cf) - 1.0) > 1e-6:
-                raise OneControlConfigError(f"step5.tuning.ratio_candidates.{head}.{cid_s} ratios must sum to 1.0")
-            out.append({"id": cid_s, "target_gold": tg, "aux_gold": ag, "cf": cf})
+                raise OneControlConfigError(f"step5.tuning.ratio_candidates.explanation.{cid} ratios must sum to 1.0")
+            out.append({"id": str(cid), "target_gold": tg, "aux_gold": ag, "cf": cf})
         if not out:
-            raise OneControlConfigError(f"step5.tuning.ratio_candidates.{head} must not be empty")
+            raise OneControlConfigError("step5.tuning.ratio_candidates.explanation must not be empty")
         return out
 
-    def _mix_group(group_key: str, heads: tuple[str, ...], fields: set[str]) -> dict[str, list[dict[str, Any]]]:
-        group = _mapping(raw.get(group_key), f"step5.tuning.{group_key}")
-        out: dict[str, list[dict[str, Any]]] = {}
-        for head in heads:
-            values = _mapping(group.get(head), f"step5.tuning.{group_key}.{head}")
-            head_rows: list[dict[str, Any]] = []
-            for cid, item in values.items():
-                if not isinstance(item, Mapping):
-                    raise OneControlConfigError(f"step5.tuning.{group_key}.{head}.{cid} must be a mapping")
-                _reject_unknown_keys(item, fields, f"step5.tuning.{group_key}.{head}.{cid}")
-                row = {"id": str(cid)}
-                total = 0.0
-                for field in sorted(fields):
-                    value = _rcr_float(item.get(field), f"step5.tuning.{group_key}.{head}.{cid}.{field}", min_value=0.0, max_value=1.0)
-                    row[field] = value
-                    total += value
-                if abs(total - 1.0) > 1e-6:
-                    raise OneControlConfigError(f"step5.tuning.{group_key}.{head}.{cid} values must sum to 1.0")
-                head_rows.append(row)
-            if not head_rows:
-                raise OneControlConfigError(f"step5.tuning.{group_key}.{head} must not be empty")
-            out[head] = head_rows
-        return out
+    def _mix_candidates(group_key: str, fields: set[str], subkey: str = "explanation") -> list[dict[str, Any]]:
+        values = _mapping(_mapping(raw.get(group_key), f"step5.tuning.{group_key}").get(subkey), f"step5.tuning.{group_key}.{subkey}")
+        rows: list[dict[str, Any]] = []
+        for cid, item in values.items():
+            if not isinstance(item, Mapping):
+                raise OneControlConfigError(f"step5.tuning.{group_key}.{subkey}.{cid} must be a mapping")
+            _reject_unknown_keys(item, fields, f"step5.tuning.{group_key}.{subkey}.{cid}")
+            row = {"id": str(cid)}
+            total = 0.0
+            for field in sorted(fields):
+                value = _rcr_float(item.get(field), f"step5.tuning.{group_key}.{subkey}.{cid}.{field}", min_value=0.0, max_value=1.0)
+                row[field] = value
+                total += value
+            if abs(total - 1.0) > 1e-6:
+                raise OneControlConfigError(f"step5.tuning.{group_key}.{subkey}.{cid} values must sum to 1.0")
+            rows.append(row)
+        if not rows:
+            raise OneControlConfigError(f"step5.tuning.{group_key}.{subkey} must not be empty")
+        return rows
 
     innovation = raw.get("innovation_weight_candidates")
     if not isinstance(innovation, list) or not innovation:
         raise OneControlConfigError("step5.tuning.innovation_weight_candidates must be a non-empty list")
     innovation_out: list[dict[str, Any]] = []
-    seen_innov: set[str] = set()
+    seen: set[str] = set()
     for idx, item in enumerate(innovation):
         if not isinstance(item, Mapping):
             raise OneControlConfigError(f"step5.tuning.innovation_weight_candidates[{idx}] must be a mapping")
-        _reject_unknown_keys(
-            item,
-            {"id", "lci", "fca", "explainer_loss_weight", "ccv_numeric_control_weight"},
-            f"step5.tuning.innovation_weight_candidates[{idx}]",
-        )
+        _reject_unknown_keys(item, {"id", "fca", "explainer_loss_weight", "ccv_numeric_control_weight"}, f"step5.tuning.innovation_weight_candidates[{idx}]")
         cid = str(item.get("id") or "").strip()
-        if not cid or cid in seen_innov:
+        if not cid or cid in seen:
             raise OneControlConfigError("step5.tuning.innovation_weight_candidates ids must be unique and non-empty")
-        seen_innov.add(cid)
-        innovation_out.append(
-            {
-                "id": cid,
-                "lci": _rcr_float(item.get("lci"), f"step5.tuning.innovation_weight_candidates.{cid}.lci", min_value=0.0),
-                "fca": _rcr_float(item.get("fca"), f"step5.tuning.innovation_weight_candidates.{cid}.fca", min_value=0.0),
-                "explainer_loss_weight": _rcr_float(item.get("explainer_loss_weight"), f"step5.tuning.innovation_weight_candidates.{cid}.explainer_loss_weight", min_value=0.0),
-                "ccv_numeric_control_weight": _rcr_float(item.get("ccv_numeric_control_weight"), f"step5.tuning.innovation_weight_candidates.{cid}.ccv_numeric_control_weight", min_value=0.0),
-            }
-        )
+        seen.add(cid)
+        innovation_out.append({
+            "id": cid,
+            "fca": _rcr_float(item.get("fca"), f"step5.tuning.innovation_weight_candidates.{cid}.fca", min_value=0.0),
+            "explainer_loss_weight": _rcr_float(item.get("explainer_loss_weight"), f"step5.tuning.innovation_weight_candidates.{cid}.explainer_loss_weight", min_value=0.0),
+            "ccv_numeric_control_weight": _rcr_float(item.get("ccv_numeric_control_weight"), f"step5.tuning.innovation_weight_candidates.{cid}.ccv_numeric_control_weight", min_value=0.0),
+        })
 
     strategy = _mapping(raw.get("search_strategy"), "step5.tuning.search_strategy")
-    _reject_unknown_keys(
-        strategy,
-        {"stage_a_fraction", "stage_b_fraction", "extended_primary_fraction", "extended_backup_fraction"},
-        "step5.tuning.search_strategy",
-    )
+    _reject_unknown_keys(strategy, {"stage_a_fraction", "stage_b_fraction", "extended_primary_fraction", "extended_backup_fraction"}, "step5.tuning.search_strategy")
+    lr_values = raw.get("lr_candidates")
+    if not isinstance(lr_values, list) or not lr_values:
+        raise OneControlConfigError("step5.tuning.lr_candidates must be a non-empty list")
     return {
         "enabled": _bool(raw.get("enabled")),
         "selected_tuning_candidate": selected_tuning_candidate,
         "fallback_tuning_candidate": fallback_tuning_candidate,
-        "effective_samples": _head_positive_int_map("effective_samples"),
-        "optimizer_steps": _head_positive_int_map("optimizer_steps"),
+        "effective_samples": _single_positive_int_map("effective_samples"),
+        "optimizer_steps": _single_positive_int_map("optimizer_steps"),
         "batch_candidate": batch_candidate,
         "fallback_batch_candidate": fallback_batch_candidate,
         "selected_budget_candidate": selected_budget,
         "pilot_fraction_candidates": _fraction_list("pilot_fraction_candidates"),
-        "lr_candidates": lr_candidates,
+        "lr_candidates": [_rcr_float(value, "step5.tuning.lr_candidates", min_value=0.0) for value in lr_values],
         "warmup_fraction_candidates": _fraction_list("warmup_fraction_candidates"),
         "innovation_weight_candidates": innovation_out,
-        "ratio_candidates": {
-            "step5A": _ratio_candidates("step5A", ((1.0, 1.0), (0.0, 0.0), (0.0, 0.0))),
-            "step5B": _ratio_candidates("step5B", ((0.30, 0.45), (0.10, 0.25), (0.34, 0.50))),
-        },
-        "cf_tier_mix_candidates": _mix_group("cf_tier_mix_candidates", ("step5A", "step5B"), {"high", "medium", "low_weighted"}),
+        "ratio_candidates": {"explanation": _ratio_candidates()},
+        "cf_tier_mix_candidates": {"explanation": _mix_candidates("cf_tier_mix_candidates", {"high", "medium", "low_weighted"})},
         "gold_tier_mix_candidates": {
-            **_mix_group("gold_tier_mix_candidates", ("target_gold", "aux_gold"), {"high", "medium"}),
+            "target_gold": _mix_candidates("gold_tier_mix_candidates", {"high", "medium"}, "target_gold"),
+            "aux_gold": _mix_candidates("gold_tier_mix_candidates", {"high", "medium"}, "aux_gold"),
         },
         "search_strategy": {
             "stage_a_fraction": _rcr_float(strategy.get("stage_a_fraction"), "step5.tuning.search_strategy.stage_a_fraction", min_value=0.0, max_value=1.0),
@@ -3758,10 +3608,8 @@ def _step5_candidate_tokens(candidate: str) -> dict[str, str]:
     tokens = {str(part).strip() for part in str(candidate or "").split("+") if str(part).strip()}
     out: dict[str, str] = {}
     for prefixes, key, label in (
-        (("A_RATIO_", "A_TARGET_ONLY"), "step5A_ratio", "A_RATIO_/A_TARGET_ONLY"),
-        (("B_RATIO_",), "step5B_ratio", "B_RATIO_"),
-        (("A_CF_MIX_", "A_NO_CF"), "step5A_cf_mix", "A_CF_MIX_/A_NO_CF"),
-        (("B_CF_MIX_",), "step5B_cf_mix", "B_CF_MIX_"),
+        (("STEP5_RATIO_",), "ratio", "STEP5_RATIO_"),
+        (("STEP5_CF_MIX_",), "cf_mix", "STEP5_CF_MIX_"),
         (("TG_MIX_",), "target_gold_mix", "TG_MIX_"),
         (("AG_MIX_",), "aux_gold_mix", "AG_MIX_"),
         (("LR_",), "lr", "LR_"),
@@ -3785,41 +3633,12 @@ def _candidate_row_by_id(rows: Any, wanted: str, label: str) -> Mapping[str, Any
     raise OneControlConfigError(f"selected Step5 candidate id {wanted!r} missing from {label}")
 
 
-def _assert_step5_cf_mix_candidate_semantics(tuning_config: Mapping[str, Any]) -> None:
-    cf_candidates = tuning_config.get("cf_tier_mix_candidates") if isinstance(tuning_config.get("cf_tier_mix_candidates"), Mapping) else {}
-    for (head, cid), expected in _STEP5_HISTORICAL_CF_MIX_SEMANTICS.items():
-        row = _candidate_row_by_id((cf_candidates or {}).get(head), cid, f"step5.tuning.cf_tier_mix_candidates.{head}")
-        _assert_close_mapping(
-            row,
-            expected,
-            fields=("high", "medium", "low_weighted"),
-            label=f"step5.tuning.cf_tier_mix_candidates.{head}.{cid}",
-        )
-    for head, cid in _STEP5_FORMAL_CF_MIX_IDS.items():
-        _candidate_row_by_id((cf_candidates or {}).get(head), cid, f"step5.tuning.cf_tier_mix_candidates.{head}")
-
-
-def _assert_step5_formal_mainline_candidate_ids(tokens: Mapping[str, str]) -> None:
-    if tokens.get("step5A_cf_mix") != _STEP5_FORMAL_CF_MIX_IDS["step5A"]:
-        raise OneControlConfigError(
-            "Step5A scorer-clean formal mainline requires the no-CF Step5A mix id; "
-            f"use {_STEP5_FORMAL_CF_MIX_IDS['step5A']} as the selected Step5A CF mix id."
-        )
-    if tokens.get("step5B_cf_mix") != _STEP5_FORMAL_CF_MIX_IDS["step5B"]:
-        raise OneControlConfigError(
-            "B_CF_MIX_1 is retired from the Step5B formal mainline; "
-            f"use {_STEP5_FORMAL_CF_MIX_IDS['step5B']} as the selected Step5B CF mix id."
-        )
-
-
 def _assert_close_mapping(actual: Mapping[str, Any], expected: Mapping[str, Any], *, fields: tuple[str, ...], label: str) -> None:
     for field in fields:
         a = _rcr_float(actual.get(field), f"{label}.{field}", min_value=0.0)
         e = _rcr_float(expected.get(field), f"{label}.selected.{field}", min_value=0.0)
         if abs(a - e) > 1e-6:
-            raise OneControlConfigError(
-                f"{label}.{field}={a} does not match selected Step5 tuning candidate value {e}"
-            )
+            raise OneControlConfigError(f"{label}.{field}={a} does not match selected Step5 tuning candidate value {e}")
 
 
 def _assert_step5_selected_candidate_consistency(
@@ -3830,55 +3649,44 @@ def _assert_step5_selected_candidate_consistency(
     innovation_config: Mapping[str, Any],
 ) -> None:
     tokens = _step5_candidate_tokens(str(tuning_config.get("selected_tuning_candidate") or ""))
-    _assert_step5_cf_mix_candidate_semantics(tuning_config)
-    _assert_step5_formal_mainline_candidate_ids(tokens)
-    ratio_candidates = tuning_config.get("ratio_candidates") if isinstance(tuning_config.get("ratio_candidates"), Mapping) else {}
-    cf_candidates = tuning_config.get("cf_tier_mix_candidates") if isinstance(tuning_config.get("cf_tier_mix_candidates"), Mapping) else {}
-    gold_candidates = tuning_config.get("gold_tier_mix_candidates") if isinstance(tuning_config.get("gold_tier_mix_candidates"), Mapping) else {}
-    for head, ratio_key, cf_key in (
-        ("step5A", "step5A_ratio", "step5A_cf_mix"),
-        ("step5B", "step5B_ratio", "step5B_cf_mix"),
-    ):
-        head_cfg = _mapping(sampler_config.get(head), f"step5.sampler.{head}")
-        ratio = _candidate_row_by_id((ratio_candidates or {}).get(head), tokens[ratio_key], f"step5.tuning.ratio_candidates.{head}")
-        actual_ratio = {
-            "target_gold": head_cfg.get("target_gold_ratio"),
-            "aux_gold": head_cfg.get("aux_gold_ratio"),
-            "cf": head_cfg.get("cf_ratio"),
-        }
-        _assert_close_mapping(actual_ratio, ratio, fields=("target_gold", "aux_gold", "cf"), label=f"step5.sampler.{head}")
-        cf_mix = _candidate_row_by_id((cf_candidates or {}).get(head), tokens[cf_key], f"step5.tuning.cf_tier_mix_candidates.{head}")
-        _assert_close_mapping(
-            _mapping(head_cfg.get("cf_tier_mix"), f"step5.sampler.{head}.cf_tier_mix"),
-            cf_mix,
-            fields=("high", "medium", "low_weighted"),
-            label=f"step5.sampler.{head}.cf_tier_mix",
-        )
-    target_mix = _candidate_row_by_id((gold_candidates or {}).get("target_gold"), tokens["target_gold_mix"], "step5.tuning.gold_tier_mix_candidates.target_gold")
-    aux_mix = _candidate_row_by_id((gold_candidates or {}).get("aux_gold"), tokens["aux_gold_mix"], "step5.tuning.gold_tier_mix_candidates.aux_gold")
-    for head in ("step5A", "step5B"):
-        head_cfg = _mapping(sampler_config.get(head), f"step5.sampler.{head}")
-        _assert_close_mapping(
-            _mapping(head_cfg.get("target_gold_tier_mix"), f"step5.sampler.{head}.target_gold_tier_mix"),
-            target_mix,
-            fields=("high", "medium"),
-            label=f"step5.sampler.{head}.target_gold_tier_mix",
-        )
-        _assert_close_mapping(
-            _mapping(head_cfg.get("aux_gold_tier_mix"), f"step5.sampler.{head}.aux_gold_tier_mix"),
-            aux_mix,
-            fields=("high", "medium"),
-            label=f"step5.sampler.{head}.aux_gold_tier_mix",
-        )
+    if tokens.get("ratio") != _STEP5_FORMAL_RATIO_ID:
+        raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_RATIO_ID}")
+    if tokens.get("cf_mix") != _STEP5_FORMAL_CF_MIX_ID:
+        raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_CF_MIX_ID}")
+    explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
+    ratio = _candidate_row_by_id(
+        (tuning_config.get("ratio_candidates") or {}).get("explanation"),
+        tokens["ratio"],
+        "step5.tuning.ratio_candidates.explanation",
+    )
+    _assert_close_mapping(
+        {
+            "target_gold": explanation_cfg.get("target_gold_ratio"),
+            "aux_gold": explanation_cfg.get("aux_gold_ratio"),
+            "cf": explanation_cfg.get("cf_ratio"),
+        },
+        ratio,
+        fields=("target_gold", "aux_gold", "cf"),
+        label="step5.sampler.explanation",
+    )
+    cf_mix = _candidate_row_by_id(
+        (tuning_config.get("cf_tier_mix_candidates") or {}).get("explanation"),
+        tokens["cf_mix"],
+        "step5.tuning.cf_tier_mix_candidates.explanation",
+    )
+    _assert_close_mapping(
+        _mapping(explanation_cfg.get("cf_tier_mix"), "step5.sampler.explanation.cf_tier_mix"),
+        cf_mix,
+        fields=("high", "medium", "low_weighted"),
+        label="step5.sampler.explanation.cf_tier_mix",
+    )
     selected_lr = float(str(tokens["lr"])[len("LR_") :])
     if abs(float(row.get("lr")) - selected_lr) > 1e-12:
         raise OneControlConfigError(f"step5.train.lr={row.get('lr')} does not match selected candidate {tokens['lr']}")
     weights = _candidate_row_by_id(tuning_config.get("innovation_weight_candidates"), tokens["weight"], "step5.tuning.innovation_weight_candidates")
-    lci = _mapping(innovation_config.get("lci"), "step5.lci")
     fca = _mapping(innovation_config.get("fca"), "step5.fca")
     ccv = _mapping(innovation_config.get("ccv"), "step5.ccv")
     checks = (
-        ("step5.lci.weight", lci.get("weight"), weights.get("lci")),
         ("step5.fca.weight", fca.get("weight"), weights.get("fca")),
         ("step5.train.explainer_loss_weight", row.get("explainer_loss_weight"), weights.get("explainer_loss_weight")),
         ("step5.ccv.numeric_control_weight", ccv.get("numeric_control_weight"), weights.get("ccv_numeric_control_weight")),
@@ -3895,31 +3703,23 @@ def _step5_formal_active_candidate_payload(
     row: Mapping[str, Any],
 ) -> dict[str, Any]:
     tokens = _step5_candidate_tokens(str(tuning_config.get("selected_tuning_candidate") or ""))
-    step5a_cfg = _mapping(sampler_config.get("step5A"), "step5.sampler.step5A")
-    step5b_cfg = _mapping(sampler_config.get("step5B"), "step5.sampler.step5B")
-    step5a_mix = dict(_mapping(step5a_cfg.get("cf_tier_mix"), "step5.sampler.step5A.cf_tier_mix"))
-    step5b_mix = dict(_mapping(step5b_cfg.get("cf_tier_mix"), "step5.sampler.step5B.cf_tier_mix"))
-    low_weighted_disabled = (
-        float(step5a_mix.get("low_weighted") or 0.0) == 0.0
-        and float(step5b_mix.get("low_weighted") or 0.0) == 0.0
-    )
+    explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
+    explanation_mix = dict(_mapping(explanation_cfg.get("cf_tier_mix"), "step5.sampler.explanation.cf_tier_mix"))
+    low_weighted_disabled = float(explanation_mix.get("low_weighted") or 0.0) == 0.0
     return {
-        "schema_version": "odcr_step5_formal_active_candidate/1",
+        "schema_version": "odcr_step5_formal_active_candidate/2",
+        "mode": "explanation_only",
         "selected_tuning_candidate": str(tuning_config.get("selected_tuning_candidate") or ""),
         "candidate_parts": {
-            "step5A_ratio_id": tokens["step5A_ratio"],
-            "step5B_ratio_id": tokens["step5B_ratio"],
-            "step5A_cf_mix_id": tokens["step5A_cf_mix"],
-            "step5B_cf_mix_id": tokens["step5B_cf_mix"],
+            "ratio_id": tokens["ratio"],
+            "cf_mix_id": tokens["cf_mix"],
             "target_gold_mix_id": tokens["target_gold_mix"],
             "aux_gold_mix_id": tokens["aux_gold_mix"],
             "lr_id": tokens["lr"],
             "weights_id": tokens["weight"],
         },
-        "step5A_cf_mix_id": tokens["step5A_cf_mix"],
-        "step5A_cf_mix": step5a_mix,
-        "step5B_cf_mix_id": tokens["step5B_cf_mix"],
-        "step5B_cf_mix": step5b_mix,
+        "explanation_cf_mix_id": tokens["cf_mix"],
+        "explanation_cf_mix": explanation_mix,
         "lr": float(row.get("lr") or 0.0),
         "weights_id": tokens["weight"],
         "batch_candidate": str(tuning_config.get("batch_candidate") or ""),
@@ -3932,7 +3732,6 @@ def _step5_formal_active_candidate_payload(
         "active_sampler_source": "configs/odcr.yaml:step5.sampler + configs/odcr.yaml:step5.tuning.selected_tuning_candidate",
         "ai_analysis_runtime_config_source": "evidence_only_not_runtime_config",
     }
-
 
 def _resolve_step5_memory_truth_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step5.memory_truth"), "step5.memory_truth")
@@ -4063,7 +3862,7 @@ def resolve_config(
     direction = str(task.get("direction") or "unspecified")
 
     stage_for_train = "step5" if command == "eval" else command
-    step5_head_norm = run_naming.parse_step5_head(step5_head if command == "step5" else "combined")
+    step5_head_norm = run_naming.parse_step5_head(step5_head if command == "step5" else "explanation")
     stage_cfg = _get(cfg, stage_for_train, {})
     if not isinstance(stage_cfg, Mapping):
         stage_cfg = {}
@@ -4100,8 +3899,8 @@ def resolve_config(
         requested_phase = str(mode or "").strip()
         if not requested_phase:
             requested_phase = str(step5_lifecycle_config.get("formal_default_phase") or "train_only")
-        if requested_phase not in {"train_only", "eval_only", "full"}:
-            raise OneControlConfigError("Step5 lifecycle mode must be train_only, eval_only, or full")
+        if requested_phase not in {"train_only", "full"}:
+            raise OneControlConfigError("Step5 lifecycle mode must be train_only or full")
         step5_lifecycle_phase = requested_phase
         step5_train_only_resolved = requested_phase == "train_only"
         step5_allow_embedded_final_eval = (
@@ -4123,6 +3922,10 @@ def resolve_config(
     need_eval = command in ("step4", "step5", "eval")
     if need_eval:
         eval_profile_name, eval_profile_obj = _resolve_eval_profile(cfg, eval_profile)
+    eval_cfg_top = _get(cfg, "eval", {})
+    eval_split = str((eval_cfg_top.get("split") if isinstance(eval_cfg_top, Mapping) else None) or "valid").strip().lower()
+    if eval_split not in {"valid", "test"}:
+        raise OneControlConfigError("eval.split must be either valid or test")
     hw_name_from_profile = eval_profile_obj.get("hardware") if eval_profile_obj else None
     hw_name, hw = _active_hardware(cfg, str(hw_name_from_profile) if hw_name_from_profile else None)
     ddp_world_size = _positive_int(hw.get("ddp_world_size", 1), "hardware.ddp_world_size")
@@ -4224,6 +4027,24 @@ def resolve_config(
     need_rerank = command == "eval" and bool(eval_profile_obj.get("rerank"))
     rerank_name = str(eval_profile_obj.get("rerank")) if eval_profile_obj.get("rerank") else None
     rerank_id, rerank = _resolve_rerank(cfg, rerank_name, need_rerank=need_rerank)
+    if stage_for_train == "step5" and command == "eval":
+        if eval_profile_name != "paper_greedy_25":
+            raise OneControlConfigError(
+                "Step5 official eval requires eval profile paper_greedy_25; "
+                f"{eval_profile_name!r} is diagnostic_only and cannot write official paper metrics."
+            )
+        if not bool(eval_profile_obj.get("official", False)):
+            raise OneControlConfigError("eval.profiles.paper_greedy_25 must declare official: true")
+        if str(decode_id) != "paper_greedy_25":
+            raise OneControlConfigError("Step5 official eval requires eval.decode.paper_greedy_25")
+        if bool(eval_profile_obj.get("rerank")):
+            raise OneControlConfigError("Step5 official paper_greedy_25 eval forbids rerank")
+        if str(decode.get("decode_strategy", "")).strip().lower() != "greedy":
+            raise OneControlConfigError("Step5 official paper_greedy_25 decode_strategy must be greedy")
+        if int(decode.get("max_explanation_length", 0)) != 25 or int(decode.get("hard_max_len", 0)) != 25:
+            raise OneControlConfigError("Step5 official paper_greedy_25 max/hard length must be 25")
+        if abs(float(decode.get("repetition_penalty", 1.0)) - 1.0) > 1e-12:
+            raise OneControlConfigError("Step5 official paper_greedy_25 repetition_penalty must be 1.0")
 
     iteration_id = "v1"
     run_name: str | None = None
@@ -4276,80 +4097,7 @@ def resolve_config(
         step3_checkpoint_dir = str(_stage_root(repo_root, tid, "step3", from_run))
     elif command == "step5":
         if step5_lifecycle_phase == "eval_only":
-            if step5_head_norm != "step5A":
-                raise OneControlConfigError("Step5 --eval-only is currently a Step5A rating handoff entrypoint; Step5B must fail closed.")
-            if not str(from_step5 or "").strip():
-                raise OneControlConfigError("Step5 --eval-only requires --from-step5-run")
-            try:
-                step5_run = run_naming.parse_step5_run_id(
-                    str(from_step5),
-                    head=step5_head_norm,
-                    require_head_suffix=True,
-                )
-            except ValueError as exc:
-                raise OneControlConfigError(str(exc)) from exc
-            run_root = _stage_root(repo_root, tid, "step5", step5_run)
-            if not run_root.is_dir():
-                raise OneControlConfigError(f"Step5 eval-only source run missing: {run_root}")
-            run_summary_path = run_root / "meta" / "run_summary.json"
-            stage_status_path = run_root / "meta" / "stage_status.json"
-            try:
-                run_summary = json.loads(run_summary_path.read_text(encoding="utf-8")) if run_summary_path.is_file() else {}
-                stage_status = json.loads(stage_status_path.read_text(encoding="utf-8")) if stage_status_path.is_file() else {}
-            except json.JSONDecodeError as exc:
-                raise OneControlConfigError(f"Step5 eval-only source metadata is invalid JSON: {exc}") from exc
-            existing_head = str(
-                stage_status.get("step5_head")
-                or stage_status.get("head")
-                or run_summary.get("step5_head")
-                or run_naming.step5_head_from_run_id(step5_run)
-            )
-            if existing_head != step5_head_norm:
-                raise OneControlConfigError(
-                    f"Step5 eval-only source head mismatch: run={existing_head!r} cli={step5_head_norm!r}"
-                )
-            status_norm = str(run_summary.get("status") or "").strip().lower()
-            if status_norm not in {"train_completed_no_eval", "completed_with_eval_handoff", "eval_handoff_accepted"}:
-                raise OneControlConfigError(
-                    "Step5A eval-only expects a train-only checkpoint awaiting handoff; "
-                    f"run_summary.status={status_norm or '(missing)'}"
-                )
-            upstream_payload = stage_status.get("upstream") if isinstance(stage_status.get("upstream"), Mapping) else {}
-            src = (
-                str(upstream_payload.get("from_step4") or "").strip()
-                or str(run_summary.get("from_step4") or "").strip()
-                or run_naming.step4_slug_from_step5_slug(step5_run)
-            )
-            if from_step4 and run_naming.parse_run_id(str(from_step4)) != run_naming.parse_run_id(src):
-                raise OneControlConfigError(f"--from-step4 {from_step4!r} does not match --from-step5-run lineage {src!r}")
-            try:
-                upstream = resolve_upstream(
-                    repo_root=repo_root,
-                    stage="step4",
-                    task=tid,
-                    from_run=src,
-                    mode="formal",
-                    consumer_stage="step5",
-                    repair=True,
-                )
-            except UpstreamResolutionError as exc:
-                raise OneControlConfigError(str(exc)) from exc
-            step4_run = upstream.run_id
-            upstream_resolution_payload = upstream.to_payload(repo_root)
-            upstream_from_step3 = (
-                (upstream.stage_status.get("upstream") or {}).get("from_step3")
-                or run_summary.get("from_step3")
-            )
-            from_run = run_naming.parse_run_id(str(upstream_from_step3)) if upstream_from_step3 else _lineage_for_step5(step4_run)
-            step3_checkpoint_dir = str(_stage_root(repo_root, tid, "step3", from_run))
-            raw_checkpoint = str(checkpoint or "").strip()
-            checkpoint_path = Path(raw_checkpoint).expanduser() if raw_checkpoint else path_layout.best_model_path(run_root)
-            if not checkpoint_path.is_absolute():
-                checkpoint_path = (repo_root / checkpoint_path).resolve()
-            else:
-                checkpoint_path = checkpoint_path.resolve()
-            model_path = str(checkpoint_path)
-            eval_run_dir = str((run_root / "eval").resolve())
+            raise OneControlConfigError("Step5 eval-only rating handoff is retired; use eval after an explanation handoff.")
         else:
             src = from_step4 or "latest"
             try:
@@ -4389,19 +4137,48 @@ def resolve_config(
     elif command == "eval":
         src = from_step5 or "latest"
         try:
-            upstream = resolve_upstream(
-                repo_root=repo_root,
-                stage="step5",
-                task=tid,
-                from_run=None if src == "latest" else src,
-                mode="formal",
-                consumer_stage="eval",
-                repair=True,
+            upstream = (
+                resolve_latest(repo_root=repo_root, stage="step5", task=tid, repair=True)
+                if src == "latest"
+                else resolve_run(
+                    repo_root=repo_root,
+                    stage="step5",
+                    task=tid,
+                    run_id=run_naming.parse_stage_run_id("step5", str(src)),
+                    repair=True,
+                    requested_run=str(src),
+                )
             )
         except UpstreamResolutionError as exc:
             raise OneControlConfigError(str(exc)) from exc
+        status_payload = upstream.stage_status if isinstance(upstream.stage_status, Mapping) else {}
+        final_status = str(status_payload.get("final_status") or "").strip().lower()
+        artifacts_payload = status_payload.get("artifacts") if isinstance(status_payload.get("artifacts"), Mapping) else {}
+        checkpoint_item = artifacts_payload.get("selected_checkpoint") if isinstance(artifacts_payload, Mapping) else {}
+        checkpoint_path = str(checkpoint_item.get("path") or "").strip() if isinstance(checkpoint_item, Mapping) else ""
+        if not checkpoint_path:
+            checkpoint_path = str(status_payload.get("selected_checkpoint") or "").strip()
+        if checkpoint_path:
+            checkpoint_abs = (
+                (repo_root / checkpoint_path).resolve()
+                if not Path(checkpoint_path).is_absolute()
+                else Path(checkpoint_path).expanduser().resolve()
+            )
+        else:
+            checkpoint_abs = Path()
+        if final_status not in {"completed_with_explanation_handoff", "train_completed_no_explanation_handoff"}:
+            raise OneControlConfigError(
+                f"Step5 run {upstream.run_id} is not eligible for official eval reclosure: final_status={final_status!r}"
+            )
+        if not checkpoint_path or not checkpoint_abs.is_file():
+            raise OneControlConfigError(
+                f"Step5 official eval reclosure requires selected checkpoint for run {upstream.run_id}; got {checkpoint_path!r}"
+            )
         step5_run = upstream.run_id
         upstream_resolution_payload = upstream.to_payload(repo_root)
+        upstream_resolution_payload["eligible_for_eval_reclosure"] = True
+        upstream_resolution_payload["needs_explanation_handoff"] = final_status == "train_completed_no_explanation_handoff"
+        upstream_resolution_payload["eval_reclosure_reason"] = "one_epoch_post_train_official_eval"
         upstream_payload = upstream.stage_status.get("upstream") if isinstance(upstream.stage_status, Mapping) else {}
         if isinstance(upstream_payload, Mapping):
             upstream_from_step3 = str(upstream_payload.get("from_step3") or "").strip()
@@ -4412,10 +4189,13 @@ def resolve_config(
         inferred_from_run, inferred_step4 = _lineage_for_eval(step5_run)
         from_run = run_naming.parse_run_id(upstream_from_step3) if upstream_from_step3 else inferred_from_run
         step4_run = run_naming.parse_run_id(upstream_from_step4) if upstream_from_step4 else inferred_step4
-        eval_stage = "rerank" if need_rerank else "eval"
-        eval_run_id = _alloc_run(repo_root, tid, eval_stage, run_id or "auto", dry_run=dry_run)
         run_root = _stage_root(repo_root, tid, "step5", step5_run)
-        eval_run_dir = str(_stage_root(repo_root, tid, eval_stage, eval_run_id))
+        if need_rerank:
+            eval_stage = "rerank"
+            eval_run_id = _alloc_run(repo_root, tid, eval_stage, run_id or "auto", dry_run=dry_run)
+            eval_run_dir = str(_stage_root(repo_root, tid, eval_stage, eval_run_id))
+        else:
+            eval_run_dir = str((run_root / "post_train_eval" / eval_split).resolve())
     else:
         raise OneControlConfigError(f"unsupported command for resolver: {command}")
 
@@ -4433,6 +4213,11 @@ def resolve_config(
     step4_step5_pool_exports_config = _resolve_step4_step5_pool_exports_config(cfg)
     step4_gold_quality_config = _resolve_step4_gold_quality_config(cfg)
     step4_cf_tiers_config = _resolve_step4_cf_tiers_config(cfg)
+    rating_source_config = (
+        validate_rating_source(resolve_rating_source_config(_get(cfg, "rating_source"), repo_root=repo_root), repo_root=repo_root)
+        if stage_for_train == "step5"
+        else {}
+    )
     step3_structured_losses_config = _resolve_step3_structured_losses_config(cfg)
     step3_ddp_config = _resolve_step3_ddp_config(cfg) if stage_for_train == "step3" else {}
     step3_loss_semantics_config = _resolve_step3_loss_semantics_config(cfg)
@@ -4442,26 +4227,12 @@ def resolve_config(
     )
     step5_model_factory_policy = {}
     if stage_for_train == "step5":
-        _head_for_factory = step5_head_norm if command == "step5" else "combined"
         step5_model_factory_policy = {
             "schema_version": "odcr_step5_model_factory_policy/1",
-            "head": _head_for_factory,
-            "step5A": {
-                "factory": "build_step5A_small_scorer_model",
-                "branch": "scorer_clean",
-                "uses_big_model": False,
-                "uses_tokenizer": False,
-                "uses_generation": False,
-                "returns_word_dist": False,
-                "computes_decoder_ce": False,
-                "scorer_init_source": "frozen_step3_teacher",
-                "step3_checkpoint_path": "runs/step3/task2/2/model/best_observed.pth",
-                "step3_checkpoint_sha256": "9089ac53b138c12ba1260370aed3d637b305f7f7f6a98a7bcbc7721eb5559017",
-                "functional_parity_required": True,
-                "residual_calibration": "zero_init",
-            },
-            "step5B": {
-                "factory": "build_step5B_large_explainer_model",
+            "mode": "explanation_only",
+            "head": "explanation",
+            "explanation": {
+                "factory": "build_step5_explanation_model",
                 "branch": "explainer_rich",
                 "uses_big_model": True,
                 "uses_tokenizer": True,
@@ -4470,30 +4241,14 @@ def resolve_config(
                 "computes_decoder_ce": True,
                 "uses_aux_cf": True,
             },
-            "active": (
-                {
-                    "factory": "build_step5A_small_scorer_model",
-                    "uses_big_model": False,
-                        "uses_tokenizer": False,
-                        "uses_generation": False,
-                        "returns_word_dist": False,
-                        "scorer_init_source": "frozen_step3_teacher",
-                        "functional_parity_required": True,
-                        "residual_calibration": "zero_init",
-                    }
-                if _head_for_factory == "step5A"
-                else (
-                    {
-                        "factory": "build_step5B_large_explainer_model",
-                        "uses_big_model": True,
-                        "uses_tokenizer": True,
-                        "uses_generation": True,
-                        "returns_word_dist": True,
-                    }
-                    if _head_for_factory == "step5B"
-                    else {"factory": "combined_big_model_disabled_for_formal", "combined_formal_enabled": False}
-                )
-            ),
+            "active": {
+                "factory": "build_step5_explanation_model",
+                "uses_big_model": True,
+                "uses_tokenizer": True,
+                "uses_generation": True,
+                "returns_word_dist": True,
+                "trains_rating": False,
+            },
         }
     step5_model_config = _resolve_step5_model_config(cfg, runtime_roots)
     step5_ddp_config = _resolve_step5_ddp_config(cfg) if stage_for_train == "step5" else {}
@@ -4522,6 +4277,20 @@ def resolve_config(
         if stage_for_train == "step5"
         else {}
     )
+    step5_valid_loss_config = _resolve_step5_valid_loss_config(cfg) if stage_for_train == "step5" else {}
+    step5_final_eval_config = _resolve_step5_final_eval_config(cfg) if stage_for_train == "step5" else {}
+    if (
+        stage_for_train == "step5"
+        and command == "eval"
+        and step5_eval_config
+        and bool(step5_eval_config.get("old_eval_batch_2048_retired"))
+    ):
+        eval_batch_size, eval_per_gpu = _step5_official_eval_batch_layout(
+            step5_eval_config,
+            eval_split=eval_split,
+            ddp_world_size=ddp_world_size,
+        )
+        row["eval_batch_size"] = int(eval_batch_size)
     train_precision, train_precision_source = _resolve_train_precision(stage_for_train, train, row)
     row["train_precision"] = train_precision
     row.setdefault("tokenizer_max_length", int(step3_tokenizer_config["max_length"]))
@@ -4611,7 +4380,9 @@ def resolve_config(
         _apply_step5_native_lora_row(row, step5_innovation_config)
         train_precision, train_precision_source = _resolve_train_precision(stage_for_train, train, row)
         row["train_precision"] = train_precision
-        row["step5_head"] = step5_head_norm if command == "step5" else "combined"
+        row["step5_mode"] = "explanation_only"
+        row["step5_head"] = "explanation"
+        row["rating_source"] = dict(rating_source_config)
         row["head_specific_lora_allowlist_id"] = (
             f"{_STEP5_LORA_TARGET_POLICY_ID}:{row['step5_head']}"
         )
@@ -4619,15 +4390,22 @@ def resolve_config(
             f"step5_head_specific_trainable_contract/1:{row['step5_head']}"
         )
         row["head_gated_loss_contract"] = {
-            "schema_version": "odcr_step5_head_gated_loss_contract/1",
+            "schema_version": "odcr_step5_explanation_loss_contract/1",
             "head": row["step5_head"],
-            "combined_formal_enabled": False,
+            "mode": "explanation_only",
+            "rating_training": False,
+            "active_losses": ["explainer_ce", "ccv", "fca"],
         }
         row["final_lora_target_modules"] = list(row.get("lora_target_modules") or [])
         row["forbidden_lora_targets"] = _step5_forbidden_lora_targets_from_model_config(
             step5_model_config.get("nlayers")
         )
         row.update(step5_eval_config)
+        row["valid_loss_label_max_length"] = int(step5_valid_loss_config["label_max_length"])
+        row["final_eval_prediction_max_length"] = int(step5_final_eval_config["prediction_max_length"])
+        row["final_eval_reference_max_length"] = int(step5_final_eval_config["reference_max_length"])
+        row["step5_final_eval"] = dict(step5_final_eval_config)
+        row["step5_valid_loss"] = dict(step5_valid_loss_config)
         row.update(step5_model_config)
         row.update(step5_ddp_config)
         max_effective_epochs = int((step5_effective_epoch_config or {}).get("max_effective_epochs") or (step5_sampler_config.get("epochs") or {}).get("max_effective_epochs", 1))
@@ -4664,8 +4442,7 @@ def resolve_config(
         row["step5_effective_samples"] = dict(step5_tuning_config.get("effective_samples") or {})
         row["step5_optimizer_steps"] = dict(step5_tuning_config.get("optimizer_steps") or {})
         row["step5_formal_active_candidate"] = dict(step5_formal_active_candidate_config)
-        row["step5A_cf_mix_id"] = str(step5_formal_active_candidate_config.get("step5A_cf_mix_id") or "")
-        row["step5B_cf_mix_id"] = str(step5_formal_active_candidate_config.get("step5B_cf_mix_id") or "")
+        row["step5_explanation_cf_mix_id"] = str(step5_formal_active_candidate_config.get("explanation_cf_mix_id") or "")
         row["step5_lifecycle"] = dict(step5_lifecycle_config)
         row["step5_lifecycle_phase"] = step5_lifecycle_phase
         row["step5_train_only"] = bool(step5_train_only_resolved)
@@ -4736,7 +4513,9 @@ def resolve_config(
         "transport_env": "ODCR_RUNTIME_PRECISION_MODE",
     }
     if stage_for_train == "step5":
-        payload["step5_head"] = step5_head_norm if command == "step5" else "combined"
+        payload["step5_mode"] = "explanation_only"
+        payload["step5_head"] = "explanation"
+        payload["rating_source"] = dict(rating_source_config)
         payload["selected_tuning_candidate"] = str(step5_tuning_config.get("selected_tuning_candidate") or "")
         payload["fallback_tuning_candidate"] = str(step5_tuning_config.get("fallback_tuning_candidate") or "")
         payload["step5_effective_samples"] = dict(step5_tuning_config.get("effective_samples") or {})
@@ -4750,7 +4529,7 @@ def resolve_config(
         payload["final_lora_target_modules"] = list(row.get("final_lora_target_modules") or [])
         payload["forbidden_lora_targets"] = list(row.get("forbidden_lora_targets") or [])
         payload["deleted_legacy_modules"] = list(row.get("deleted_legacy_modules") or [])
-        payload["combined_formal_enabled"] = False
+        payload["retired_combined_formal_enabled"] = False
         payload["all_trainable_grad_required"] = True
         payload["head_specific_trainable_policy"] = row.get("head_specific_trainable_policy")
         payload["head_gated_loss_contract"] = row.get("head_gated_loss_contract")
@@ -4766,6 +4545,8 @@ def resolve_config(
         payload["step5_lifecycle"] = step5_lifecycle_config
         payload["step5_memory_truth"] = step5_memory_truth_config
         payload["step5_eval"] = step5_eval_config
+        payload["step5_valid_loss"] = step5_valid_loss_config
+        payload["step5_final_eval"] = step5_final_eval_config
 
     decode_strategy = str(decode.get("decode_strategy", "greedy")).strip().lower()
     decode_seed = _optional_int(decode.get("decode_seed"))
@@ -4798,6 +4579,7 @@ def resolve_config(
         "hardware": f"hardware.profiles.{hw_name}",
         "train": f"{stage_for_train}.train",
         "eval_profile": f"eval.profiles.{eval_profile_name}" if eval_profile_name else None,
+        "eval_split": "eval.split",
         "decode": f"eval.decode.{decode_id}" if decode_id else None,
         "rerank": f"eval.rerank.{rerank_id}" if rerank_id else None,
         "step4_rcr": "step4.rcr",
@@ -4806,6 +4588,7 @@ def resolve_config(
         "step4_step5_pool_exports": "step4.step5_pool_exports",
         "step4_gold_quality": "step4.gold_quality",
         "step4_cf_tiers": "step4.cf_tiers",
+        "rating_source": "rating_source" if stage_for_train == "step5" else None,
         "step3_structured_losses": "step3.structured_losses",
         "step3_loss_semantics": "step3.loss_semantics",
         "step3_ddp_find_unused_parameters": "step3.ddp.find_unused_parameters",
@@ -4877,7 +4660,7 @@ def resolve_config(
         "final_lora_target_modules": "Step5 runtime head-aware LoRA allowlist",
         "forbidden_lora_targets": "Step5 runtime LoRA forbidden target policy",
         "deleted_legacy_modules": "Step5 active production model deletion contract",
-        "combined_formal_enabled": "Step5 combined formal ban until audited",
+        "retired_combined_formal_enabled": "retired head-split marker",
         "all_trainable_grad_required": "Step5 formal/E4 all-trainable-grad gate",
         "head_specific_trainable_policy": "Step5 head-aware trainable contract",
         "head_gated_loss_contract": "Step5 train loop head-gated loss contract",
@@ -4896,23 +4679,13 @@ def resolve_config(
             if stage_for_train == "step5"
             else None
         ),
-        "step5_formal_active_candidate.step5A_cf_mix_id": (
+        "step5_formal_active_candidate.explanation_cf_mix_id": (
             "configs/odcr.yaml:step5.tuning.selected_tuning_candidate"
             if stage_for_train == "step5"
             else None
         ),
-        "step5_formal_active_candidate.step5A_cf_mix": (
-            "configs/odcr.yaml:step5.sampler.step5A.cf_tier_mix"
-            if stage_for_train == "step5"
-            else None
-        ),
-        "step5_formal_active_candidate.step5B_cf_mix_id": (
-            "configs/odcr.yaml:step5.tuning.selected_tuning_candidate"
-            if stage_for_train == "step5"
-            else None
-        ),
-        "step5_formal_active_candidate.step5B_cf_mix": (
-            "configs/odcr.yaml:step5.sampler.step5B.cf_tier_mix"
+        "step5_formal_active_candidate.explanation_cf_mix": (
+            "configs/odcr.yaml:step5.sampler.explanation.cf_tier_mix"
             if stage_for_train == "step5"
             else None
         ),
@@ -4942,22 +4715,27 @@ def resolve_config(
         "step5_allow_embedded_final_eval": "step5.lifecycle embedded-final-eval diagnostic gates" if command == "step5" else None,
         "step5_checkpoint_load_policy": "step5.lifecycle.checkpoint_load_policy" if stage_for_train == "step5" else None,
         "step5_eval": "step5.eval" if stage_for_train == "step5" else None,
+        "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
+        "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
         "train_per_gpu_batch_size": "step5.train.per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_per_gpu_batch_size": "step5.eval.valid_per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_global_batch_size": "step5.eval.valid_batch_size" if stage_for_train == "step5" else None,
         "valid_forward_micro_batch_size": "step5.eval.valid_forward_micro_batch_size" if stage_for_train == "step5" else None,
         "validation_microbatch_accumulation": "step5.eval.metric_accumulation" if stage_for_train == "step5" else None,
         "validation_memory_policy": "step5.eval.validation_memory_policy" if stage_for_train == "step5" else None,
-        "step5A_validation_mode": "step5.eval.step5A_validation_mode" if stage_for_train == "step5" else None,
+        "step5_validation_mode": "step5.eval.validation_mode" if stage_for_train == "step5" else None,
         "formal_entry_E4_validation_required": (
             "step5.eval.formal_entry_E4_validation_required" if stage_for_train == "step5" else None
         ),
         "old_eval_batch_2048_retired": "step5.eval.old_eval_batch_2048_retired" if stage_for_train == "step5" else None,
         "valid_loss_components": "step5.eval.valid_loss_components" if stage_for_train == "step5" else None,
-        "step5A_validation_scorer_only": "step5.eval.step5A_validation_mode" if stage_for_train == "step5" else None,
-        "validation_flans_logits_materialized": "Step5A scorer-only validation runtime contract" if stage_for_train == "step5" else None,
+        "validation_flans_logits_materialized": "not_applicable_explanation_only" if stage_for_train == "step5" else None,
         "validation_e4_evidence_id": "AI_analysis formal-entry E4 with validation evidence" if stage_for_train == "step5" else None,
-        "validation_oom_guard_status": "step5.eval valid_per_gpu <= train per_gpu guard" if stage_for_train == "step5" else None,
+        "validation_oom_guard_status": (
+            "step5.eval explicit batch is governed by runtime OOM evidence, not train per_gpu cap"
+            if stage_for_train == "step5"
+            else None
+        ),
         "step5_memory_truth": "step5.memory_truth",
         "step5_gradient_checkpointing_reentrant_policy": "step5.memory_truth.gradient_checkpointing_reentrant_policy",
         "step5_ddp_find_unused_parameters": "configs/odcr.yaml:step5.ddp.find_unused_parameters",
@@ -5076,7 +4854,7 @@ def resolve_config(
         "sanity",
     ):
         field_sources[f"step4_gold_quality.{key}"] = f"step4.gold_quality.{key}"
-    for key in ("schema_version", "hard_reject", "step5A", "step5B", "sampling_weight"):
+    for key in ("schema_version", "hard_reject", "explanation", "sampling_weight"):
         field_sources[f"step4_cf_tiers.{key}"] = f"step4.cf_tiers.{key}"
     for key in (
         "cache_enabled",
@@ -5110,8 +4888,7 @@ def resolve_config(
         "full_audit_default_allowed",
         "legacy_gold_heavy_exports_allowed",
         "auto_budget",
-        "step5A",
-        "step5B",
+        "explanation",
         "epochs",
     ):
         field_sources[f"step5_sampler.{key}"] = f"step5.sampler.{key}"
@@ -5121,8 +4898,8 @@ def resolve_config(
         "train_policy",
         "valid_test_policy",
         "input_formatting_only",
-        "score_only_step5A",
-        "explanation_only_step5B",
+        "explanation_only",
+        "active_templates",
     ):
         field_sources[f"step5_prompt_templates.{key}"] = f"step5.prompt_templates.{key}"
     for key in (
@@ -5165,7 +4942,7 @@ def resolve_config(
         "metric_accumulation",
         "validation_microbatch_accumulation",
         "validation_memory_policy",
-        "step5A_validation_mode",
+        "step5_validation_mode",
         "formal_entry_E4_validation_required",
         "old_eval_batch_2048_retired",
         "valid_loss_components",
@@ -5190,12 +4967,11 @@ def resolve_config(
         "formal_default_phase",
         "embedded_final_eval_default",
         "allow_embedded_final_eval_diagnostic",
-        "eval_handoff_required_for_downstream",
+        "explanation_handoff_required_for_downstream",
         "checkpoint_load_policy",
         "cpu_staged_checkpoint_load_required",
         "write_latest_after_train_only",
         "e5_post_train_lifecycle_required",
-        "step5B_requires_independent_e4_e5",
     ):
         field_sources[f"step5_lifecycle.{key}"] = f"step5.lifecycle.{key}"
     for key in (
@@ -5228,6 +5004,7 @@ def resolve_config(
         "step4_runtime": "step4.runtime",
         "step4_step5_dedicated_exports": "step4.step5_dedicated_exports",
         "step4_step5_pool_exports": "step4.step5_pool_exports",
+        "rating_source": "rating_source" if stage_for_train == "step5" else None,
         "step5_data_pipeline": "step5.data_pipeline" if stage_for_train == "step5" else None,
         "upstream_resolution": upstream_resolution_payload if upstream_resolution_payload else None,
         "active_stage_status": active_stage_status_payload if active_stage_status_payload else None,
@@ -5287,7 +5064,7 @@ def resolve_config(
             "final_lora_target_modules": "Step5 runtime head-aware LoRA allowlist",
             "forbidden_lora_targets": "Step5 runtime LoRA forbidden target policy",
             "deleted_legacy_modules": "Step5 active production model deletion contract",
-            "combined_formal_enabled": "Step5 combined formal ban until audited",
+            "retired_combined_formal_enabled": "retired head-split marker",
             "all_trainable_grad_required": "Step5 formal/E4 all-trainable-grad gate",
             "head_specific_trainable_policy": "Step5 head-aware trainable contract",
             "head_gated_loss_contract": "Step5 train loop head-gated loss contract",
@@ -5333,6 +5110,8 @@ def resolve_config(
         "step5_allow_embedded_final_eval": "step5.lifecycle embedded-final-eval diagnostic gates" if command == "step5" else None,
         "step5_checkpoint_load_policy": "step5.lifecycle.checkpoint_load_policy" if stage_for_train == "step5" else None,
         "step5_memory_truth": "step5.memory_truth" if stage_for_train == "step5" else None,
+        "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
+        "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
     }
     train_fp = fingerprint({"payload": payload, "hardware": hw_semantic, "ddp_world_size": ddp_world_size})
     gen_fp = fingerprint({"decode": decode, "eval_batch_size": eval_batch_size, "rerank": rerank}) if need_decode else ""
@@ -5444,6 +5223,7 @@ def resolve_config(
         },
         "eval": {
             "profile": eval_profile_name or None,
+            "split": eval_split,
             "eval_batch_size": eval_batch_size,
             "eval_per_gpu_batch_size": eval_per_gpu,
             **(
@@ -5456,13 +5236,17 @@ def resolve_config(
                             step5_eval_config["validation_microbatch_accumulation"]
                         ),
                         "validation_memory_policy": str(step5_eval_config["validation_memory_policy"]),
-                        "step5A_validation_mode": str(step5_eval_config["step5A_validation_mode"]),
+                        "step5_validation_mode": str(step5_eval_config["step5_validation_mode"]),
                         "formal_entry_E4_validation_required": bool(
                             step5_eval_config["formal_entry_E4_validation_required"]
                         ),
                         "old_eval_batch_2048_retired": bool(step5_eval_config["old_eval_batch_2048_retired"]),
                     },
-                    "eval_batch_size_role_for_step5_train_validation": "not_active",
+                    "eval_batch_size_role_for_step5_train_validation": (
+                        "step5_official_eval_uses_step5_eval_batch"
+                        if command == "eval"
+                        else "not_active"
+                    ),
                 }
                 if stage_for_train == "step5"
                 else {}
@@ -5518,6 +5302,7 @@ def resolve_config(
         "step3_paper_candidate_selection": step3_paper_candidate_selection_config if stage_for_train == "step3" else None,
         "step3_checkpoint_averaging": step3_checkpoint_averaging_config if stage_for_train == "step3" else None,
         "step5": step5_innovation_config if stage_for_train == "step5" else None,
+        "rating_source": rating_source_config if stage_for_train == "step5" else None,
         "step5_task_decoupled_policy": (
             step5_task_decoupled_policy_config if stage_for_train == "step5" else None
         ),
@@ -5527,7 +5312,7 @@ def resolve_config(
         "final_lora_target_modules": list(row.get("final_lora_target_modules") or []) if stage_for_train == "step5" else None,
         "forbidden_lora_targets": list(row.get("forbidden_lora_targets") or []) if stage_for_train == "step5" else None,
         "deleted_legacy_modules": list(row.get("deleted_legacy_modules") or []) if stage_for_train == "step5" else None,
-        "combined_formal_enabled": False if stage_for_train == "step5" else None,
+        "retired_combined_formal_enabled": False if stage_for_train == "step5" else None,
         "all_trainable_grad_required": True if stage_for_train == "step5" else None,
         "head_specific_trainable_policy": row.get("head_specific_trainable_policy") if stage_for_train == "step5" else None,
         "head_gated_loss_contract": row.get("head_gated_loss_contract") if stage_for_train == "step5" else None,
@@ -5541,6 +5326,8 @@ def resolve_config(
         "step5_batch_candidates": step5_batch_candidates_config if stage_for_train == "step5" else None,
         "step5_tuning": step5_tuning_config if stage_for_train == "step5" else None,
         "step5_eval": step5_eval_config if stage_for_train == "step5" else None,
+        "step5_valid_loss": step5_valid_loss_config if stage_for_train == "step5" else None,
+        "step5_final_eval": step5_final_eval_config if stage_for_train == "step5" else None,
         "step5_formal_active_candidate": (
             step5_formal_active_candidate_config if stage_for_train == "step5" else None
         ),
@@ -5690,10 +5477,13 @@ def resolve_config(
         test_forward_micro_batch_size=int(row.get("test_forward_micro_batch_size", 0)),
         validation_microbatch_accumulation=bool(row.get("validation_microbatch_accumulation", False)),
         validation_memory_policy=str(row.get("validation_memory_policy", "")),
-        step5A_validation_mode=str(row.get("step5A_validation_mode", "")),
+        step5_validation_mode=str(row.get("step5_validation_mode", "")),
         formal_entry_E4_validation_required=bool(row.get("formal_entry_E4_validation_required", False)),
         old_eval_batch_2048_retired=bool(row.get("old_eval_batch_2048_retired", False)),
         valid_loss_components_json=json_dumps(row.get("valid_loss_components", {})),
+        valid_loss_label_max_length=int(row.get("valid_loss_label_max_length", row.get("train_label_max_length", 64))),
+        final_eval_prediction_max_length=int(row.get("final_eval_prediction_max_length", 25)),
+        final_eval_reference_max_length=int(row.get("final_eval_reference_max_length", 25)),
         num_proc=num_proc,
         ddp_world_size=ddp_world_size,
         seed=int(project.get("seed", 3407)),
@@ -5710,7 +5500,7 @@ def resolve_config(
         decode_strategy=decode_strategy,
         decode_seed=decode_seed,
         max_explanation_length=int(decode["max_explanation_length"]),
-        train_label_max_length=int(train.get("train_label_max_length", 64)),
+        train_label_max_length=int(row.get("train_label_max_length", train.get("train_label_max_length", 64))),
         no_repeat_ngram_size=no_repeat,
         min_len=min_len,
         domain_fusion_mode=domain_fusion_mode,
@@ -5776,6 +5566,7 @@ def resolve_config(
         global_eval_batch_size=eval_batch_size,
         eval_per_gpu_batch_size=eval_per_gpu,
         eval_profile_id=eval_profile_name,
+        eval_split=eval_split,
         consumed_presets_json=json_dumps(consumed),
         config_before_cli_json=json_dumps({"config_path": str(config_path)}),
         matrix_session_id=None,
@@ -5798,13 +5589,15 @@ def resolve_config(
         step4_cf_tiers_config_json=json_dumps(step4_cf_tiers_config),
         step5_innovation_config_json=json_dumps(step5_innovation_config),
         step5_task_decoupled_policy_config_json=json_dumps(step5_task_decoupled_policy_config),
-        step5_head=step5_head_norm if command == "step5" else "combined",
+        rating_source_config_json=json_dumps(rating_source_config),
+        step5_mode="explanation_only",
+        step5_head="explanation",
         lora_target_policy_id=str(row.get("lora_target_policy_id", "")),
         head_specific_lora_allowlist_id=str(row.get("head_specific_lora_allowlist_id", "")),
         final_lora_target_modules=tuple(row.get("final_lora_target_modules", ()) or ()),
         forbidden_lora_targets=tuple(row.get("forbidden_lora_targets", ()) or ()),
         deleted_legacy_modules=tuple(row.get("deleted_legacy_modules", ()) or ()),
-        combined_formal_enabled=bool(row.get("combined_formal_enabled", False)),
+        combined_formal_enabled=bool(row.get("retired_combined_formal_enabled", False)),
         all_trainable_grad_required=bool(row.get("all_trainable_grad_required", False)),
         head_specific_trainable_policy=str(row.get("head_specific_trainable_policy", "")),
         head_gated_loss_contract_json=json_dumps(row.get("head_gated_loss_contract", {})),

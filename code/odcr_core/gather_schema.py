@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 
@@ -36,6 +36,7 @@ class GatheredBatch:
     evidence_quality_prior: Optional[torch.Tensor] = None
     sampler_component_id: Optional[torch.Tensor] = None
     sampler_tier_id: Optional[torch.Tensor] = None
+    raw_ref_text: Optional[Sequence[str]] = None
 
     def assert_uniform_batch_dim(self) -> None:
         """校验各张量首维（batch）一致；失败时指出字段名。"""
@@ -94,6 +95,11 @@ class GatheredBatch:
                     f"GatheredBatch 批量维不一致：基准 batch_size={b}（来自 user_idx），"
                     f"字段 {name!r} 的首维为 {int(t.shape[0])}。"
                 )
+        if self.raw_ref_text is not None and len(self.raw_ref_text) != b:
+            raise ValueError(
+                f"GatheredBatch 批量维不一致：基准 batch_size={b}（来自 user_idx），"
+                f"字段 'raw_ref_text' 的长度为 {len(self.raw_ref_text)}。"
+            )
 
 
 def require_gathered_batch(obj: Any) -> GatheredBatch:

@@ -1,4 +1,4 @@
-"""Step4-owned derived exports for dedicated Step5A/Step5B training tables."""
+"""Step4-owned derived exports for audit/control and Step5 explanation tables."""
 from __future__ import annotations
 
 import hashlib
@@ -25,12 +25,12 @@ STEP4_DEDICATED_EXPORTS_STATUS_SCHEMA_VERSION = "odcr_step4_step5_dedicated_expo
 STEP4_DEDICATED_EXPORTS_STATUS = "step5_dedicated_exports_status.json"
 STEP4_DEDICATED_EXPORTS_DIRNAME = "step5_exports"
 FULL_AUDIT_PARQUET = "odcr_routing_full_audit.parquet"
-STEP5A_SCORER_TRAIN_PARQUET = "step5A_scorer_train.parquet"
-STEP5B_EXPLAINER_TRAIN_PARQUET = "step5B_explainer_train.parquet"
-STEP5A_GOLD_ANCHOR_PARQUET = "step5A_gold_anchor.parquet"
-STEP5A_CF_AUG_PARQUET = "step5A_cf_aug.parquet"
-STEP5B_GOLD_ANCHOR_PARQUET = "step5B_gold_anchor.parquet"
-STEP5B_CF_AUG_PARQUET = "step5B_cf_aug.parquet"
+STEP5_EXPLANATION_SCORER_TRAIN_PARQUET = "rating_stability_control_scorer_train.parquet"
+STEP5_EXPLANATION_EXPLAINER_TRAIN_PARQUET = "step5_explanation_explainer_train.parquet"
+STEP5_EXPLANATION_GOLD_ANCHOR_PARQUET = "rating_stability_control_gold_anchor.parquet"
+STEP5_EXPLANATION_CF_AUG_PARQUET = "rating_stability_control_cf_aug.parquet"
+STEP5_EXPLANATION_GOLD_ANCHOR_PARQUET = "step5_explanation_gold_anchor.parquet"
+STEP5_EXPLANATION_CF_AUG_PARQUET = "step5_explanation_cf_aug.parquet"
 ROUTE_INTERSECTION_REPORT = "step5_route_intersection_report.json"
 STEP5_TRAIN_MANIFEST = "step5_train_manifest.json"
 
@@ -72,7 +72,7 @@ STEP5_DEDICATED_SOURCE_REQUIRED_COLUMNS: tuple[str, ...] = (
     "item_idx_global",
 )
 
-STEP5A_SCORER_TRAIN_COLUMNS: tuple[str, ...] = (
+STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS: tuple[str, ...] = (
     "user",
     "item",
     "rating",
@@ -110,7 +110,7 @@ STEP5A_SCORER_TRAIN_COLUMNS: tuple[str, ...] = (
     "evidence_quality_prior",
 )
 
-STEP5B_EXPLAINER_TRAIN_COLUMNS: tuple[str, ...] = STEP5A_SCORER_TRAIN_COLUMNS
+STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS: tuple[str, ...] = STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS
 
 STRING_COLUMNS = {
     "user",
@@ -176,7 +176,7 @@ FLOAT_COLUMNS = {
 FIELD_REASONS: dict[str, str] = {
     "user": "human-readable source user id for audit and traceability",
     "item": "human-readable source item id for audit and traceability",
-    "rating": "rating target required by Step5 scorer training",
+    "rating": "rating label retained for Step3 rating-source lineage and audit joins",
     "review": "source review text retained as the text-side evidence field",
     "explanation": "raw Step4 explanation target retained for training/audit comparison",
     "clean_text": "cleaned explanation text used by current Step5 tokenization",
@@ -186,19 +186,19 @@ FIELD_REASONS: dict[str, str] = {
     "item_idx_global": "global item index contract required by Step5 embedding lookup",
     "sample_origin": "origin split required for gold-anchor versus CF augmentation accounting",
     "train_keep": "Step4 posterior train gate used by dedicated export filters",
-    "route_scorer": "Step4 posterior Step5A scorer route decision",
-    "route_explainer": "Step4 posterior Step5B explainer route decision",
+    "route_scorer": "Step4 posterior rating-stability/scorer-safety audit control signal",
+    "route_explainer": "Step4 posterior primary Step5 explanation training route decision",
     "sample_weight_hint": "posterior sample weight used by Step5 loss scheduling",
     "confidence_bucket": "posterior confidence group for UCI/CCV control",
     "uncertainty_score": "posterior uncertainty score for UCI and route diagnostics",
     "cf_reliability_score": "RCR posterior reliability basis for LCI/FCA weighting",
-    "content_retention_score": "content retention basis for scorer stability and FCA",
-    "rating_stability_score": "rating stability basis for scorer route confidence",
+    "content_retention_score": "content retention basis for rating-stability audit and FCA",
+    "rating_stability_score": "rating-stability basis for scorer-safety audit confidence",
     "style_shift_score": "style-shift basis for explainer routing and FCA diversity",
     "text_quality_score": "text hygiene score for route confidence and validation",
-    "route_reason_scorer": "human-readable scorer-route posterior reason",
+    "route_reason_scorer": "human-readable rating-stability/scorer-safety posterior reason",
     "route_reason_explainer": "human-readable explainer-route posterior reason",
-    "preprocess_route_scorer_prior": "preprocess scorer prior retained as prior-only audit context",
+    "preprocess_route_scorer_prior": "preprocess rating-stability prior retained as prior-only audit context",
     "preprocess_route_explainer_prior": "preprocess explainer prior retained as prior-only audit context",
     "entropy_score": "generation entropy feature retained for uncertainty lineage",
     "content_evidence": "CCV/FCA content evidence basis",
@@ -525,14 +525,14 @@ def _stats_payload(store: dict[str, dict[str, dict[str, _Stats]]]) -> dict[str, 
 def _column_source_table(full_columns: Sequence[str]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     full_set = set(full_columns)
-    for col in sorted(set(STEP5A_SCORER_TRAIN_COLUMNS) | set(STEP5B_EXPLAINER_TRAIN_COLUMNS)):
+    for col in sorted(set(STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS) | set(STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS)):
         fields[col] = {
             "included_in": [
                 name
                 for name, columns in (
                     ("full_audit", full_columns),
-                    ("step5A_scorer_train", STEP5A_SCORER_TRAIN_COLUMNS),
-                    ("step5B_explainer_train", STEP5B_EXPLAINER_TRAIN_COLUMNS),
+                    ("rating_stability_control_scorer_train", STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+                    ("step5_explanation_explainer_train", STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
                 )
                 if col in set(columns)
             ],
@@ -544,7 +544,7 @@ def _column_source_table(full_columns: Sequence[str]) -> dict[str, Any]:
         fields[str(col)] = {
             "included_in": ["full_audit"],
             "source_column_present": True,
-            "reason": "audit-only Step4 source column intentionally excluded from narrow Step5A/B train tables",
+            "reason": "audit-only Step4 source column intentionally excluded from narrow RatingStabilityControl/B train tables",
         }
     return {
         "schema_version": "odcr_step4_dedicated_export_source_table/1",
@@ -578,8 +578,8 @@ def export_step4_dedicated_exports(
     output_dir = run_dir / str(cfg["output_dir_name"])
     header = _read_header(source_csv)
     _validate_required_columns(header, STEP5_DEDICATED_SOURCE_REQUIRED_COLUMNS, context="Step4 full export")
-    _validate_required_columns(header, STEP5A_SCORER_TRAIN_COLUMNS, context="Step5A scorer column contract")
-    _validate_required_columns(header, STEP5B_EXPLAINER_TRAIN_COLUMNS, context="Step5B explainer column contract")
+    _validate_required_columns(header, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS, context="RatingStabilityControl scorer column contract")
+    _validate_required_columns(header, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS, context="Step5 explanation explainer column contract")
     base_validation = validate_step4_export_ready(run_dir, repo_root=root)
     if not base_validation.ready:
         raise Step4DedicatedExportError("source Step4 export is not ready: " + "; ".join(base_validation.errors))
@@ -604,18 +604,18 @@ def export_step4_dedicated_exports(
             "output_dir": _repo_relative(root, output_dir),
             "planned_exports": {
                 "full_audit": FULL_AUDIT_PARQUET,
-                "step5A_scorer_train": STEP5A_SCORER_TRAIN_PARQUET,
-                "step5B_explainer_train": STEP5B_EXPLAINER_TRAIN_PARQUET,
+                "rating_stability_control_scorer_train": STEP5_EXPLANATION_SCORER_TRAIN_PARQUET,
+                "step5_explanation_explainer_train": STEP5_EXPLANATION_EXPLAINER_TRAIN_PARQUET,
             },
             "filter_rules": {
-                "step5A_scorer_train": f"train_keep==1 AND route_scorer==1 AND sample_weight_hint>{scorer_min_weight:g}",
-                "step5B_explainer_train": f"train_keep==1 AND route_explainer==1 AND sample_weight_hint>{explainer_min_weight:g}",
+                "rating_stability_control_scorer_train": f"train_keep==1 AND route_scorer==1 AND sample_weight_hint>{scorer_min_weight:g}",
+                "step5_explanation_explainer_train": f"train_keep==1 AND route_explainer==1 AND sample_weight_hint>{explainer_min_weight:g}",
             },
             "full_audit_role": str(cfg.get("full_audit_role", "audit_only")),
             "narrow_column_counts": {
                 "full_audit": len(header),
-                "step5A_scorer_train": len(STEP5A_SCORER_TRAIN_COLUMNS),
-                "step5B_explainer_train": len(STEP5B_EXPLAINER_TRAIN_COLUMNS),
+                "rating_stability_control_scorer_train": len(STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+                "step5_explanation_explainer_train": len(STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
             },
             "source_readiness": base_validation.to_payload(root),
         }
@@ -623,16 +623,16 @@ def export_step4_dedicated_exports(
     output_dir.mkdir(parents=True, exist_ok=True)
     sinks: dict[str, _ParquetSink] = {
         "full_audit": _ParquetSink(output_dir / FULL_AUDIT_PARQUET, header),
-        "step5A_scorer_train": _ParquetSink(output_dir / STEP5A_SCORER_TRAIN_PARQUET, STEP5A_SCORER_TRAIN_COLUMNS),
-        "step5B_explainer_train": _ParquetSink(output_dir / STEP5B_EXPLAINER_TRAIN_PARQUET, STEP5B_EXPLAINER_TRAIN_COLUMNS),
+        "rating_stability_control_scorer_train": _ParquetSink(output_dir / STEP5_EXPLANATION_SCORER_TRAIN_PARQUET, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+        "step5_explanation_explainer_train": _ParquetSink(output_dir / STEP5_EXPLANATION_EXPLAINER_TRAIN_PARQUET, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
     }
     if bool(cfg.get("write_gold_cf_subsplits", True)):
         sinks.update(
             {
-                "step5A_gold_anchor": _ParquetSink(output_dir / STEP5A_GOLD_ANCHOR_PARQUET, STEP5A_SCORER_TRAIN_COLUMNS),
-                "step5A_cf_aug": _ParquetSink(output_dir / STEP5A_CF_AUG_PARQUET, STEP5A_SCORER_TRAIN_COLUMNS),
-                "step5B_gold_anchor": _ParquetSink(output_dir / STEP5B_GOLD_ANCHOR_PARQUET, STEP5B_EXPLAINER_TRAIN_COLUMNS),
-                "step5B_cf_aug": _ParquetSink(output_dir / STEP5B_CF_AUG_PARQUET, STEP5B_EXPLAINER_TRAIN_COLUMNS),
+                "rating_stability_control_gold_anchor": _ParquetSink(output_dir / STEP5_EXPLANATION_GOLD_ANCHOR_PARQUET, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+                "rating_stability_control_cf_aug": _ParquetSink(output_dir / STEP5_EXPLANATION_CF_AUG_PARQUET, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+                "step5_explanation_gold_anchor": _ParquetSink(output_dir / STEP5_EXPLANATION_GOLD_ANCHOR_PARQUET, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
+                "step5_explanation_cf_aug": _ParquetSink(output_dir / STEP5_EXPLANATION_CF_AUG_PARQUET, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
             }
         )
 
@@ -652,15 +652,15 @@ def export_step4_dedicated_exports(
     confidence_breakdown: dict[str, dict[str, int]] = {}
     origin_breakdown: dict[str, dict[str, int]] = {
         "full_audit": {},
-        "step5A_scorer_train": {},
-        "step5B_explainer_train": {},
+        "rating_stability_control_scorer_train": {},
+        "step5_explanation_explainer_train": {},
     }
     sample_weight_stats: dict[str, dict[str, dict[str, _Stats]]] = {}
     uncertainty_stats: dict[str, dict[str, dict[str, _Stats]]] = {}
     text_quality_stats: dict[str, dict[str, dict[str, _Stats]]] = {}
     drop_reason_counts: dict[str, int] = {}
-    low_confidence_kept_counts: dict[str, Any] = {"all": 0, "by_origin": {}, "step5A_scorer_train": 0, "step5B_explainer_train": 0}
-    zero_weight_counts: dict[str, Any] = {"all": 0, "by_origin": {}, "step5A_scorer_train": 0, "step5B_explainer_train": 0}
+    low_confidence_kept_counts: dict[str, Any] = {"all": 0, "by_origin": {}, "rating_stability_control_scorer_train": 0, "step5_explanation_explainer_train": 0}
+    zero_weight_counts: dict[str, Any] = {"all": 0, "by_origin": {}, "rating_stability_control_scorer_train": 0, "step5_explanation_explainer_train": 0}
     total_rows = 0
 
     dtype = {col: "string" for col in STRING_COLUMNS if col in header}
@@ -675,22 +675,22 @@ def export_step4_dedicated_exports(
             aux_cf = chunk["sample_origin"].astype(str) == "aux_cf"
             target_gold = chunk["sample_origin"].astype(str) == "target_gold"
             aux_gold = chunk["sample_origin"].astype(str) == "aux_gold"
-            step5a_mask = train_keep & route_scorer & (sample_weight > scorer_min_weight)
+            rating_stability_control_mask = train_keep & route_scorer & (sample_weight > scorer_min_weight)
             step5b_mask = train_keep & route_explainer & (sample_weight > explainer_min_weight)
 
             sinks["full_audit"].write(chunk.loc[:, header])
-            sinks["step5A_scorer_train"].write(chunk.loc[step5a_mask, STEP5A_SCORER_TRAIN_COLUMNS])
-            sinks["step5B_explainer_train"].write(chunk.loc[step5b_mask, STEP5B_EXPLAINER_TRAIN_COLUMNS])
-            if "step5A_gold_anchor" in sinks:
-                sinks["step5A_gold_anchor"].write(chunk.loc[step5a_mask & (target_gold | aux_gold), STEP5A_SCORER_TRAIN_COLUMNS])
-                sinks["step5A_cf_aug"].write(chunk.loc[step5a_mask & aux_cf, STEP5A_SCORER_TRAIN_COLUMNS])
-                sinks["step5B_gold_anchor"].write(chunk.loc[step5b_mask & (target_gold | aux_gold), STEP5B_EXPLAINER_TRAIN_COLUMNS])
-                sinks["step5B_cf_aug"].write(chunk.loc[step5b_mask & aux_cf, STEP5B_EXPLAINER_TRAIN_COLUMNS])
+            sinks["rating_stability_control_scorer_train"].write(chunk.loc[rating_stability_control_mask, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS])
+            sinks["step5_explanation_explainer_train"].write(chunk.loc[step5b_mask, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS])
+            if "rating_stability_control_gold_anchor" in sinks:
+                sinks["rating_stability_control_gold_anchor"].write(chunk.loc[rating_stability_control_mask & (target_gold | aux_gold), STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS])
+                sinks["rating_stability_control_cf_aug"].write(chunk.loc[rating_stability_control_mask & aux_cf, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS])
+                sinks["step5_explanation_gold_anchor"].write(chunk.loc[step5b_mask & (target_gold | aux_gold), STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS])
+                sinks["step5_explanation_cf_aug"].write(chunk.loc[step5b_mask & aux_cf, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS])
 
             _increment_counts(composition, _value_counts(chunk["sample_origin"]))
             _increment_counts(origin_breakdown["full_audit"], _value_counts(chunk["sample_origin"]))
-            _increment_counts(origin_breakdown["step5A_scorer_train"], _value_counts(chunk.loc[step5a_mask, "sample_origin"]))
-            _increment_counts(origin_breakdown["step5B_explainer_train"], _value_counts(chunk.loc[step5b_mask, "sample_origin"]))
+            _increment_counts(origin_breakdown["rating_stability_control_scorer_train"], _value_counts(chunk.loc[rating_stability_control_mask, "sample_origin"]))
+            _increment_counts(origin_breakdown["step5_explanation_explainer_train"], _value_counts(chunk.loc[step5b_mask, "sample_origin"]))
 
             single_counts["train_keep"] += int(train_keep.sum())
             single_counts["route_scorer"] += int(route_scorer.sum())
@@ -706,8 +706,8 @@ def export_step4_dedicated_exports(
             intersections["train_keep_and_route_explainer_and_aux_gold"] += int((train_keep & route_explainer & aux_gold).sum())
 
             _update_confidence_breakdown(confidence_breakdown, "full_audit", chunk)
-            _update_confidence_breakdown(confidence_breakdown, "step5A_scorer_train", chunk.loc[step5a_mask])
-            _update_confidence_breakdown(confidence_breakdown, "step5B_explainer_train", chunk.loc[step5b_mask])
+            _update_confidence_breakdown(confidence_breakdown, "rating_stability_control_scorer_train", chunk.loc[rating_stability_control_mask])
+            _update_confidence_breakdown(confidence_breakdown, "step5_explanation_explainer_train", chunk.loc[step5b_mask])
             _update_stats_by_origin_route(sample_weight_stats, chunk, value_col="sample_weight_hint")
             _update_stats_by_origin_route(uncertainty_stats, chunk, value_col="uncertainty_score")
             _update_stats_by_origin_route(text_quality_stats, chunk, value_col="text_quality_score")
@@ -718,13 +718,13 @@ def export_step4_dedicated_exports(
             low_kept = train_keep & (pd.to_numeric(chunk["confidence_bucket"], errors="raise").fillna(-1).astype(int) == 0)
             low_confidence_kept_counts["all"] += int(low_kept.sum())
             _increment_counts(low_confidence_kept_counts["by_origin"], _value_counts(chunk.loc[low_kept, "sample_origin"]))
-            low_confidence_kept_counts["step5A_scorer_train"] += int((low_kept & step5a_mask).sum())
-            low_confidence_kept_counts["step5B_explainer_train"] += int((low_kept & step5b_mask).sum())
+            low_confidence_kept_counts["rating_stability_control_scorer_train"] += int((low_kept & rating_stability_control_mask).sum())
+            low_confidence_kept_counts["step5_explanation_explainer_train"] += int((low_kept & step5b_mask).sum())
             zero_weight = sample_weight <= 0.0
             zero_weight_counts["all"] += int(zero_weight.sum())
             _increment_counts(zero_weight_counts["by_origin"], _value_counts(chunk.loc[zero_weight, "sample_origin"]))
-            zero_weight_counts["step5A_scorer_train"] += int((zero_weight & step5a_mask).sum())
-            zero_weight_counts["step5B_explainer_train"] += int((zero_weight & step5b_mask).sum())
+            zero_weight_counts["rating_stability_control_scorer_train"] += int((zero_weight & rating_stability_control_mask).sum())
+            zero_weight_counts["step5_explanation_explainer_train"] += int((zero_weight & step5b_mask).sum())
     except Exception:
         for sink in sinks.values():
             sink.cleanup()
@@ -733,7 +733,7 @@ def export_step4_dedicated_exports(
     sink_records: dict[str, dict[str, Any]] = {}
     try:
         for name, sink in sinks.items():
-            sink_records[name] = sink.commit(require_non_empty=name in {"full_audit", "step5A_scorer_train", "step5B_explainer_train"})
+            sink_records[name] = sink.commit(require_non_empty=name in {"full_audit", "rating_stability_control_scorer_train", "step5_explanation_explainer_train"})
     except Exception:
         for sink in sinks.values():
             sink.cleanup()
@@ -745,8 +745,8 @@ def export_step4_dedicated_exports(
         )
 
     filter_rules = {
-        "step5A_scorer_train": f"train_keep==1 AND route_scorer==1 AND sample_weight_hint>{scorer_min_weight:g}",
-        "step5B_explainer_train": f"train_keep==1 AND route_explainer==1 AND sample_weight_hint>{explainer_min_weight:g}",
+        "rating_stability_control_scorer_train": f"train_keep==1 AND route_scorer==1 AND sample_weight_hint>{scorer_min_weight:g}",
+        "step5_explanation_explainer_train": f"train_keep==1 AND route_explainer==1 AND sample_weight_hint>{explainer_min_weight:g}",
     }
     export_row_counts = {name: int(record["row_count"]) for name, record in sink_records.items()}
     report = {
@@ -786,12 +786,12 @@ def export_step4_dedicated_exports(
     for name, record in sink_records.items():
         role = {
             "full_audit": "audit_only",
-            "step5A_scorer_train": "step5A_train",
-            "step5B_explainer_train": "step5B_train",
-            "step5A_gold_anchor": "step5A_gold_anchor",
-            "step5A_cf_aug": "step5A_cf_aug",
-            "step5B_gold_anchor": "step5B_gold_anchor",
-            "step5B_cf_aug": "step5B_cf_aug",
+            "rating_stability_control_scorer_train": "rating_stability_control_train",
+            "step5_explanation_explainer_train": "step5_explanation_train",
+            "rating_stability_control_gold_anchor": "rating_stability_control_gold_anchor",
+            "rating_stability_control_cf_aug": "rating_stability_control_cf_aug",
+            "step5_explanation_gold_anchor": "step5_explanation_gold_anchor",
+            "step5_explanation_cf_aug": "step5_explanation_cf_aug",
         }.get(name, name)
         item = {
             "path": _repo_relative(root, record["path"]),
@@ -802,14 +802,14 @@ def export_step4_dedicated_exports(
             "role": role,
             "format": "parquet",
         }
-        if name == "step5A_scorer_train":
-            item["filter"] = filter_rules["step5A_scorer_train"]
-        elif name == "step5B_explainer_train":
-            item["filter"] = filter_rules["step5B_explainer_train"]
-        elif name.startswith("step5A_"):
-            item["parent_filter"] = filter_rules["step5A_scorer_train"]
-        elif name.startswith("step5B_"):
-            item["parent_filter"] = filter_rules["step5B_explainer_train"]
+        if name == "rating_stability_control_scorer_train":
+            item["filter"] = filter_rules["rating_stability_control_scorer_train"]
+        elif name == "step5_explanation_explainer_train":
+            item["filter"] = filter_rules["step5_explanation_explainer_train"]
+        elif name.startswith("rating_stability_control_"):
+            item["parent_filter"] = filter_rules["rating_stability_control_scorer_train"]
+        elif name.startswith("step5_explanation_"):
+            item["parent_filter"] = filter_rules["step5_explanation_explainer_train"]
         manifest_exports[name] = item
 
     manifest = {
@@ -835,11 +835,11 @@ def export_step4_dedicated_exports(
         },
         "column_contract": {
             "full_audit_column_count": len(header),
-            "step5A_scorer_train_column_count": len(STEP5A_SCORER_TRAIN_COLUMNS),
-            "step5B_explainer_train_column_count": len(STEP5B_EXPLAINER_TRAIN_COLUMNS),
+            "rating_stability_control_scorer_train_column_count": len(STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+            "step5_explanation_explainer_train_column_count": len(STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
             "required_columns": list(STEP5_DEDICATED_SOURCE_REQUIRED_COLUMNS),
-            "step5A_scorer_train_columns": list(STEP5A_SCORER_TRAIN_COLUMNS),
-            "step5B_explainer_train_columns": list(STEP5B_EXPLAINER_TRAIN_COLUMNS),
+            "rating_stability_control_scorer_train_columns": list(STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS),
+            "step5_explanation_explainer_train_columns": list(STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS),
         },
         "source_table": _column_source_table(header),
         "export_config": cfg,
@@ -945,16 +945,16 @@ def validate_step4_dedicated_exports(
         exports = manifest.get("exports")
         if not isinstance(exports, Mapping):
             raise Step4DedicatedExportError("dedicated manifest exports must be an object")
-        required_names = ("full_audit", "step5A_scorer_train", "step5B_explainer_train")
+        required_names = ("full_audit", "rating_stability_control_scorer_train", "step5_explanation_explainer_train")
         for name in required_names:
             if name not in exports or not isinstance(exports.get(name), Mapping):
                 raise Step4DedicatedExportError(f"dedicated manifest missing export {name}")
         if str(exports["full_audit"].get("role") or "") != "audit_only":
             raise Step4DedicatedExportError("full_audit export role must be audit_only")
-        if str(exports["step5A_scorer_train"].get("role") or "") != "step5A_train":
-            raise Step4DedicatedExportError("step5A_scorer_train role must be step5A_train")
-        if str(exports["step5B_explainer_train"].get("role") or "") != "step5B_train":
-            raise Step4DedicatedExportError("step5B_explainer_train role must be step5B_train")
+        if str(exports["rating_stability_control_scorer_train"].get("role") or "") != "rating_stability_control_train":
+            raise Step4DedicatedExportError("rating_stability_control_scorer_train role must be rating_stability_control_train")
+        if str(exports["step5_explanation_explainer_train"].get("role") or "") != "step5_explanation_train":
+            raise Step4DedicatedExportError("step5_explanation_explainer_train role must be step5_explanation_train")
         diagnostics_exports: dict[str, Any] = {}
         for name, item in exports.items():
             if not isinstance(item, Mapping):
@@ -969,11 +969,11 @@ def validate_step4_dedicated_exports(
             row_count = int(pf.metadata.num_rows)
             if row_count != int(item.get("row_count") or -1):
                 raise Step4DedicatedExportError(f"dedicated export row_count mismatch: {name}")
-            if name in {"step5A_scorer_train", "step5A_gold_anchor", "step5A_cf_aug"}:
-                _validate_required_columns(columns, STEP5A_SCORER_TRAIN_COLUMNS, context=f"{name} parquet")
-            if name in {"step5B_explainer_train", "step5B_gold_anchor", "step5B_cf_aug"}:
-                _validate_required_columns(columns, STEP5B_EXPLAINER_TRAIN_COLUMNS, context=f"{name} parquet")
-            if name in {"step5A_scorer_train", "step5B_explainer_train"} and row_count <= 0:
+            if name in {"rating_stability_control_scorer_train", "rating_stability_control_gold_anchor", "rating_stability_control_cf_aug"}:
+                _validate_required_columns(columns, STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS, context=f"{name} parquet")
+            if name in {"step5_explanation_explainer_train", "step5_explanation_gold_anchor", "step5_explanation_cf_aug"}:
+                _validate_required_columns(columns, STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS, context=f"{name} parquet")
+            if name in {"rating_stability_control_scorer_train", "step5_explanation_explainer_train"} and row_count <= 0:
                 raise Step4DedicatedExportError(f"{name} must be non-empty")
             diagnostics_exports[name] = {
                 "path": _repo_relative(root, path),
@@ -984,19 +984,19 @@ def validate_step4_dedicated_exports(
                 "role": str(item.get("role") or ""),
             }
         report_counts = report.get("export_row_counts") if isinstance(report.get("export_row_counts"), Mapping) else {}
-        for name in ("full_audit", "step5A_scorer_train", "step5B_explainer_train"):
+        for name in ("full_audit", "rating_stability_control_scorer_train", "step5_explanation_explainer_train"):
             if int(report_counts.get(name) or -1) != int(exports[name].get("row_count") or -2):
                 raise Step4DedicatedExportError(f"route report export row_count mismatch for {name}")
         intersections = report.get("intersections") if isinstance(report.get("intersections"), Mapping) else {}
-        if int(intersections.get("train_keep_and_route_scorer") or -1) < int(exports["step5A_scorer_train"].get("row_count") or 0):
-            raise Step4DedicatedExportError("Step5A row_count exceeds train_keep_and_route_scorer intersection")
-        if int(intersections.get("train_keep_and_route_explainer") or -1) < int(exports["step5B_explainer_train"].get("row_count") or 0):
-            raise Step4DedicatedExportError("Step5B row_count exceeds train_keep_and_route_explainer intersection")
+        if int(intersections.get("train_keep_and_route_scorer") or -1) < int(exports["rating_stability_control_scorer_train"].get("row_count") or 0):
+            raise Step4DedicatedExportError("RatingStabilityControl row_count exceeds train_keep_and_route_scorer intersection")
+        if int(intersections.get("train_keep_and_route_explainer") or -1) < int(exports["step5_explanation_explainer_train"].get("row_count") or 0):
+            raise Step4DedicatedExportError("Step5 explanation row_count exceeds train_keep_and_route_explainer intersection")
         zero_weight = report.get("zero_weight_counts") if isinstance(report.get("zero_weight_counts"), Mapping) else {}
-        if int(zero_weight.get("step5A_scorer_train") or 0) != 0:
-            raise Step4DedicatedExportError("Step5A dedicated export contains zero-weight rows")
-        if int(zero_weight.get("step5B_explainer_train") or 0) != 0:
-            raise Step4DedicatedExportError("Step5B dedicated export contains zero-weight rows")
+        if int(zero_weight.get("rating_stability_control_scorer_train") or 0) != 0:
+            raise Step4DedicatedExportError("RatingStabilityControl dedicated export contains zero-weight rows")
+        if int(zero_weight.get("step5_explanation_explainer_train") or 0) != 0:
+            raise Step4DedicatedExportError("Step5 explanation dedicated export contains zero-weight rows")
         result.ready = True
         result.diagnostics = {
             "source_full_export": _repo_relative(root, source_csv),
@@ -1038,8 +1038,8 @@ def step4_dedicated_stage_status_fields(
     exports = ((validation.diagnostics or {}).get("exports") or {}) if validation.ready else {}
     if isinstance(exports, Mapping):
         fields["selected_full_audit_export"] = (exports.get("full_audit") or {}).get("path") if isinstance(exports.get("full_audit"), Mapping) else None
-        fields["step5A_scorer_train_export"] = (exports.get("step5A_scorer_train") or {}).get("path") if isinstance(exports.get("step5A_scorer_train"), Mapping) else None
-        fields["step5B_explainer_train_export"] = (exports.get("step5B_explainer_train") or {}).get("path") if isinstance(exports.get("step5B_explainer_train"), Mapping) else None
+        fields["rating_stability_control_scorer_train_export"] = (exports.get("rating_stability_control_scorer_train") or {}).get("path") if isinstance(exports.get("rating_stability_control_scorer_train"), Mapping) else None
+        fields["step5_explanation_explainer_train_export"] = (exports.get("step5_explanation_explainer_train") or {}).get("path") if isinstance(exports.get("step5_explanation_explainer_train"), Mapping) else None
     return fields
 
 
@@ -1081,8 +1081,8 @@ def write_step5_dedicated_exports_status(
         if isinstance(status["artifacts"], dict):
             for key in (
                 "selected_full_audit_export",
-                "step5A_scorer_train_export",
-                "step5B_explainer_train_export",
+                "rating_stability_control_scorer_train_export",
+                "step5_explanation_explainer_train_export",
                 "step5_train_manifest",
                 "route_intersection_report",
                 "step5_dedicated_exports_status",
@@ -1117,10 +1117,10 @@ __all__ = [
     "STEP4_DEDICATED_EXPORTS_STATUS",
     "STEP4_DEDICATED_EXPORTS_STATUS_SCHEMA_VERSION",
     "STEP4_ROUTE_INTERSECTION_REPORT_SCHEMA_VERSION",
-    "STEP5A_SCORER_TRAIN_COLUMNS",
-    "STEP5A_SCORER_TRAIN_PARQUET",
-    "STEP5B_EXPLAINER_TRAIN_COLUMNS",
-    "STEP5B_EXPLAINER_TRAIN_PARQUET",
+    "STEP5_EXPLANATION_SCORER_TRAIN_COLUMNS",
+    "STEP5_EXPLANATION_SCORER_TRAIN_PARQUET",
+    "STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS",
+    "STEP5_EXPLANATION_EXPLAINER_TRAIN_PARQUET",
     "STEP5_TRAIN_MANIFEST",
     "Step4DedicatedExportError",
     "Step4DedicatedExportValidationResult",

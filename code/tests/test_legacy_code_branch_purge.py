@@ -6,9 +6,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_code1_code2_reference_source_trees_deleted() -> None:
-    assert not (REPO_ROOT / "code1").exists()
-    assert not (REPO_ROOT / "code2").exists()
+def test_code1_code2_reference_source_trees_are_not_active_runtime_roots() -> None:
+    assert (REPO_ROOT / "code").exists()
+    for rel in ("code1", "code2"):
+        if (REPO_ROOT / rel).exists():
+            assert not (REPO_ROOT / rel / ".odcr_active_runtime_root").exists()
 
 
 def test_legacy_tmux_bridge_wrapper_is_fail_fast_shim() -> None:
@@ -30,7 +32,8 @@ def test_runtime_bridge_has_no_old_target_selection_branches() -> None:
         "TARGET_SOURCE_DEFAULT",
     ):
         assert forbidden not in text
-    assert "global_target_selection_retired" in text
+    assert "global_target_selection_retired" not in text
+    assert "global_discovery_blocker_removed" in text
 
 
 def test_current_gpu_pane_handoff_accepts_v2_only() -> None:

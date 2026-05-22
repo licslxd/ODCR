@@ -459,7 +459,19 @@ def discover_panes(
     )
 
 
-def select_unique_pane(
+def _candidate_preference_key(candidate: PaneCandidate) -> tuple[int, int, int, str, str, str]:
+    command_class = str(candidate.command_class or classify_command(candidate.pane_command))
+    return (
+        0 if bool(candidate.active) else 1,
+        0 if bool(candidate.cwd_match_repo) else 1,
+        0 if command_class in {"shell", "srun"} else 1,
+        str(candidate.socket),
+        str(candidate.target),
+        str(candidate.pane_id),
+    )
+
+
+def select_preferred_pane(
     *,
     socket: str | None = None,
     target: str | None = None,
@@ -472,10 +484,11 @@ def select_unique_pane(
     candidates = list(discovery.candidates)
     if target:
         candidates = [candidate for candidate in candidates if candidate.target == target or candidate.pane_id == target]
-    if len(candidates) != 1:
+    if not candidates:
         raise RuntimeError(
-            "Fresh tmux GPU pane discovery did not resolve exactly one runnable pane "
+            "Fresh tmux GPU pane discovery did not find a runnable pane "
             f"(candidates={len(candidates)}, sockets={len(discovery.sockets_considered)}). "
-            "This is a bridge/pane discovery ambiguity, not proof that CUDA is unavailable."
+            "This is a bridge/pane discovery failure, not proof that CUDA is unavailable."
         )
-    return candidates[0], discovery
+    return sorted(candidates, key=_candidate_preference_key)[0], discovery
+

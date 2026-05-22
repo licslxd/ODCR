@@ -165,18 +165,17 @@ socket plus pane, and treats the tmux server PID as diagnostic-only. Handoff
 failure must delete stale active handoff state, print a warning, and continue
 into the GPU shell. The old `AI_analysis/runtime/gpu_pane.json` is historical
 hint material only and cannot select Step5/E4/formal targets.
-GPU use is allowed by default for repo-local validation, probe, and bounded
-runtime once the current pane is a user-created, already-entered, uniquely
-validated GPU pane. The controlled tmux GPU bridge,
-`python code/tools/odcr_tmux_gpu_bridge.py`, may send one bridge-generated
-command file to that pane. It is not arbitrary send-keys, and it is no longer
-limited by a GPU whitelist hard blocker. Bridge output stays under
-`AI_analysis/01_raw_logs` or `AI_analysis/05_final_reports` by default. The
-formal namespace guard remains mandatory: validation must not write formal
-latest pointers, formal checkpoints, Step4/Step5/eval/rerank outputs, or paper
-metrics unless a future request explicitly confirms a formal run. post-edit
-full is not a GPU prerequisite; fast sanity and current-pane validation are the
-GPU preflight, and runtime evidence takes priority over static full-suite
+GPU use is allowed by default for repo-local validation, probe, bounded runtime,
+eval, rerank, diagnostics, and user-authorized fixed training/evaluation work
+once the current pane is a user-created, already-entered, uniquely validated GPU
+pane. The controlled tmux GPU bridge may dispatch through
+`./odcr runtime bridge exec -- ...`. It is no longer limited by a GPU whitelist
+hard blocker or a formal-training string blocker; fresh CUDA validation and the
+formal namespace guard are the active safety contracts. Bridge output stays
+under `AI_analysis/01_raw_logs` or `AI_analysis/05_final_reports` by default
+unless the caller supplies explicit stdout/status/pid paths. post-edit full is
+not a GPU prerequisite; fast sanity and current-pane validation are the GPU
+preflight, and runtime evidence takes priority over static full-suite
 instability.
 
 Bridge runtime has two active execution classes. Short probes such as
@@ -305,20 +304,13 @@ consumer compatibility for Step5.
 
 ## Active Step5
 
-Step5 has two active paths.
+Step5 has one active path: explanation-only training.
 
-Step5A is the scorer stability path:
-
-- Consumes Step4 posterior `route_scorer` samples
-- Uses LCI for scorer stability
-- Uses UCI weights derived from Step4 reliability, uncertainty, confidence,
-  and sample-weight fields
-
-Step5B is the controlled explanation path:
-
-- Consumes Step4 posterior `route_explainer` samples
-- Uses CCV through an explicit control packet
-- Uses FCA to align scorer evidence and explainer evidence bases
+Rating metrics come from the Step3 accepted scorer declared in
+`configs/odcr.yaml: rating_source`. Step5 consumes Step4 posterior
+`route_explainer` samples, uses CCV through an explicit control packet, and
+uses FCA for evidence-basis alignment. Step5 does not train a rating scorer and
+does not write rating MAE/RMSE.
 
 Step5 valid/test target factual rows are not Step4 exports. When Step5 builds
 eval-only control packets for these rows, the control contract is explicitly
@@ -341,10 +333,10 @@ Active Step5 controls live under:
 - `step5.memory_truth`
 - `step5.train.explainer_loss_weight`
 
-The active Step5B verbalizer receives explicit structured control, not prompt
+The active Step5 verbalizer receives explicit structured control, not prompt
 concatenation. Step4 `sample_weight_hint` remains the posterior base sample
-weight; `step5.explainer_gate.explainer_only_multiplier` is only a Step5B
-training scheduling multiplier.
+weight; `step5.explainer_gate.explainer_only_multiplier` is only an
+explanation training scheduling multiplier.
 
 Step5 GPU admission uses the `step5.memory_truth` contract. Candidate rejection
 may use real OOM, CUDA allocator failure, forward/backward failure, non-finite
@@ -427,7 +419,7 @@ The following are retired and must not become active control surfaces:
 - `eta`
 - `lambda_lci`
 - `lambda_fca`
-- prompt concatenation as Step5B control
+- prompt concatenation as Step5 control
 - `content_preserve_score`
 - old public LoRA params outside `step5.ccv.native_lora`
 - top-level `logs/`, `code/log.out`, `nohup*.log`, fallback/mirror logs,
@@ -499,4 +491,5 @@ The auxiliary layer is active source code under `code/odcr_core/aux/`:
 
 Docs describe these registries; they do not maintain independent rule or scope
 lists. Legacy bridge generic modes (`repo-command`, `repo-script`,
-`repo-module`, `command-file`) are retired fail-fast paths.
+`repo-module`, `command-file`) are retired fail-fast paths; non-formal dynamic
+dispatch uses `./odcr runtime bridge exec -- ...`.

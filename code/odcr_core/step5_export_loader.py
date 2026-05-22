@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -44,6 +45,7 @@ from odcr_core.training_checkpoint import file_fingerprint, stable_hash
 STEP5_EXPORT_LOADER_SCHEMA_VERSION = "odcr_step5_export_loader/1"
 STEP5_TRAIN_TABLE_CACHE_SCHEMA_VERSION = "odcr_step5_train_table_cache/1"
 STEP5_TRAIN_TABLE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_train_table_semantic/1"
+STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION = "odcr_step5_pool_train_table_cache/1"
 
 STEP5_RUNTIME_DIAGNOSTIC_KEYS: frozenset[str] = frozenset(
     {
@@ -120,14 +122,14 @@ STEP5_TRAIN_OPTIONAL_COLUMNS: tuple[str, ...] = (
     "control_coverage_proxy",
     "evidence_alignment_proxy",
     "coverage_diversity_proxy",
-    "cf_tier_step5A",
-    "cf_tier_step5B",
-    "cf_quality_score_step5A",
-    "cf_quality_score_step5B",
-    "cf_tier_reasons_step5A",
-    "cf_tier_reasons_step5B",
-    "cf_sampling_weight_step5A",
-    "cf_sampling_weight_step5B",
+    "cf_tier_rating_stability_control",
+    "cf_tier_step5_explanation",
+    "cf_quality_score_rating_stability_control",
+    "cf_quality_score_step5_explanation",
+    "cf_tier_reasons_rating_stability_control",
+    "cf_tier_reasons_step5_explanation",
+    "cf_sampling_weight_rating_stability_control",
+    "cf_sampling_weight_step5_explanation",
 )
 STEP5_TRAIN_VALIDATION_COLUMNS: tuple[str, ...] = tuple(
     dict.fromkeys((*STEP5_TRAIN_REQUIRED_COLUMNS, *STEP4_RCR_REQUIRED_COLUMNS))
@@ -582,6 +584,137 @@ def _cache_key(source: Step5ExportSource, *, explainer_only_multiplier: float) -
     )
 
 
+def _pool_sampler_tuning_identity(tuning_config: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Content-affecting Step5 pool sampler knobs only.
+
+    Optimizer, loss, decode, and runtime fields are lineage-only for the sampled
+    table cache.  They do not alter the selected rows or rendered prompt text.
+    """
+
+    tuning = dict(tuning_config or {})
+    return {
+        "selected_budget_candidate": tuning.get("selected_budget_candidate"),
+        "batch_candidate": tuning.get("batch_candidate"),
+        "effective_samples": dict(tuning.get("effective_samples") or {})
+        if isinstance(tuning.get("effective_samples"), Mapping)
+        else {},
+    }
+
+
+def _pool_sample_cache_identity(
+    *,
+    pool_source: Any,
+    sampler_config: Mapping[str, Any] | None,
+    batch_candidates_config: Mapping[str, Any] | None,
+    tuning_config: Mapping[str, Any] | None,
+    mode: str,
+    task_head: str,
+    bounded_max_rows: int | None,
+    columns: Sequence[str] | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION,
+        "source": _source_table_semantic_payload(pool_source),
+        "sampler_config": dict(sampler_config or {}),
+        "batch_candidates_config": dict(batch_candidates_config or {}),
+        "tuning_identity": _pool_sampler_tuning_identity(tuning_config),
+        "mode": str(mode),
+        "task_head": str(task_head),
+        "bounded_max_rows": int(bounded_max_rows) if bounded_max_rows is not None else None,
+        "columns": [str(col) for col in columns] if columns is not None else None,
+    }
+
+
+def _pool_sample_cache_lineage(
+    *,
+    sampler_config: Mapping[str, Any] | None,
+    batch_candidates_config: Mapping[str, Any] | None,
+    tuning_config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "odcr_step5_pool_train_table_cache_lineage/1",
+        "sampler_config": dict(sampler_config or {}),
+        "batch_candidates_config": dict(batch_candidates_config or {}),
+        "tuning_config": dict(tuning_config or {}),
+    }
+
+
+def _pool_sample_cache_key(identity: Mapping[str, Any]) -> str:
+    return stable_hash(identity)
+
+
+def _pool_sample_cache_manifest_payload(
+    *,
+    cache_key: str,
+    cache_path: Path,
+    identity: Mapping[str, Any],
+    lineage: Mapping[str, Any],
+    row_count: int,
+    raw_row_count: int,
+    stats: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION,
+        "cache_key": str(cache_key),
+        "cache_path": str(cache_path),
+        "cache_identity": dict(identity),
+        "cache_identity_hash": stable_hash(identity),
+        "lineage_metadata": dict(lineage),
+        "lineage_metadata_hash": stable_hash(lineage),
+        "row_count": int(row_count),
+        "raw_row_count": int(raw_row_count),
+        "stats": dict(stats),
+    }
+
+
+def _load_pool_sample_cache(
+    cache_dir: Path,
+    *,
+    expected_identity: Mapping[str, Any],
+    expected_cache_key: str,
+    source: Step5ExportSource,
+    pool_source: Any,
+    stale_policy: str,
+) -> Step5TrainTableLoadResult | None:
+    manifest_path = cache_dir / "cache_manifest.json"
+    cache_path = cache_dir / "train_sampled.parquet"
+    if not manifest_path.is_file() or not cache_path.is_file():
+        return None
+    policy = str(stale_policy or "rebuild").strip().lower()
+
+    def _stale(message: str) -> Step5TrainTableLoadResult | None:
+        if policy == "rebuild":
+            return None
+        raise Step5ExportLoaderError(message)
+
+    manifest = _load_json(manifest_path, label="Step5 pool train table cache manifest")
+    if str(manifest.get("schema_version")) != STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION:
+        return _stale(f"Step5 pool train table cache schema mismatch at {manifest_path}.")
+    if str(manifest.get("cache_key") or "") != str(expected_cache_key):
+        return _stale(f"Step5 pool train table cache key mismatch at {manifest_path}.")
+    if dict(manifest.get("cache_identity") or {}) != dict(expected_identity):
+        return _stale(f"Step5 pool train table cache identity mismatch at {manifest_path}.")
+    df = pd.read_parquet(cache_path)
+    _check_required_columns(tuple(df.columns), source.required_columns, ctx="Step5 formal_train pool cache")
+    row_count = int(manifest.get("row_count", len(df)))
+    if row_count != len(df):
+        return _stale("Step5 pool train table cache row count mismatch.")
+    stats = dict(manifest.get("stats") or {})
+    stats["cache_load_wall_time_s"] = float(stats.get("cache_load_wall_time_s") or 0.0)
+    return Step5TrainTableLoadResult(
+        train_df=df,
+        audit_raw_df=df.head(16).copy(),
+        source=pool_source,  # type: ignore[arg-type]
+        cache_dir=cache_dir,
+        cache_manifest_path=manifest_path,
+        cache_hit=True,
+        raw_row_count=int(manifest.get("raw_row_count", len(df))),
+        filtered_row_count=int(len(df)),
+        raw_index_min_max=_idx_minmax_from_df(df),
+        stats=stats,
+    )
+
+
 def _load_cache(
     cache_dir: Path,
     *,
@@ -831,6 +964,8 @@ def _parse_sampler_config(raw: Mapping[str, Any] | str | None) -> dict[str, Any]
 def load_step5_pool_train_table(
     export_path: str | Path,
     *,
+    cache_root: str | Path | None = None,
+    cache_enabled: bool = True,
     index_contract_path: str | Path | None = None,
     manifest_path: str | Path | None = None,
     index_contract: Mapping[str, Any] | None = None,
@@ -839,10 +974,11 @@ def load_step5_pool_train_table(
     sampler_config: Mapping[str, Any] | str | None = None,
     batch_candidates_config: Mapping[str, Any] | str | None = None,
     tuning_config: Mapping[str, Any] | str | None = None,
-    task_head: str = "combined",
+    task_head: str = "explanation",
     bounded_max_rows: int | None = None,
     validate_sample_rows: int = 16,
     verify_sha256: bool = True,
+    stale_policy: str = "rebuild",
     validation_ctx: Mapping[str, Any] | None = None,
 ) -> Step5TrainTableLoadResult:
     """Load Step5 train rows from Step4 pools and the sampling contract.
@@ -855,6 +991,11 @@ def load_step5_pool_train_table(
     mode_norm = str(mode).strip().lower()
     if mode_norm not in {"validate_only", "bounded", "formal_prepare", "formal_train"}:
         raise Step5ExportLoaderError(f"unsupported Step5 pool loader mode: {mode!r}")
+    stale_policy_norm = str(stale_policy or "rebuild").strip().lower()
+    if stale_policy_norm not in {"rebuild", "fail_fast"}:
+        raise Step5ExportLoaderError(
+            f"unsupported step5.export_loader.stale_policy: {stale_policy!r}; expected rebuild or fail_fast."
+        )
     source = validate_step5_export_source(
         export_path,
         index_contract_path=index_contract_path,
@@ -905,6 +1046,43 @@ def load_step5_pool_train_table(
     # Pool parquet files extend the canonical Step4 CSV contract with derived
     # quality/tier fields, so do not restrict reads to the source CSV header.
     columns = tuple(dict.fromkeys((*STEP5_TRAIN_LOADER_COLUMNS, "sample_id", "task_head", "effective_epoch")))
+    cache_dir: Path | None = None
+    cache_manifest_path: Path | None = None
+    cache_hit = False
+    cache_identity: dict[str, Any] | None = None
+    cache_lineage: dict[str, Any] | None = None
+    cache_key: str | None = None
+    if mode_norm == "formal_train" and bool(cache_enabled):
+        root = Path(cache_root).expanduser().resolve() if cache_root is not None else source.export_path.parent / ".step5_pool_cache"
+        cache_identity = _pool_sample_cache_identity(
+            pool_source=pool_source,
+            sampler_config=sampler,
+            batch_candidates_config=batch_candidates,
+            tuning_config=tuning,
+            mode=mode_norm,
+            task_head=str(task_head),
+            bounded_max_rows=bounded_max_rows,
+            columns=columns,
+        )
+        cache_lineage = _pool_sample_cache_lineage(
+            sampler_config=sampler,
+            batch_candidates_config=batch_candidates,
+            tuning_config=tuning,
+        )
+        cache_key = _pool_sample_cache_key(cache_identity)
+        cache_dir = root / str(cache_key)
+        cached = _load_pool_sample_cache(
+            cache_dir,
+            expected_identity=cache_identity,
+            expected_cache_key=cache_key,
+            source=source,
+            pool_source=pool_source,
+            stale_policy=stale_policy_norm,
+        )
+        if cached is not None:
+            return cached
+    elif mode_norm == "formal_train" and not bool(cache_enabled):
+        raise Step5ExportLoaderError("step5.export_loader.cache_enabled=false is not allowed for formal_train.")
     try:
         sampled = sample_effective_epochs_from_pools(
             pool_source,
@@ -922,17 +1100,56 @@ def load_step5_pool_train_table(
     if train_df.empty:
         raise Step5ExportLoaderError("Step5 pool sampler produced zero rows; check pool distribution and sampling contract.")
     validate_split_indices(train_df, source.index_contract, "train", ctx=dict(validation_ctx or {}))
+    stats = dict(sampled.stats)
+    if cache_dir is not None and cache_identity is not None and cache_lineage is not None and cache_key is not None:
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = cache_dir.with_name(f"{cache_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=False)
+        tmp_path = tmp_dir / "train_sampled.parquet"
+        try:
+            train_df.to_parquet(tmp_path, index=False)
+            manifest_payload = _pool_sample_cache_manifest_payload(
+                cache_key=cache_key,
+                cache_path=cache_dir / "train_sampled.parquet",
+                identity=cache_identity,
+                lineage=cache_lineage,
+                row_count=len(train_df),
+                raw_row_count=sampled.raw_row_count,
+                stats=stats,
+            )
+            atomic_write_json(tmp_dir / "cache_manifest.json", manifest_payload)
+            for attempt in range(2):
+                if cache_dir.exists():
+                    if cache_dir.is_dir():
+                        shutil.rmtree(cache_dir, ignore_errors=True)
+                    else:
+                        try:
+                            cache_dir.unlink()
+                        except FileNotFoundError:
+                            pass
+                try:
+                    os.replace(str(tmp_dir), str(cache_dir))
+                    break
+                except FileExistsError:
+                    if attempt >= 1:
+                        raise
+            cache_manifest_path = cache_dir / "cache_manifest.json"
+        finally:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
     return Step5TrainTableLoadResult(
         train_df=train_df,
         audit_raw_df=sampled.audit_raw_df,
         source=pool_source,  # type: ignore[arg-type]
-        cache_dir=None,
-        cache_manifest_path=None,
-        cache_hit=False,
+        cache_dir=cache_dir,
+        cache_manifest_path=cache_manifest_path,
+        cache_hit=cache_hit,
         raw_row_count=int(sampled.raw_row_count),
         filtered_row_count=int(sampled.filtered_row_count),
         raw_index_min_max=_idx_minmax_from_df(train_df),
-        stats={**dict(sampled.stats), "full_csv_parse": False},
+        stats={**stats, "full_csv_parse": False},
     )
 
 

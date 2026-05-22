@@ -1,4 +1,4 @@
-"""Head-aware native LoRA injection for Step5.
+"""Explanation-only native LoRA injection for Step5.
 
 The active Step5 path is allowlist-only: an empty ``target_modules`` list no
 longer means "scan the model".  The resolver should pass the policy sentinel,
@@ -22,12 +22,12 @@ from odcr_core.step5_grad_contract import (
 
 HEAD_AWARE_LORA_TARGET_SENTINEL = "__HEAD_AWARE_STEP5_DEFAULT__"
 
-_STEP5A_PREFIXES: tuple[str, ...] = (
+_RETIRED_SCORER_PREFIXES: tuple[str, ...] = (
     "domain_gate",
     "transformer_encoder",
 )
 
-_STEP5B_PREFIXES: tuple[str, ...] = (
+_EXPLANATION_PREFIXES: tuple[str, ...] = (
     "domain_gate",
     "transformer_encoder",
     "ccv_numeric_adapter",
@@ -37,7 +37,7 @@ _STEP5B_PREFIXES: tuple[str, ...] = (
     "flan_explainer",
 )
 
-_COMBINED_PREFIXES: tuple[str, ...] = tuple(dict.fromkeys(_STEP5A_PREFIXES + _STEP5B_PREFIXES))
+_EXPLANATION_PREFIXES: tuple[str, ...] = tuple(dict.fromkeys(_RETIRED_SCORER_PREFIXES + _EXPLANATION_PREFIXES))
 
 
 class LoRALinear(nn.Module):
@@ -86,12 +86,8 @@ def _parent_and_child(model: nn.Module, dotted: str) -> Tuple[nn.Module, str]:
 
 
 def _prefixes_for_head(head: str) -> tuple[str, ...]:
-    norm = normalize_step5_head_for_contract(head)
-    if norm == "step5A":
-        return _STEP5A_PREFIXES
-    if norm == "step5B":
-        return _STEP5B_PREFIXES
-    return _COMBINED_PREFIXES
+    normalize_step5_head_for_contract(head)
+    return _EXPLANATION_PREFIXES
 
 
 def _legacy_target_hit(name: str) -> str | None:
@@ -188,7 +184,7 @@ def resolve_step5_lora_targets(
     }
 
 
-def discover_step5_text_linear_targets(model: nn.Module, *, head: str = "combined") -> List[str]:
+def discover_step5_text_linear_targets(model: nn.Module, *, head: str = "explanation") -> List[str]:
     """Compatibility helper returning the explicit head-aware allowlist."""
     return head_aware_step5_lora_targets(model, head=head)
 

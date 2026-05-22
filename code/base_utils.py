@@ -11,7 +11,7 @@ _NLTK_LOCAL = require_nltk_data_dir()
 os.environ["NLTK_DATA"] = _NLTK_LOCAL
 
 import re
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 from rouge import rouge, rouge_from_word_lists
 from nltk import word_tokenize
@@ -284,6 +284,47 @@ def filter_by_entropy(entropy_values, percentile=0.75):
 
 
 PAPER_METRICS_SCHEMA_VERSION = "odcr_paper_comparable_text/1.0"
+OFFICIAL_PAPER_METRICS_SCHEMA_VERSION = "odcr_step5_official_paper_metrics/1"
+PAPER_METRIC_INPUT_SCHEMA_VERSION = "odcr_step5_paper_metric_inputs/1"
+
+
+def _tokenizer_truncate_decode_text(text: Any, tokenizer: Any, *, max_len: int) -> Tuple[str, List[int], int]:
+    if tokenizer is None:
+        raise ValueError("official paper metric input builder requires tokenizer")
+    if int(max_len) <= 0:
+        raise ValueError(f"official paper metric max_len must be positive, got {max_len!r}")
+    raw = "" if text is None else str(text)
+    encoded = tokenizer(raw, add_special_tokens=False, truncation=False)
+    original_ids = [int(x) for x in list(encoded.get("input_ids") or [])]
+    ids = original_ids[: int(max_len)]
+    try:
+        decoded = tokenizer.decode(ids, skip_special_tokens=True)
+    except TypeError:
+        decoded = tokenizer.decode(ids)
+    return str(decoded).strip(), ids, int(len(original_ids))
+
+
+def build_paper_metric_inputs(pred_text: Any, ref_text: Any, tokenizer: Any, max_len: int = 25) -> Dict[str, Any]:
+    """Build the only official Step5_e paper metric input pair.
+
+    Both sides are re-tokenized from raw text, truncated to the same token
+    budget, then decoded before metric computation. Official metrics must use
+    ``metric_pred`` and ``metric_ref`` from this function, not raw pred/ref text.
+    """
+    metric_pred, pred_ids, pred_original_len = _tokenizer_truncate_decode_text(pred_text, tokenizer, max_len=max_len)
+    metric_ref, ref_ids, ref_original_len = _tokenizer_truncate_decode_text(ref_text, tokenizer, max_len=max_len)
+    return {
+        "schema_version": PAPER_METRIC_INPUT_SCHEMA_VERSION,
+        "max_len": int(max_len),
+        "metric_pred": metric_pred,
+        "metric_ref": metric_ref,
+        "prediction_token_count": int(len(pred_ids)),
+        "reference_token_count": int(len(ref_ids)),
+        "prediction_original_token_count": int(pred_original_len),
+        "reference_original_token_count": int(ref_original_len),
+        "prediction_truncated": bool(pred_original_len > int(max_len)),
+        "reference_truncated": bool(ref_original_len > int(max_len)),
+    }
 
 
 def paper_tokenize_words(s: str) -> List[str]:
@@ -372,4 +413,68 @@ def compute_paper_comparable_text_metrics(
             "scale_ratio_0_1": {"1": round(d1r, 6), "2": round(d2r, 6)},
         },
         "note": "repo evaluate_text 仍保留（含空格切分 ROUGE）；本块为统一分词后的论文对照口径",
+    }
+
+
+def official_paper_metrics(
+    predictions: Sequence[str],
+    references: Sequence[str],
+) -> Dict[str, Any]:
+    """Single official Step5_e paper metric implementation.
+
+    Inputs must already be the 25-token ``metric_pred`` / ``metric_ref`` texts
+    produced by :func:`build_paper_metric_inputs`.
+    """
+    pred_list = [str(p) if p is not None else "" for p in predictions]
+    ref_list = [str(r) if r is not None else "" for r in references]
+    if len(pred_list) != len(ref_list):
+        raise ValueError(f"official paper metrics length mismatch: {len(pred_list)} != {len(ref_list)}")
+    paper = compute_paper_comparable_text_metrics(pred_list, ref_list)
+    try:
+        import evaluate
+        _cache = get_meteor_cache_dir()
+        os.makedirs(_cache, exist_ok=True)
+        _patch_nltk_download_offline_only()
+        _meteor_dir = get_meteor_metric_module_dir()
+        _meteor_script = None
+        if os.path.isdir(_meteor_dir):
+            for _entry in sorted(os.listdir(_meteor_dir)):
+                _candidate = os.path.join(_meteor_dir, _entry, "meteor.py")
+                if os.path.isfile(_candidate):
+                    _meteor_script = _candidate
+                    break
+        if _meteor_script:
+            meteor = evaluate.load(_meteor_script, cache_dir=_cache)
+        else:
+            meteor = evaluate.load("meteor", cache_dir=_cache)
+        meteor_score = round(float(meteor.compute(predictions=pred_list, references=ref_list)["meteor"]) * 100.0, 4)
+    except Exception:
+        _logger.exception("official METEOR failed")
+        meteor_score = 0.0
+    return {
+        "schema_version": OFFICIAL_PAPER_METRICS_SCHEMA_VERSION,
+        "input_schema_version": PAPER_METRIC_INPUT_SCHEMA_VERSION,
+        "token_length_policy": {
+            "prediction_max_length": 25,
+            "reference_max_length": 25,
+            "unit": "tokenizer_tokens_then_decode",
+        },
+        "rouge": paper["rouge"],
+        "bleu": paper["bleu"],
+        "meteor": meteor_score,
+        "distinct_corpus": paper["distinct_corpus"],
+        "tokenization": paper["tokenization"],
+        "scale": "percent_0_100",
+    }
+
+
+def diagnostic_metrics(
+    predictions: Sequence[str],
+    references: Sequence[str],
+) -> Dict[str, Any]:
+    """Non-official text diagnostics; never use for Step5 best selection."""
+    return {
+        "schema_version": "odcr_step5_diagnostic_metrics/1",
+        "official_paper_metrics": False,
+        "evaluate_text": evaluate_text(predictions, references),
     }

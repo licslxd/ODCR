@@ -110,7 +110,7 @@ class Step5CacheManifestTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(reason, "missing_manifest")
 
-    def test_manifest_gate_rejects_step5_innovation_hash_mismatch(self) -> None:
+    def test_manifest_gate_accepts_audit_only_step5_innovation_hash_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             fp = self._fingerprint(repo)
@@ -130,8 +130,8 @@ class Step5CacheManifestTest(unittest.TestCase):
                 str(cache_dir),
                 expected_fingerprint=fp,
             )
-            self.assertFalse(ok)
-            self.assertEqual(reason, "step5_innovation_config_hash_mismatch")
+            self.assertTrue(ok, reason)
+            self.assertEqual(reason, "hit")
 
     def test_eval_only_fingerprint_labels_factual_default_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +164,111 @@ class Step5CacheManifestTest(unittest.TestCase):
             self.assertFalse(contract["is_rcr_posterior"])
             self.assertFalse(contract["is_step4_export_posterior"])
             self.assertTrue(fp["eval_control_contract_hash"])
+
+    def test_official_eval_cache_identity_ignores_training_and_decode_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            train = repo / "step4_export" / "train.csv"
+            valid = repo / "step4_export" / "valid.csv"
+            index_contract = repo / "step4_export" / "index_contract.json"
+            train.parent.mkdir(parents=True, exist_ok=True)
+            train.write_text("user_idx_global,item_idx_global,rating,clean_text\n1,2,5,ok\n", encoding="utf-8")
+            valid.write_text("user_idx_global,item_idx_global,rating,explanation\n3,4,4,ok\n", encoding="utf-8")
+            index_contract.write_text(json.dumps({"step4_export_lineage": {"lineage_hash": "abc"}}), encoding="utf-8")
+            model_dir = repo / "models" / "flan"
+            model_dir.mkdir(parents=True)
+            (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+            with self._env(repo, model_dir):
+                fp1 = step5_engine._build_tokenize_cache_fingerprint(
+                    train_path=str(train),
+                    eval_split_path=str(valid),
+                    task_idx=4,
+                    split_label="valid",
+                    tok=_DummyTokenizer(),
+                    max_length=25,
+                    cache_version=step5_engine.ODCR_TOKENIZE_CACHE_VERSION,
+                    eval_only=True,
+                    index_contract_path=str(index_contract),
+                    step4_export_lineage={"lineage_hash": "abc"},
+                )
+                payload = json.loads(os.environ["ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON"])
+                payload["step5_innovation"]["fca"]["weight"] = 0.99
+                payload["step5_sampler"] = {"seed": 999, "ratio": {"target_gold": 0.1}}
+                os.environ["ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON"] = json.dumps(payload, sort_keys=True)
+                os.environ["ODCR_TRAINING_SEMANTIC_FINGERPRINT"] = "changed-training"
+                os.environ["ODCR_GENERATION_SEMANTIC_FINGERPRINT"] = "changed-decode"
+                fp2 = step5_engine._build_tokenize_cache_fingerprint(
+                    train_path=str(train),
+                    eval_split_path=str(valid),
+                    task_idx=4,
+                    split_label="valid",
+                    tok=_DummyTokenizer(),
+                    max_length=25,
+                    cache_version=step5_engine.ODCR_TOKENIZE_CACHE_VERSION,
+                    eval_only=True,
+                    index_contract_path=str(index_contract),
+                    step4_export_lineage={"lineage_hash": "abc"},
+                )
+            self.assertEqual(fp1["cache_identity_hash"], fp2["cache_identity_hash"])
+            self.assertEqual(fp1["fingerprint_hash"], fp2["fingerprint_hash"])
+            self.assertNotEqual(fp1["lineage_metadata_hash"], fp2["lineage_metadata_hash"])
+
+    def test_train_cache_identity_ignores_training_batch_and_loss_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            train = repo / "step4_export" / "train.csv"
+            valid = repo / "step4_export" / "valid.csv"
+            index_contract = repo / "step4_export" / "index_contract.json"
+            train.parent.mkdir(parents=True, exist_ok=True)
+            train.write_text("user_idx_global,item_idx_global,rating,clean_text\n1,2,5,ok\n", encoding="utf-8")
+            valid.write_text("user_idx_global,item_idx_global,rating,explanation\n3,4,4,ok\n", encoding="utf-8")
+            index_contract.write_text(json.dumps({"step4_export_lineage": {"lineage_hash": "abc"}}), encoding="utf-8")
+            model_dir = repo / "models" / "flan"
+            model_dir.mkdir(parents=True)
+            (model_dir / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+            sampler_summary = {
+                "sample_plan_hash": "same-sampled-rows",
+                "source": {
+                    "pool_manifest": {"sha256": "pool-sha"},
+                    "sampling_contract": {"sha256": "sampling-sha"},
+                },
+            }
+            with self._env(repo, model_dir):
+                fp1 = step5_engine._build_tokenize_cache_fingerprint(
+                    train_path=str(train),
+                    eval_split_path=str(valid),
+                    task_idx=4,
+                    split_label="train",
+                    tok=_DummyTokenizer(),
+                    max_length=25,
+                    cache_version=step5_engine.ODCR_TOKENIZE_CACHE_VERSION,
+                    eval_only=False,
+                    index_contract_path=str(index_contract),
+                    step4_export_lineage={"lineage_hash": "abc"},
+                    step5_sampler_summary=sampler_summary,
+                )
+                payload = json.loads(os.environ["ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON"])
+                payload["train"] = {"batch_size": 384, "per_gpu_batch_size": 192}
+                payload["step5_innovation"]["fca"]["weight"] = 0.99
+                payload["losses"] = {"repeat_ul": 0.03, "terminal_clean": 0.02}
+                os.environ["ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON"] = json.dumps(payload, sort_keys=True)
+                os.environ["ODCR_TRAINING_SEMANTIC_FINGERPRINT"] = "changed-training"
+                fp2 = step5_engine._build_tokenize_cache_fingerprint(
+                    train_path=str(train),
+                    eval_split_path=str(valid),
+                    task_idx=4,
+                    split_label="train",
+                    tok=_DummyTokenizer(),
+                    max_length=25,
+                    cache_version=step5_engine.ODCR_TOKENIZE_CACHE_VERSION,
+                    eval_only=False,
+                    index_contract_path=str(index_contract),
+                    step4_export_lineage={"lineage_hash": "abc"},
+                    step5_sampler_summary=sampler_summary,
+                )
+            self.assertEqual(fp1["cache_identity_hash"], fp2["cache_identity_hash"])
+            self.assertEqual(fp1["fingerprint_hash"], fp2["fingerprint_hash"])
+            self.assertNotEqual(fp1["lineage_metadata_hash"], fp2["lineage_metadata_hash"])
 
 
 if __name__ == "__main__":

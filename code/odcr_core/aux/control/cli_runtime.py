@@ -36,6 +36,26 @@ def cmd_runtime(args: argparse.Namespace) -> int:
             argv.append("--no-send")
         if getattr(args, "timeout", None) is not None:
             argv.extend(["--timeout", str(args.timeout)])
+        if args.bridge_command == "exec":
+            if bool(getattr(args, "background", False)):
+                argv.append("--background")
+            if not bool(getattr(args, "require_cuda", True)):
+                argv.append("--no-require-cuda")
+            for key, flag in (
+                ("stdout_path", "--stdout"),
+                ("stderr_path", "--stderr"),
+                ("pid_file", "--pid-file"),
+                ("status_path", "--status-path"),
+            ):
+                value = getattr(args, key, None)
+                if value:
+                    argv.extend([flag, str(value)])
+            if not bool(getattr(args, "stderr_to_stdout", True)):
+                argv.append("--split-stderr")
+            exec_argv = list(getattr(args, "exec_argv", []) or [])
+            if exec_argv:
+                argv.append("--")
+                argv.extend(str(item) for item in exec_argv if str(item) != "--")
         if args.bridge_command == "_handshake-child":
             for key in ("kind", "status_path", "log_path", "report_path", "repo_root", "stage", "task"):
                 value = getattr(args, key, None)

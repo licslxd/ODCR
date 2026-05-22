@@ -325,15 +325,17 @@ def parse_full_bleu_decode_strategy(v: Any, *, ctx: str = "full_bleu_decode_stra
 
 
 def parse_checkpoint_selection_mode(v: Any, *, ctx: str = "checkpoint_selection_mode") -> str:
-    """canonical best.pth：guarded_composite=valid_loss 门槛 + 主口径文本复合 tie-break；valid_loss_only=仅逐 epoch 未变差。"""
+    """canonical best.pth selection mode."""
     s = str(v).strip().lower()
-    if s in ("guarded_composite", "valid_loss_only"):
+    if s in ("guarded_composite", "official_paper_metrics"):
         return s
-    raise ValueError(f"{ctx} 须为 guarded_composite 或 valid_loss_only，当前为 {v!r}")
+    if s == "valid_loss_only":
+        raise ValueError(f"{ctx}: valid_loss_only is retired for Step5_e final best; use official_paper_metrics.")
+    raise ValueError(f"{ctx} 须为 guarded_composite 或 official_paper_metrics，当前为 {v!r}")
 
 
 def parse_train_mode(v: Any, *, ctx: str = "train_mode") -> str:
-    """Step5 文本侧：lora=仅训练 LoRA 旁路；full=全参数（禁止作为 Step5B 默认）。"""
+    """Step5 文本侧：lora=仅训练 LoRA 旁路；full=全参数（禁止作为 Step5 explanation 默认）。"""
     s = str(v).strip().lower()
     if s in ("lora", "full"):
         return s
@@ -1320,11 +1322,10 @@ class FinalTrainingConfig:
     test_forward_micro_batch_size: int
     validation_microbatch_accumulation: bool
     validation_memory_policy: str
-    step5A_validation_mode: str
+    step5_validation_mode: str
     formal_entry_E4_validation_required: bool
     old_eval_batch_2048_retired: bool
     valid_loss_components_json: str
-
     train_batch_size: int
     global_batch_size: int
     batch_size_global: int
@@ -1422,6 +1423,9 @@ class FinalTrainingConfig:
     generate_top_p: float = 0.9
     max_explanation_length: int = 25
     train_label_max_length: int = 64
+    valid_loss_label_max_length: int = 128
+    final_eval_prediction_max_length: int = 25
+    final_eval_reference_max_length: int = 25
     train_dynamic_padding: bool = True
     train_padding_strategy: str = "dynamic_batch"
     decode_strategy: str = "greedy"
@@ -1464,10 +1468,12 @@ class FinalTrainingConfig:
     lambda_ortho_xcov: float = 1.0
     lambda_ortho_cos: float = 0.25
     lambda_ortho_step5: float = 0.15
-    # Step5A/Step5B：LCI 与 FCA 权重来自 step5.lci / step5.fca。
+    # Step5 explanation-only：FCA/CCV 权重来自 step5.fca / step5.ccv。
     step5_lci_weight: float = 0.12
     step5_fca_weight: float = 0.08
-    step5_head: str = "combined"
+    step5_mode: str = "explanation_only"
+    step5_head: str = "explanation"
+    rating_source_config_json: str = "{}"
     lora_target_policy_id: str = ""
     head_specific_lora_allowlist_id: str = ""
     final_lora_target_modules: Tuple[str, ...] = ()
@@ -1516,7 +1522,7 @@ class FinalTrainingConfig:
     nuser: int = 0
     nitem: int = 0
 
-    # Step5B：训练范式（manifest / config_resolved；train_mode=lora 时由 step5_native_lora 注入）
+    # Step5 explanation：训练范式（manifest / config_resolved；train_mode=lora 时由 step5_native_lora 注入）
     train_mode: str = "lora"
     train_precision: str = "bf16"
     allow_tf32: bool = True
@@ -1624,6 +1630,37 @@ def build_mainline_alignment_monitor_override(cfg: FinalTrainingConfig) -> Dict[
 def build_full_bleu_monitor_cfg_override(cfg: FinalTrainingConfig) -> Dict[str, Any]:
     """训练期 valid 文本监控与 guarded checkpoint 的 generate 覆盖：与主 decode 口径一致（见 build_mainline_alignment_monitor_override）。"""
     return build_mainline_alignment_monitor_override(cfg)
+
+
+def build_official_paper_greedy_25_override(cfg: FinalTrainingConfig) -> Dict[str, Any]:
+    from executors.decode_controller import resolve_decode_backend_name
+
+    return {
+        "strategy": "greedy",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "gap_threshold": 0.0,
+        "prefix_greedy_steps": 0,
+        "top_k": 1,
+        "repetition_penalty": 1.0,
+        "no_repeat_ngram_size": 0,
+        "min_len": 0,
+        "soft_max_len": 0,
+        "hard_max_len": 25,
+        "eos_boost_start": 9999,
+        "eos_boost_value": 0.0,
+        "tail_temperature": -1.0,
+        "tail_top_p": -1.0,
+        "forbid_eos_after_open_quote": False,
+        "forbid_eos_after_open_bracket": False,
+        "forbid_bad_terminal_tokens": True,
+        "token_repeat_window": int(getattr(cfg, "decode_token_repeat_window", 4)),
+        "token_repeat_max": int(getattr(cfg, "decode_token_repeat_max", 2)),
+        "decode_seed": None,
+        "uncertainty_entropy_eps": float(getattr(cfg, "uncertainty_entropy_eps", 1e-8)),
+        "decode_backend": resolve_decode_backend_name(getattr(cfg, "train_time_eval_decode_backend", "sdpa_kv_safe")),
+        "decode_run_context": "train_time_eval",
+    }
 
 
 def format_full_bleu_monitor_log_line(cfg: FinalTrainingConfig) -> str:
@@ -1898,7 +1935,7 @@ def build_resolved_training_config(
     if preset_nm != "step3":
         coef_f = float(_coerce_task_param_numeric(row["coef"]))
 
-    # ----- Step5B explainer objective weight. -----
+    # ----- Step5 explanation objective weight. -----
     explainer_loss_weight_f = 0.0
     src["explainer_loss_weight"] = "inactive"
     if preset_nm == "step5":
@@ -2122,7 +2159,9 @@ def build_resolved_training_config(
     step5_lifecycle_phase_v = "train_only"
     step5_allow_embedded_final_eval_v = False
     step5_memory_truth_config_json_v = "{}"
-    step5_head_v = "combined"
+    step5_head_v = "explanation"
+    step5_mode_v = "explanation_only"
+    rating_source_config_json_v = "{}"
     lora_target_policy_id_v = ""
     head_specific_lora_allowlist_id_v = ""
     final_lora_target_modules_v: Tuple[str, ...] = ()
@@ -2150,8 +2189,12 @@ def build_resolved_training_config(
     src["step5_allow_embedded_final_eval"] = "inactive"
     src["step5_memory_truth"] = "inactive"
     if preset_nm == "step5":
-        step5_head_v = str(row.get("step5_head") or _payload.get("step5_head") or "combined").strip()
-        if step5_head_v not in {"step5A", "step5B", "combined"}:
+        step5_mode_v = str(row.get("step5_mode") or _payload.get("step5_mode") or "explanation_only").strip()
+        rating_source_config_json_v = json.dumps(_payload.get("rating_source") or row.get("rating_source") or {}, ensure_ascii=False, sort_keys=True)
+        step5_head_v = str(row.get("step5_head") or _payload.get("step5_head") or "explanation").strip()
+        if step5_mode_v != "explanation_only":
+            raise RuntimeError(f"invalid Step5 mode in resolved payload: {step5_mode_v!r}")
+        if step5_head_v != "explanation":
             raise RuntimeError(f"invalid Step5 head in resolved payload: {step5_head_v!r}")
         lora_target_policy_id_v = str(row.get("lora_target_policy_id") or _payload.get("lora_target_policy_id") or "")
         head_specific_lora_allowlist_id_v = str(
@@ -2172,7 +2215,7 @@ def build_resolved_training_config(
             for x in (row.get("deleted_legacy_modules") or _payload.get("deleted_legacy_modules") or [])
             if str(x).strip()
         )
-        combined_formal_enabled_v = bool(row.get("combined_formal_enabled", _payload.get("combined_formal_enabled", False)))
+        combined_formal_enabled_v = bool(row.get("retired_combined_formal_enabled", _payload.get("retired_combined_formal_enabled", False)))
         all_trainable_grad_required_v = bool(
             row.get("all_trainable_grad_required", _payload.get("all_trainable_grad_required", False))
         )
@@ -2193,7 +2236,7 @@ def build_resolved_training_config(
         if not isinstance(st5_policy, dict):
             raise RuntimeError(
                 "effective payload missing step5_task_decoupled_policy; "
-                "Step5A/Step5B separation must come from configs/odcr.yaml."
+                "Step5 explanation policy must come from configs/odcr.yaml."
             )
         st5_loader = _payload.get("step5_export_loader")
         if not isinstance(st5_loader, dict):
@@ -2626,7 +2669,7 @@ def build_resolved_training_config(
     test_forward_micro_batch_size_v = int(row.get("test_forward_micro_batch_size", valid_forward_micro_batch_size_v))
     validation_microbatch_accumulation_v = bool(row.get("validation_microbatch_accumulation", False))
     validation_memory_policy_v = str(row.get("validation_memory_policy", ""))
-    step5a_validation_mode_v = str(row.get("step5A_validation_mode", ""))
+    step5_validation_mode_v = str(row.get("step5_validation_mode", ""))
     formal_entry_e4_validation_required_v = bool(row.get("formal_entry_E4_validation_required", False))
     old_eval_batch_2048_retired_v = bool(row.get("old_eval_batch_2048_retired", False))
     valid_loss_components_v = row.get("valid_loss_components", {})
@@ -2642,7 +2685,7 @@ def build_resolved_training_config(
     src["valid_forward_micro_batch_size"] = "step5.eval" if preset_nm == "step5" and "valid_forward_micro_batch_size" in row else "inactive"
     src["validation_microbatch_accumulation"] = "step5.eval" if preset_nm == "step5" and "validation_microbatch_accumulation" in row else "inactive"
     src["validation_memory_policy"] = "step5.eval" if preset_nm == "step5" and "validation_memory_policy" in row else "inactive"
-    src["step5A_validation_mode"] = "step5.eval" if preset_nm == "step5" and "step5A_validation_mode" in row else "inactive"
+    src["step5_validation_mode"] = "step5.eval" if preset_nm == "step5" and "step5_validation_mode" in row else "inactive"
     src["formal_entry_E4_validation_required"] = "step5.eval" if preset_nm == "step5" and "formal_entry_E4_validation_required" in row else "inactive"
     src["old_eval_batch_2048_retired"] = "step5.eval" if preset_nm == "step5" and "old_eval_batch_2048_retired" in row else "inactive"
     src["valid_loss_components"] = "step5.eval" if preset_nm == "step5" and "valid_loss_components" in row else "inactive"
@@ -2713,10 +2756,13 @@ def build_resolved_training_config(
         test_forward_micro_batch_size=int(test_forward_micro_batch_size_v),
         validation_microbatch_accumulation=bool(validation_microbatch_accumulation_v),
         validation_memory_policy=str(validation_memory_policy_v),
-        step5A_validation_mode=str(step5a_validation_mode_v),
+        step5_validation_mode=str(step5_validation_mode_v),
         formal_entry_E4_validation_required=bool(formal_entry_e4_validation_required_v),
         old_eval_batch_2048_retired=bool(old_eval_batch_2048_retired_v),
         valid_loss_components_json=json.dumps(valid_loss_components_v, ensure_ascii=False, sort_keys=True),
+        valid_loss_label_max_length=int(row.get("valid_loss_label_max_length", row.get("train_label_max_length", 64))),
+        final_eval_prediction_max_length=int(row.get("final_eval_prediction_max_length", 25)),
+        final_eval_reference_max_length=int(row.get("final_eval_reference_max_length", 25)),
         train_batch_size=G,
         global_batch_size=G,
         batch_size_global=G,
@@ -2816,7 +2862,9 @@ def build_resolved_training_config(
         lambda_ortho_step5=float(lambda_ortho_step5_v),
         step5_lci_weight=float(step5_lci_weight_v),
         step5_fca_weight=float(step5_fca_weight_v),
+        step5_mode=str(step5_mode_v),
         step5_head=str(step5_head_v),
+        rating_source_config_json=str(rating_source_config_json_v),
         lora_target_policy_id=str(lora_target_policy_id_v),
         head_specific_lora_allowlist_id=str(head_specific_lora_allowlist_id_v),
         final_lora_target_modules=final_lora_target_modules_v,

@@ -17,9 +17,12 @@ _RE_ITER = re.compile(r"^v(\d+)$", re.IGNORECASE)
 # 实验 run：纯十进制段用下划线连接，如 1、2、2_1、2_1_1
 _RE_RUN_SLUG = re.compile(r"^(\d+(?:_\d+)*)$")
 _RE_PACK = re.compile(r"^pack(\d+)$", re.IGNORECASE)
-STEP5_HEAD_CHOICES = ("step5A", "step5B", "combined")
-_STEP5_HEAD_BY_LOWER = {head.lower(): head for head in STEP5_HEAD_CHOICES}
-_RE_STEP5_HEAD_SLUG = re.compile(r"^(\d+(?:_\d+)*)_(step5A|step5B|combined)$", re.IGNORECASE)
+STEP5_HEAD_CHOICES = ("explanation",)
+STEP5_LEGACY_EXPLAINER_ALIAS = "step5" + "B"
+STEP5_RETIRED_SCORER_HEAD = "step5" + "A"
+STEP5_RETIRED_COMBINED_HEAD = "combined"
+_STEP5_HEAD_BY_LOWER = {"explanation": "explanation", STEP5_LEGACY_EXPLAINER_ALIAS.lower(): "explanation"}
+_RE_STEP5_HEAD_SLUG = re.compile(r"^(\d+(?:_\d+)*)_(explanation|step5_explanation)$", re.IGNORECASE)
 _STEP5_RUN_ID_ERROR = (
     "Step5 run-id must include consumed Step4 run prefix, e.g. 1_1, or use --run-id auto."
 )
@@ -52,12 +55,14 @@ def parse_run_id(raw: str) -> str:
 
 
 def parse_step5_head(raw: str | None) -> str:
-    s = str(raw or "combined").strip()
+    s = str(raw or "explanation").strip()
     if not s:
-        s = "combined"
+        s = "explanation"
+    if s.lower() in {STEP5_RETIRED_SCORER_HEAD.lower(), STEP5_RETIRED_COMBINED_HEAD.lower()}:
+        raise ValueError("Retired Step5 head: rating now uses rating_source and Step5 trains explanations only.")
     head = _STEP5_HEAD_BY_LOWER.get(s.lower())
     if head is None:
-        raise ValueError(f"Step5 --head must be one of {', '.join(STEP5_HEAD_CHOICES)}; got {raw!r}")
+        raise ValueError(f"Step5 --head must be explanation; got {raw!r}")
     return head
 
 
@@ -69,7 +74,7 @@ def _split_step5_head_suffix(raw: str) -> tuple[str, str | None]:
     return m.group(1), parse_step5_head(m.group(2))
 
 
-def step5_head_from_run_id(raw: str | None, *, default: str = "combined") -> str:
+def step5_head_from_run_id(raw: str | None, *, default: str = "explanation") -> str:
     _, head = _split_step5_head_suffix(str(raw or ""))
     return head or parse_step5_head(default)
 
@@ -82,9 +87,8 @@ def parse_step5_run_id(
 ) -> str:
     """Parse a Step5 run id.
 
-    New formal head runs are ``{step4_run}_{step5_seq}_{head}``, for example
-    ``1_1_step5A``. Legacy numeric ``{step4_run}_{step5_seq}`` remains accepted
-    for already-written combined runs and explicit compatibility reads.
+    New formal runs are numeric ``{step4_run}_{step5_seq}``. The legacy
+    explainer suffix remains accepted as a read-only migration alias.
     """
     s = (raw or "").strip()
     if not s:
@@ -99,11 +103,8 @@ def parse_step5_run_id(
     if len(parts) < 2:
         raise ValueError(_STEP5_RUN_ID_ERROR)
     if parsed_head is None:
-        if require_head_suffix or expected_head in {"step5A", "step5B"}:
-            raise ValueError(
-                f"{_STEP5_RUN_ID_ERROR} Head-specific formal runs must use a suffix such as "
-                f"{numeric_slug}_{expected_head or 'step5A'}."
-            )
+        if require_head_suffix:
+            raise ValueError(f"{_STEP5_RUN_ID_ERROR} Step5 explanation runs no longer require a head suffix.")
         return numeric_slug
     if expected_head is not None and parsed_head != expected_head:
         raise ValueError(f"Step5 run-id head suffix {parsed_head!r} does not match --head {expected_head!r}.")
@@ -116,7 +117,7 @@ def step5_numeric_slug(run_id: str) -> str:
 
 
 def normalize_step5_run_id_for_step4(raw: str, *, step4_run: str, head: str) -> str:
-    normalized = parse_step5_run_id(raw, head=head, require_head_suffix=parse_step5_head(head) in {"step5A", "step5B"})
+    normalized = parse_step5_run_id(raw, head=head, require_head_suffix=False)
     inferred = step4_slug_from_step5_slug(normalized)
     expected = parse_run_id(step4_run)
     if inferred != expected:
@@ -210,13 +211,13 @@ def allocate_multi_seed_run_id(multi_seed_parent: Path, requested: Optional[str]
     return allocate_child_dir(multi_seed_parent, requested=requested, kind="run")
 
 
-def allocate_step5_run_id(step5_parent: Path, step4_run_parsed: str, *, head: str = "combined") -> str:
-    """在 ``runs/step5`` 下按 ``{step4}_{n}_{head}`` 递增，避免 Step5A/Step5B 覆盖。"""
+def allocate_step5_run_id(step5_parent: Path, step4_run_parsed: str, *, head: str = "explanation") -> str:
+    """在 ``runs/step5`` 下按 ``{step4}_{n}`` 递增。"""
     base = parse_run_id(step4_run_parsed)
-    head_norm = parse_step5_head(head)
+    parse_step5_head(head)
     n = 1
     while True:
-        cand = f"{base}_{n}_{head_norm}"
+        cand = f"{base}_{n}"
         target = step5_parent / cand
         if not target.exists():
             return cand
@@ -226,7 +227,7 @@ def allocate_step5_run_id(step5_parent: Path, step4_run_parsed: str, *, head: st
 def step4_slug_from_step5_slug(step5_run: str) -> str:
     """由 Step5 目录名反推 Step4 目录名：去掉 Step5 序号与可选 head 后缀。
 
-    例：``2_1_10`` → ``2_1``，``1_1_step5A`` → ``1``。
+    例：``2_1_10`` → ``2_1``。
 
     **唯一约定**：全仓库凡涉及「step5_run → step4_run」须调用本函数（或下方别名），禁止各模块自写解析。
     """

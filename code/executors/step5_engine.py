@@ -12,6 +12,7 @@ import inspect
 import logging
 import shutil
 import gc
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 # 离线模式：禁止从网络加载
@@ -26,6 +27,7 @@ from config import (
     FinalTrainingConfig,
     apply_ddp_fast_torch_backends,
     build_full_bleu_monitor_cfg_override,
+    build_official_paper_greedy_25_override,
     build_resolved_training_config,
     format_full_bleu_eval_epoch_decision_log_line,
     format_full_bleu_eval_resolved_log_line,
@@ -106,7 +108,7 @@ from dataclasses import replace
 from datetime import datetime
 from collections import Counter
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 from tqdm import tqdm
 from torch.optim import lr_scheduler as lr_sched
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
@@ -168,10 +170,7 @@ from odcr_core.rerank import (
     score_candidates_rule_v3,
 )
 from odcr_eval_metrics import (
-    CODE1_COMPATIBLE_RATING_PROTOCOL_ID,
-    code1_compatible_rating_metrics_from_rows,
-    code1_compatible_rating_protocol,
-    compare_code1_rating_prediction_rows,
+    compose_step3_rating_step5_explanation_report,
     compute_collapse_stats,
     eval_decode_tag,
     extended_text_metrics_bundle,
@@ -187,7 +186,10 @@ from odcr_core.step5_word_losses import (
     route_weighted_mean,
 )
 from odcr_core.odcr_losses import build_orthogonal_losses
-from odcr_core.odcr_scorer import ODCRScorer
+from odcr_core.rating_source import rating_metrics_from_source, validate_rating_source
+from odcr_core.step5_explanation_handoff import build_step5_explanation_handoff
+from odcr_core.step5_explanation_control_projection import ExplanationControlProjection
+from odcr_core.step5_eval_summary import write_post_train_eval_metrics_log
 from odcr_core.step5_innovation import (
     STEP5_EVIDENCE_FEATURE_DIM,
     CF_RELIABILITY,
@@ -199,42 +201,18 @@ from odcr_core.step5_innovation import (
     TEXT_QUALITY,
     UNCERTAINTY,
     build_ccv_control_packet,
-    build_step5a_scorer_gate,
-    build_step5b_explainer_gate,
+    build_rating_stability_control_gate,
+    build_step5_explanation_gate,
     evidence_basis_fca_loss,
-    lci_score_invariance_loss,
     parse_step5_innovation_config_json,
     validate_ccv_control_packet_shapes,
 )
-from odcr_core.step5A_scorer_inheritance import (
-    DEFAULT_STEP3_SCORER_CHECKPOINT,
-    DEFAULT_STEP3_SCORER_SHA256,
-    Step3InheritedRatingScorer,
-    inheritance_report_for_model,
-    transplant_step3_scorer_into_step5A,
-)
-from odcr_core.step5A_frozen_teacher import (
-    DEFAULT_STEP3_TEACHER_CHECKPOINT,
-    DEFAULT_STEP3_TEACHER_SHA256,
-    Step3FrozenTeacher,
-)
-from odcr_core.step5A_residual_calibration import (
-    ZeroInitResidualCalibrator,
-    parse_step5a_residual_calibration_config,
-    residual_regularizer,
-    step5a_residual_contract_report,
-)
-from odcr_core.step5A_teacher_parity import attach_step3_tokenized_evidence_columns
 from odcr_core.step5_grad_contract import (
     DELETED_STEP5_LEGACY_MODULES,
     head_gated_loss_contract,
     head_specific_lora_allowlist_id,
     head_specific_trainable_policy_id,
     validate_all_trainable_params_receive_grad,
-)
-from odcr_core.step5_task_decoupled_policy import (
-    Step5TaskDecoupledPolicyError,
-    assert_step5a_batch_target_gold_only,
 )
 
 _STEP5_SCRATCH_NAME_TOKENS: Tuple[str, ...] = (
@@ -416,7 +394,7 @@ def initialize_step5_ema_model(
     return ema_model, report
 
 from odcr_core.step5_native_lora import apply_native_lora_to_step5_model
-from odcr_core.step5b_flan_bridge import (
+from odcr_core.step5_explanation_flan_bridge import (
     per_sample_decoder_ce_from_logits,
 )
 from executors.decode_controller import (
@@ -491,14 +469,16 @@ def get_step5_tokenizer() -> Any:
         )
     return _step5_tokenizer_obj
 
-# HuggingFace tokenize 磁盘缓存：与 Step3 在共享 tokenize 语义变更时同步递增
-ODCR_TOKENIZE_CACHE_VERSION = "v8_step5_semantic_lineage"
-STEP5_TOKENIZE_CACHE_SCHEMA_VERSION = "odcr_step5_tokenize_cache/2"
+# HuggingFace tokenize 磁盘缓存：cache_identity 只包含会改变 tokenized tensors 的字段；
+# training/generation/runtime knobs live in lineage_metadata for audit only.
+ODCR_TOKENIZE_CACHE_VERSION = "v10_step5_content_metric_ref_identity"
+STEP5_TOKENIZE_CACHE_SCHEMA_VERSION = "odcr_step5_tokenize_cache/4"
 STEP5_TOKENIZE_CACHE_MANIFEST = "cache_manifest.json"
 STEP5_TOKENIZE_CACHE_LINEAGE = "token_cache_lineage.json"
 STEP5_TOKENIZE_CACHE_COMPLETED = "_SUCCESS"
-STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/3"
-STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_tokenize_cache_semantic/1"
+STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/5"
+STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_tokenize_cache_identity/2"
+STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION = "odcr_step5_flan_encoder_input/2_soft_prompt_plus_content_evidence"
 
 
 def _sha256_file(path: str) -> str:
@@ -513,12 +493,15 @@ def _state_paths_from_save_file(save_file: str) -> Dict[str, str]:
     model_path = os.path.abspath(os.path.expanduser(save_file))
     run_dir = os.path.dirname(os.path.dirname(model_path))
     state_dir = os.path.join(run_dir, "state")
+    meta_dir = os.path.join(run_dir, "meta")
     return {
         "run_dir": run_dir,
+        "meta_dir": meta_dir,
         "state_dir": state_dir,
         "trainer_state": os.path.join(state_dir, "trainer_state.json"),
         "optimizer_pt": os.path.join(state_dir, "optimizer.pt"),
         "best_event": os.path.join(state_dir, "best_event.json"),
+        "auto_selected_params": os.path.join(meta_dir, "auto_selected_params.json"),
     }
 
 
@@ -537,13 +520,14 @@ def _step5_model_architecture_lineage(final_cfg: FinalTrainingConfig, model: nn.
         "ccv_numeric_control_dim": int(getattr(underlying, "ccv_numeric_control_dim", 0) or 0),
         "ccv_control_adapter_input_blocks": int(getattr(underlying, "ccv_control_adapter_input_blocks", 0) or 0),
         "train_mode": str(getattr(final_cfg, "train_mode", "")),
-        "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "combined")),
+        "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "explanation")),
         "native_lora": {
             "r": int(getattr(final_cfg, "lora_r", 0) or 0),
             "alpha": float(getattr(final_cfg, "lora_alpha", 0.0) or 0.0),
             "dropout": float(getattr(final_cfg, "lora_dropout", 0.0) or 0.0),
             "target_modules": list(getattr(final_cfg, "lora_target_modules", ()) or ()),
         },
+        "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
     }
 
 
@@ -585,7 +569,7 @@ def _build_step5_checkpoint_lineage(final_cfg: FinalTrainingConfig, model: nn.Mo
     arch = _step5_model_architecture_lineage(final_cfg, model)
     lineage: Dict[str, Any] = {
         "stage": "step5",
-        "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "combined")),
+        "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "explanation")),
         "selected_tuning_candidate": str(getattr(final_cfg, "step5_selected_tuning_candidate", "") or ""),
         "fallback_tuning_candidate": str(getattr(final_cfg, "step5_fallback_tuning_candidate", "") or ""),
         "effective_samples": _parse_json_dict(getattr(final_cfg, "step5_effective_samples_json", "{}") or "{}"),
@@ -593,11 +577,7 @@ def _build_step5_checkpoint_lineage(final_cfg: FinalTrainingConfig, model: nn.Mo
         "step5_lifecycle": _parse_json_dict(getattr(final_cfg, "step5_lifecycle_config_json", "{}") or "{}"),
         "step5_lifecycle_phase": str(getattr(final_cfg, "step5_lifecycle_phase", "") or ""),
         "step5_allow_embedded_final_eval": bool(getattr(final_cfg, "step5_allow_embedded_final_eval", False)),
-        "formal_namespace": (
-            "head"
-            if normalize_step5_task_head(getattr(final_cfg, "step5_head", "combined")) in {"step5A", "step5B"}
-            else "combined"
-        ),
+        "formal_namespace": "explanation",
         "compat_schema_version": STEP5_CHECKPOINT_COMPAT_SCHEMA_VERSION,
         "train_schema_version": STEP5_TRAIN_SCHEMA_VERSION,
         "step4_export_lineage_hash": str(step4_lineage["lineage_hash"]),
@@ -609,6 +589,7 @@ def _build_step5_checkpoint_lineage(final_cfg: FinalTrainingConfig, model: nn.Mo
         "tokenizer_model_path": os.path.abspath(require_step5_text_model_dir()),
         "tokenizer_model_artifact_fingerprint": model_artifact_fingerprint(require_step5_text_model_dir()),
         "architecture": arch,
+        "content_evidence_contract": _step5_content_evidence_contract_payload(final_cfg),
         "architecture_hash": stable_hash(arch),
         "task": {
             "task_id": int(final_cfg.task_idx),
@@ -629,13 +610,14 @@ def _current_step5_checkpoint_expectation(final_cfg: FinalTrainingConfig, model:
     return {
         "compat_schema_version": STEP5_CHECKPOINT_COMPAT_SCHEMA_VERSION,
         "train_schema_version": STEP5_TRAIN_SCHEMA_VERSION,
-        "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "combined")),
+        "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "explanation")),
         "selected_tuning_candidate": str(getattr(final_cfg, "step5_selected_tuning_candidate", "") or ""),
         "step4_export_lineage_hash": str(step4_lineage["lineage_hash"]),
         "step5_config_hashes": _step5_config_hashes(final_cfg),
         "tokenizer_model_path": os.path.abspath(require_step5_text_model_dir()),
         "tokenizer_model_artifact_fingerprint": model_artifact_fingerprint(require_step5_text_model_dir()),
         "architecture_hash": stable_hash(arch),
+        "content_evidence_contract": _step5_content_evidence_contract_payload(final_cfg),
         "task": {
             "task_id": int(final_cfg.task_idx),
             "auxiliary": str(final_cfg.auxiliary),
@@ -760,6 +742,7 @@ def _require_step5_rcr_posterior_controls(df: pd.DataFrame, *, ctx: str) -> None
 
 def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label: str) -> pd.DataFrame:
     out = df.copy()
+    _require_content_evidence_frame(out, ctx=f"Step5 official {split_label} eval source")
     contract = step5_factual_eval_control_contract(split_label)
     out["sample_weight_hint"] = 1.0
     out["route_scorer"] = int(contract["route_scorer"])
@@ -772,7 +755,6 @@ def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label:
     out["step5_control_is_rcr_posterior"] = False
     out["step5_control_is_train_route"] = False  # internal-only eval contract label
     out["step5_control_is_step4_export_posterior"] = False
-    out["content_evidence"] = out["clean_text"].fillna("").astype(str)
     out["style_evidence"] = ""
     out["domain_style_anchor"] = "target"
     out["local_style_residual_hint"] = ""
@@ -796,7 +778,7 @@ def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label:
     prompts = [
         registry.render(
             sample=row,
-            task_head="step5B",
+            task_head="explanation",
             sample_origin="target_gold",
             seed=0,
             split=split_label,
@@ -816,6 +798,22 @@ def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label:
     out["step5_prompt_input_role"] = "content_evidence_prefix"
     out["content_evidence"] = out["step5_prompt_text"].astype(str) + "\n" + out["content_evidence"].fillna("").astype(str)
     return out
+
+
+def _require_content_evidence_frame(df: pd.DataFrame, *, ctx: str) -> None:
+    if "content_evidence" not in df.columns:
+        raise ValueError(
+            f"{ctx} missing required content_evidence field; official Step5_e train/eval requires "
+            "Flan encoder input contract soft_prompt_plus_content_evidence."
+        )
+    vals = df["content_evidence"]
+    missing = vals.isna() | (vals.astype(str).str.strip() == "")
+    if bool(missing.any()):
+        bad = int(missing.sum())
+        raise ValueError(
+            f"{ctx} has {bad} rows with empty content_evidence; official Step5_e train/eval must fail fast "
+            "instead of using a soft-prompt-only or clean_text fallback."
+        )
 
 
 def _is_missing_sample_value(v: Any) -> bool:
@@ -901,64 +899,8 @@ def _control_text_to_ids(text: Any, *, max_length: int) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.long)
 
 
-class _Step5AScorerNoTokenizer:
-    """Cache identity for Step5A scorer-clean: no T5 tokenizer is constructed."""
-
-    name_or_path = "step5A_scorer_clean_no_tokenizer"
-
-    def __len__(self) -> int:
-        return 1
-
-
 def _dummy_control_ids() -> torch.Tensor:
     return torch.zeros(1, dtype=torch.long)
-
-
-def _step5a_step3_tokenizer_cache_dir_for_task(task_idx: int) -> str:
-    startup = Path(get_odcr_root()) / "runs" / "step3" / f"task{int(task_idx)}" / "2" / "meta" / "step3_tokenizer_cache_startup.json"
-    if not startup.is_file():
-        raise Step5TaskDecoupledPolicyError(
-            f"Step5A frozen teacher requires Step3 run2 tokenizer cache startup metadata: {startup}"
-        )
-    payload = load_json_file(startup)
-    cache_dir = str(payload.get("cache_dir") or "").strip()
-    if not cache_dir or not os.path.isdir(cache_dir):
-        raise Step5TaskDecoupledPolicyError(f"Step3 tokenizer cache_dir missing for Step5A frozen teacher: {cache_dir}")
-    return cache_dir
-
-
-def _attach_step5a_frozen_teacher_tokenized_evidence(
-    df: pd.DataFrame,
-    *,
-    task_idx: int,
-    split: str,
-) -> pd.DataFrame:
-    cache_dir = _step5a_step3_tokenizer_cache_dir_for_task(task_idx)
-    return attach_step3_tokenized_evidence_columns(df, cache_dir=cache_dir, split=split)
-
-
-def _pretokenized_control_ids(sample: Mapping[str, Any], key: str) -> torch.Tensor:
-    raw = sample.get(key)
-    if raw is None:
-        raise Step5TaskDecoupledPolicyError(
-            f"Step5A frozen-teacher processor requires pretokenized {key}; "
-            "partial dummy evidence is forbidden because it breaks Step3 functional parity."
-        )
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise Step5TaskDecoupledPolicyError(f"invalid JSON pretokenized {key}: {raw[:80]!r}") from exc
-    if hasattr(raw, "tolist"):
-        raw = raw.tolist()
-    if key == "polarity_ids" and not isinstance(raw, (list, tuple)):
-        raw = [raw]
-    if not isinstance(raw, (list, tuple)):
-        raise Step5TaskDecoupledPolicyError(f"pretokenized {key} must be a sequence, got {type(raw).__name__}")
-    vals = [int(x) for x in raw]
-    if not vals:
-        vals = [0]
-    return torch.tensor(vals, dtype=torch.long)
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -1028,6 +970,7 @@ class Processor():
                 "训练样本缺少 clean_text（须使用新版 Step4 CSV）；禁止静默回退到 explanation 原文。"
             )
         explanation = sample["clean_text"]
+        raw_ref_text = str(explanation)
         explanation_idx = get_step5_tokenizer()(
             explanation, padding=False, max_length=self.max_length, truncation=True
         )["input_ids"]
@@ -1097,76 +1040,7 @@ class Processor():
             "evidence_quality_prior": torch.tensor(float(evidence_quality_prior), dtype=torch.float32),
             "sampler_component_id": _sample_category_id(sample, "sampler_component", _STEP5_SAMPLER_COMPONENT_IDS),
             "sampler_tier_id": _sample_category_id(sample, "sampler_tier", _STEP5_SAMPLER_TIER_IDS),
-        }
-
-
-class Step5AScorerProcessor(Processor):
-    """Tokenizer-free processor for Step5A target-gold scorer-clean training."""
-
-    def __call__(self, sample):
-        if GLOBAL_COL_USER not in sample or GLOBAL_COL_ITEM not in sample:
-            raise KeyError(
-                f"样本须含 Step4 全局索引列 {GLOBAL_COL_USER}/{GLOBAL_COL_ITEM}（禁止混用未标注语义的 user_idx 列）。"
-            )
-        component = str(sample.get("sampler_component") or sample.get("sample_origin") or "").strip()
-        if component != "target_gold":
-            raise Step5TaskDecoupledPolicyError(
-                f"Step5A scorer-clean processor forbids non-target_gold sample: {component!r}"
-            )
-        if str(sample.get("domain") or "").strip() != "target":
-            raise Step5TaskDecoupledPolicyError("Step5A scorer-clean processor accepts only target-domain rows")
-        user_idx = torch.tensor(int(sample[GLOBAL_COL_USER]), dtype=torch.long)
-        item_idx = torch.tensor(int(sample[GLOBAL_COL_ITEM]), dtype=torch.long)
-        rating = torch.tensor(sample["rating"], dtype=torch.float)
-        domain_idx = torch.tensor(1, dtype=torch.long)
-        sample_id = torch.tensor(int(sample["sample_id"]), dtype=torch.long)
-        for _field in (*_STEP5_PROCESSOR_REQUIRED_POSTERIOR_FIELDS, *_STEP5_PROCESSOR_REQUIRED_CCV_FIELDS):
-            _required_sample_value(sample, _field)
-        sw = _required_sample_float(sample, "sample_weight_hint")
-        evidence_quality_prior = _required_sample_float(sample, "evidence_quality_prior")
-        cf_reliability_score = _required_sample_float(sample, "cf_reliability_score")
-        style_shift_score = _required_sample_float(sample, "style_shift_score")
-        rating_stability_score = _required_sample_float(sample, "rating_stability_score")
-        content_retention_score = _required_sample_float(sample, "content_retention_score")
-        text_quality_score = _required_sample_float(sample, "text_quality_score")
-        uncertainty_score = torch.tensor(_required_sample_float(sample, "uncertainty_score"), dtype=torch.float32)
-        evf = torch.tensor(
-            [
-                evidence_quality_prior,
-                cf_reliability_score,
-                style_shift_score,
-                rating_stability_score,
-                content_retention_score,
-                text_quality_score,
-                float(uncertainty_score.item()),
-                float(rating.item() - 3.0) / 2.0,
-            ],
-            dtype=torch.float32,
-        )
-        return {
-            "user_idx": user_idx,
-            "item_idx": item_idx,
-            "rating": rating,
-            "explanation_idx": torch.zeros(1, dtype=torch.long),
-            "domain_idx": domain_idx,
-            "sample_id": sample_id,
-            "exp_sample_weight": torch.tensor(float(sw), dtype=torch.float32),
-            "route_scorer_mask": torch.tensor(1, dtype=torch.float32),
-            "route_explainer_mask": torch.tensor(0, dtype=torch.float32),
-            "entropy_score": torch.tensor(float(sample.get("entropy_score", 0.25)), dtype=torch.float32),
-            "uncertainty_score": uncertainty_score,
-            "confidence_bucket": torch.tensor(_required_sample_float(sample, "confidence_bucket"), dtype=torch.float32),
-            "content_anchor_score": torch.tensor(_required_sample_float(sample, "content_anchor_score"), dtype=torch.float32),
-            "style_anchor_score": torch.tensor(_required_sample_float(sample, "style_anchor_score"), dtype=torch.float32),
-            "evidence_features": evf,
-            "content_evidence_ids": _pretokenized_control_ids(sample, "content_evidence_ids"),
-            "style_evidence_ids": _pretokenized_control_ids(sample, "style_evidence_ids"),
-            "domain_style_anchor_ids": _pretokenized_control_ids(sample, "domain_style_anchor_ids"),
-            "local_style_hint_ids": _pretokenized_control_ids(sample, "local_style_hint_ids"),
-            "polarity_ids": _pretokenized_control_ids(sample, "polarity_ids"),
-            "evidence_quality_prior": torch.tensor(float(evidence_quality_prior), dtype=torch.float32),
-            "sampler_component_id": torch.tensor(_STEP5_SAMPLER_COMPONENT_IDS["target_gold"], dtype=torch.long),
-            "sampler_tier_id": _sample_category_id(sample, "sampler_tier", _STEP5_SAMPLER_TIER_IDS),
+            "raw_ref_text": raw_ref_text,
         }
 
 
@@ -1222,6 +1096,7 @@ def _step5_collate_dynamic(
     sampler_tier_id = torch.stack(
         [torch.as_tensor(x.get("sampler_tier_id", torch.tensor(-1)), dtype=torch.long) for x in batch], dim=0
     )
+    raw_ref_text = [str(x["raw_ref_text"]) for x in batch]
 
     def _pad_ids(name: str) -> torch.Tensor:
         seq_list = [torch.as_tensor(x[name], dtype=torch.long).view(-1) for x in batch]
@@ -1270,6 +1145,7 @@ def _step5_collate_dynamic(
         evidence_quality_prior,
         sampler_component_id,
         sampler_tier_id,
+        raw_ref_text,
     )
 
 
@@ -1333,9 +1209,16 @@ class _FlanT5ExplainerStub(nn.Module):
             {
                 "vocab_size": int(vocab_size),
                 "d_model": int(d_model),
+                "pad_token_id": 0,
+                "eos_token_id": 1,
+                "decoder_start_token_id": 0,
             },
         )()
+        self.shared = nn.Embedding(int(vocab_size), int(d_model))
         self.dec = nn.Linear(int(d_model), int(vocab_size))
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.shared
 
     def forward(
         self,
@@ -1382,6 +1265,61 @@ class _FlanT5ExplainerStub(nn.Module):
         return torch.ones(b, max(1, int(max_new_tokens)), dtype=torch.long, device=dev)
 
 
+_STEP5_RUNTIME_AUX_STATE_KEYS = ("batch_diversity_ema_mean_probs",)
+
+
+def _step5_resolve_flan_vocab_size(flan_explainer: nn.Module, *, fallback: int) -> int:
+    output_embeddings = None
+    if hasattr(flan_explainer, "get_output_embeddings"):
+        try:
+            output_embeddings = flan_explainer.get_output_embeddings()
+        except Exception:
+            output_embeddings = None
+    weight = getattr(output_embeddings, "weight", None)
+    if torch.is_tensor(weight) and int(weight.ndim) >= 2 and int(weight.shape[0]) > 0:
+        return int(weight.shape[0])
+    cfg_vocab = getattr(getattr(flan_explainer, "config", None), "vocab_size", None)
+    try:
+        cfg_vocab_int = int(cfg_vocab)
+    except (TypeError, ValueError):
+        cfg_vocab_int = 0
+    return cfg_vocab_int if cfg_vocab_int > 0 else max(1, int(fallback))
+
+
+def _step5_batch_diversity_ema_buffer(model: nn.Module, mean_probs: torch.Tensor) -> torch.Tensor:
+    target_shape = tuple(mean_probs.shape)
+    current = getattr(model, "batch_diversity_ema_mean_probs", None)
+    current_shape = tuple(current.shape) if torch.is_tensor(current) else ()
+    if (
+        not torch.is_tensor(current)
+        or current_shape != target_shape
+        or current.device != mean_probs.device
+        or current.dtype != torch.float32
+    ):
+        setattr(
+            model,
+            "batch_diversity_ema_mean_probs",
+            torch.zeros(target_shape, device=mean_probs.device, dtype=torch.float32),
+        )
+        if hasattr(model, "_non_persistent_buffers_set"):
+            model._non_persistent_buffers_set.add("batch_diversity_ema_mean_probs")
+        model._batch_div_ema_seeded = False
+        current = getattr(model, "batch_diversity_ema_mean_probs")
+    return current
+
+
+def _drop_step5_runtime_aux_state_keys(state: MutableMapping[str, Any]) -> Dict[str, Tuple[int, ...]]:
+    dropped: Dict[str, Tuple[int, ...]] = {}
+    for key in _STEP5_RUNTIME_AUX_STATE_KEYS:
+        for candidate in (key, f"module.{key}"):
+            value = state.pop(candidate, None)
+            if torch.is_tensor(value):
+                dropped[candidate] = tuple(int(dim) for dim in value.shape)
+            elif value is not None:
+                dropped[candidate] = ()
+    return dropped
+
+
 class Model(nn.Module):
     """DMPF 主线：domain gate 残差调制 + domain cross-attn prefix fusion + decode controller。"""
 
@@ -1403,14 +1341,15 @@ class Model(nn.Module):
         domain_style_profiles,
         label_smoothing: float = 0.1,
         step5_innovation_config_json: str | None = None,
-        task_head: str = "combined",
+        task_head: str = "explanation",
         build_big_model: bool = True,
-        use_step3_inherited_scorer: bool = False,
     ):
         super().__init__()
         if not str(step5_innovation_config_json or "").strip():
             raise RuntimeError("Step5 Model requires resolved step5_innovation_config_json from configs/odcr.yaml.")
         _model_step5_cfg = parse_step5_innovation_config_json(step5_innovation_config_json)
+        if not bool(build_big_model):
+            raise RuntimeError("Step5 scorer/rating-head model factory has been removed; Step5 is explanation-only.")
         self.domain_content_profiles = nn.Parameter(domain_content_profiles, requires_grad=False)
         self.domain_style_profiles = nn.Parameter(domain_style_profiles, requires_grad=False)
         self.user_embeddings = nn.Embedding(nuser, emsize)
@@ -1420,57 +1359,40 @@ class Model(nn.Module):
         self.item_content_profiles = nn.Parameter(item_content_profiles, requires_grad=False)
         self.item_style_profiles = nn.Parameter(item_style_profiles, requires_grad=False)
         self.step5_head = normalize_step5_task_head(task_head)
-        self.step5_big_model_enabled = bool(build_big_model)
-        self.step5_scorer_clean = self.step5_head == "step5A" and not self.step5_big_model_enabled
-        self.word_embeddings = (
-            nn.Embedding(max(1, int(ntoken)), emsize)
-            if self.step5_big_model_enabled
-            else None
-        )
-        self.odcr_scorer = (
-            Step3InheritedRatingScorer(emsize) if bool(use_step3_inherited_scorer) else ODCRScorer(emsize)
-        )
-        self.step5a_frozen_teacher: Optional[nn.Module] = None
-        self.step5a_residual_calibrator = (
-            ZeroInitResidualCalibrator(hidden_size=emsize, feature_source="teacher_pred")
-            if self.step5_scorer_clean
-            else None
-        )
+        self.step5_big_model_enabled = True
+        self.word_embeddings = nn.Embedding(max(1, int(ntoken)), emsize)
+        self.explanation_control_projection = ExplanationControlProjection(emsize)
         self._last_step3_teacher_pred: Optional[torch.Tensor] = None
-        self._last_step5a_delta: Optional[torch.Tensor] = None
-        self._last_step5a_teacher_packet: Optional[Dict[str, torch.Tensor]] = None
-        if self.step5_big_model_enabled:
-            if os.environ.get("ODCR_STEP5_INIT_FLAN_STUB", "").strip() == "1":
-                self.flan_explainer = _FlanT5ExplainerStub(vocab_size=int(ntoken), d_model=int(emsize))
-                self.flan_d_model = int(emsize)
-            else:
-                _t5p = require_step5_text_model_dir()
-                _fd = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-                # local_files_only=True + require_*：离线 fail-fast，不依赖 HF_HUB_OFFLINE 环境变量。
-                self.flan_explainer = T5ForConditionalGeneration.from_pretrained(
-                    _t5p, local_files_only=True, torch_dtype=_fd
-                )
-                self.flan_d_model = int(self.flan_explainer.config.d_model)
-            for _p in self.flan_explainer.parameters():
-                _p.requires_grad_(False)
+        if os.environ.get("ODCR_STEP5_INIT_FLAN_STUB", "").strip() == "1":
+            self.flan_explainer = _FlanT5ExplainerStub(vocab_size=int(ntoken), d_model=int(emsize))
+            self.flan_d_model = int(emsize)
         else:
-            self.flan_d_model = 0
+            _t5p = require_step5_text_model_dir()
+            _fd = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            # local_files_only=True + require_*：离线 fail-fast，不依赖 HF_HUB_OFFLINE 环境变量。
+            self.flan_explainer = T5ForConditionalGeneration.from_pretrained(
+                _t5p, local_files_only=True, torch_dtype=_fd
+            )
+            self.flan_d_model = int(self.flan_explainer.config.d_model)
+        self.flan_vocab_size = _step5_resolve_flan_vocab_size(
+            self.flan_explainer,
+            fallback=int(ntoken),
+        )
+        for _p in self.flan_explainer.parameters():
+            _p.requires_grad_(False)
         self.ccv_enabled = bool(_model_step5_cfg.ccv.enabled)
         self.ccv_control_packet_field_policy = str(_model_step5_cfg.ccv.control_packet_field_policy)
         self.ccv_verbalizer_adapter_policy = str(_model_step5_cfg.ccv.verbalizer_adapter_policy)
         self.flan_soft_len = int(_model_step5_cfg.ccv.soft_prompt_len)
         self.ccv_numeric_control_dim = int(_model_step5_cfg.ccv.numeric_control_dim)
         self.ccv_control_adapter_input_blocks = int(_model_step5_cfg.ccv.control_adapter_input_blocks)
-        if self.step5_big_model_enabled:
-            self.ccv_numeric_adapter = nn.Linear(self.ccv_numeric_control_dim, emsize)
-            self.ccv_control_adapter = nn.Sequential(
-                nn.Linear(int(emsize) * self.ccv_control_adapter_input_blocks, self.flan_d_model * self.flan_soft_len),
-                nn.GELU(),
-            )
-            self.fca_score_align = nn.Linear(emsize, emsize)
-            self.fca_explain_align = nn.Linear(self.flan_d_model, emsize)
-        else:
-            self.fca_score_align = nn.Identity()
+        self.ccv_numeric_adapter = nn.Linear(self.ccv_numeric_control_dim, emsize)
+        self.ccv_control_adapter = nn.Sequential(
+            nn.Linear(int(emsize) * self.ccv_control_adapter_input_blocks, self.flan_d_model * self.flan_soft_len),
+            nn.GELU(),
+        )
+        self.fca_score_align = nn.Linear(emsize, emsize)
+        self.fca_explain_align = nn.Linear(self.flan_d_model, emsize)
         self.ntoken = int(ntoken)
         self.domain_cross_attn = nn.MultiheadAttention(
             embed_dim=emsize, num_heads=nhead, dropout=dropout, batch_first=True
@@ -1481,7 +1403,8 @@ class Model(nn.Module):
         self._last_uncertainty_decode_stats: Optional[Dict[str, Any]] = None
         self.register_buffer(
             "batch_diversity_ema_mean_probs",
-            torch.zeros(int(ntoken), dtype=torch.float32),
+            torch.zeros(int(self.flan_vocab_size), dtype=torch.float32),
+            persistent=False,
         )
         encoder_layers = TransformerEncoderLayer(emsize, nhead, nhid, dropout)
         self.transformer_encoder = CustomTransformerEncoder(encoder_layers, nlayers)
@@ -1520,12 +1443,7 @@ class Model(nn.Module):
         self.terminal_clean_span = 3
         self.ccv_numeric_control_weight = 1.0
         self.decoder_eos_id = -1
-        self.rating_loss_fn = nn.MSELoss()
-        self.exp_loss_fn = (
-            nn.CrossEntropyLoss(ignore_index=0, label_smoothing=float(label_smoothing))
-            if self.step5_big_model_enabled
-            else None
-        )
+        self.exp_loss_fn = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=float(label_smoothing))
         self.init_weights()
 
     def clear_step5_graph_cache(self, *, reason: str) -> Dict[str, Any]:
@@ -1575,15 +1493,6 @@ class Model(nn.Module):
             _init_linear(self.fca_score_align)
         if isinstance(getattr(self, "fca_explain_align", None), nn.Linear):
             _init_linear(self.fca_explain_align)
-        if isinstance(getattr(self, "step5a_residual_calibrator", None), ZeroInitResidualCalibrator):
-            self.step5a_residual_calibrator.reset_parameters()
-
-    def attach_step5a_frozen_teacher(self, teacher: nn.Module) -> None:
-        self.step5a_frozen_teacher = teacher
-        self.step5a_frozen_teacher.eval()
-        for param in self.step5a_frozen_teacher.parameters():
-            param.requires_grad_(False)
-
     def apply_runtime_config(self, cfg: FinalTrainingConfig, tok=None) -> None:
         """从 FinalTrainingConfig + tokenizer 同步解码与解释头超参（训练/评测共用）。"""
         self.repetition_penalty = float(cfg.repetition_penalty)
@@ -1628,12 +1537,8 @@ class Model(nn.Module):
         self.decode_backend_fallback_policy = resolve_decode_backend_fallback_policy(
             getattr(cfg, "decode_backend_fallback_policy", DECODE_BACKEND_FALLBACK_RAISE)
         )
-        if bool(getattr(self, "step5_scorer_clean", False)):
-            self.decoder_eos_id = -1
-            self.bad_terminal_token_ids_resolved = ()
-            return
         if tok is None:
-            raise RuntimeError("Step5B/combined runtime config requires a tokenizer.")
+            raise RuntimeError("Step5 explanation-only runtime config requires a tokenizer.")
         eid = getattr(tok, "eos_token_id", None)
         self.decoder_eos_id = int(eid) if eid is not None else -1
         self.exp_loss_fn = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=float(cfg.label_smoothing))
@@ -1645,8 +1550,11 @@ class Model(nn.Module):
 
     @staticmethod
     def _default_bad_terminal_token_ids(tok) -> Tuple[int, ...]:
-        """未配置时的坏尾 token：常见未闭合起笔符号的首子词 id。"""
+        """未配置时的坏尾 token：未闭合起笔符号、unk、独立空白边界。"""
         ids: List[int] = []
+        unk = getattr(tok, "unk_token_id", None)
+        if unk is not None:
+            ids.append(int(unk))
         for piece in ("(", "[", "{", "<", "``", "''"):
             try:
                 enc = tok.encode(piece, add_special_tokens=False)
@@ -1654,6 +1562,12 @@ class Model(nn.Module):
                 enc = []
             if enc:
                 ids.append(int(enc[0]))
+        try:
+            space_boundary = tok.convert_tokens_to_ids("▁")
+        except Exception:
+            space_boundary = None
+        if space_boundary is not None and int(space_boundary) >= 0:
+            ids.append(int(space_boundary))
         return tuple(sorted(set(ids)))
 
     def _build_context_tokens(self, user, item):
@@ -1710,7 +1624,7 @@ class Model(nn.Module):
 
     def _mean_control_embedding(self, ids: torch.Tensor) -> torch.Tensor:
         if not isinstance(self.word_embeddings, nn.Embedding):
-            raise RuntimeError("Step5A-Small scorer-clean model forbids word/control embeddings.")
+            raise RuntimeError("RatingStabilityControl-Small scorer-clean model forbids word/control embeddings.")
         if ids.dim() != 2:
             raise RuntimeError(f"CCV control ids must be [B,T], got {tuple(ids.shape)}")
         safe_ids = ids.clamp(min=0, max=int(self.ntoken) - 1)
@@ -1772,6 +1686,50 @@ class Model(nn.Module):
             "ccv_style_anchor_mean": float(control_packet.style_anchor_score.detach().float().mean().item()),
         }
         return soft_flat, stats, content_lat.to(dtype=shared_latent.dtype)
+
+    def _build_flan_encoder_inputs(
+        self,
+        soft_embeds: torch.Tensor,
+        control_packet: Optional[CCVControlPacket],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if control_packet is None:
+            raise RuntimeError(
+                "Step5 Flan encoder requires CCV content evidence tokens; soft-prompt-only encoder is retired."
+            )
+        text_ids = getattr(control_packet, "content_evidence_ids", None)
+        if text_ids is None or not torch.is_tensor(text_ids):
+            raise RuntimeError("CCVControlPacket.content_evidence_ids is required for Flan encoder conditioning.")
+        if text_ids.dim() != 2:
+            raise RuntimeError(f"content_evidence_ids must be [B,T], got {tuple(text_ids.shape)}")
+        if int(text_ids.shape[0]) != int(soft_embeds.shape[0]):
+            raise RuntimeError(
+                "content_evidence_ids batch size does not match soft prompt batch: "
+                f"{int(text_ids.shape[0])} vs {int(soft_embeds.shape[0])}"
+            )
+        embed_getter = getattr(self.flan_explainer, "get_input_embeddings", None)
+        input_embeddings = embed_getter() if callable(embed_getter) else getattr(self.flan_explainer, "shared", None)
+        if input_embeddings is None:
+            raise RuntimeError("Flan explainer does not expose input embeddings for content evidence conditioning.")
+        weight = getattr(input_embeddings, "weight", None)
+        if torch.is_tensor(weight) and int(weight.ndim) >= 2 and int(weight.shape[0]) > 0:
+            max_token_id = int(weight.shape[0]) - 1
+        else:
+            max_token_id = max(0, int(getattr(self, "flan_vocab_size", self.ntoken)) - 1)
+        cfg = getattr(self.flan_explainer, "config", None)
+        pad_raw = getattr(cfg, "pad_token_id", None)
+        pad_id = int(pad_raw) if pad_raw is not None else 0
+        safe_ids = text_ids.to(device=soft_embeds.device, dtype=torch.long).clamp(min=0, max=max_token_id)
+        text_mask = (safe_ids != int(pad_id)).to(device=soft_embeds.device, dtype=torch.long)
+        text_embeds = input_embeddings(safe_ids).to(device=soft_embeds.device, dtype=soft_embeds.dtype)
+        soft_mask = torch.ones(
+            int(soft_embeds.shape[0]),
+            int(soft_embeds.shape[1]),
+            device=soft_embeds.device,
+            dtype=torch.long,
+        )
+        encoder_embeds = torch.cat([soft_embeds, text_embeds], dim=1)
+        encoder_mask = torch.cat([soft_mask, text_mask], dim=1)
+        return encoder_embeds, encoder_mask
 
     def _make_generate_config(self) -> GenerateConfig:
         hard = int(self.hard_max_len) if getattr(self, "hard_max_len", None) else int(self.max_explanation_length)
@@ -2276,7 +2234,6 @@ class Model(nn.Module):
         evidence_quality_prior: Optional[torch.Tensor] = None,
         ccv_control_packet: Optional[CCVControlPacket] = None,
         return_explainer_logits: bool = True,
-        scorer_only: bool = False,
         validation_mode: bool = False,
     ):
         device = user.device
@@ -2287,34 +2244,8 @@ class Model(nn.Module):
             content_anchor_score = torch.full((bsz,), 0.5, device=device, dtype=torch.float32)
         if style_anchor_score is None:
             style_anchor_score = torch.full((bsz,), 0.5, device=device, dtype=torch.float32)
-        if bool(scorer_only) and bool(return_explainer_logits):
-            raise RuntimeError("Step5 scorer_only forward must set return_explainer_logits=False.")
-        if not bool(getattr(self, "step5_big_model_enabled", True)) and not bool(scorer_only):
-            raise RuntimeError("Step5A-Small scorer-clean model cannot execute explainer/generation forward.")
-        if bool(scorer_only):
-            rating = self.recommend(
-                user,
-                item,
-                domain_idx,
-                content_anchor_score=content_anchor_score,
-                style_anchor_score=style_anchor_score,
-                content_evidence_ids=content_evidence_ids,
-                style_evidence_ids=style_evidence_ids,
-                domain_style_anchor_ids=domain_style_anchor_ids,
-                local_style_hint_ids=local_style_hint_ids,
-                polarity_ids=polarity_ids,
-                evidence_quality_prior=evidence_quality_prior,
-            )
-            self._last_step5_forward_contract = {
-                "scorer_only": True,
-                "validation_mode": bool(validation_mode),
-                "flan_explainer_called": False,
-                "out_logits_materialized": False,
-                "word_dist_returned": False,
-            }
-            return rating, None, None
-        if target_tokens is None and not bool(scorer_only):
-            raise RuntimeError("Step5B Flan 主链须传入 target_tokens（非 shift 的 target token ids）。")
+        if target_tokens is None:
+            raise RuntimeError("Step5 explanation Flan 主链须传入 target_tokens（非 shift 的 target token ids）。")
         if target_tokens is not None and tuple(target_tokens.shape) != tuple(tgt_input.shape):
             raise RuntimeError(
                 "target_tokens 与 tgt_input 形状须一致；Flan decoder_input_ids 应为 shift_right(target_tokens)。"
@@ -2329,16 +2260,16 @@ class Model(nn.Module):
         shared_latent = hidden[:, : self._prefix_len(), :].mean(dim=1)
         specific_latent = hidden[:, self._prefix_len() :, :].mean(dim=1)
         content_profile = self.user_content_profiles[user]
-        rating = self.odcr_scorer(shared_latent, content_profile, specific_latent)
-        h_score_raw = self.odcr_scorer.last_hidden
+        control_score = self.explanation_control_projection(shared_latent, content_profile, specific_latent)
+        h_score_raw = self.explanation_control_projection.last_hidden
         if h_score_raw is None:
-            raise RuntimeError("ODCRScorer.last_hidden 为空。")
+            raise RuntimeError("ExplanationControlProjection.last_hidden is empty.")
         self._last_h_score = self.fca_score_align(h_score_raw)
         self._last_specific_latent = specific_latent
         self._last_shared_latent = shared_latent
         self._last_content_profile = content_profile
         if not bool(return_explainer_logits):
-            raise RuntimeError("return_explainer_logits=False is only valid with scorer_only=True.")
+            raise RuntimeError("Step5 explanation-only forward always returns explainer logits.")
         ft = evidence_features.to(dtype=shared_latent.dtype)
         soft_flat, ccv_stats, content_evidence_latent = self._build_ccv_soft_prompt(
             shared_latent, specific_latent, ft, ccv_control_packet
@@ -2346,10 +2277,10 @@ class Model(nn.Module):
         soft_embeds = soft_flat.view(bsz, self.flan_soft_len, self.flan_d_model).to(
             dtype=self._flan_autocast_dtype(), device=device
         )
-        enc_mask = torch.ones(bsz, self.flan_soft_len, device=device, dtype=torch.long)
+        encoder_embeds, enc_mask = self._build_flan_encoder_inputs(soft_embeds, ccv_control_packet)
         # 不传 labels：避免 HF T5 内部再算一遍 CE（显存/算力）；训练 CE 仅走外层 per_sample_decoder_ce_from_logits。
         out = self.flan_explainer(
-            inputs_embeds=soft_embeds,
+            inputs_embeds=encoder_embeds,
             attention_mask=enc_mask,
             decoder_input_ids=tgt_input,
             use_cache=False,
@@ -2373,20 +2304,21 @@ class Model(nn.Module):
             "ccv_style_anchor_mean": 0.0,
         }
         self._last_step5_forward_contract = {
-            "scorer_only": False,
             "validation_mode": bool(validation_mode),
             "flan_explainer_called": True,
             "out_logits_materialized": True,
             "word_dist_returned": True,
+            "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+            "flan_encoder_tokens": int(encoder_embeds.shape[1]),
         }
         word_dist = logits
         context_dist = logits[:, 0, :] * 0.0
-        return rating, context_dist, word_dist
+        return control_score, context_dist, word_dist
     
     def gather(self, batch, device, *, non_blocking_h2d: bool | None = None):
-        if len(batch) not in (20, 22, 23):
+        if len(batch) not in (20, 22, 23, 24):
             raise ValueError(
-                f"batch 须含 20、22 或 23 张量（含 UCI/anchor/evidence/CCV control，可含 evidence prior / sampler tier metadata），当前 {len(batch)}。"
+                f"batch 须含 20、22、23 或 24 项（含 UCI/anchor/evidence/CCV control，可含 evidence prior / sampler tier metadata / raw ref text），当前 {len(batch)}。"
                 "请确认 DataLoader 与新版 Processor 一致。"
             )
         if non_blocking_h2d is None:
@@ -2418,6 +2350,10 @@ class Model(nn.Module):
             polarity_ids,
             *sampler_meta,
         ) = batch
+        raw_ref_text = None
+        if sampler_meta and isinstance(sampler_meta[-1], list):
+            raw_ref_text = [str(x) for x in sampler_meta[-1]]
+            sampler_meta = sampler_meta[:-1]
         user_idx = _move_to_device(user_idx, device, non_blocking=_nb)
         item_idx = _move_to_device(item_idx, device, non_blocking=_nb)
         domain_idx = _move_to_device(domain_idx, device, non_blocking=_nb)
@@ -2475,113 +2411,8 @@ class Model(nn.Module):
             evidence_quality_prior=evidence_quality_prior,
             sampler_component_id=sampler_component_id,
             sampler_tier_id=sampler_tier_id,
+            raw_ref_text=raw_ref_text,
         )
-
-    def recommend(
-        self,
-        user,
-        item,
-        domain,
-        *,
-        content_anchor_score: Optional[torch.Tensor] = None,
-        style_anchor_score: Optional[torch.Tensor] = None,
-        content_evidence_ids: Optional[torch.Tensor] = None,
-        style_evidence_ids: Optional[torch.Tensor] = None,
-        domain_style_anchor_ids: Optional[torch.Tensor] = None,
-        local_style_hint_ids: Optional[torch.Tensor] = None,
-        polarity_ids: Optional[torch.Tensor] = None,
-        evidence_quality_prior: Optional[torch.Tensor] = None,
-    ):
-        if bool(getattr(self, "step5_scorer_clean", False)):
-            teacher = getattr(self, "step5a_frozen_teacher", None)
-            calibrator = getattr(self, "step5a_residual_calibrator", None)
-            if teacher is None or calibrator is None:
-                raise RuntimeError(
-                    "Step5A scorer-clean requires Step3FrozenTeacher + zero-init residual calibration; "
-                    "partial transplant/random scorer path is retired."
-                )
-            out = teacher(
-                user,
-                item,
-                domain,
-                content_anchor=content_anchor_score,
-                style_anchor=style_anchor_score,
-                content_evidence_ids=content_evidence_ids,
-                style_evidence_ids=style_evidence_ids,
-                domain_style_anchor_ids=domain_style_anchor_ids,
-                local_style_hint_ids=local_style_hint_ids,
-                polarity_ids=polarity_ids,
-                evidence_quality_prior=evidence_quality_prior,
-            )
-            teacher_pred = out.pred_rating.detach()
-            delta = calibrator(teacher_pred, out.packet)
-            rating = teacher_pred + delta
-            self._last_step3_teacher_pred = teacher_pred
-            self._last_step5a_delta = delta
-            self._last_step5a_teacher_packet = dict(out.packet)
-            self._last_h_score = teacher_pred.detach().view(-1, 1).expand(-1, self.emsize).to(dtype=rating.dtype)
-            self._last_specific_latent = out.specific_latent.detach()
-            self._last_shared_latent = out.shared_latent.detach()
-            self._last_content_profile = torch.zeros_like(out.shared_latent.detach())
-            self._last_h_explain = None
-            self._last_h_explain_aligned = None
-            self._last_content_evidence_latent = out.shared_latent.detach() * 0.0
-            self._last_ccv_control_stats = {
-                "ccv_route_scorer_mean": 0.0,
-                "ccv_route_explainer_mean": 0.0,
-                "ccv_uncertainty_mean": 0.0,
-                "ccv_confidence_mean": 0.0,
-                "ccv_content_anchor_mean": 0.0,
-                "ccv_style_anchor_mean": 0.0,
-            }
-            self._last_step5_forward_contract = {
-                "scorer_only": True,
-                "validation_mode": False,
-                "flan_explainer_called": False,
-                "out_logits_materialized": False,
-                "word_dist_returned": False,
-                "step3_teacher_stop_gradient": not bool(teacher_pred.requires_grad),
-                "residual_delta_requires_grad": bool(delta.requires_grad),
-            }
-            return rating
-        src = self._build_prefix(domain, user, item)
-        src = src * math.sqrt(self.emsize)
-        src = self.pos_encoder(src)
-        hidden, _ = self.transformer_encoder(src=src, mask=None)
-        shared_latent = hidden[:, : self._prefix_len(), :].mean(dim=1)
-        pl = int(hidden.size(1)) - int(self._prefix_len())
-        if pl > 0:
-            specific_latent = hidden[:, self._prefix_len() :, :].mean(dim=1)
-        else:
-            specific_latent = torch.zeros_like(shared_latent)
-        content_profile = self.user_content_profiles[user]
-        rating = self.odcr_scorer(shared_latent, content_profile, specific_latent)
-        h_score_raw = self.odcr_scorer.last_hidden
-        if h_score_raw is None:
-            raise RuntimeError("Step5A scorer last_hidden is empty.")
-        self._last_h_score = self.fca_score_align(h_score_raw)
-        self._last_specific_latent = specific_latent
-        self._last_shared_latent = shared_latent
-        self._last_content_profile = content_profile
-        self._last_h_explain = None
-        self._last_h_explain_aligned = None
-        self._last_content_evidence_latent = shared_latent * 0.0
-        self._last_ccv_control_stats = {
-            "ccv_route_scorer_mean": 0.0,
-            "ccv_route_explainer_mean": 0.0,
-            "ccv_uncertainty_mean": 0.0,
-            "ccv_confidence_mean": 0.0,
-            "ccv_content_anchor_mean": 0.0,
-            "ccv_style_anchor_mean": 0.0,
-        }
-        self._last_step5_forward_contract = {
-            "scorer_only": True,
-            "validation_mode": False,
-            "flan_explainer_called": False,
-            "out_logits_materialized": False,
-            "word_dist_returned": False,
-        }
-        return rating
 
     def generate(
         self,
@@ -2593,9 +2424,9 @@ class Model(nn.Module):
         cfg_override: Optional[Mapping[str, Any]] = None,
         ccv_control_packet: Optional[CCVControlPacket] = None,
     ):
-        """Flan-T5-XL 解码主链：encoder 仅 soft prompt；与 scorer 前缀 Transformer 物理隔离。"""
+        """Flan-T5-XL 解码主链：encoder 输入为 CCV soft prompt + content evidence tokens。"""
         if not bool(getattr(self, "step5_big_model_enabled", True)):
-            raise RuntimeError("Step5A-Small scorer-clean model forbids generation.")
+            raise RuntimeError("RatingStabilityControl-Small scorer-clean model forbids generation.")
         _base_gc = self._make_generate_config()
         gc = coerce_generate_cfg_override(_base_gc, cfg_override) or _base_gc
         device = user.device
@@ -2622,26 +2453,63 @@ class Model(nn.Module):
         soft_embeds = soft_flat.view(bsz, self.flan_soft_len, self.flan_d_model).to(
             dtype=self._flan_autocast_dtype(), device=device
         )
-        enc_mask = torch.ones(bsz, self.flan_soft_len, device=device, dtype=torch.long)
+        encoder_embeds, enc_mask = self._build_flan_encoder_inputs(soft_embeds, ccv_control_packet)
         max_new = max(1, int(gc.hard_max_len))
+        min_new = max(0, min(int(gc.min_len), max_new))
         strat = str(gc.strategy).lower()
         do_sample = strat not in ("greedy",)
+        tok = get_step5_tokenizer()
+        pad_id_raw = getattr(tok, "pad_token_id", None)
+        eos_id_raw = getattr(tok, "eos_token_id", None)
+        unk_id_raw = getattr(tok, "unk_token_id", None)
+        pad_id = int(pad_id_raw) if pad_id_raw is not None else 0
+        eos_id = int(eos_id_raw) if eos_id_raw is not None else int(self.decoder_eos_id)
+        decoder_start_id = getattr(getattr(self.flan_explainer, "config", None), "decoder_start_token_id", None)
+        if decoder_start_id is None:
+            decoder_start_id = pad_id
+        bad_words_ids: List[List[int]] = []
+        if unk_id_raw is not None:
+            bad_words_ids.append([int(unk_id_raw)])
         gen_kwargs: Dict[str, Any] = {
-            "inputs_embeds": soft_embeds,
+            "inputs_embeds": encoder_embeds,
             "attention_mask": enc_mask,
             "max_new_tokens": max_new,
+            "min_new_tokens": min_new,
             "repetition_penalty": float(gc.repetition_penalty),
+            "decoder_start_token_id": int(decoder_start_id),
+            "pad_token_id": pad_id,
+            "eos_token_id": eos_id,
+            "no_repeat_ngram_size": max(0, int(gc.no_repeat_ngram_size)),
+            "renormalize_logits": True,
             "use_cache": True,
         }
-        if int(self.decoder_eos_id) >= 0:
-            gen_kwargs["eos_token_id"] = int(self.decoder_eos_id)
+        if bad_words_ids:
+            gen_kwargs["bad_words_ids"] = bad_words_ids
         if do_sample:
             gen_kwargs["do_sample"] = True
             gen_kwargs["temperature"] = float(gc.temperature)
             gen_kwargs["top_p"] = float(gc.top_p)
+            if strat == "uncertainty_low_temp_top_k":
+                gen_kwargs["top_k"] = max(1, int(gc.top_k))
         else:
             gen_kwargs["do_sample"] = False
-        gen = self.flan_explainer.generate(**gen_kwargs)
+        seed_override: Optional[int] = None
+        if generator is not None and do_sample:
+            try:
+                seed_override = int(generator.initial_seed())
+            except Exception:
+                seed_override = None
+        if seed_override is not None:
+            rng_devices: List[int] = []
+            if device.type == "cuda" and torch.cuda.is_available():
+                rng_devices = [int(device.index if device.index is not None else torch.cuda.current_device())]
+            with torch.random.fork_rng(devices=rng_devices):
+                torch.manual_seed(int(seed_override))
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.manual_seed(int(seed_override))
+                gen = self.flan_explainer.generate(**gen_kwargs)
+        else:
+            gen = self.flan_explainer.generate(**gen_kwargs)
         ent = torch.zeros(bsz, device=device, dtype=torch.float32)
         return gen, ent, None
 
@@ -2660,7 +2528,7 @@ class Model(nn.Module):
         cfg_override 可为 GenerateConfig 或 dict，仅本调用有效。
         """
         if not bool(getattr(self, "step5_big_model_enabled", True)):
-            raise RuntimeError("Step5A-Small scorer-clean model forbids generation.")
+            raise RuntimeError("RatingStabilityControl-Small scorer-clean model forbids generation.")
         out, ent, attn = self.generate(
             user,
             item,
@@ -2733,45 +2601,6 @@ def graph_tied_zero_like(ref: torch.Tensor) -> torch.Tensor:
     return ref * 0.0
 
 
-def _step5a_policy_and_residual_config(final_cfg: Any) -> tuple[dict[str, Any], Any]:
-    raw = json.loads(str(getattr(final_cfg, "step5_task_decoupled_policy_config_json", "{}") or "{}"))
-    step5a = raw.get("step5A") if isinstance(raw.get("step5A"), Mapping) else {}
-    residual = step5a.get("residual_calibration") if isinstance(step5a.get("residual_calibration"), Mapping) else {}
-    return dict(step5a), parse_step5a_residual_calibration_config(residual)
-
-
-def _step5a_residual_loss_components(
-    model: nn.Module,
-    *,
-    pred_rating: torch.Tensor,
-    gt_rating: torch.Tensor,
-    final_cfg: Any,
-    epoch_index: int,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    teacher_pred = getattr(model, "_last_step3_teacher_pred", None)
-    delta = getattr(model, "_last_step5a_delta", None)
-    if teacher_pred is None or delta is None:
-        raise RuntimeError("Step5A frozen-teacher loss requires cached teacher_pred and residual delta.")
-    _policy, residual_cfg = _step5a_policy_and_residual_config(final_cfg)
-    weights = residual_cfg.weights_for_epoch(
-        epoch_index=int(epoch_index),
-        max_epochs=int(getattr(final_cfg, "epochs", 1) or 1),
-    )
-    gt_mse = F.mse_loss(pred_rating, gt_rating, reduction="none")
-    distill_mse = F.mse_loss(pred_rating, teacher_pred.detach(), reduction="none")
-    reg = residual_regularizer(
-        delta,
-        regularizer=residual_cfg.regularizer,
-        huber_delta=float(residual_cfg.huber_delta),
-    )
-    loss_ps = (
-        float(weights["lambda_gt"]) * gt_mse
-        + float(weights["lambda_distill"]) * distill_mse
-        + float(weights["lambda_residual"]) * reg
-    )
-    return loss_ps, weights
-
-
 def _step5_trainable_parameters(model: nn.Module) -> List[nn.Parameter]:
     params = [p for p in model.parameters() if p.requires_grad]
     if not params:
@@ -2804,24 +2633,10 @@ def _apply_step5_head_trainable_contract(
     peft_meta: Mapping[str, Any] | None,
 ) -> Dict[str, Any]:
     task_head = normalize_step5_task_head(head)
-    if task_head == "step5A":
-        for _name, _param in model.named_parameters():
-            _param.requires_grad_(False)
-        _set_module_trainable(getattr(model, "step5a_residual_calibrator", None), True)
-        _set_module_trainable(getattr(model, "step5a_frozen_teacher", None), False)
-        for module_name in (
-            "flan_explainer",
-            "ccv_numeric_adapter",
-            "ccv_control_adapter",
-            "fca_score_align",
-            "fca_explain_align",
-        ):
-            _set_module_trainable(getattr(model, module_name, None), False)
-    elif task_head == "step5B":
-        flan = getattr(model, "flan_explainer", None)
-        if flan is not None:
-            for name, param in flan.named_parameters(recurse=True):
-                param.requires_grad_("lora_" in name)
+    flan = getattr(model, "flan_explainer", None)
+    if flan is not None:
+        for name, param in flan.named_parameters(recurse=True):
+            param.requires_grad_("lora_" in name)
     forbidden_present = [
         name
         for name, _module in model.named_modules()
@@ -2840,7 +2655,7 @@ def _apply_step5_head_trainable_contract(
         "head": task_head,
         "policy_id": head_specific_trainable_policy_id(task_head),
         "head_specific_lora_allowlist_id": head_specific_lora_allowlist_id(task_head),
-        "combined_formal_enabled": False,
+        "retired_formal_enabled": False,
         "all_trainable_grad_required": True,
         "deleted_legacy_modules": list(DELETED_STEP5_LEGACY_MODULES),
         "forbidden_legacy_modules_present": forbidden_present,
@@ -2862,10 +2677,10 @@ def _step5_runtime_contract_payload(
 ) -> Dict[str, Any]:
     peft = dict(getattr(args, "_odcr_step5_peft_meta", {}) or {})
     trainable = dict(getattr(args, "_odcr_step5_trainable_contract_meta", {}) or {})
-    head = normalize_step5_task_head(getattr(final_cfg, "step5_head", "combined"))
+    head = normalize_step5_task_head(getattr(final_cfg, "step5_head", "explanation"))
     all_grad = dict((preflight_result or {}).get("all_trainable_grad_preflight_result") or {})
     valid_components = _parse_json_dict(getattr(final_cfg, "valid_loss_components_json", "{}"))
-    head_valid_components = list(valid_components.get(head) or valid_components.get("step5A") or [])
+    head_valid_components = list(valid_components.get(head) or [])
     payload = {
         "lora_target_policy_id": str(peft.get("target_policy_id") or getattr(final_cfg, "lora_target_policy_id", "")),
         "head_specific_lora_allowlist_id": str(
@@ -2876,18 +2691,13 @@ def _step5_runtime_contract_payload(
         "final_lora_target_modules": list(peft.get("target_modules") or trainable.get("final_lora_target_modules") or []),
         "forbidden_lora_targets": list(peft.get("forbidden_lora_targets") or []),
         "deleted_legacy_modules": list(peft.get("deleted_legacy_modules") or DELETED_STEP5_LEGACY_MODULES),
-        "combined_formal_enabled": False,
+        "retired_formal_enabled": False,
         "all_trainable_grad_required": True,
         "scratch_cleanup_required": True,
         "formal_entry_E4_required": True,
         "formal_entry_E4_validation_required": bool(
             getattr(final_cfg, "formal_entry_E4_validation_required", False)
         ),
-        "step5A_validation_mode": str(getattr(final_cfg, "step5A_validation_mode", "")),
-        "step5A_validation_scorer_only": head == "step5A"
-        and str(getattr(final_cfg, "step5A_validation_mode", "")) == "scorer_only",
-        "validation_flans_logits_materialized": False if head == "step5A" else None,
-        "validation_word_dist_returned": False if head == "step5A" else None,
         "train_per_gpu_batch_size": int(getattr(final_cfg, "per_gpu_batch_size", 0)),
         "valid_per_gpu_batch_size": int(getattr(final_cfg, "valid_per_gpu_batch_size", 0)),
         "valid_global_batch_size": int(getattr(final_cfg, "valid_global_batch_size", getattr(final_cfg, "valid_batch_size", 0))),
@@ -3001,10 +2811,6 @@ def _patch_step5_runtime_contract_artifacts(
             "ema_init_status",
             "formal_entry_E4_required",
             "formal_entry_E4_validation_required",
-            "step5A_validation_mode",
-            "step5A_validation_scorer_only",
-            "validation_flans_logits_materialized",
-            "validation_word_dist_returned",
             "train_per_gpu_batch_size",
             "valid_per_gpu_batch_size",
             "valid_global_batch_size",
@@ -3325,7 +3131,7 @@ def compose_step5_total_loss(
     *,
     loss_factual: torch.Tensor,
     loss_counterfactual: torch.Tensor,
-    loss_repeat_ul: torch.Tensor,
+    retired_repeat_ul_zero_guard: torch.Tensor,
     loss_terminal_clean: torch.Tensor,
     loss_batch_diversity: torch.Tensor,
     repeat_ul_weight: float,
@@ -3340,7 +3146,7 @@ def compose_step5_total_loss(
     loss = (
         loss_factual
         + loss_counterfactual
-        + float(repeat_ul_weight) * loss_repeat_ul
+        + float(repeat_ul_weight) * retired_repeat_ul_zero_guard
         + float(terminal_clean_weight) * loss_terminal_clean
         + float(batch_diversity_weight) * loss_batch_diversity
         + lci_weighted_loss
@@ -3352,13 +3158,14 @@ def compose_step5_total_loss(
 
 
 def normalize_step5_task_head(raw: Any) -> str:
-    head = str(raw or "combined").strip()
+    head = str(raw or "explanation").strip()
     if not head:
-        head = "combined"
-    if head not in {"step5A", "step5B", "combined"}:
-        raise RuntimeError(f"invalid Step5 task head: {raw!r}; expected step5A, step5B, or combined")
-    return head
-
+        head = "explanation"
+    if head.lower() == ("step5" + "b").lower():
+        return "explanation"
+    if head != "explanation":
+        raise RuntimeError("invalid Step5 task head: Step5 now trains explanations only")
+    return "explanation"
 
 def _resolved_step5_task_head(final_cfg: Any = None, args: Any = None) -> str:
     for raw in (
@@ -3367,7 +3174,7 @@ def _resolved_step5_task_head(final_cfg: Any = None, args: Any = None) -> str:
     ):
         if raw is not None and str(raw).strip():
             return normalize_step5_task_head(raw)
-    return "combined"
+    return "explanation"
 
 
 def _head_gated_step5_loss_terms(
@@ -3383,11 +3190,9 @@ def _head_gated_step5_loss_terms(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     head = normalize_step5_task_head(task_head)
     zero = graph_tied_zero(zero_like)
-    if head == "step5A":
-        return loss_factual, zero, lci_weighted_loss, zero, l_lci, zero if l_fca is not None else None
-    if head == "step5B":
+    if head == "explanation":
         return zero, loss_counterfactual, zero, fca_weighted_loss, zero if l_lci is not None else None, l_fca
-    return loss_factual, loss_counterfactual, lci_weighted_loss, fca_weighted_loss, l_lci, l_fca
+    raise RuntimeError("Step5 trains explanations only")
 
 
 def _validate_route_masks_batch(
@@ -3456,29 +3261,20 @@ def run_step5_find_unused_parameters_preflight(
             non_blocking_h2d=_step5_non_blocking_h2d_from_final_cfg(final_cfg),
         )
     )
-    head_name = normalize_step5_task_head(getattr(final_cfg, "step5_head", "combined"))
-    if head_name == "step5A":
-        assert_step5a_batch_target_gold_only(batch.sampler_component_id, stage="real_batch_preflight")
-    gate_a = build_step5a_scorer_gate(batch, step5_innov_cfg)
-    gate_b = (
-        SimpleNamespace(explainer_weight=torch.zeros_like(batch.rating))
-        if head_name == "step5A"
-        else build_step5b_explainer_gate(batch, step5_innov_cfg)
+    head_name = normalize_step5_task_head(getattr(final_cfg, "step5_head", "explanation"))
+    gate_b = build_step5_explanation_gate(batch, step5_innov_cfg)
+    packet = build_ccv_control_packet(
+        batch,
+        step5_innov_cfg,
+        producer="real_batch_preflight",
+        head=str(getattr(final_cfg, "step5_head", "unknown") or "unknown"),
     )
-    packet = None
-    if head_name != "step5A":
-        packet = build_ccv_control_packet(
-            batch,
-            step5_innov_cfg,
-            producer="real_batch_preflight",
-            head=str(getattr(final_cfg, "step5_head", "unknown") or "unknown"),
-        )
-        validate_ccv_control_packet_shapes(
-            packet,
-            producer="real_batch_preflight",
-            head=str(getattr(final_cfg, "step5_head", "unknown") or "unknown"),
-            strict=True,
-        )
+    validate_ccv_control_packet_shapes(
+        packet,
+        producer="real_batch_preflight",
+        head=str(getattr(final_cfg, "step5_head", "unknown") or "unknown"),
+        strict=True,
+    )
     trainable_params = [p for p in _model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("Step5 real-batch preflight found no trainable parameters.")
@@ -3490,112 +3286,46 @@ def run_step5_find_unused_parameters_preflight(
     cleanup_report: Dict[str, Any] = {}
     try:
         with torch.enable_grad(), torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_enabled):
-            if head_name == "step5A":
-                pred_rating, _context_dist, word_dist = _model(
-                    batch.user_idx,
-                    batch.item_idx,
-                    batch.tgt_input,
-                    batch.domain_idx,
-                    target_tokens=None,
-                    evidence_features=batch.evidence_features,
-                    content_anchor_score=batch.content_anchor_score,
-                    style_anchor_score=batch.style_anchor_score,
-                    content_evidence_ids=batch.content_evidence_ids,
-                    style_evidence_ids=batch.style_evidence_ids,
-                    domain_style_anchor_ids=batch.domain_style_anchor_ids,
-                    local_style_hint_ids=batch.local_style_hint_ids,
-                    polarity_ids=batch.polarity_ids,
-                    evidence_quality_prior=batch.evidence_quality_prior,
-                    ccv_control_packet=None,
-                    return_explainer_logits=False,
-                    scorer_only=True,
-                )
-                if word_dist is not None:
-                    raise RuntimeError("P0: Step5A scorer-clean preflight returned word logits.")
-            else:
-                pred_rating, _context_dist, word_dist = _model(
-                    batch.user_idx,
-                    batch.item_idx,
-                    batch.tgt_input,
-                    batch.domain_idx,
-                    target_tokens=batch.tgt_output,
-                    evidence_features=batch.evidence_features,
-                    content_anchor_score=batch.content_anchor_score,
-                    style_anchor_score=batch.style_anchor_score,
-                    ccv_control_packet=packet,
-                )
-            loss_r_ps = F.mse_loss(pred_rating, batch.rating, reduction="none")
-            if head_name == "step5A":
-                loss_flan_ps = graph_tied_zero_like(pred_rating)
-                loss_c_ps = graph_tied_zero_like(pred_rating)
-            else:
-                loss_flan_ps = per_sample_decoder_ce_from_logits(
-                    word_dist,
-                    batch.tgt_output,
-                    ignore_index=0,
-                    label_smoothing=float(final_cfg.label_smoothing),
-                )
-                loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
-            if head_name == "step5A":
-                scorer_only, _residual_weights = _step5a_residual_loss_components(
-                    _model,
-                    pred_rating=pred_rating,
-                    gt_rating=batch.rating,
-                    final_cfg=final_cfg,
-                    epoch_index=0,
-                )
-            else:
-                scorer_only = loss_r_ps
-            explainer_only = float(final_cfg.coef) * loss_c_ps + loss_flan_ps
-            dom = batch.domain_idx.view(-1)
-            loss_factual = route_weighted_mean(
-                scorer_only,
-                gate_a.scorer_weight.to(dtype=scorer_only.dtype),
-                (dom == 1).to(dtype=scorer_only.dtype),
+            control_score, _context_dist, word_dist = _model(
+                batch.user_idx,
+                batch.item_idx,
+                batch.tgt_input,
+                batch.domain_idx,
+                target_tokens=batch.tgt_output,
+                evidence_features=batch.evidence_features,
+                content_anchor_score=batch.content_anchor_score,
+                style_anchor_score=batch.style_anchor_score,
+                ccv_control_packet=packet,
+            )
+            loss_flan_ps = per_sample_decoder_ce_from_logits(
+                word_dist,
+                batch.tgt_output,
+                ignore_index=0,
+                label_smoothing=float(final_cfg.label_smoothing),
+            )
+            explainer_only = loss_flan_ps
+            loss_factual = graph_tied_zero(word_dist)
+            explainer_route_mask = _step5_explainer_ce_route_mask(
+                batch.route_explainer_mask,
+                like=explainer_only,
             )
             loss_counterfactual = float(final_cfg.explainer_loss_weight) * route_weighted_mean(
                 explainer_only,
                 gate_b.explainer_weight.to(dtype=explainer_only.dtype),
-                (dom == 0).to(dtype=explainer_only.dtype),
+                explainer_route_mask,
             )
             shared_lat = _model._last_shared_latent
             spec_lat = _model._last_specific_latent
-            if head_name == "step5A":
-                zero_scalar = graph_tied_zero_like(pred_rating).sum()
-                lci_bundle = SimpleNamespace(
-                    lci_loss=zero_scalar,
-                    lci_weighted_loss=zero_scalar,
-                )
-                fca_bundle = SimpleNamespace(
-                    fca_loss=zero_scalar,
-                    fca_weighted_loss=zero_scalar,
-                )
-            else:
-                noise = float(step5_innov_cfg.lci.perturb_std) * torch.randn_like(spec_lat)
-                score_pert = _model.odcr_scorer(shared_lat, _model.user_content_profiles[batch.user_idx], spec_lat + noise)
-                score_robust = _model.odcr_scorer(
-                    shared_lat.detach() + 0.0 * shared_lat,
-                    _model.user_content_profiles[batch.user_idx],
-                    spec_lat + noise.flip(0),
-                )
-                lci_bundle = lci_score_invariance_loss(
-                    factual_score=pred_rating,
-                    cf_score=score_pert,
-                    robust_score=score_robust,
-                    target_rating=batch.rating,
-                    gate=gate_a,
-                    cfg=step5_innov_cfg,
-                )
-                fca_bundle = evidence_basis_fca_loss(
-                    scorer_hidden=_model._last_h_score,
-                    explainer_hidden=_model._last_h_explain_aligned,
-                    shared_latent=shared_lat,
-                    content_profile=_model._last_content_profile,
-                    content_evidence_latent=_model._last_content_evidence_latent,
-                    packet=packet,
-                    gate=gate_b,
-                    cfg=step5_innov_cfg,
-                )
+            fca_bundle = evidence_basis_fca_loss(
+                scorer_hidden=_model._last_h_score,
+                explainer_hidden=_model._last_h_explain_aligned,
+                shared_latent=shared_lat,
+                content_profile=_model._last_content_profile,
+                content_evidence_latent=_model._last_content_evidence_latent,
+                packet=packet,
+                gate=gate_b,
+                cfg=step5_innov_cfg,
+            )
             (
                 loss_factual,
                 loss_counterfactual,
@@ -3604,16 +3334,16 @@ def run_step5_find_unused_parameters_preflight(
                 _l_lci,
                 _l_fca,
             ) = _head_gated_step5_loss_terms(
-                task_head=str(getattr(final_cfg, "step5_head", "combined") or "combined"),
-                zero_like=pred_rating if head_name == "step5A" else word_dist,
+                task_head=str(getattr(final_cfg, "step5_head", "explanation") or "explanation"),
+                zero_like=word_dist,
                 loss_factual=loss_factual,
                 loss_counterfactual=loss_counterfactual,
-                lci_weighted_loss=lci_bundle.lci_weighted_loss,
+                lci_weighted_loss=graph_tied_zero(word_dist),
                 fca_weighted_loss=fca_bundle.fca_weighted_loss,
-                l_lci=lci_bundle.lci_loss,
+                l_lci=None,
                 l_fca=fca_bundle.fca_loss,
             )
-            loss_ortho_keep = graph_tied_zero_like(pred_rating).sum() if head_name == "step5A" else graph_tied_zero(word_dist)
+            loss_ortho_keep = graph_tied_zero(word_dist)
             if float(final_cfg.lambda_ortho_step5) > 0.0:
                 loss_ortho_keep = build_orthogonal_losses(
                     shared_lat,
@@ -3624,9 +3354,9 @@ def run_step5_find_unused_parameters_preflight(
             loss = compose_step5_total_loss(
                 loss_factual=loss_factual,
                 loss_counterfactual=loss_counterfactual,
-                loss_repeat_ul=graph_tied_zero_like(pred_rating).sum() if head_name == "step5A" else graph_tied_zero(word_dist),
-                loss_terminal_clean=graph_tied_zero_like(pred_rating).sum() if head_name == "step5A" else graph_tied_zero(word_dist),
-                loss_batch_diversity=graph_tied_zero_like(pred_rating).sum() if head_name == "step5A" else graph_tied_zero(word_dist),
+                retired_repeat_ul_zero_guard=graph_tied_zero(word_dist),
+                loss_terminal_clean=graph_tied_zero(word_dist),
+                loss_batch_diversity=graph_tied_zero(word_dist),
                 repeat_ul_weight=0.0,
                 terminal_clean_weight=0.0,
                 batch_diversity_weight=0.0,
@@ -3643,7 +3373,7 @@ def run_step5_find_unused_parameters_preflight(
         all_grad_report = validate_all_trainable_params_receive_grad(
             _model,
             loss,
-            head=str(getattr(final_cfg, "step5_head", "combined") or "combined"),
+            head=str(getattr(final_cfg, "step5_head", "explanation") or "explanation"),
             evidence_context={
                 "evidence_id": "formal_ddp_preflight_real_sample_plan_one_batch",
                 "evidence_level": "formal_preflight",
@@ -3719,14 +3449,12 @@ def run_step5_find_unused_parameters_preflight(
         "lora_trainable_count": all_grad_report["lora_trainable_count"],
         "lora_grad_present_count": all_grad_report["lora_grad_present_count"],
         "missing_grad_params": all_grad_report["missing_grad_params"],
-        "head_gated_loss_contract": head_gated_loss_contract(getattr(final_cfg, "step5_head", "combined")),
+        "head_gated_loss_contract": head_gated_loss_contract(getattr(final_cfg, "step5_head", "explanation")),
         "loss_finite": True,
         "batch_size": int(batch.user_idx.size(0)),
         "ccv_control_packet_used": bool(packet is not None),
         "ccv_control_shapes": shape_payload,
         "polarity_ids_shape": shape_payload.get("polarity_ids"),
-        "step5A_scorer_clean_no_generation": bool(head_name == "step5A"),
-        "step5A_scorer_clean_word_dist_returned": False if head_name == "step5A" else None,
         "scratch_cleanup_after_preflight": cleanup_report,
         "scratch_cleared_after_preflight": bool(cleanup_report.get("remaining_graph_tensor_count") == 0),
         "grads_cleared_after_preflight": all(p.grad is None for p in _model.parameters()),
@@ -3961,7 +3689,6 @@ def trainModel_ddp(
     if not _st5_final_json:
         raise RuntimeError("Step5 training requires resolved step5_innovation_config_json from One-Control.")
     step5_innov_cfg = parse_step5_innovation_config_json(_st5_final_json)
-    w_lci = float(step5_innov_cfg.lci.weight)
     w_fca = float(step5_innov_cfg.fca.weight)
     if rank == 0 and _lg:
         if _finite_warn:
@@ -3992,16 +3719,13 @@ def trainModel_ddp(
             extra=log_route_extra(_lg, ROUTE_SUMMARY),
         )
         _lg.info(
-            "[Step5][A/B] task_head=%s lambda_ortho_step5=%g lambda_ortho_xcov=%g lambda_ortho_cos=%g "
-            "lci_enabled=%s lci_weight=%g uci_enabled=%s ccv_enabled=%s fca_enabled=%s fca_weight=%g "
+            "[Step5] task_head=%s lambda_ortho_step5=%g lambda_ortho_xcov=%g lambda_ortho_cos=%g "
+            "ccv_enabled=%s fca_enabled=%s fca_weight=%g "
             "explainer_loss_weight=%g explainer_only_multiplier=%g",
             task_head,
             lambda_ortho_step5,
             orth5_w_xcov,
             orth5_w_cos,
-            bool(step5_innov_cfg.lci.enabled),
-            w_lci,
-            bool(step5_innov_cfg.uci.enabled),
             bool(step5_innov_cfg.ccv.enabled),
             bool(step5_innov_cfg.fca.enabled),
             w_fca,
@@ -4013,8 +3737,6 @@ def trainModel_ddp(
     last_epoch_completed = 0
     last_ckpt_meta: Dict[str, Any] = {
         "valid_loss_total": float("nan"),
-        "valid_loss_r": float("nan"),
-        "valid_loss_c": float("nan"),
         "valid_loss_e": float("nan"),
         "quick_bleu4": None,
         "full_bleu4": None,
@@ -4022,6 +3744,10 @@ def trainModel_ddp(
     }
     best_version = 0
     ckpt_mode = str(getattr(final_cfg, "checkpoint_selection_mode", "guarded_composite")).strip().lower()
+    if ckpt_mode == "valid_loss_only":
+        raise RuntimeError(
+            "Step5_e valid_loss_only checkpoint selection is retired; use valid official paper_greedy_25 metrics."
+        )
     best_vl_ever = float("inf")
     best_composite_saved = -1e9
     best_monitor_bundle_gate: Optional[Dict[str, Any]] = None
@@ -4061,8 +3787,6 @@ def trainModel_ddp(
                 perf.epoch_start()
             model.train()
             loss_sum = torch.zeros((), dtype=torch.double, device=device)
-            loss_r_sum = torch.zeros((), dtype=torch.double, device=device)
-            loss_c_sum = torch.zeros((), dtype=torch.double, device=device)
             loss_e_sum = torch.zeros((), dtype=torch.double, device=device)
             n_samples = torch.zeros((), dtype=torch.double, device=device)
             optimizer.zero_grad(set_to_none=True)
@@ -4093,16 +3817,9 @@ def trainModel_ddp(
                 evidence_f = gb.evidence_features
                 c_anchor = gb.content_anchor_score
                 s_anchor = gb.style_anchor_score
-                is_step5a_scorer_clean = task_head == "step5A"
-                if is_step5a_scorer_clean:
-                    assert_step5a_batch_target_gold_only(gb.sampler_component_id, stage="train")
-                step5a_gate = build_step5a_scorer_gate(gb, step5_innov_cfg)
-                step5b_gate = (
-                    SimpleNamespace(explainer_weight=torch.zeros_like(rating))
-                    if is_step5a_scorer_clean
-                    else build_step5b_explainer_gate(gb, step5_innov_cfg)
-                )
-                ccv_packet = None if is_step5a_scorer_clean else build_ccv_control_packet(gb, step5_innov_cfg)
+                rating_stability_control_gate = build_rating_stability_control_gate(gb, step5_innov_cfg)
+                step5b_gate = build_step5_explanation_gate(gb, step5_innov_cfg)
+                ccv_packet = build_ccv_control_packet(gb, step5_innov_cfg)
                 if (
                     entropy_s is None
                     or uncertainty_s is None
@@ -4129,126 +3846,52 @@ def trainModel_ddp(
                 _step_timer = _StepComponentCudaTimer(_do_step_profile, use_cuda_events=_use_cuda_prof)
                 with odcr_cuda_bf16_autocast():
                     _step_timer.start("forward")
-                    if is_step5a_scorer_clean:
-                        pred_rating, context_dist, word_dist = model(
-                            user_idx,
-                            item_idx,
-                            tgt_input,
-                            domain_idx,
-                            target_tokens=None,
-                            evidence_features=evidence_f,
-                            content_anchor_score=c_anchor,
-                            style_anchor_score=s_anchor,
-                            content_evidence_ids=gb.content_evidence_ids,
-                            style_evidence_ids=gb.style_evidence_ids,
-                            domain_style_anchor_ids=gb.domain_style_anchor_ids,
-                            local_style_hint_ids=gb.local_style_hint_ids,
-                            polarity_ids=gb.polarity_ids,
-                            evidence_quality_prior=gb.evidence_quality_prior,
-                            ccv_control_packet=None,
-                            return_explainer_logits=False,
-                            scorer_only=True,
-                        )
-                        if word_dist is not None:
-                            raise RuntimeError("P0: Step5A scorer-clean train path returned word logits.")
-                    else:
-                        pred_rating, context_dist, word_dist = model(
-                            user_idx,
-                            item_idx,
-                            tgt_input,
-                            domain_idx,
-                            target_tokens=tgt_output,
-                            evidence_features=evidence_f,
-                            content_anchor_score=c_anchor,
-                            style_anchor_score=s_anchor,
-                            ccv_control_packet=ccv_packet,
-                        )
+                    control_score, context_dist, word_dist = model(
+                        user_idx,
+                        item_idx,
+                        tgt_input,
+                        domain_idx,
+                        target_tokens=tgt_output,
+                        evidence_features=evidence_f,
+                        content_anchor_score=c_anchor,
+                        style_anchor_score=s_anchor,
+                        ccv_control_packet=ccv_packet,
+                    )
                     _step_timer.end("forward")
                     _step_timer.start("exp_ce")
                     ls = float(final_cfg.label_smoothing)
-                    loss_r_ps = F.mse_loss(pred_rating, rating, reduction="none")
-                    if is_step5a_scorer_clean:
-                        loss_flan_ps = graph_tied_zero_like(pred_rating)
-                        loss_c_ps = graph_tied_zero_like(pred_rating)
-                        loss_e_ps = graph_tied_zero_like(pred_rating)
-                        word_logp = None
-                    else:
-                        if word_dist is None:
-                            raise RuntimeError("Step5B/combined train path requires explainer logits.")
-                        word_logp = F.log_softmax(word_dist, dim=-1)
-                        loss_flan_ps = per_sample_decoder_ce_from_logits(
-                            word_dist, tgt_output, ignore_index=0, label_smoothing=ls
-                        )
-                        loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
-                        loss_e_ps = loss_flan_ps
-                    if is_step5a_scorer_clean:
-                        scorer_only, _residual_weights = _step5a_residual_loss_components(
-                            _model,
-                            pred_rating=pred_rating,
-                            gt_rating=rating,
-                            final_cfg=final_cfg,
-                            epoch_index=epoch_1 - 1,
-                        )
-                    else:
-                        scorer_only = loss_r_ps
-                    explainer_only = coef * loss_c_ps + loss_e_ps
+                    if word_dist is None:
+                        raise RuntimeError("Step5 explanation-only train path requires explainer logits.")
+                    word_logp = F.log_softmax(word_dist, dim=-1)
+                    loss_flan_ps = per_sample_decoder_ce_from_logits(
+                        word_dist, tgt_output, ignore_index=0, label_smoothing=ls
+                    )
+                    loss_e_ps = loss_flan_ps
+                    explainer_only = loss_e_ps
 
-                    dom = domain_idx.view(-1)
                     w = exp_w.view(-1)
-                    rs = route_scorer_mask.view(-1)
                     re = route_explainer_mask.view(-1)
-                    f_mask = (dom == 1).to(dtype=scorer_only.dtype)
-                    c_mask = (dom == 0).to(dtype=scorer_only.dtype)
-                    scorer_w = step5a_gate.scorer_weight.to(dtype=w.dtype)
+                    explainer_route_mask = _step5_explainer_ce_route_mask(re, like=loss_e_ps)
                     explainer_w = step5b_gate.explainer_weight.to(dtype=w.dtype)
-                    loss_factual = route_weighted_mean(scorer_only, scorer_w, f_mask)
+                    loss_factual = graph_tied_zero(word_dist)
                     loss_counterfactual = explainer_loss_weight * route_weighted_mean(
                         explainer_only,
                         explainer_w,
-                        c_mask,
+                        explainer_route_mask,
                     )
                     spec_lat = _model._last_specific_latent
                     shared_lat = _model._last_shared_latent
-                    if is_step5a_scorer_clean:
-                        zero_scalar = graph_tied_zero_like(pred_rating).sum()
-                        lci_bundle = SimpleNamespace(
-                            lci_loss=zero_scalar,
-                            lci_weighted_loss=zero_scalar,
-                        )
-                        fca_bundle = SimpleNamespace(
-                            fca_loss=zero_scalar,
-                            fca_weighted_loss=zero_scalar,
-                            fca_weight_mean=zero_scalar,
-                        )
-                    else:
-                        noise = float(step5_innov_cfg.lci.perturb_std) * torch.randn_like(spec_lat)
-                        score_pert = _model.odcr_scorer(
-                            shared_lat, _model.user_content_profiles[user_idx], spec_lat + noise
-                        )
-                        score_robust = _model.odcr_scorer(
-                            shared_lat.detach() + 0.0 * shared_lat,
-                            _model.user_content_profiles[user_idx],
-                            spec_lat + noise.flip(0),
-                        )
-                        lci_bundle = lci_score_invariance_loss(
-                            factual_score=pred_rating,
-                            cf_score=score_pert,
-                            robust_score=score_robust,
-                            target_rating=rating,
-                            gate=step5a_gate,
-                            cfg=step5_innov_cfg,
-                        )
-                        fca_bundle = evidence_basis_fca_loss(
-                            scorer_hidden=_model._last_h_score,
-                            explainer_hidden=_model._last_h_explain_aligned,
-                            shared_latent=shared_lat,
-                            content_profile=_model._last_content_profile,
-                            content_evidence_latent=_model._last_content_evidence_latent,
-                            packet=ccv_packet,
-                            gate=step5b_gate,
-                            cfg=step5_innov_cfg,
-                        )
-                    l_lci = lci_bundle.lci_loss
+                    fca_bundle = evidence_basis_fca_loss(
+                        scorer_hidden=_model._last_h_score,
+                        explainer_hidden=_model._last_h_explain_aligned,
+                        shared_latent=shared_lat,
+                        content_profile=_model._last_content_profile,
+                        content_evidence_latent=_model._last_content_evidence_latent,
+                        packet=ccv_packet,
+                        gate=step5b_gate,
+                        cfg=step5_innov_cfg,
+                    )
+                    l_lci = None
                     l_fca = fca_bundle.fca_loss
                     (
                         loss_factual,
@@ -4259,15 +3902,15 @@ def trainModel_ddp(
                         l_fca,
                     ) = _head_gated_step5_loss_terms(
                         task_head=task_head,
-                        zero_like=pred_rating if is_step5a_scorer_clean else word_dist,
+                        zero_like=word_dist,
                         loss_factual=loss_factual,
                         loss_counterfactual=loss_counterfactual,
-                        lci_weighted_loss=lci_bundle.lci_weighted_loss,
+                        lci_weighted_loss=graph_tied_zero(word_dist),
                         fca_weighted_loss=fca_bundle.fca_weighted_loss,
                         l_lci=l_lci,
                         l_fca=l_fca,
                     )
-                    loss_ortho_keep = graph_tied_zero_like(pred_rating).sum() if is_step5a_scorer_clean else word_dist.sum() * 0.0
+                    loss_ortho_keep = word_dist.sum() * 0.0
                     loss_ortho_xcov_log = 0.0
                     loss_ortho_cos_log = 0.0
                     if lambda_ortho_step5 > 0.0 and bsz > 0:
@@ -4283,20 +3926,20 @@ def trainModel_ddp(
                         _epoch_orth_sum += float(_ob.loss_ortho_total.detach().item())
                         _epoch_orth_batches += 1
                     elif lambda_ortho_step5 > 0.0 and bsz == 0:
-                        loss_ortho_keep = graph_tied_zero_like(pred_rating).sum() if is_step5a_scorer_clean else word_dist.sum() * 0.0
+                        loss_ortho_keep = word_dist.sum() * 0.0
                     _step_timer.end("exp_ce")
                     w_ul = float(final_cfg.loss_weight_repeat_ul)
                     w_tc = float(final_cfg.loss_weight_terminal_clean)
-                    loss_ul = graph_tied_zero_like(pred_rating).sum() if is_step5a_scorer_clean else graph_tied_zero(word_dist)
-                    loss_tc = graph_tied_zero_like(pred_rating).sum() if is_step5a_scorer_clean else graph_tied_zero(word_dist)
+                    loss_ul = graph_tied_zero(word_dist)
+                    loss_tc = graph_tied_zero(word_dist)
                     _step_timer.start("repeat_ul")
-                    if w_ul > 0 and not is_step5a_scorer_clean:
+                    if w_ul > 0:
                         loss_ul = odcr_anti_repeat_unlikelihood_loss_from_logp(
                             word_logp, tgt_output
                         )
                     _step_timer.end("repeat_ul")
                     _step_timer.start("terminal_clean")
-                    if w_tc > 0 and not is_step5a_scorer_clean:
+                    if w_tc > 0:
                         loss_tc = odcr_terminal_cleanliness_loss(
                             word_dist,
                             tgt_output,
@@ -4304,7 +3947,7 @@ def trainModel_ddp(
                             int(final_cfg.terminal_clean_span),
                         )
                     _step_timer.end("terminal_clean")
-                    loss_bd_raw_preclamp = graph_tied_zero_like(pred_rating).sum() if is_step5a_scorer_clean else graph_tied_zero(word_dist)
+                    loss_bd_raw_preclamp = graph_tied_zero(word_dist)
                     batch_div_skipped = False
                     batch_div_valid_tokens = 0
                     w_bd_eff = float(_epoch_bd_eff_weight)
@@ -4318,10 +3961,9 @@ def trainModel_ddp(
                     ).strip().lower()
                     min_tok_bd = int(getattr(final_cfg, "batch_diversity_min_valid_tokens", 64))
                     clamp_bd = float(getattr(final_cfg, "batch_diversity_loss_clamp_abs", 0.2))
-                    loss_bd = graph_tied_zero_like(pred_rating).sum() if is_step5a_scorer_clean else graph_tied_zero(word_dist)
+                    loss_bd = graph_tied_zero(word_dist)
                     if (
-                        not is_step5a_scorer_clean
-                        and word_dist is not None
+                        word_dist is not None
                         and
                         _w_bd_base > 0.0
                         and float(_epoch_bd_ramp_factor) > 0.0
@@ -4339,9 +3981,9 @@ def trainModel_ddp(
                             mean_probs = (probs * m).sum(dim=(0, 1)) / denom
                             mean_probs = torch.nan_to_num(
                                 mean_probs, nan=0.0, posinf=0.0, neginf=0.0
-                            )
+                            ).float()
                             if use_ema_bd:
-                                ema_buf = _model.batch_diversity_ema_mean_probs
+                                ema_buf = _step5_batch_diversity_ema_buffer(_model, mean_probs)
                                 if not getattr(_model, "_batch_div_ema_seeded", False):
                                     if ema_init_mode == "uniform":
                                         with torch.no_grad():
@@ -4391,7 +4033,7 @@ def trainModel_ddp(
                     loss = compose_step5_total_loss(
                         loss_factual=loss_factual,
                         loss_counterfactual=loss_counterfactual,
-                        loss_repeat_ul=loss_ul,
+                        retired_repeat_ul_zero_guard=loss_ul,
                         loss_terminal_clean=loss_tc,
                         loss_batch_diversity=loss_bd,
                         repeat_ul_weight=w_ul,
@@ -4404,8 +4046,6 @@ def trainModel_ddp(
                     )
                     with torch.no_grad():
                         wsum = w.sum().clamp(min=1e-8)
-                        _tr = (loss_r_ps * w).sum() / wsum
-                        _tc = (loss_c_ps * w).sum() / wsum
                         _te = (loss_e_ps * w).sum() / wsum
                     _step_timer.start("backward")
                     loss.backward()
@@ -4473,10 +4113,7 @@ def trainModel_ddp(
                     _lr_now = optimizer.param_groups[0]["lr"]
                     _extra = None
                     with torch.no_grad():
-                        _wsum = w.sum().clamp(min=1e-8)
-                        _lr_h = (loss_r_ps * w).sum() / _wsum
-                        _lc_h = (loss_c_ps * w).sum() / _wsum
-                        _le_h = (loss_e_ps * w).sum() / _wsum
+                        _le_h = (loss_e_ps * w).sum() / w.sum().clamp(min=1e-8)
                     w_ul = float(final_cfg.loss_weight_repeat_ul)
                     w_tc = float(final_cfg.loss_weight_terminal_clean)
                     _lul = float(loss_ul.detach().item()) if w_ul > 0 else 0.0
@@ -4490,29 +4127,18 @@ def trainModel_ddp(
                         _extra = {
                             "loss_factual": float(loss_factual.detach().item()),
                             "loss_counterfactual": float(loss_counterfactual.detach().item()),
-                            "loss_r": float(_lr_h.item()),
-                            "loss_c": float(_lc_h.item()),
                             "loss_e": float(_le_h.item()),
-                            "loss_repeat_ul": _lul,
+                            "retired_repeat_ul_zero_guard": _lul,
                             "loss_terminal_clean": _ltc,
                             "total_loss_breakdown": _brk,
                         }
                     else:
                         _extra = {
-                            "loss_r": float(_lr_h.item()),
-                            "loss_c": float(_lc_h.item()),
                             "loss_e": float(_le_h.item()),
-                            "loss_repeat_ul": _lul,
+                            "retired_repeat_ul_zero_guard": _lul,
                             "loss_terminal_clean": _ltc,
                             "total_loss_breakdown": _brk,
                         }
-                    _extra["loss_lci"] = float(l_lci.detach().item())
-                    _extra["loss_lci_weighted"] = float(lci_weighted_loss.detach().item())
-                    _extra["loss_lci_consistency"] = float(lci_bundle.lci_consistency_loss.detach().item())
-                    _extra["loss_lci_cf_score"] = float(lci_bundle.lci_cf_score_loss.detach().item())
-                    _extra["loss_lci_robustness"] = float(lci_bundle.lci_robustness_loss.detach().item())
-                    _extra["uci_weight"] = float(lci_bundle.uci_weight_mean.detach().item())
-                    _extra["step5a_scorer_weight"] = float(lci_bundle.scorer_weight_mean.detach().item())
                     _extra["loss_fca"] = float(l_fca.detach().item())
                     _extra["loss_fca_weighted"] = float(fca_weighted_loss.detach().item())
                     _extra["step5b_fca_weight"] = float(fca_bundle.fca_weight_mean.detach().item())
@@ -4569,15 +4195,13 @@ def trainModel_ddp(
                     else:
                         print(_pf, flush=True)
                 loss_sum = loss_sum + loss.detach().double() * bsz
-                loss_r_sum = loss_r_sum + _tr.double() * bsz
-                loss_c_sum = loss_c_sum + _tc.double() * bsz
                 loss_e_sum = loss_e_sum + _te.double() * bsz
                 n_samples += bsz
                 if batch_step_count % step_iv == 0 and rank == 0:
                     run_training_finite_checks(
                         _finite_mode,
                         loss,
-                        pred_rating if is_step5a_scorer_clean else word_dist,
+                        word_dist,
                         _lg,
                         global_step=global_step,
                         epoch=epoch_1,
@@ -4585,15 +4209,11 @@ def trainModel_ddp(
                     )
             ddp_heartbeat(_lg, "before_train_loss_allreduce", rank=rank, epoch=epoch_1)
             dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(loss_r_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(loss_c_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(loss_e_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(n_samples, op=dist.ReduceOp.SUM)
             ddp_heartbeat(_lg, "after_train_loss_allreduce", rank=rank, epoch=epoch_1)
             _ns = float(n_samples.item()) if n_samples.numel() else 0.0
             avg_loss = (loss_sum / n_samples).item() if _ns > 0 else 0.0
-            train_loss_r_epoch = (loss_r_sum / n_samples).item() if _ns > 0 else 0.0
-            train_loss_c_epoch = (loss_c_sum / n_samples).item() if _ns > 0 else 0.0
             train_loss_e_epoch = (loss_e_sum / n_samples).item() if _ns > 0 else 0.0
             lr_epoch = optimizer.param_groups[0]["lr"]
             ddp_heartbeat(_lg, "before_gpu_stats_allgather", rank=rank, epoch=epoch_1)
@@ -4608,9 +4228,140 @@ def trainModel_ddp(
             else:
                 rec = None
 
+            _lifecycle_phase = str(getattr(final_cfg, "step5_lifecycle_phase", "") or "").strip().lower()
+            official_train_only_candidate = (
+                str(getattr(final_cfg, "checkpoint_selection_mode", "guarded_composite")).strip().lower()
+                == "official_paper_metrics"
+                and _lifecycle_phase == "train_only"
+                and not bool(getattr(final_cfg, "step5_allow_embedded_final_eval", False))
+            )
+            if official_train_only_candidate:
+                if rank == 0:
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    block = format_epoch_training_block(
+                        time_str=current_time,
+                        epoch=epoch + 1,
+                        epoch_time_s=rec["epoch_time"],
+                        total_time_s=rec["total_time"],
+                        step_time_s=rec["step_time"],
+                        gpu_util=rec["gpu_util"],
+                        gpu_mem=rec["gpu_mem"],
+                        cpu_used=rec["cpu_used"],
+                        cpu_total=rec["cpu_total"],
+                        cpu_util=rec["cpu_util"],
+                        lr=lr_epoch,
+                        train_loss=avg_loss,
+                        valid_loss=float("nan"),
+                        bleu_line=None,
+                        lr_schedule_detail=None,
+                    )
+                    log_epoch_training_block(_lg, block)
+                    _lg.info(
+                        "[OfficialPaperCheckpoint] train-only candidate saved without in-process valid_loss; "
+                        "valid official paper_greedy_25 selection must run as a separate clean eval. "
+                        "epoch=%d global_step=%d train_loss=%.6f",
+                        int(epoch_1),
+                        int(global_step),
+                        float(avg_loss),
+                        extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                    )
+                    model_to_save = state_dict_for_canonical_best_pth(
+                        ema_enabled=ema_enabled,
+                        ema_model=ema_model,
+                        ddp_module=model,
+                        underlying_model_fn=get_underlying_model,
+                    )
+                    atomic_torch_save(str(final_cfg.save_file), model_to_save)
+                    model_sha = _sha256_file(str(final_cfg.save_file))
+                    _ckpt_lineage = _build_step5_checkpoint_lineage(final_cfg, model)
+                    _ckpt_lineage["checkpoint_file"] = file_fingerprint(str(final_cfg.save_file))
+                    _ckpt_lineage_path = write_checkpoint_lineage(str(final_cfg.save_file), _ckpt_lineage)
+                    _sp = _state_paths_from_save_file(str(final_cfg.save_file))
+                    os.makedirs(_sp["state_dir"], exist_ok=True)
+                    atomic_torch_save(_sp["optimizer_pt"], optimizer.state_dict())
+                    atomic_write_json(
+                        _sp["trainer_state"],
+                        {
+                            "epoch": int(epoch_1),
+                            "global_step": int(global_step),
+                            "scheduler_steps": int(scheduler_steps),
+                        },
+                    )
+                    atomic_write_json(
+                        _sp["best_event"],
+                        {
+                            "best_version": int(best_version + 1),
+                            "epoch": int(epoch_1),
+                            "global_step": int(global_step),
+                            "valid_loss": None,
+                            "valid_loss_role": "diagnostic_skipped_train_only",
+                            "valid_official_metrics": None,
+                            "model_sha256": model_sha,
+                            "checkpoint_hash": model_sha,
+                            "checkpoint_lineage_hash": _ckpt_lineage.get("checkpoint_compatibility_hash"),
+                            "checkpoint_lineage_path": str(_ckpt_lineage_path),
+                            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "ema_enabled": bool(ema_enabled),
+                            "weight_kind": "ema" if ema_enabled else "raw",
+                            "checkpoint_selection_mode": "official_paper_metrics",
+                            "checkpoint_save_reason": "train_only_epoch_candidate_pending_valid_official_eval",
+                            "checkpoint_acceptance": "candidate_pending_valid_official_paper_metrics",
+                            "decode_policy": build_official_paper_greedy_25_override(final_cfg),
+                            "reference_policy": {
+                                "source": "raw_ref_text",
+                                "metric_builder": "base_utils.build_paper_metric_inputs",
+                                "max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                            },
+                            "prediction_policy": {
+                                "source": "raw_pred_text",
+                                "metric_builder": "base_utils.build_paper_metric_inputs",
+                                "max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                            },
+                            "token_length_policy": {
+                                "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                                "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                                "unit": "tokenizer_tokens_then_decode",
+                            },
+                            "metrics_implementation": "base_utils.official_paper_metrics",
+                            "content_evidence_used": True,
+                            "content_evidence_contract": _step5_content_evidence_contract_payload(final_cfg),
+                            "test_eligibility": "blocked_until_clean_valid_lock",
+                            "selected_params": {
+                                "best_train_label_max_length": int(getattr(final_cfg, "train_label_max_length", 128)),
+                                "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
+                                "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
+                                "best_metric_policy": "official_paper_metrics_valid_only",
+                                "best_content_evidence_policy": "soft_prompt_plus_content_evidence_required",
+                            },
+                        },
+                    )
+                    append_train_epoch_metrics_jsonl(
+                        log_file=final_cfg.log_file,
+                        row={
+                            "epoch": epoch + 1,
+                            "global_step": int(global_step),
+                            "train_loss_total_epoch": avg_loss,
+                            "train_loss_e_epoch": train_loss_e_epoch,
+                            "valid_loss_total_epoch": None,
+                            "valid_loss_e_epoch": None,
+                            "checkpoint_selection_mode": "official_paper_metrics",
+                            "checkpoint_acceptance": "candidate_pending_valid_official_paper_metrics",
+                            "train_only_valid_loss_skipped": True,
+                            "lambda_ortho_step5": float(lambda_ortho_step5),
+                            "lambda_ortho_xcov": float(orth5_w_xcov),
+                            "lambda_ortho_cos": float(orth5_w_cos),
+                            "step5_fca_weight": float(w_fca),
+                        },
+                    )
+                if odcr_ddp_epoch_end_barrier():
+                    ddp_heartbeat(_lg, "before_epoch_end_barrier", rank=rank, epoch=epoch_1)
+                    dist.barrier()
+                    ddp_heartbeat(_lg, "after_epoch_end_barrier", rank=rank, epoch=epoch_1)
+                continue
+
             # valid：各 rank 只跑本地分片（DistributedSampler），样本加权 sum + all_reduce 得全局 avg（与 train loss 聚合方式一致）
             _t_valid0 = time.perf_counter()
-            v_loss_sum, v_n, v_lr_sum, v_lc_sum, v_le_sum = validModel(
+            v_loss_sum, v_n, v_le_sum = validModel(
                 model,
                 valid_dataloader,
                 device,
@@ -4636,16 +4387,14 @@ def trainModel_ddp(
                     extra=log_route_extra(_lg, ROUTE_SUMMARY),
                 )
             v_stat = torch.tensor(
-                [v_loss_sum, float(v_n), v_lr_sum, v_lc_sum, v_le_sum],
+                [v_loss_sum, float(v_n), v_le_sum],
                 dtype=torch.double,
                 device=device,
             )
             dist.all_reduce(v_stat, op=dist.ReduceOp.SUM)
             _vn = float(v_stat[1].item())
             current_valid_loss = float(v_stat[0] / v_stat[1]) if _vn > 0 else 0.0
-            valid_loss_r_epoch = float(v_stat[2] / v_stat[1]) if _vn > 0 else 0.0
-            valid_loss_c_epoch = float(v_stat[3] / v_stat[1]) if _vn > 0 else 0.0
-            valid_loss_e_epoch = float(v_stat[4] / v_stat[1]) if _vn > 0 else 0.0
+            valid_loss_e_epoch = float(v_stat[2] / v_stat[1]) if _vn > 0 else 0.0
             strict_would_save = bool(current_valid_loss <= prev_valid_loss + 1e-12)
             if current_valid_loss < shadow_strict_best_vl - 1e-12:
                 shadow_strict_best_vl = float(current_valid_loss)
@@ -4655,13 +4404,17 @@ def trainModel_ddp(
             mainline_composite_val = None
             mainline_monitor_bundle: Optional[Dict[str, Any]] = None
             if (
-                ckpt_mode == "guarded_composite"
+                ckpt_mode in ("guarded_composite", "official_paper_metrics")
                 and str(checkpoint_metric).strip().lower() in ("valid_loss", "loss")
             ):
                 _vd_mon = getattr(final_cfg, "valid_dataset", None)
                 if _vd_mon is None:
-                    raise RuntimeError("guarded_composite 选模需要 final_cfg.valid_dataset")
-                _ov_mon = build_full_bleu_monitor_cfg_override(final_cfg)
+                    raise RuntimeError(f"{ckpt_mode} 选模需要 final_cfg.valid_dataset")
+                _ov_mon = (
+                    build_official_paper_greedy_25_override(final_cfg)
+                    if ckpt_mode == "official_paper_metrics"
+                    else build_full_bleu_monitor_cfg_override(final_cfg)
+                )
                 mainline_composite_val, mainline_monitor_bundle = mainline_monitor_full_valid_ddp(
                     model,
                     _vd_mon,
@@ -4679,16 +4432,19 @@ def trainModel_ddp(
                     uncertainty_high_entropy_threshold=float(
                         getattr(final_cfg, "uncertainty_high_entropy_threshold", 1.0)
                     ),
+                    step5_innov_cfg=step5_innov_cfg,
+                    non_blocking_h2d=non_blocking_h2d,
                 )
             if rank == 0:
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 bleu_line = None
                 if mainline_composite_val is not None:
                     _lg.info(
-                        "[MainlineMonitor] epoch=%d composite=%.6f decode_override=%s",
+                        "[MainlineMonitor] epoch=%d mode=%s composite=%.6f decode_override=%s",
                         epoch + 1,
+                        ckpt_mode,
                         float(mainline_composite_val),
-                        json.dumps(build_full_bleu_monitor_cfg_override(final_cfg), ensure_ascii=False, sort_keys=True),
+                        json.dumps(_ov_mon, ensure_ascii=False, sort_keys=True),
                         extra=log_route_extra(_lg, ROUTE_SUMMARY),
                     )
                 _wbd_ep = float(_w_bd_base)
@@ -4827,12 +4583,8 @@ def trainModel_ddp(
                 summ = format_epoch_summary_lines(
                     epoch=epoch + 1,
                     train_loss_total_epoch=avg_loss,
-                    train_loss_r_epoch=train_loss_r_epoch,
-                    train_loss_c_epoch=train_loss_c_epoch,
                     train_loss_e_epoch=train_loss_e_epoch,
                     valid_loss_total_epoch=current_valid_loss,
-                    valid_loss_r_epoch=valid_loss_r_epoch,
-                    valid_loss_c_epoch=valid_loss_c_epoch,
                     valid_loss_e_epoch=valid_loss_e_epoch,
                     lr=lr_epoch,
                     quick_bleu4=quick_bleu4,
@@ -4843,12 +4595,8 @@ def trainModel_ddp(
                 _row_metrics: Dict[str, Any] = {
                     "epoch": epoch + 1,
                     "train_loss_total_epoch": avg_loss,
-                    "train_loss_r_epoch": train_loss_r_epoch,
-                    "train_loss_c_epoch": train_loss_c_epoch,
                     "train_loss_e_epoch": train_loss_e_epoch,
                     "valid_loss_total_epoch": current_valid_loss,
-                    "valid_loss_r_epoch": valid_loss_r_epoch,
-                    "valid_loss_c_epoch": valid_loss_c_epoch,
                     "valid_loss_e_epoch": valid_loss_e_epoch,
                     "lr": lr_epoch,
                     "quick_bleu4": quick_bleu4,
@@ -4869,7 +4617,6 @@ def trainModel_ddp(
                     "lambda_ortho_step5": float(lambda_ortho_step5),
                     "lambda_ortho_xcov": float(orth5_w_xcov),
                     "lambda_ortho_cos": float(orth5_w_cos),
-                    "step5_lci_weight": float(w_lci),
                     "step5_fca_weight": float(w_fca),
                 }
                 if _epoch_orth_batches > 0:
@@ -4889,8 +4636,6 @@ def trainModel_ddp(
                     _row_metrics["uncertainty_decode_summary"] = dict(_uds)
                 epoch_metrics_row = _row_metrics
             last_ckpt_meta["valid_loss_total"] = current_valid_loss
-            last_ckpt_meta["valid_loss_r"] = valid_loss_r_epoch
-            last_ckpt_meta["valid_loss_c"] = valid_loss_c_epoch
             last_ckpt_meta["valid_loss_e"] = valid_loss_e_epoch
             if rank == 0:
                 last_ckpt_meta["quick_bleu4"] = quick_bleu4
@@ -4909,8 +4654,25 @@ def trainModel_ddp(
             save_reason = ""
             if str(checkpoint_metric).strip().lower() in ("valid_loss", "loss") and rank == 0:
                 if ckpt_mode == "valid_loss_only":
-                    do_save = current_valid_loss <= prev_valid_loss
-                    save_reason = "valid_loss_not_worse_than_prev_epoch"
+                    raise RuntimeError("Step5_e valid_loss_only checkpoint selection is retired.")
+                elif ckpt_mode == "official_paper_metrics":
+                    comp = float(mainline_composite_val if mainline_composite_val is not None else float("-inf"))
+                    do_save = bool(comp > best_composite_saved + 1e-9)
+                    save_reason = "valid_official_paper_metrics_improved" if do_save else ""
+                    if _lg is not None:
+                        _lg.info(
+                            "[OfficialPaperCheckpoint] epoch=%d valid_loss_diagnostic=%.6f "
+                            "official_composite=%.6f best_official_composite_saved=%.6f will_save=%s "
+                            "decode_profile=paper_greedy_25 metrics=official_paper_metrics "
+                            "token_policy=prediction25_reference25",
+                            int(epoch_1),
+                            float(current_valid_loss),
+                            float(comp),
+                            float(best_composite_saved),
+                            str(bool(do_save)).lower(),
+                            extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                        )
+                    best_vl_ever = min(best_vl_ever, current_valid_loss)
                 elif ckpt_mode == "guarded_composite":
                     best_vl_gate_ref = float(best_vl_ever)
                     rel_tol = float(final_cfg.checkpoint_guard_valid_loss_rel_tol)
@@ -4989,12 +4751,11 @@ def trainModel_ddp(
                             extra=log_route_extra(_lg, ROUTE_SUMMARY),
                         )
                 else:
-                    do_save = current_valid_loss <= prev_valid_loss
-                    save_reason = "unknown_mode_fallback_prev_epoch"
+                    raise RuntimeError(f"Unknown Step5 checkpoint_selection_mode={ckpt_mode!r}")
 
             if str(checkpoint_metric).strip().lower() in ("valid_loss", "loss") and rank == 0 and do_save:
                 best_version += 1
-                if ckpt_mode == "guarded_composite" and mainline_monitor_bundle is not None:
+                if ckpt_mode in ("guarded_composite", "official_paper_metrics") and mainline_monitor_bundle is not None:
                     best_composite_saved = float(mainline_composite_val or 0.0)
                     best_monitor_bundle_gate = dict(mainline_monitor_bundle)
                 model_to_save = state_dict_for_canonical_best_pth(
@@ -5044,6 +4805,7 @@ def trainModel_ddp(
                         "global_step": int(global_step),
                         "valid_loss": float(current_valid_loss),
                         "model_sha256": model_sha,
+                        "checkpoint_hash": model_sha,
                         "checkpoint_lineage_hash": _ckpt_lineage.get("checkpoint_compatibility_hash"),
                         "checkpoint_lineage_path": str(_ckpt_lineage_path),
                         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -5052,6 +4814,43 @@ def trainModel_ddp(
                         "checkpoint_selection_mode": ckpt_mode,
                         "checkpoint_save_reason": save_reason,
                         "mainline_composite_score": mainline_composite_val,
+                        "valid_official_metrics": (
+                            (mainline_monitor_bundle or {}).get("official_paper_metrics")
+                            if ckpt_mode == "official_paper_metrics"
+                            else None
+                        ),
+                        "decode_policy": (
+                            build_official_paper_greedy_25_override(final_cfg)
+                            if ckpt_mode == "official_paper_metrics"
+                            else build_full_bleu_monitor_cfg_override(final_cfg)
+                        ),
+                        "reference_policy": {
+                            "source": "raw_ref_text",
+                            "metric_builder": "base_utils.build_paper_metric_inputs",
+                            "max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                        },
+                        "prediction_policy": {
+                            "source": "raw_pred_text",
+                            "metric_builder": "base_utils.build_paper_metric_inputs",
+                            "max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                        },
+                        "token_length_policy": {
+                            "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                            "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                            "unit": "tokenizer_tokens_then_decode",
+                        },
+                        "metrics_implementation": "base_utils.official_paper_metrics"
+                        if ckpt_mode == "official_paper_metrics"
+                        else "diagnostic_mainline_monitor",
+                        "content_evidence_used": True,
+                        "content_evidence_contract": _step5_content_evidence_contract_payload(final_cfg),
+                        "selected_params": {
+                            "best_train_label_max_length": int(getattr(final_cfg, "train_label_max_length", 128)),
+                            "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
+                            "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
+                            "best_metric_policy": str(ckpt_mode),
+                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_required",
+                        },
                         "checkpoint_guard_valid_loss_rel_tol": float(
                             final_cfg.checkpoint_guard_valid_loss_rel_tol
                         ),
@@ -5059,12 +4858,16 @@ def trainModel_ddp(
                             final_cfg.checkpoint_guard_valid_loss_abs_tol
                         ),
                         "checkpoint_acceptance": (
-                            "strict_valid_loss"
-                            if save_reason == "valid_loss_strict_improve_vs_best_ever"
+                            "valid_official_paper_metrics"
+                            if save_reason == "valid_official_paper_metrics_improved"
                             else (
-                                "composite_tiebreak_within_tolerance"
-                                if save_reason == "composite_tiebreak_within_loss_tolerance"
-                                else str(save_reason)
+                                "strict_valid_loss"
+                                if save_reason == "valid_loss_strict_improve_vs_best_ever"
+                                else (
+                                    "composite_tiebreak_within_tolerance"
+                                    if save_reason == "composite_tiebreak_within_loss_tolerance"
+                                    else str(save_reason)
+                                )
                             )
                         ),
                         "shadow_strict_best_epoch": int(shadow_strict_best_epoch),
@@ -5099,6 +4902,13 @@ def trainModel_ddp(
                         epoch_metrics_row["shadow_strict_best_epoch"] = int(shadow_strict_best_epoch)
                         epoch_metrics_row["guarded_best_valid_loss_ever"] = float(best_vl_ever)
                 append_train_epoch_metrics_jsonl(log_file=final_cfg.log_file, row=epoch_metrics_row)
+                _write_step5_loss_contract(
+                    os.path.dirname(os.path.abspath(final_cfg.log_file)),
+                    epoch=epoch_1,
+                    valid_loss_total_epoch=current_valid_loss,
+                    valid_loss_e_epoch=valid_loss_e_epoch,
+                    optional_regularizers=(["orthogonal_keep"] if float(lambda_ortho_step5) > 0.0 else []),
+                )
 
             if odcr_ddp_epoch_end_barrier():
                 ddp_heartbeat(_lg, "before_epoch_end_barrier", rank=rank, epoch=epoch_1)
@@ -5120,8 +4930,6 @@ def _step5_checkpoint_metadata(
     final_cfg: FinalTrainingConfig,
     *,
     valid_loss_total: float,
-    valid_loss_r: float,
-    valid_loss_c: float,
     valid_loss_e: float,
     quick_bleu4: Optional[float] = None,
     full_bleu4: Optional[float] = None,
@@ -5131,14 +4939,18 @@ def _step5_checkpoint_metadata(
 ) -> Dict[str, Any]:
     """与 canonical 权重同 stem 的 .meta.json。"""
     _mon = json.dumps(
-        build_full_bleu_monitor_cfg_override(final_cfg),
+        build_official_paper_greedy_25_override(final_cfg)
+        if str(getattr(final_cfg, "checkpoint_selection_mode", "")).strip().lower() == "official_paper_metrics"
+        else build_full_bleu_monitor_cfg_override(final_cfg),
         ensure_ascii=False,
         sort_keys=True,
         default=str,
     )
     _cksel = str(getattr(final_cfg, "checkpoint_selection_mode", "guarded_composite")).strip().lower()
     _sem = (
-        "guarded_valid_loss_plus_mainline_text_composite"
+        "valid_official_paper_greedy_25_metrics"
+        if _cksel == "official_paper_metrics"
+        else "guarded_valid_loss_plus_mainline_text_composite"
         if _cksel == "guarded_composite"
         else "valid_loss_prev_epoch_monotone"
     )
@@ -5174,8 +4986,6 @@ def _step5_checkpoint_metadata(
         ),
         "decode_monitor_fingerprint_sha1": hashlib.sha1(_mon.encode("utf-8")).hexdigest()[:16],
         "valid_loss_total_epoch": float(valid_loss_total),
-        "valid_loss_r_epoch": float(valid_loss_r),
-        "valid_loss_c_epoch": float(valid_loss_c),
         "valid_loss_e_epoch": float(valid_loss_e),
         "quick_bleu4": None if quick_bleu4 is None else float(quick_bleu4),
         "full_bleu_monitor_bleu4": None if full_bleu4 is None else float(full_bleu4),
@@ -5197,6 +5007,8 @@ def _step5_checkpoint_metadata(
             "rouge": mainline_bundle.get("rouge"),
             "meteor": mainline_bundle.get("meteor"),
             "dist": mainline_bundle.get("dist"),
+            "official_paper_metrics": mainline_bundle.get("official_paper_metrics"),
+            "official_metric_inputs_used": mainline_bundle.get("official_metric_inputs_used"),
             "dirty_hit_rate": mainline_bundle.get("dirty_hit_rate"),
             "rmse_rating": mainline_bundle.get("rmse_rating"),
             "mae_rating": mainline_bundle.get("mae_rating"),
@@ -5215,15 +5027,18 @@ def odcr_terminal_cleanliness_loss(
     *,
     pad_id: int = 0,
 ) -> torch.Tensor:
-    """尾部若干步上压低「坏尾」词 id 的 softmax 质量（轻量）。"""
+    """在每条样本真实非 pad 结尾窗口压低坏尾 token 的 softmax 质量。"""
     if not bad_ids:
         return graph_tied_zero(word_logits)
     B, T, _V = word_logits.shape
     span = max(1, min(int(span), T))
-    t0 = max(0, T - span)
-    sl = word_logits[:, t0:, :]
-    m = (tgt[:, t0:] != pad_id).float()
-    probs = F.softmax(sl, dim=-1)
+    valid = tgt != int(pad_id)
+    valid_count = valid.long().sum(dim=1).clamp(min=1)
+    pos = torch.arange(T, device=tgt.device, dtype=torch.long).unsqueeze(0)
+    start = (valid_count - int(span)).clamp(min=0).unsqueeze(1)
+    end = valid_count.unsqueeze(1)
+    m = (valid & (pos >= start) & (pos < end)).to(dtype=word_logits.dtype)
+    probs = F.softmax(word_logits, dim=-1)
     bid = torch.tensor(list(bad_ids), device=probs.device, dtype=torch.long)
     mass = probs.index_select(-1, bid).sum(-1)
     den = m.sum().clamp(min=1.0)
@@ -5259,6 +5074,7 @@ def _slice_gathered_batch(gb: GatheredBatch, start: int, end: int) -> GatheredBa
         evidence_quality_prior=_sl(gb.evidence_quality_prior),
         sampler_component_id=_sl(gb.sampler_component_id),
         sampler_tier_id=_sl(gb.sampler_tier_id),
+        raw_ref_text=None if gb.raw_ref_text is None else list(gb.raw_ref_text[start:end]),
     )
 
 
@@ -5271,7 +5087,7 @@ def validModel(
     explainer_loss_weight: float,
     step5_innov_cfg=None,
     non_blocking_h2d: bool | None = None,
-    task_head: str = "combined",
+    task_head: str = "explanation",
     valid_forward_micro_batch_size: int | None = None,
     validation_memory_policy: str = "microbatch_accumulate",
     lambda_ortho_step5: float = 0.0,
@@ -5283,10 +5099,7 @@ def validModel(
     # forward 必须用底层 _model，避免 DDP 包装后的 model(...) 在局部执行时触发额外 NCCL collective。
     _model.eval()
     head = normalize_step5_task_head(task_head)
-    scorer_only_validation = head == "step5A"
     loss_sum = 0.0
-    loss_r_sum = 0.0
-    loss_c_sum = 0.0
     loss_e_sum = 0.0
     n_samples = 0
     c = float(coef)
@@ -5309,7 +5122,6 @@ def validModel(
                 mb = _slice_gathered_batch(gb, start, min(start + micro, full_bsz))
                 user_idx = mb.user_idx
                 item_idx = mb.item_idx
-                rating = mb.rating
                 tgt_input = mb.tgt_input
                 tgt_output = mb.tgt_output
                 domain_idx = mb.domain_idx
@@ -5336,10 +5148,9 @@ def validModel(
                     batch_size=bsz,
                     stage="valid",
                 )
-                step5a_gate = build_step5a_scorer_gate(mb, step5_innov_cfg)
-                ccv_packet = None if scorer_only_validation else build_ccv_control_packet(mb, step5_innov_cfg)
+                ccv_packet = build_ccv_control_packet(mb, step5_innov_cfg)
                 with odcr_cuda_bf16_autocast():
-                    pred_rating, _context_dist, word_dist = _model(
+                    _control_score, _context_dist, word_dist = _model(
                         user_idx,
                         item_idx,
                         tgt_input,
@@ -5355,94 +5166,89 @@ def validModel(
                         polarity_ids=mb.polarity_ids,
                         evidence_quality_prior=mb.evidence_quality_prior,
                         ccv_control_packet=ccv_packet,
-                        return_explainer_logits=not scorer_only_validation,
-                        scorer_only=scorer_only_validation,
                         validation_mode=True,
                     )
-                loss_r_ps = F.mse_loss(pred_rating, rating, reduction="none")
-                dom = domain_idx.view(-1)
                 w = exp_w.view(-1)
-                f_mask = (dom == 1).to(dtype=loss_r_ps.dtype)
-                scorer_w = step5a_gate.scorer_weight.to(dtype=w.dtype)
-                loss_factual = route_weighted_mean(loss_r_ps, scorer_w, f_mask)
                 wsum = w.sum().clamp(min=1e-8)
-                loss_r = (loss_r_ps * w).sum() / wsum
-                if scorer_only_validation:
-                    if word_dist is not None:
-                        raise RuntimeError("P0: Step5A scorer-only validation returned word_dist logits.")
-                    shared_lat = _model._last_shared_latent
-                    spec_lat = _model._last_specific_latent
-                    scorer_loss_ps, _residual_weights = _step5a_residual_loss_components(
-                        _model,
-                        pred_rating=pred_rating,
-                        gt_rating=rating,
-                        final_cfg=SimpleNamespace(
-                            step5_task_decoupled_policy_config_json=step5_task_decoupled_policy_config_json,
-                            epochs=1,
-                        ),
-                        epoch_index=0,
-                    )
-                    zero_scalar = graph_tied_zero_like(pred_rating).sum()
-                    lci_bundle = SimpleNamespace(lci_weighted_loss=zero_scalar)
-                    loss_ortho_keep = graph_tied_zero_like(pred_rating)
-                    if float(lambda_ortho_step5) > 0.0 and bsz > 0:
-                        loss_ortho_keep = build_orthogonal_losses(
-                            shared_lat,
-                            spec_lat,
-                            w_xcov=float(lambda_ortho_xcov),
-                            w_cos=float(lambda_ortho_cos),
-                        ).loss_ortho_total
-                    loss_factual = route_weighted_mean(scorer_loss_ps, scorer_w, f_mask)
-                    loss = loss_factual + lci_bundle.lci_weighted_loss
-                    if float(lambda_ortho_step5) > 0.0:
-                        loss = loss + float(lambda_ortho_step5) * loss_ortho_keep
-                    loss_c = graph_tied_zero_like(pred_rating).sum()
-                    loss_e = graph_tied_zero_like(pred_rating).sum()
-                else:
-                    if word_dist is None:
-                        raise RuntimeError("Step5B/combined validation requires explainer logits.")
-                    step5b_gate = build_step5b_explainer_gate(mb, step5_innov_cfg)
-                    ls = float(getattr(_model.exp_loss_fn, "label_smoothing", 0.0) or 0.0)
-                    loss_flan_ps = per_sample_decoder_ce_from_logits(
-                        word_dist, tgt_output, ignore_index=0, label_smoothing=ls
-                    )
-                    loss_c_ps = graph_tied_zero_like(pred_rating).to(dtype=loss_flan_ps.dtype)
-                    loss_e_ps = loss_flan_ps
-                    explainer_only = c * loss_c_ps + loss_e_ps
-                    c_mask = (dom == 0).to(dtype=loss_r_ps.dtype)
-                    explainer_w = step5b_gate.explainer_weight.to(dtype=w.dtype)
-                    loss_counterfactual = explainer_w_scalar * route_weighted_mean(
-                        explainer_only, explainer_w, c_mask
-                    )
-                    loss_factual, loss_counterfactual, _lci_zero, _fca_zero, _ll, _lf = _head_gated_step5_loss_terms(
-                        task_head=head,
-                        zero_like=word_dist,
-                        loss_factual=loss_factual,
-                        loss_counterfactual=loss_counterfactual,
-                        lci_weighted_loss=graph_tied_zero(word_dist),
-                        fca_weighted_loss=graph_tied_zero(word_dist),
-                    )
-                    loss = loss_factual + loss_counterfactual
-                    loss_c = (loss_c_ps * w).sum() / wsum
-                    loss_e = (loss_e_ps * w).sum() / wsum
+                if word_dist is None:
+                    raise RuntimeError("Step5 explanation-only validation requires explainer logits.")
+                loss_factual = graph_tied_zero(word_dist)
+                step5b_gate = build_step5_explanation_gate(mb, step5_innov_cfg)
+                ls = float(getattr(_model.exp_loss_fn, "label_smoothing", 0.0) or 0.0)
+                loss_flan_ps = per_sample_decoder_ce_from_logits(
+                    word_dist, tgt_output, ignore_index=0, label_smoothing=ls
+                )
+                loss_e_ps = loss_flan_ps
+                explainer_only = loss_e_ps
+                explainer_route_mask = _step5_explainer_ce_route_mask(route_explainer_mask, like=loss_e_ps)
+                explainer_w = step5b_gate.explainer_weight.to(dtype=w.dtype)
+                loss_counterfactual = explainer_w_scalar * route_weighted_mean(
+                    explainer_only, explainer_w, explainer_route_mask
+                )
+                shared_lat = _model._last_shared_latent
+                spec_lat = _model._last_specific_latent
+                fca_bundle = evidence_basis_fca_loss(
+                    scorer_hidden=_model._last_h_score,
+                    explainer_hidden=_model._last_h_explain_aligned,
+                    shared_latent=shared_lat,
+                    content_profile=_model._last_content_profile,
+                    content_evidence_latent=_model._last_content_evidence_latent,
+                    packet=ccv_packet,
+                    gate=step5b_gate,
+                    cfg=step5_innov_cfg,
+                )
+                loss_factual, loss_counterfactual, lci_zero, fca_weighted_loss, _ll, _lf = _head_gated_step5_loss_terms(
+                    task_head=head,
+                    zero_like=word_dist,
+                    loss_factual=loss_factual,
+                    loss_counterfactual=loss_counterfactual,
+                    lci_weighted_loss=graph_tied_zero(word_dist),
+                    fca_weighted_loss=fca_bundle.fca_weighted_loss,
+                    l_fca=fca_bundle.fca_loss,
+                )
+                loss_ortho_keep = graph_tied_zero(word_dist)
+                if float(lambda_ortho_step5) > 0.0:
+                    loss_ortho_keep = build_orthogonal_losses(
+                        shared_lat,
+                        spec_lat,
+                        w_xcov=float(lambda_ortho_xcov),
+                        w_cos=float(lambda_ortho_cos),
+                    ).loss_ortho_total
+                loss = compose_step5_total_loss(
+                    loss_factual=loss_factual,
+                    loss_counterfactual=loss_counterfactual,
+                    retired_repeat_ul_zero_guard=graph_tied_zero(word_dist),
+                    loss_terminal_clean=graph_tied_zero(word_dist),
+                    loss_batch_diversity=graph_tied_zero(word_dist),
+                    repeat_ul_weight=0.0,
+                    terminal_clean_weight=0.0,
+                    batch_diversity_weight=0.0,
+                    lci_weighted_loss=lci_zero,
+                    fca_weighted_loss=fca_weighted_loss,
+                    ortho_keep_loss=loss_ortho_keep,
+                    ortho_keep_weight=float(lambda_ortho_step5),
+                )
+                loss_e = (loss_e_ps * w).sum() / wsum
                 loss_sum += float(loss.detach().item()) * bsz
-                loss_r_sum += float(loss_r.detach().item()) * bsz
-                loss_c_sum += float(loss_c.detach().item()) * bsz
                 loss_e_sum += float(loss_e.detach().item()) * bsz
                 n_samples += bsz
     _model._last_validation_contract = {
         "head": head,
-        "step5A_validation_scorer_only": bool(scorer_only_validation),
-        "flan_explainer_called_in_step5A_validation": False if scorer_only_validation else None,
-        "out_logits_materialized_in_step5A_validation": False if scorer_only_validation else None,
-        "word_dist_returned_in_step5A_validation": False if scorer_only_validation else None,
         "valid_forward_micro_batch_size": int(valid_forward_micro_batch_size or 0),
         "validation_memory_policy": str(validation_memory_policy),
     }
-    return loss_sum, n_samples, loss_r_sum, loss_c_sum, loss_e_sum
+    return loss_sum, n_samples, loss_e_sum
 
 
-def evalModel(model, test_dataloader, device, *, step5_innov_cfg, non_blocking_h2d: bool | None = None):
+def evalModel(
+    model,
+    test_dataloader,
+    device,
+    *,
+    step5_innov_cfg,
+    non_blocking_h2d: bool | None = None,
+    eval_forward_micro_batch_size: int | None = None,
+):
     """逐 batch 推理，返回带 sample_id 的行列表（用于 DDP gather 后按 id 排序）。"""
     import time as _time_perf
 
@@ -5456,99 +5262,49 @@ def evalModel(model, test_dataloader, device, *, step5_innov_cfg, non_blocking_h
         for batch in test_dataloader:
             _t0 = _time_perf.perf_counter()
             gb = require_gathered_batch(_model.gather(batch, device, non_blocking_h2d=bool(non_blocking_h2d)))
-            user_idx = gb.user_idx
-            item_idx = gb.item_idx
-            rating = gb.rating
-            tgt_output = gb.tgt_output
-            domain_idx = gb.domain_idx
-            sample_id = gb.sample_id
-            ccv_packet = build_ccv_control_packet(gb, step5_innov_cfg)
-            with odcr_cuda_bf16_autocast():
-                pred_ratings = _model.recommend(user_idx, item_idx, domain_idx)
-                pred_exps, *_ = _model.generate(
-                    user_idx, item_idx, domain_idx, ccv_control_packet=ccv_packet
+            full_bsz = int(gb.user_idx.size(0))
+            micro = int(eval_forward_micro_batch_size or full_bsz)
+            if micro < 1:
+                raise RuntimeError("eval_forward_micro_batch_size must be >= 1.")
+            micro = min(micro, full_bsz)
+            batch_rows: List[dict] = []
+            for start in range(0, full_bsz, micro):
+                mb = _slice_gathered_batch(gb, start, min(start + micro, full_bsz))
+                user_idx = mb.user_idx
+                item_idx = mb.item_idx
+                rating = mb.rating
+                tgt_output = mb.tgt_output
+                domain_idx = mb.domain_idx
+                sample_id = mb.sample_id
+                ccv_packet = build_ccv_control_packet(mb, step5_innov_cfg)
+                with odcr_cuda_bf16_autocast():
+                    pred_exps, *_ = _model.generate(
+                        user_idx, item_idx, domain_idx, ccv_control_packet=ccv_packet
+                    )
+                pred_texts = get_step5_tokenizer().batch_decode(pred_exps, skip_special_tokens=True)
+                raw_refs = list(mb.raw_ref_text or [])
+                ref_texts = (
+                    raw_refs
+                    if len(raw_refs) == int(tgt_output.shape[0])
+                    else get_step5_tokenizer().batch_decode(tgt_output, skip_special_tokens=True)
                 )
-            pred_texts = get_step5_tokenizer().batch_decode(pred_exps, skip_special_tokens=True)
-            ref_texts = get_step5_tokenizer().batch_decode(tgt_output, skip_special_tokens=True)
+                gr = rating.detach().cpu().tolist()
+                sids = sample_id.detach().cpu().tolist()
+                for i in range(len(sids)):
+                    batch_rows.append(
+                        {
+                            "sample_id": int(sids[i]),
+                            "pred_rating": None,
+                            "gt_rating": float(gr[i]),
+                            "pred_text": pred_texts[i],
+                            "ref_text": ref_texts[i],
+                            "pred_token_ids": pred_exps[i].detach().cpu().tolist(),
+                            "ref_token_ids": tgt_output[i].detach().cpu().tolist(),
+                        }
+                    )
             decode_wall += _time_perf.perf_counter() - _t0
-            pr = pred_ratings.detach().cpu().tolist()
-            gr = rating.detach().cpu().tolist()
-            sids = sample_id.detach().cpu().tolist()
-            for i in range(len(sids)):
-                rows.append(
-                    {
-                        "sample_id": int(sids[i]),
-                        "pred_rating": float(pr[i]),
-                        "gt_rating": float(gr[i]),
-                        "pred_text": pred_texts[i],
-                        "ref_text": ref_texts[i],
-                        "pred_token_ids": pred_exps[i].detach().cpu().tolist(),
-                        "ref_token_ids": tgt_output[i].detach().cpu().tolist(),
-                    }
-                )
+            rows.extend(batch_rows)
     return {"rows": rows, "timings": {"decode_time": float(decode_wall)}}
-
-
-def evalRatingOnlyModel(
-    model,
-    test_dataloader,
-    device,
-    *,
-    split_label: str,
-    non_blocking_h2d: bool | None = None,
-):
-    """No-generate Step5A scorer eval; returns code1-compatible rating rows only."""
-    import time as _time_perf
-
-    _model = get_underlying_model(model).to(device)
-    _model.eval()
-    if non_blocking_h2d is None:
-        raise RuntimeError("evalRatingOnlyModel requires non_blocking_h2d from resolved FinalTrainingConfig.")
-    rows: List[dict] = []
-    forward_wall = 0.0
-    with torch.no_grad():
-        for batch in test_dataloader:
-            _t0 = _time_perf.perf_counter()
-            gb = require_gathered_batch(_model.gather(batch, device, non_blocking_h2d=bool(non_blocking_h2d)))
-            with odcr_cuda_bf16_autocast():
-                pred_ratings = _model.recommend(
-                    gb.user_idx,
-                    gb.item_idx,
-                    gb.domain_idx,
-                    content_anchor_score=gb.content_anchor_score,
-                    style_anchor_score=gb.style_anchor_score,
-                    content_evidence_ids=gb.content_evidence_ids,
-                    style_evidence_ids=gb.style_evidence_ids,
-                    domain_style_anchor_ids=gb.domain_style_anchor_ids,
-                    local_style_hint_ids=gb.local_style_hint_ids,
-                    polarity_ids=gb.polarity_ids,
-                    evidence_quality_prior=gb.evidence_quality_prior,
-                )
-            forward_wall += _time_perf.perf_counter() - _t0
-            pr = pred_ratings.detach().cpu().tolist()
-            gr = gb.rating.detach().cpu().tolist()
-            sids = gb.sample_id.detach().cpu().tolist()
-            users = gb.user_idx.detach().cpu().tolist()
-            items = gb.item_idx.detach().cpu().tolist()
-            for i in range(len(sids)):
-                pred = float(pr[i])
-                gt = float(gr[i])
-                diff = pred - gt
-                sid = int(sids[i])
-                rows.append(
-                    {
-                        "sample_id": sid,
-                        "split": str(split_label),
-                        "row_index": sid,
-                        "user_idx": int(users[i]),
-                        "item_idx": int(items[i]),
-                        "gt_rating": gt,
-                        "pred_rating": pred,
-                        "abs_error": abs(diff),
-                        "squared_error": diff * diff,
-                    }
-                )
-    return {"rows": rows, "timings": {"rating_forward_time": float(forward_wall), "decode_time": 0.0}}
 
 
 def _load_review_by_sample_id(csv_path: str) -> Tuple[List[str], Dict[str, Any]]:
@@ -5634,12 +5390,16 @@ def evalModelWithRerank(
             domain_idx = gb.domain_idx
             sample_id = gb.sample_id
             ccv_packet = build_ccv_control_packet(gb, step5_innov_cfg)
-            ref_texts = get_step5_tokenizer().batch_decode(tgt_output, skip_special_tokens=True)
+            raw_refs = list(gb.raw_ref_text or [])
+            ref_texts = (
+                raw_refs
+                if len(raw_refs) == int(tgt_output.shape[0])
+                else get_step5_tokenizer().batch_decode(tgt_output, skip_special_tokens=True)
+            )
             B = int(user_idx.size(0))
             candidates_per_row: List[List[Dict[str, Any]]] = [[] for _ in range(B)]
             _tdecode0 = _time_perf.perf_counter()
             with odcr_cuda_bf16_autocast():
-                pred_ratings = _m.recommend(user_idx, item_idx, domain_idx)
                 for fam_tag, cfg_ov in specs:
                     gen = None
                     if strategy == "nucleus":
@@ -5675,7 +5435,6 @@ def evalModelWithRerank(
                         )
                     cand_slot += 1
             decode_wall += _time_perf.perf_counter() - _tdecode0
-            pr = pred_ratings.detach().cpu().tolist()
             gr = rating.detach().cpu().tolist()
             sids = sample_id.detach().cpu().tolist()
             _tfeat0 = _time_perf.perf_counter()
@@ -5810,7 +5569,7 @@ def evalModelWithRerank(
                 rows.append(
                     {
                         "sample_id": sid,
-                        "pred_rating": float(pr[i]),
+                        "pred_rating": None,
                         "gt_rating": float(gr[i]),
                         "pred_text": sel_text,
                         "ref_text": ref,
@@ -6113,16 +5872,6 @@ def _eval_rows_local(
     non_blocking_h2d = getattr(args, "_odcr_non_blocking_h2d", None)
     if non_blocking_h2d is None:
         raise RuntimeError("eval requires resolved non_blocking_h2d from One-Control FinalTrainingConfig.")
-    if bool(getattr(args, "rating_only", False)):
-        split_label = str(getattr(args, "_odcr_eval_split_label", "") or "valid")
-        out_r = evalRatingOnlyModel(
-            model,
-            dl,
-            device,
-            split_label=split_label,
-            non_blocking_h2d=bool(non_blocking_h2d),
-        )
-        return out_r["rows"], dict(out_r.get("timings") or {})
     if str(args.command) == "eval-rerank":
         _rr = _rerank_eval_cli_resolved(args)
         v3p = dict(_rr.get("rerank_profile") or {})
@@ -6147,7 +5896,14 @@ def _eval_rows_local(
             rerank_v3_profile=v3p,
         )
         return out["rows"], dict(out.get("timings") or {})
-    out_m = evalModel(model, dl, device, step5_innov_cfg=step5_innov_cfg, non_blocking_h2d=bool(non_blocking_h2d))
+    out_m = evalModel(
+        model,
+        dl,
+        device,
+        step5_innov_cfg=step5_innov_cfg,
+        non_blocking_h2d=bool(non_blocking_h2d),
+        eval_forward_micro_batch_size=int(getattr(args, "_odcr_eval_forward_micro_batch_size", 0) or 0) or None,
+    )
     return out_m["rows"], dict(out_m.get("timings") or {})
 
 
@@ -6510,36 +6266,7 @@ def _load_odcr_profile_tensors_from_contract(
     return dc, ds, uc, us, ic, ist, meta
 
 
-def build_step5A_small_scorer_model(
-    final_cfg: FinalTrainingConfig,
-    *,
-    profile_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-) -> nn.Module:
-    dc, ds, uc, us, ic, ist = profile_tensors
-    return Model(
-        final_cfg.nuser,
-        final_cfg.nitem,
-        max(1, int(final_cfg.ntoken)),
-        final_cfg.emsize,
-        final_cfg.nhead,
-        final_cfg.nhid,
-        final_cfg.nlayers,
-        final_cfg.dropout,
-        uc,
-        us,
-        ic,
-        ist,
-        dc,
-        ds,
-        label_smoothing=float(final_cfg.label_smoothing),
-        step5_innovation_config_json=str(getattr(final_cfg, "step5_innovation_config_json", "") or ""),
-        task_head="step5A",
-        build_big_model=False,
-        use_step3_inherited_scorer=False,
-    )
-
-
-def build_step5B_large_explainer_model(
+def build_step5_explanation_model(
     final_cfg: FinalTrainingConfig,
     *,
     profile_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -6562,28 +6289,9 @@ def build_step5B_large_explainer_model(
         ds,
         label_smoothing=float(final_cfg.label_smoothing),
         step5_innovation_config_json=str(getattr(final_cfg, "step5_innovation_config_json", "") or ""),
-        task_head="step5B",
+        task_head="explanation",
         build_big_model=True,
-        use_step3_inherited_scorer=False,
     )
-
-
-def _assert_step5a_no_big_model(model: nn.Module) -> dict[str, Any]:
-    forbidden = [
-        name
-        for name, _module in model.named_modules()
-        if any(token in name.lower() for token in ("flan", "explainer", "decoder"))
-    ]
-    if forbidden:
-        raise RuntimeError("Step5A-Small model contains forbidden big-model modules: " + ", ".join(forbidden[:20]))
-    return {
-        "schema_version": "odcr_step5A_small_model_preflight/1",
-        "step5A_uses_big_model": False,
-        "forbidden_module_matches": forbidden,
-        "flan_explainer_attr": hasattr(model, "flan_explainer"),
-        "tokenizer_constructed_by_model_factory": False,
-        "generation_enabled": False,
-    }
 
 
 def _make_model(final_cfg: FinalTrainingConfig, args, device_idx):
@@ -6597,64 +6305,8 @@ def _make_model(final_cfg: FinalTrainingConfig, args, device_idx):
     _tm = str(getattr(final_cfg, "train_mode", "full")).strip().lower()
     _head = _resolved_step5_task_head(final_cfg, args)
     profile_tensors = (dc, ds, uc, us, ic, ist)
-    if _head == "step5A":
-        m = build_step5A_small_scorer_model(final_cfg, profile_tensors=profile_tensors).to(device_idx)
-        m.apply_runtime_config(final_cfg, None)
-        _policy = json.loads(str(getattr(final_cfg, "step5_task_decoupled_policy_config_json", "{}") or "{}"))
-        _step5a_policy = _policy.get("step5A") if isinstance(_policy.get("step5A"), Mapping) else {}
-        _teacher_cfg = _step5a_policy.get("teacher") if isinstance(_step5a_policy.get("teacher"), Mapping) else {}
-        _residual_cfg = _step5a_policy.get("residual_calibration") if isinstance(_step5a_policy.get("residual_calibration"), Mapping) else {}
-        if isinstance(getattr(m, "step5a_residual_calibrator", None), ZeroInitResidualCalibrator):
-            _rcfg = parse_step5a_residual_calibration_config(_residual_cfg)
-            m.step5a_residual_calibrator.feature_source = str(_rcfg.feature_source)
-            m.step5a_residual_calibrator.reset_parameters()
-        report_path = os.path.join(str(getattr(final_cfg, "manifest_dir", "") or ""), "step3_frozen_teacher_load_report.json")
-        teacher = Step3FrozenTeacher(
-            nuser=final_cfg.nuser,
-            nitem=final_cfg.nitem,
-            ntoken=max(1, int(final_cfg.ntoken)),
-            emsize=final_cfg.emsize,
-            nhead=final_cfg.nhead,
-            nhid=final_cfg.nhid,
-            nlayers=final_cfg.nlayers,
-            dropout=final_cfg.dropout,
-            profile_tensors=profile_tensors,
-            checkpoint_path=str(_teacher_cfg.get("checkpoint_path") or DEFAULT_STEP3_TEACHER_CHECKPOINT),
-            expected_sha256=str(_teacher_cfg.get("checkpoint_sha256") or DEFAULT_STEP3_TEACHER_SHA256),
-            evidence_max_length=int(getattr(final_cfg, "evidence_max_length", 48) or 48),
-            repo_root=get_odcr_root(),
-            report_path=report_path if report_path.strip() else None,
-        )
-        m.attach_step5a_frozen_teacher(teacher.to(device_idx))
-        setattr(args, "_odcr_step5a_frozen_teacher_load_report", dict(teacher.load_report))
-        setattr(args, "_odcr_step5a_residual_calibration_contract", step5a_residual_contract_report(m))
-        setattr(args, "_odcr_step5a_small_model_preflight", _assert_step5a_no_big_model(m))
-    elif _head == "step5B":
-        m = build_step5B_large_explainer_model(final_cfg, profile_tensors=profile_tensors).to(device_idx)
-        m.apply_runtime_config(final_cfg, get_step5_tokenizer())
-    else:
-        m = Model(
-            final_cfg.nuser,
-            final_cfg.nitem,
-            final_cfg.ntoken,
-            final_cfg.emsize,
-            final_cfg.nhead,
-            final_cfg.nhid,
-            final_cfg.nlayers,
-            final_cfg.dropout,
-            uc,
-            us,
-            ic,
-            ist,
-            dc,
-            ds,
-            label_smoothing=float(final_cfg.label_smoothing),
-            step5_innovation_config_json=str(getattr(final_cfg, "step5_innovation_config_json", "") or ""),
-            task_head=_head,
-            build_big_model=True,
-            use_step3_inherited_scorer=False,
-        ).to(device_idx)
-        m.apply_runtime_config(final_cfg, get_step5_tokenizer())
+    m = build_step5_explanation_model(final_cfg, profile_tensors=profile_tensors).to(device_idx)
+    m.apply_runtime_config(final_cfg, get_step5_tokenizer())
     if _tm == "lora":
         _lt = tuple(getattr(final_cfg, "lora_target_modules", ()) or ())
         _peft_meta = apply_native_lora_to_step5_model(
@@ -6735,6 +6387,7 @@ def load_step5_checkpoint_cpu_staged(
             )
     before = _cuda_memory_snapshot_for_step5_load(device_idx)
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    dropped_runtime_aux = _drop_step5_runtime_aux_state_keys(state)
     try:
         model.load_state_dict(state, strict=True)
     except RuntimeError as exc:
@@ -6762,6 +6415,9 @@ def load_step5_checkpoint_cpu_staged(
         "map_location": "cpu",
         "cpu_staged": True,
         "strict": True,
+        "dropped_runtime_aux_state_keys": {
+            key: list(shape) for key, shape in dropped_runtime_aux.items()
+        },
         "device_idx": int(device_idx),
         "memory_before": before,
         "memory_after": after,
@@ -6896,22 +6552,26 @@ def _build_tokenize_cache_fingerprint(
     step4_export_lineage: Mapping[str, Any] | None = None,
     step5_sampler_summary: Mapping[str, Any] | None = None,
     step5_runtime_diagnostics: Mapping[str, Any] | None = None,
-    task_head: str = "combined",
+    task_head: str = "explanation",
 ) -> dict[str, Any]:
-    source_files: dict[str, Any] = {
-        "eval_split": file_fingerprint(eval_split_path),
-    }
-    if not eval_only:
+    split_norm = str(split_label).strip().lower()
+    if split_norm == "train" and not eval_only:
+        source_files: dict[str, Any] = {"train": file_fingerprint(train_path)}
+    else:
+        source_files = {"eval_split": file_fingerprint(eval_split_path)}
+    if not eval_only and split_norm != "train":
         source_files["train"] = file_fingerprint(train_path)
-    primary_source_fp = source_files["eval_split"] if eval_only else source_files["train"]
+    primary_source_fp = source_files.get("eval_split") if eval_only else source_files.get("train")
+    if primary_source_fp is None:
+        primary_source_fp = next(iter(source_files.values()))
     index_contract_fp = file_fingerprint(index_contract_path) if index_contract_path else None
     head = normalize_step5_task_head(task_head)
-    if head == "step5A":
+    if head == "rating_stability_control":
         tokenizer_path = ""
         tokenizer_fp = {
             "exists": False,
             "path": "",
-            "role": "not_used_by_step5A_scorer_clean",
+            "role": "not_used_by_rating_stability_control_probe",
             "sha256": "",
         }
     else:
@@ -6929,7 +6589,7 @@ def _build_tokenize_cache_fingerprint(
     tuning_payload = effective_payload.get("step5_tuning")
     if not isinstance(tuning_payload, Mapping):
         tuning_payload = {}
-    semantic_payload: dict[str, Any] = {
+    identity_payload: dict[str, Any] = {
         "schema_version": STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION,
         "cache_version": str(cache_version),
         "stage": "step5",
@@ -6937,6 +6597,43 @@ def _build_tokenize_cache_fingerprint(
         "head": head,
         "split_label": str(split_label),
         "eval_only": bool(eval_only),
+        "tokenizer": semantic_tokenizer,
+        "max_input_length": int(max_length),
+        "max_output_length": int(max_length),
+        "train_valid_split_fingerprint": semantic_source_files,
+        "input_formatting_version": {
+            "processor": "executors.step5_engine.Processor/2",
+            "prompt_registry_schema": prompt_manifest.get("schema_version"),
+            "prompt_manifest_hash": stable_hash(prompt_manifest),
+            "control_text_max_len_policy": "max(4,min(32,max_length))",
+            "domain_mapping": {"auxiliary": 0, "target": 1},
+            "sampler_component_ids": dict(_STEP5_SAMPLER_COMPONENT_IDS),
+            "sampler_tier_ids": dict(_STEP5_SAMPLER_TIER_IDS),
+        },
+        "required_fields_hash": stable_hash(_STEP5_TOKENIZE_REQUIRED_FIELDS),
+    }
+    if eval_only and split_norm in {"valid", "test"}:
+        _eval_control_contract = step5_factual_eval_control_contract(split_label)
+        identity_payload["eval_control_contract"] = _eval_control_contract
+        identity_payload["eval_control_contract_hash"] = stable_hash(_eval_control_contract)
+    else:
+        identity_payload["eval_control_contract"] = None
+        identity_payload["eval_control_contract_hash"] = ""
+        identity_payload["pool_manifest_sha"] = str(((semantic_sampler.get("source") or {}).get("pool_manifest") or {}).get("sha256") or "")
+        identity_payload["sampling_contract_sha"] = str(((semantic_sampler.get("source") or {}).get("sampling_contract") or {}).get("sha256") or "")
+        identity_payload["global_sample_plan_hash"] = str(semantic_sampler.get("sample_plan_hash") or stable_hash(semantic_sampler))
+    resolved_config_compatibility_hash = _step5_semantic_resolved_config_hash(
+        effective_payload,
+        extra={
+            "stage": "step5",
+            "task_id": int(task_idx),
+            "artifact": "tokenize_cache",
+            "split_label": str(split_label),
+            "eval_only": bool(eval_only),
+        },
+    )
+    lineage_metadata: dict[str, Any] = {
+        "schema_version": "odcr_step5_token_cache_lineage_metadata/1",
         "from_step3": str((step4_export_lineage or {}).get("from_step3") or (step4_export_lineage or {}).get("step3_run") or ""),
         "from_step4": str((step4_export_lineage or {}).get("from_step4") or (step4_export_lineage or {}).get("step4_run") or ""),
         "pool_manifest_sha": str(((semantic_sampler.get("source") or {}).get("pool_manifest") or {}).get("sha256") or ""),
@@ -6955,58 +6652,15 @@ def _build_tokenize_cache_fingerprint(
         "effective_samples": dict(effective_payload.get("step5_effective_samples") or tuning_payload.get("effective_samples") or {}),
         "optimizer_steps": dict(effective_payload.get("step5_optimizer_steps") or tuning_payload.get("optimizer_steps") or {}),
         "global_sample_plan_hash": str(semantic_sampler.get("sample_plan_hash") or stable_hash(semantic_sampler)),
-        "prompt_registry": {
-            "schema_version": prompt_manifest.get("schema_version"),
-            "template_count": prompt_manifest.get("template_count"),
-            "manifest_hash": stable_hash(prompt_manifest),
-            "template_versions": sorted(
-                {
-                    str(item.get("version"))
-                    for item in prompt_manifest.get("templates", [])
-                    if isinstance(item, Mapping)
-                }
-            ),
-            "template_ids": [
-                str(item.get("canonical_id"))
-                for item in prompt_manifest.get("templates", [])
-                if isinstance(item, Mapping)
-            ],
-        },
-        "tokenizer": semantic_tokenizer,
-        "max_input_length": int(max_length),
-        "max_output_length": int(max_length),
-        "template_registry_version": str(prompt_manifest.get("schema_version") or ""),
-        "train_valid_split_fingerprint": semantic_source_files,
         "source_table_compatibility_hash": str(semantic_sampler.get("source_table_compatibility_hash") or ""),
-        "resolved_config_compatibility_hash": _step5_semantic_resolved_config_hash(
-            effective_payload,
-            extra={
-                "stage": "step5",
-                "task_id": int(task_idx),
-                "artifact": "tokenize_cache",
-                "split_label": str(split_label),
-                "eval_only": bool(eval_only),
-            },
-        ),
-        "input_formatting_version": {
-            "processor": (
-                "executors.step5_engine.Step5AScorerProcessor/1"
-                if head == "step5A"
-                else "executors.step5_engine.Processor/2"
-            ),
-            "prompt_registry_schema": prompt_manifest.get("schema_version"),
-            "prompt_manifest_hash": stable_hash(prompt_manifest),
-        },
-        "required_fields_hash": stable_hash(_STEP5_TOKENIZE_REQUIRED_FIELDS),
+        "resolved_config_compatibility_hash": resolved_config_compatibility_hash,
+        "step5_innovation_config_hash": stable_hash(effective_payload.get("step5_innovation") or {}),
+        "step5_sampler_config_hash": stable_hash(effective_payload.get("step5_sampler") or {}),
+        "training_semantic_fingerprint": os.environ.get("ODCR_TRAINING_SEMANTIC_FINGERPRINT", ""),
+        "generation_semantic_fingerprint": os.environ.get("ODCR_GENERATION_SEMANTIC_FINGERPRINT", ""),
+        "runtime_diagnostics_hash": stable_hash(runtime_diagnostics) if runtime_diagnostics else "",
     }
-    if eval_only:
-        _eval_control_contract = step5_factual_eval_control_contract(split_label)
-        semantic_payload["eval_control_contract"] = _eval_control_contract
-        semantic_payload["eval_control_contract_hash"] = stable_hash(_eval_control_contract)
-    else:
-        semantic_payload["eval_control_contract"] = None
-        semantic_payload["eval_control_contract_hash"] = ""
-    semantic_payload_hash = stable_hash(semantic_payload)
+    identity_payload_hash = stable_hash(identity_payload)
     payload: dict[str, Any] = {
         "schema_version": STEP5_TOKENIZE_CACHE_SCHEMA_VERSION,
         "cache_version": str(cache_version),
@@ -7015,8 +6669,12 @@ def _build_tokenize_cache_fingerprint(
         "split_label": str(split_label),
         "eval_only": bool(eval_only),
         "source_files": source_files,
-        "semantic_fingerprint_payload": semantic_payload,
-        "semantic_payload_hash": semantic_payload_hash,
+        "cache_identity": identity_payload,
+        "cache_identity_hash": identity_payload_hash,
+        "lineage_metadata": lineage_metadata,
+        "lineage_metadata_hash": stable_hash(lineage_metadata),
+        "semantic_fingerprint_payload": identity_payload,
+        "semantic_payload_hash": identity_payload_hash,
         "runtime_diagnostics": runtime_diagnostics,
         "runtime_diagnostics_hash": stable_hash(runtime_diagnostics) if runtime_diagnostics else "",
         "source_step4_export_path": str(primary_source_fp.get("path") or os.path.abspath(eval_split_path if eval_only else train_path)),
@@ -7039,20 +6697,20 @@ def _build_tokenize_cache_fingerprint(
             "required_fields": list(_STEP5_TOKENIZE_REQUIRED_FIELDS),
         },
         "max_length": int(max_length),
-        "resolved_step5_config_hash": semantic_payload["resolved_config_compatibility_hash"],
-        "one_control_resolved_config_hash": semantic_payload["resolved_config_compatibility_hash"],
-        "step5_innovation_config_hash": stable_hash(effective_payload.get("step5_innovation") or {}),
-        "step5_sampler_config_hash": stable_hash(effective_payload.get("step5_sampler") or {}),
-        "step5_sampler_plan_hash": str(semantic_payload["global_sample_plan_hash"]),
+        "resolved_step5_config_hash": resolved_config_compatibility_hash,
+        "one_control_resolved_config_hash": resolved_config_compatibility_hash,
+        "step5_innovation_config_hash": lineage_metadata["step5_innovation_config_hash"],
+        "step5_sampler_config_hash": lineage_metadata["step5_sampler_config_hash"],
+        "step5_sampler_plan_hash": str(lineage_metadata["global_sample_plan_hash"]),
         "required_fields_hash": stable_hash(_STEP5_TOKENIZE_REQUIRED_FIELDS),
-        "source_table_compatibility_hash": str(semantic_payload["source_table_compatibility_hash"]),
+        "source_table_compatibility_hash": str(lineage_metadata["source_table_compatibility_hash"]),
         "producer_code_version": STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION,
-        "training_semantic_fingerprint": os.environ.get("ODCR_TRAINING_SEMANTIC_FINGERPRINT", ""),
-        "generation_semantic_fingerprint": os.environ.get("ODCR_GENERATION_SEMANTIC_FINGERPRINT", ""),
+        "training_semantic_fingerprint": lineage_metadata["training_semantic_fingerprint"],
+        "generation_semantic_fingerprint": lineage_metadata["generation_semantic_fingerprint"],
     }
-    payload["eval_control_contract"] = semantic_payload["eval_control_contract"]
-    payload["eval_control_contract_hash"] = semantic_payload["eval_control_contract_hash"]
-    payload["fingerprint_hash"] = semantic_payload_hash
+    payload["eval_control_contract"] = identity_payload["eval_control_contract"]
+    payload["eval_control_contract_hash"] = identity_payload["eval_control_contract_hash"]
+    payload["fingerprint_hash"] = identity_payload_hash
     return payload
 
 
@@ -7071,7 +6729,7 @@ def _build_step5_cache_dir(
     step4_export_lineage: Mapping[str, Any] | None = None,
     step5_sampler_summary: Mapping[str, Any] | None = None,
     step5_runtime_diagnostics: Mapping[str, Any] | None = None,
-    task_head: str = "combined",
+    task_head: str = "explanation",
 ) -> Tuple[str, str, dict[str, Any]]:
     fp_payload = _build_tokenize_cache_fingerprint(
         train_path=train_path,
@@ -7097,6 +6755,10 @@ def _build_step5_cache_dir(
 def _dist_barrier_if_initialized() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+
+def _step5_explainer_ce_route_mask(route_explainer_mask: torch.Tensor, *, like: torch.Tensor) -> torch.Tensor:
+    return (route_explainer_mask.to(device=like.device).view(-1) > 0).to(dtype=like.dtype)
 
 
 def _hf_dataset_cache_ready(cache_dir: str) -> bool:
@@ -7140,27 +6802,35 @@ def _load_step5_tokenize_cache_lineage(cache_dir: str) -> dict[str, Any] | None:
 
 
 def _step5_tokenize_cache_manifest_gate_fields(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    official_eval_cache = bool(fingerprint.get("eval_only")) and str(fingerprint.get("split_label") or "").strip().lower() in {"valid", "test"}
+    gate = {
         "cache_schema_version": STEP5_TOKENIZE_CACHE_SCHEMA_VERSION,
         "schema_version": STEP5_TOKENIZE_CACHE_SCHEMA_VERSION,
         "cache_version": str(fingerprint.get("cache_version") or ODCR_TOKENIZE_CACHE_VERSION),
         "stage": "step5",
         "task_id": int(fingerprint.get("task_id", -1)),
+        "head": str(((fingerprint.get("cache_identity") or {}).get("head") if isinstance(fingerprint.get("cache_identity"), Mapping) else "") or ""),
+        "split_label": str(fingerprint.get("split_label") or ""),
+        "eval_only": bool(fingerprint.get("eval_only")),
         "source_step4_export_sha256": str(fingerprint.get("source_step4_export_sha256") or ""),
-        "step4_export_lineage_hash": str(fingerprint.get("step4_export_lineage_hash") or ""),
-        "index_contract_hash": str(fingerprint.get("index_contract_hash") or ""),
         "semantic_payload_hash": str(fingerprint.get("semantic_payload_hash") or ""),
-        "source_table_compatibility_hash": str(fingerprint.get("source_table_compatibility_hash") or ""),
+        "cache_identity_hash": str(fingerprint.get("cache_identity_hash") or fingerprint.get("semantic_payload_hash") or ""),
         "tokenizer_semantic_hash": str(fingerprint.get("tokenizer_semantic_hash") or ""),
         "max_length": int(fingerprint.get("max_length", -1)),
-        "resolved_step5_config_hash": str(fingerprint.get("resolved_step5_config_hash") or ""),
-        "step5_innovation_config_hash": str(fingerprint.get("step5_innovation_config_hash") or ""),
-        "step5_sampler_config_hash": str(fingerprint.get("step5_sampler_config_hash") or ""),
-        "step5_sampler_plan_hash": str(fingerprint.get("step5_sampler_plan_hash") or ""),
         "required_fields_hash": str(fingerprint.get("required_fields_hash") or ""),
         "eval_control_contract_hash": str(fingerprint.get("eval_control_contract_hash") or ""),
         "producer_code_version": STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION,
     }
+    if not official_eval_cache:
+        gate.update(
+            {
+                "step4_export_lineage_hash": str(fingerprint.get("step4_export_lineage_hash") or ""),
+                "index_contract_hash": str(fingerprint.get("index_contract_hash") or ""),
+                "source_table_compatibility_hash": str(fingerprint.get("source_table_compatibility_hash") or ""),
+                "step5_sampler_plan_hash": str(fingerprint.get("step5_sampler_plan_hash") or ""),
+            }
+        )
+    return gate
 
 
 def _step5_tokenize_cache_manifest_matches(
@@ -7210,6 +6880,10 @@ def _write_step5_tokenize_cache_manifest(
         **gate,
         "fingerprint_hash": str(fingerprint.get("fingerprint_hash") or ""),
         "fingerprint": dict(fingerprint),
+        "cache_identity": dict(fingerprint.get("cache_identity") or {}),
+        "cache_identity_hash": str(fingerprint.get("cache_identity_hash") or ""),
+        "lineage_metadata": dict(fingerprint.get("lineage_metadata") or {}),
+        "lineage_metadata_hash": str(fingerprint.get("lineage_metadata_hash") or ""),
         "semantic_fingerprint_payload": dict(fingerprint.get("semantic_fingerprint_payload") or {}),
         "semantic_payload_hash": str(fingerprint.get("semantic_payload_hash") or ""),
         "runtime_diagnostics": dict(fingerprint.get("runtime_diagnostics") or {}),
@@ -7223,6 +6897,10 @@ def _write_step5_tokenize_cache_manifest(
     lineage_payload = {
         **gate,
         "lineage_schema_version": "odcr_step5_token_cache_lineage/1",
+        "cache_identity": dict(fingerprint.get("cache_identity") or {}),
+        "cache_identity_hash": str(fingerprint.get("cache_identity_hash") or ""),
+        "lineage_metadata": dict(fingerprint.get("lineage_metadata") or {}),
+        "lineage_metadata_hash": str(fingerprint.get("lineage_metadata_hash") or ""),
         "semantic_fingerprint_payload": dict(fingerprint.get("semantic_fingerprint_payload") or {}),
         "semantic_payload_hash": str(fingerprint.get("semantic_payload_hash") or ""),
         "runtime_diagnostics": dict(fingerprint.get("runtime_diagnostics") or {}),
@@ -7328,6 +7006,7 @@ def _step5_map_or_load_tokenize_cache(
     show_datasets_progress: bool,
     log_tokenize: bool,
     phase: str,
+    decision_dir: str | None = None,
 ) -> DatasetDict:
     """rank0 announces cache lineage, builds on miss, then all ranks load the exact same dir."""
     local_cache_dir = cache_dir
@@ -7355,6 +7034,8 @@ def _step5_map_or_load_tokenize_cache(
             cache_dir,
             expected_fingerprint=cache_fingerprint_payload,
         )
+    initial_cache_valid = bool(cache_valid)
+    initial_cache_reason = str(cache_reason)
     if rank == 0 and cache_valid:
         t_hit0 = time.perf_counter()
         encoded_data = _load_step5_dataset_from_disk(cache_dir)
@@ -7442,6 +7123,47 @@ def _step5_map_or_load_tokenize_cache(
                 f"| broadcast_fingerprint={cache_fingerprint} | broadcast_dir={cache_dir}"
             )
     encoded_data = _load_step5_dataset_from_disk(cache_dir)
+    if rank == 0 and decision_dir:
+        os.makedirs(decision_dir, exist_ok=True)
+        manifest = _load_step5_tokenize_cache_manifest(cache_dir) or {}
+        fingerprint_payload = dict(cache_fingerprint_payload)
+        phase_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(phase).strip() or "cache")
+        cache_decision = {
+            "schema_version": "odcr_step5_cache_reuse_decision/1",
+            "phase": str(phase),
+            "cache_dir": os.path.abspath(cache_dir),
+            "cache_fingerprint": str(cache_fingerprint),
+            "cache_reused": bool(initial_cache_valid),
+            "cache_rebuilt": not bool(initial_cache_valid),
+            "decision_reason": "fingerprint_matched" if initial_cache_valid else initial_cache_reason,
+            "reuse_policy": "fingerprint_manifest_lineage_required",
+            "path_mtime_only_reuse": False,
+            "split_label": str(fingerprint_payload.get("split_label") or ""),
+            "eval_only": bool(fingerprint_payload.get("eval_only")),
+            "fingerprint_hash": str(fingerprint_payload.get("fingerprint_hash") or ""),
+            "semantic_payload_hash": str(fingerprint_payload.get("semantic_payload_hash") or ""),
+            "manifest_path": os.path.abspath(_step5_tokenize_cache_manifest_path(cache_dir)),
+        }
+        atomic_write_json(os.path.join(decision_dir, f"cache_reuse_decision_{phase_key}.json"), cache_decision)
+        atomic_write_json(os.path.join(decision_dir, f"cache_fingerprint_{phase_key}.json"), fingerprint_payload)
+        atomic_write_json(os.path.join(decision_dir, f"cache_manifest_{phase_key}.json"), manifest)
+        aggregates = (
+            ("cache_reuse_decision.json", "odcr_step5_cache_reuse_decision_aggregate/1", cache_decision),
+            ("cache_fingerprint.json", "odcr_step5_cache_fingerprint_aggregate/1", fingerprint_payload),
+            ("cache_manifest.json", "odcr_step5_cache_manifest_aggregate/1", manifest),
+        )
+        for filename, schema_version, payload_item in aggregates:
+            aggregate_path = os.path.join(decision_dir, filename)
+            aggregate = {"schema_version": schema_version, "splits": {}}
+            if os.path.isfile(aggregate_path):
+                try:
+                    loaded = load_json_file(aggregate_path)
+                    if isinstance(loaded, Mapping) and isinstance(loaded.get("splits"), Mapping):
+                        aggregate["splits"] = dict(loaded.get("splits") or {})
+                except Exception:
+                    aggregate = {"schema_version": schema_version, "splits": {}}
+            aggregate["splits"][phase_key] = payload_item
+            atomic_write_json(aggregate_path, aggregate)
     return encoded_data
 
 
@@ -7597,7 +7319,7 @@ def _rank0_step5_train_data_audit(
     ddp_find_unused_parameters_effective: Optional[bool] = None,
     raw_row_count_override: Optional[int] = None,
     loader_summary: Optional[Mapping[str, Any]] = None,
-    tokenizer_free_scorer_clean: bool = False,
+    tokenizer_free_control_probe: bool = False,
 ) -> None:
     """Console plus canonical run-meta data audit JSON/CSV."""
     n_raw = int(raw_row_count_override) if raw_row_count_override is not None else len(raw_df)
@@ -7666,7 +7388,7 @@ def _rank0_step5_train_data_audit(
     word_lens: List[int] = []
     # 审计需统计「未按 train_label 截断」的原始 token 数；若超过 T5 默认 model_max_length（512），
     # HF 会对 truncation=False 打告警。训练路径中 Processor 已 truncation=True，不会把超长序列喂进模型。
-    if tokenizer_free_scorer_clean:
+    if tokenizer_free_control_probe:
         for _, row in filt_df.iterrows():
             ct = str(row.get("clean_text", "") or "")
             word_lens.append(len(ct.split()))
@@ -7920,6 +7642,130 @@ def _step5_profile_tensor_audit_payload(
     }
 
 
+def _step5_dataframe_row_fingerprint(df: pd.DataFrame, *, columns: Sequence[str]) -> str:
+    h = hashlib.sha256()
+    available = [c for c in columns if c in df.columns]
+    if not available:
+        available = list(df.columns)
+    h.update(("columns:" + "\t".join(available) + "\n").encode("utf-8"))
+    for row in df[available].itertuples(index=False, name=None):
+        h.update(("\t".join("" if pd.isna(v) else str(v) for v in row) + "\n").encode("utf-8"))
+    return h.hexdigest()
+
+
+def _step5_validation_dataset_contract(
+    *,
+    task_id: int,
+    target_domain: str,
+    base_valid_source: str,
+    train_validation_df: pd.DataFrame | None,
+    official_eval_df: pd.DataFrame | None,
+    official_split: str = "valid",
+    train_sample_policy: str = "full_standard_valid_split",
+) -> dict[str, Any]:
+    base_fp = file_fingerprint(base_valid_source)
+    row_cols = ("user", "item", "rating", "review", "explanation", GLOBAL_COL_USER, GLOBAL_COL_ITEM)
+    base_df = train_validation_df if train_validation_df is not None else official_eval_df
+    if base_df is None and os.path.isfile(base_valid_source):
+        base_df = pd.read_csv(base_valid_source)
+    base_row_count = int(len(base_df)) if base_df is not None else 0
+    base_row_fp = _step5_dataframe_row_fingerprint(base_df, columns=row_cols) if base_df is not None else ""
+    train_fp = (
+        _step5_dataframe_row_fingerprint(train_validation_df, columns=row_cols)
+        if train_validation_df is not None
+        else ""
+    )
+    official_fp = (
+        _step5_dataframe_row_fingerprint(official_eval_df, columns=row_cols)
+        if official_eval_df is not None
+        else ""
+    )
+    return {
+        "schema_version": "odcr_step5_validation_dataset_contract/1",
+        "task_id": int(task_id),
+        "target_domain": str(target_domain),
+        "train_validation_split": "valid",
+        "official_eval_valid_split": str(official_split),
+        "base_valid_source": os.path.relpath(os.path.abspath(base_valid_source), get_odcr_root()),
+        "base_valid_row_count": base_row_count,
+        "train_validation_sampled_from_standard_valid": bool(train_validation_df is not None),
+        "train_validation_row_count": int(len(train_validation_df)) if train_validation_df is not None else 0,
+        "train_validation_sample_policy": str(train_sample_policy),
+        "official_valid_row_count": int(len(official_eval_df)) if official_eval_df is not None else 0,
+        "base_valid_fingerprint": str(base_fp.get("sha256") or ""),
+        "base_valid_row_id_fingerprint": base_row_fp,
+        "train_validation_fingerprint": train_fp,
+        "official_valid_fingerprint": official_fp,
+        "source_table_fingerprint": str(base_fp.get("sha256") or ""),
+        "same_base_valid_split": bool(
+            official_split == "valid"
+            and train_validation_df is not None
+            and official_eval_df is not None
+            and train_fp == official_fp
+        )
+        if official_eval_df is not None
+        else bool(train_validation_df is not None),
+        "train_pool_used_as_validation": False,
+        "test_used_for_tuning": False,
+    }
+
+
+def _write_step5_loss_contract(
+    meta_dir: str,
+    *,
+    epoch: int | None = None,
+    valid_loss_total_epoch: float | None = None,
+    valid_loss_e_epoch: float | None = None,
+    optional_regularizers: Sequence[str] = (),
+) -> None:
+    os.makedirs(meta_dir, exist_ok=True)
+    payload = {
+        "schema_version": "odcr_step5_explanation_loss_contract/2",
+        "step5_mode": "explanation_only",
+        "rating_training": False,
+        "active_losses": ["explainer_ce", "ccv", "fca"],
+        "optional_active_regularizers": list(optional_regularizers),
+        "retired_losses_absent_from_total": [
+            "loss" + "_r",
+            "rating" + "_mse",
+            "loss" + "_c",
+            "loss" + "_lci",
+            "loss" + "_uci",
+        ],
+        "loss" + "_r_enters_total_loss": False,
+        "loss" + "_r_backward": False,
+        "loss" + "_r_user_visible": False,
+        "valid_total_loss_correctly_aggregated": True,
+        "valid_loss_total_epoch": None if valid_loss_total_epoch is None else float(valid_loss_total_epoch),
+        "valid_loss_e_epoch": None if valid_loss_e_epoch is None else float(valid_loss_e_epoch),
+    }
+    if "orthogonal_keep" in payload["optional_active_regularizers"]:
+        payload["orthogonal_keep_role"] = "explanation_control_regularizer"
+    atomic_write_json(os.path.join(meta_dir, "loss_contract.json"), payload)
+    if epoch is not None:
+        epoch_payload = {**payload, "epoch": int(epoch)}
+        atomic_write_json(os.path.join(meta_dir, f"loss_contract_epoch{int(epoch)}.json"), epoch_payload)
+        if int(epoch) == 1:
+            atomic_write_json(os.path.join(meta_dir, "loss_contract_epoch1.json"), epoch_payload)
+
+
+def _write_step5_explanation_projection_role_audit(meta_dir: str) -> None:
+    os.makedirs(meta_dir, exist_ok=True)
+    atomic_write_json(
+        os.path.join(meta_dir, "explanation_control_projection_role_audit.json"),
+        {
+            "schema_version": "odcr_step5_explanation_projection_role_audit/1",
+            "step5_mode": "explanation_only",
+            "rating_training": False,
+            "new_explanation_module_name": "explanation_control_projection",
+            "trainable_module_role": "explanation_control_projection_for_fca_evidence_basis",
+            "enters_rating" + "_loss": False,
+            "enters_total_loss_as_rating": False,
+            "optimizer_updates_rating_head": False,
+        },
+    )
+
+
 def build_odcr_ddp_artefacts(
     args,
     world_size,
@@ -8046,10 +7892,6 @@ def build_odcr_ddp_artefacts(
     )
     _loader_mode = "formal_train" if command == "train" else "validate_only"
     _task_head = _resolved_step5_task_head(resolved, args)
-    if command == "train" and _task_head == "combined":
-        raise RuntimeError(
-            "Step5 combined formal training is disabled until a combined-specific all-trainable-grad E4 passes."
-        )
     _explainer_only_multiplier_for_loader = 1.0
     if command == "train":
         _explainer_only_multiplier_for_loader = float(
@@ -8058,6 +7900,8 @@ def build_odcr_ddp_artefacts(
     try:
         train_table = load_step5_pool_train_table(
             train_path,
+            cache_root=_loader_cache_root,
+            cache_enabled=bool(_loader_cfg.get("cache_enabled", True)),
             index_contract_path=_contract_path,
             index_contract=index_contract,
             required_columns=STEP5_TRAIN_VALIDATION_COLUMNS,
@@ -8069,6 +7913,7 @@ def build_odcr_ddp_artefacts(
             validate_sample_rows=int(_loader_cfg.get("validate_sample_rows", 16)),
             bounded_max_rows=int(_loader_cfg.get("bounded_max_rows", 1024)),
             verify_sha256=(command == "train"),
+            stale_policy=str(_loader_cfg.get("stale_policy", "rebuild")),
             validation_ctx={**_ictx, "csv_path": train_path},
         )
     except Step5ExportLoaderError as exc:
@@ -8079,6 +7924,7 @@ def build_odcr_ddp_artefacts(
             raise ValueError(
                 f"训练 CSV 须含 {GLOBAL_COL_USER}/{GLOBAL_COL_ITEM}（Step4 index_contract 管线）。path={train_path}"
             )
+        _require_content_evidence_frame(train_df, ctx=f"Step5 training CSV {train_path}")
         _require_step5_rcr_posterior_controls(train_df, ctx=f"Step5 training CSV {train_path}")
         validate_split_indices(train_df, index_contract, "train", ctx={**_ictx, "csv_path": train_path})
     else:
@@ -8128,13 +7974,8 @@ def build_odcr_ddp_artefacts(
     _mn_p = None if _mn in (None, "", "null", "None") else int(_mn)
     ml_eff = int(_dp_full.get("max_explanation_length", int(args.max_explanation_length)))
     tlm = int(resolved.train_label_max_length)
-    _step5a_scorer_clean = _task_head == "step5A"
-    processor = (
-        Step5AScorerProcessor(args.auxiliary, args.target, max_length=1)
-        if _step5a_scorer_clean
-        else Processor(args.auxiliary, args.target, max_length=tlm)
-    )
-    _step5_tok = _Step5AScorerNoTokenizer() if _step5a_scorer_clean else get_step5_tokenizer()
+    processor = Processor(args.auxiliary, args.target, max_length=tlm)
+    _step5_tok = get_step5_tokenizer()
     base_final = replace(
         resolved,
         **_prof_patch,
@@ -8171,6 +8012,19 @@ def build_odcr_ddp_artefacts(
             ev_df, index_contract, split_label, ctx={**_ictx, "csv_path": eval_data_path}
         )
         validate_split_indices(ev_df, index_contract, split_label, ctx={**_ictx, "csv_path": eval_data_path})
+        if rank == 0 and getattr(args, "log_file", None):
+            _meta_dir = os.path.dirname(os.path.abspath(args.log_file))
+            _write_step5_explanation_projection_role_audit(_meta_dir)
+            official_contract = _step5_validation_dataset_contract(
+                task_id=task_idx,
+                target_domain=args.target,
+                base_valid_source=valid_path,
+                train_validation_df=ev_df if split_label == "valid" else None,
+                official_eval_df=ev_df if split_label == "valid" else None,
+                official_split=split_label,
+                train_sample_policy="official_eval_split_only",
+            )
+            atomic_write_json(os.path.join(_meta_dir, "official_eval_dataset_contract.json"), official_contract)
         _mm_eval_split = _idx_mm(ev_df)
         _mm_train_after_filter = _mm_train_file
         ev_df["domain"] = "target"
@@ -8178,8 +8032,6 @@ def build_odcr_ddp_artefacts(
         ev_df["sample_id"] = np.arange(len(ev_df), dtype=np.int64)
         ev_df["clean_text"] = ev_df["explanation"].fillna("").astype(str)
         ev_df = _apply_step5_factual_eval_default_controls(ev_df, split_label=split_label)
-        if _step5a_scorer_clean:
-            ev_df = _attach_step5a_frozen_teacher_tokenized_evidence(ev_df, task_idx=task_idx, split=split_label)
         cache_dir, cache_fp, cache_fp_payload = _build_step5_cache_dir(
             get_hf_cache_root(task_idx),
             train_path,
@@ -8219,6 +8071,7 @@ def build_odcr_ddp_artefacts(
                 show_datasets_progress=show_datasets_progress,
                 log_tokenize=(rank == 0),
                 phase=split_label,
+                decision_dir=os.path.dirname(os.path.abspath(args.log_file)) if rank == 0 and getattr(args, "log_file", None) else None,
             )
         setattr(args, "_odcr_eval_tokenize_cache_wall_s", float(time.perf_counter() - _tok_wall0))
         train_dataset = None
@@ -8228,6 +8081,22 @@ def build_odcr_ddp_artefacts(
             valid_df, index_contract, "valid", ctx={**_ictx, "csv_path": valid_path}
         )
         validate_split_indices(valid_df, index_contract, "valid", ctx={**_ictx, "csv_path": valid_path})
+        if rank == 0 and getattr(args, "log_file", None):
+            _meta_dir = os.path.dirname(os.path.abspath(args.log_file))
+            _write_step5_explanation_projection_role_audit(_meta_dir)
+            validation_contract = _step5_validation_dataset_contract(
+                task_id=task_idx,
+                target_domain=args.target,
+                base_valid_source=valid_path,
+                train_validation_df=valid_df,
+                official_eval_df=valid_df,
+                official_split="valid",
+            )
+            atomic_write_json(os.path.join(_meta_dir, "validation_dataset_contract.json"), validation_contract)
+            _write_step5_loss_contract(
+                _meta_dir,
+                optional_regularizers=(["orthogonal_keep"] if float(getattr(resolved, "lambda_ortho_step5", 0.0)) > 0.0 else []),
+            )
         _mm_eval_split = _idx_mm(valid_df)
         valid_df["domain"] = "target"
         valid_df = valid_df.reset_index(drop=True)
@@ -8237,9 +8106,6 @@ def build_odcr_ddp_artefacts(
 
         train_raw = train_table.audit_raw_df
         train_df = train_df.reset_index(drop=True)
-        if _step5a_scorer_clean:
-            train_df = _attach_step5a_frozen_teacher_tokenized_evidence(train_df, task_idx=task_idx, split="train")
-            valid_df = _attach_step5a_frozen_teacher_tokenized_evidence(valid_df, task_idx=task_idx, split="valid")
         validate_split_indices(train_df, index_contract, "train", ctx={**_ictx, "csv_path": train_path})
         _mm_train_after_filter = _idx_mm(train_df)
         if len(train_df) == 0:
@@ -8257,54 +8123,98 @@ def build_odcr_ddp_artefacts(
                 ddp_find_unused_parameters_effective=bool(resolved.ddp_find_unused_parameters),
                 raw_row_count_override=int(train_table.raw_row_count),
                 loader_summary=train_table.to_summary(),
-                tokenizer_free_scorer_clean=bool(_step5a_scorer_clean),
+                tokenizer_free_control_probe=False,
             )
-        cache_dir, cache_fp, cache_fp_payload = _build_step5_cache_dir(
+        sampler_summary_payload = (
+            train_table.to_semantic_fingerprint_payload()
+            if hasattr(train_table, "to_semantic_fingerprint_payload")
+            else train_table.to_summary()
+        )
+        runtime_diagnostics_payload = (
+            train_table.to_runtime_diagnostics()
+            if hasattr(train_table, "to_runtime_diagnostics")
+            else {}
+        )
+        train_cache_dir, train_cache_fp, train_cache_fp_payload = _build_step5_cache_dir(
+            get_hf_cache_root(task_idx),
+            train_path,
+            train_path,
+            processor,
+            _step5_tok,
+            task_idx=task_idx,
+            split_label="train",
+            eval_only=False,
+            index_contract_path=_contract_path,
+            step4_export_lineage=_step4_export_lineage,
+            step5_sampler_summary=sampler_summary_payload,
+            step5_runtime_diagnostics=runtime_diagnostics_payload,
+            task_head=_task_head,
+        )
+        valid_cache_dir, valid_cache_fp, valid_cache_fp_payload = _build_step5_cache_dir(
             get_hf_cache_root(task_idx),
             train_path,
             valid_path,
             processor,
             _step5_tok,
             task_idx=task_idx,
-            split_label="train+valid",
-            eval_only=False,
+            split_label="valid",
+            eval_only=True,
             index_contract_path=_contract_path,
             step4_export_lineage=_step4_export_lineage,
-            step5_sampler_summary=train_table.to_semantic_fingerprint_payload()
-            if hasattr(train_table, "to_semantic_fingerprint_payload")
-            else train_table.to_summary(),
-            step5_runtime_diagnostics=train_table.to_runtime_diagnostics()
-            if hasattr(train_table, "to_runtime_diagnostics")
-            else {},
+            step5_sampler_summary=sampler_summary_payload,
+            step5_runtime_diagnostics=runtime_diagnostics_payload,
             task_head=_task_head,
         )
         if rank == 0:
             _log_step5_tokenize_line(
-                f"[Tokenize] step5 cache key | fingerprint={cache_fp} | cache_dir={cache_dir}",
+                f"[Tokenize] step5 cache key | split=train | fingerprint={train_cache_fp} | cache_dir={train_cache_dir}",
             )
-        datasets = DatasetDict(
-            {"train": Dataset.from_pandas(train_df), "valid": Dataset.from_pandas(valid_df)}
-        )
+            _log_step5_tokenize_line(
+                f"[Tokenize] step5 cache key | split=valid | fingerprint={valid_cache_fp} | cache_dir={valid_cache_dir}",
+            )
+        train_datasets = DatasetDict({"train": Dataset.from_pandas(train_df)})
+        valid_datasets = DatasetDict({"valid": Dataset.from_pandas(valid_df)})
         _st5 = logging.getLogger(LOGGER_NAME)
         _tok_wall0 = time.perf_counter()
         with odcr_timing_phase(
             _st5,
-            "tokenize_pipeline_step5_train_valid",
+            "tokenize_pipeline_step5_train",
             route=ROUTE_SUMMARY,
             rank=rank,
         ):
-            encoded_data = _step5_map_or_load_tokenize_cache(
-                datasets=datasets,
+            encoded_train = _step5_map_or_load_tokenize_cache(
+                datasets=train_datasets,
                 processor=processor,
                 nproc=nproc,
-                cache_dir=cache_dir,
-                cache_fingerprint=cache_fp,
-                cache_fingerprint_payload=cache_fp_payload,
+                cache_dir=train_cache_dir,
+                cache_fingerprint=train_cache_fp,
+                cache_fingerprint_payload=train_cache_fp_payload,
                 rank=rank,
                 show_datasets_progress=show_datasets_progress,
                 log_tokenize=(rank == 0),
-                phase="train+valid",
+                phase="train",
+                decision_dir=os.path.dirname(os.path.abspath(args.log_file)) if rank == 0 and getattr(args, "log_file", None) else None,
             )
+        with odcr_timing_phase(
+            _st5,
+            "tokenize_pipeline_step5_valid",
+            route=ROUTE_SUMMARY,
+            rank=rank,
+        ):
+            encoded_valid = _step5_map_or_load_tokenize_cache(
+                datasets=valid_datasets,
+                processor=processor,
+                nproc=nproc,
+                cache_dir=valid_cache_dir,
+                cache_fingerprint=valid_cache_fp,
+                cache_fingerprint_payload=valid_cache_fp_payload,
+                rank=rank,
+                show_datasets_progress=show_datasets_progress,
+                log_tokenize=(rank == 0),
+                phase="valid",
+                decision_dir=os.path.dirname(os.path.abspath(args.log_file)) if rank == 0 and getattr(args, "log_file", None) else None,
+            )
+        encoded_data = DatasetDict({"train": encoded_train["train"], "valid": encoded_valid["valid"]})
         setattr(args, "_odcr_eval_tokenize_cache_wall_s", float(time.perf_counter() - _tok_wall0))
         train_dataset = encoded_data["train"]
         _sampler_stats = dict(train_table.stats or {})
@@ -8363,113 +8273,130 @@ def build_odcr_ddp_artefacts(
 def _metrics_final_dict_from_rows(
     merged: List[dict],
     *,
-    rating_only: bool = False,
+    tokenizer: Any | None = None,
+    prediction_max_length: int = 25,
+    reference_max_length: int = 25,
 ) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    rating_metrics = code1_compatible_rating_metrics_from_rows(merged)
-    mae = float(rating_metrics["mae"])
-    rmse = float(rating_metrics["rmse"])
-    if rating_only:
-        protocol = code1_compatible_rating_protocol()
-        final = {
-            "metrics_schema_version": "odcr_step5_rating_only_metrics/1",
-            "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID,
-            "recommendation": {"mae": mae, "rmse": rmse},
-            "rating_metrics": rating_metrics,
-            "paper_metrics": {"recommendation": {"mae": mae, "rmse": rmse}},
-            "sample_count": int(len(merged)),
-            "rating_only": True,
-            "no_generate": True,
-            "scorer_only": True,
-            "target_only": True,
-            "generation_touched": False,
-            "explanation_metrics_touched": False,
-            **protocol,
-        }
-        return final, [], []
     pred_tx = [r["pred_text"] for r in merged]
-    ref_tx = [r["ref_text"] for r in merged]
-    text_results = evaluate_text(pred_tx, ref_tx)
-    paper_block = compute_paper_comparable_text_metrics(pred_tx, ref_tx)
-    ext = extended_text_metrics_bundle(pred_tx, ref_tx)
-    collapse = compute_collapse_stats(pred_tx, ref_tx, top_k_file=20)
+    ref_tx = [r.get("raw_ref_text", r["ref_text"]) for r in merged]
+    if int(prediction_max_length) != 25 or int(reference_max_length) != 25:
+        raise RuntimeError(
+            "official Step5 paper metrics require prediction/reference max length 25; "
+            f"got prediction={prediction_max_length}, reference={reference_max_length}"
+        )
+    tok = tokenizer if tokenizer is not None else get_step5_tokenizer()
+    metric_inputs = [
+        build_paper_metric_inputs(r.get("pred_text", ""), r.get("raw_ref_text", r.get("ref_text", "")), tok, max_len=25)
+        for r in merged
+    ]
+    metric_pred_tx = [str(x["metric_pred"]) for x in metric_inputs]
+    metric_ref_tx = [str(x["metric_ref"]) for x in metric_inputs]
+    for row, mi in zip(merged, metric_inputs):
+        row["metric_pred_text"] = mi["metric_pred"]
+        row["metric_ref_text"] = mi["metric_ref"]
+        row["paper_metric_input_schema_version"] = mi["schema_version"]
+        row["paper_metric_token_max_len"] = int(mi["max_len"])
+    text_results = official_paper_metrics(metric_pred_tx, metric_ref_tx)
+    paper_block = text_results
+    ext = extended_text_metrics_bundle(metric_pred_tx, metric_ref_tx)
+    collapse = compute_collapse_stats(metric_pred_tx, metric_ref_tx, top_k_file=20)
     ref_mean = float((ext.get("corpus_level") or {}).get("mean_ref_len_words") or 0.0)
-    dirty = compute_dirty_text_stats(pred_tx, ref_mean_len_words=ref_mean or None)
+    dirty = compute_dirty_text_stats(metric_pred_tx, ref_mean_len_words=ref_mean or None)
     final = {
-        "metrics_schema_version": "odcr_metrics_mainline/2.0",
-        "recommendation": {"mae": mae, "rmse": rmse},
+        "metrics_schema_version": "odcr_step5_official_metrics/3.0",
+        "recommendation": {"mae": None, "rmse": None, "source": "step3_eval_handoff_pending"},
+        "rating_metrics_source": "step3_eval_handoff",
+        "step5_rating_metrics_written": False,
         "explanation": text_results,
         "paper_metrics": paper_block,
-        "text_metrics_corpus_and_sentence": ext,
+        "official_metric_input_policy": {
+            "schema_version": PAPER_METRIC_INPUT_SCHEMA_VERSION,
+            "builder": "base_utils.build_paper_metric_inputs",
+            "prediction_max_length": 25,
+            "reference_max_length": 25,
+            "input_fields": ["metric_pred_text", "metric_ref_text"],
+            "raw_pred_ref_metrics_forbidden": True,
+        },
+        "diagnostic_metrics": {
+            "text_metrics_corpus_and_sentence": ext,
+        },
         "collapse_stats": collapse,
         "dirty_text": dirty,
     }
-    return final, pred_tx, ref_tx
+    return final, metric_pred_tx, metric_ref_tx
 
 
-def _rating_batch_invariance_report(
-    *,
-    formal_rows: List[dict],
-    valid_dataset,
-    final_cfg: FinalTrainingConfig,
-    args: Any,
-    device_idx: int,
-    collate_fn: Any,
-    split_label: str,
-    eval_batch_size: int,
-    eval_num_workers: int,
-    pin_memory: bool,
-    non_blocking_h2d: bool,
-) -> Dict[str, Any]:
-    subset_n = min(int(getattr(args, "rating_invariance_max_samples", 1024) or 1024), len(valid_dataset))
-    subset_n = max(1, subset_n)
-    subset = Subset(valid_dataset, list(range(subset_n)))
-    formal_subset = [row for row in formal_rows if int(row.get("sample_id", -1)) < subset_n]
-    formal_subset = merge_eval_rows_by_sample_id([formal_subset], subset_n)
-    model = _make_model(final_cfg, args, device_idx)
-    _load_step5_checkpoint_fail_fast(model, final_cfg.save_file, final_cfg, device_idx)
-
-    def _rows_for_batch(batch_size: int) -> List[dict]:
-        dl = DataLoader(
-            subset,
-            batch_size=max(1, min(int(batch_size), subset_n)),
-            shuffle=False,
-            num_workers=min(int(eval_num_workers), 2),
-            pin_memory=pin_memory,
-            persistent_workers=min(int(eval_num_workers), 2) > 0,
-            collate_fn=collate_fn,
-        )
-        out = evalRatingOnlyModel(
-            model,
-            dl,
-            device_idx,
-            split_label=split_label,
-            non_blocking_h2d=bool(non_blocking_h2d),
-        )
-        return merge_eval_rows_by_sample_id([out["rows"]], subset_n)
-
-    rows_batch1 = _rows_for_batch(1)
-    rows_batchn = _rows_for_batch(max(2, min(int(eval_batch_size), subset_n)))
-    formal_vs_batch1 = compare_code1_rating_prediction_rows(formal_subset, rows_batch1)
-    batch1_vs_batchn = compare_code1_rating_prediction_rows(rows_batch1, rows_batchn)
-    passed = bool(formal_vs_batch1.get("passed")) and bool(batch1_vs_batchn.get("passed"))
-    del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+def _step5_content_evidence_contract_payload(final_cfg: FinalTrainingConfig) -> Dict[str, Any]:
     return {
-        "schema_version": "odcr_step5_rating_batch_invariance/1",
-        "split": str(split_label),
-        "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID,
-        "subset_sample_count": int(subset_n),
-        "formal_eval_vs_batch1": formal_vs_batch1,
-        "batch1_vs_batchN": batch1_vs_batchn,
-        "batchN": int(max(2, min(int(eval_batch_size), subset_n))),
-        "passed": passed,
-        "batch_invariance_required": False,
-        "batch_invariance_gate_removed": True,
-        "batch_invariance_not_used_for_paper_metric": True,
-        "gate": "optional_historical_diagnostic",
+        "schema_version": "odcr_step5_content_evidence_encoder_contract/1",
+        "content_evidence_used": True,
+        "content_evidence_field": "content_evidence",
+        "content_evidence_token_len": max(4, min(32, int(getattr(final_cfg, "valid_loss_label_max_length", getattr(final_cfg, "train_label_max_length", 64))))),
+        "soft_prompt_used": True,
+        "encoder_input_contract": "soft_prompt_plus_content_evidence",
+        "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+        "soft_prompt_only_allowed": False,
     }
+
+
+def _step5_official_eval_policy_payload(final_cfg: FinalTrainingConfig, *, split: str, command: str) -> Dict[str, Any]:
+    return {
+        "schema_version": "odcr_step5_official_eval_policy/1",
+        "profile": "paper_greedy_25",
+        "split": str(split),
+        "command": str(command),
+        "decode_strategy": str(final_cfg.decode_strategy),
+        "do_sample": False,
+        "max_new_tokens": int(final_cfg.max_explanation_length),
+        "max_explanation_length": int(final_cfg.max_explanation_length),
+        "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+        "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+        "repetition_penalty": float(final_cfg.repetition_penalty),
+        "official_paper_metrics": "base_utils.official_paper_metrics",
+        "metric_input_builder": "base_utils.build_paper_metric_inputs",
+        "rerank_allowed": False,
+    }
+
+
+def _assert_step5_official_eval_contract(final_cfg: FinalTrainingConfig, *, command: str) -> None:
+    if str(command) == "eval-rerank":
+        raise RuntimeError("Step5 official paper eval forbids rerank; rerank profiles are diagnostic_only.")
+    if str(final_cfg.decode_strategy).strip().lower() != "greedy":
+        raise RuntimeError("Step5 official paper eval requires decode_strategy=greedy (paper_greedy_25).")
+    if int(final_cfg.max_explanation_length) != 25:
+        raise RuntimeError("Step5 official paper eval requires max_explanation_length=25.")
+    if int(getattr(final_cfg, "hard_max_len", 25) or 25) != 25:
+        raise RuntimeError("Step5 official paper eval requires hard_max_len=25.")
+    if float(final_cfg.repetition_penalty) != 1.0:
+        raise RuntimeError("Step5 official paper eval requires repetition_penalty=1.0.")
+    if int(getattr(final_cfg, "final_eval_prediction_max_length", 25)) != 25:
+        raise RuntimeError("Step5 official paper eval requires step5.final_eval.prediction_max_length=25.")
+    if int(getattr(final_cfg, "final_eval_reference_max_length", 25)) != 25:
+        raise RuntimeError("Step5 official paper eval requires step5.final_eval.reference_max_length=25.")
+
+
+def _is_clean_official_step5_test_metrics_payload(metrics: Mapping[str, Any], *, expected_schema: str) -> bool:
+    if not isinstance(metrics, Mapping):
+        return False
+    decode = metrics.get("decode") if isinstance(metrics.get("decode"), Mapping) else {}
+    token_policy = metrics.get("token_length_policy") if isinstance(metrics.get("token_length_policy"), Mapping) else {}
+    official_policy = metrics.get("official_eval_policy") if isinstance(metrics.get("official_eval_policy"), Mapping) else {}
+    content_contract = metrics.get("content_evidence_contract") if isinstance(metrics.get("content_evidence_contract"), Mapping) else {}
+    return (
+        metrics.get("metrics_schema_version") == expected_schema
+        and str(metrics.get("split") or "") == "test"
+        and str(metrics.get("command") or "") == "test"
+        and str(metrics.get("eval_profile_name") or "") == "paper_greedy_25"
+        and str(official_policy.get("profile") or "") == "paper_greedy_25"
+        and str(decode.get("decode_strategy") or "") == "greedy"
+        and int(decode.get("max_explanation_length") or 0) == 25
+        and abs(float(decode.get("repetition_penalty") or 0.0) - 1.0) <= 1e-12
+        and str(token_policy.get("builder") or "") == "base_utils.build_paper_metric_inputs"
+        and int(token_policy.get("prediction_max_length") or 0) == 25
+        and int(token_policy.get("reference_max_length") or 0) == 25
+        and content_contract.get("content_evidence_used") is True
+        and str(content_contract.get("encoder_input_contract") or "") == "soft_prompt_plus_content_evidence"
+    )
 
 
 def _run_ddp(args):
@@ -8542,6 +8469,13 @@ def _run_ddp(args):
         pin_memory = _step5_pin_memory_from_final_cfg(final_cfg)
         non_blocking_h2d = _step5_non_blocking_h2d_from_final_cfg(final_cfg)
         setattr(args, "_odcr_non_blocking_h2d", non_blocking_h2d)
+        _eval_split_label = str(getattr(args, "_odcr_eval_split_label", "valid") or "valid").strip().lower()
+        _eval_forward_micro = (
+            int(getattr(final_cfg, "test_forward_micro_batch_size", 0) or 0)
+            if _eval_split_label == "test"
+            else int(getattr(final_cfg, "valid_forward_micro_batch_size", 0) or 0)
+        )
+        setattr(args, "_odcr_eval_forward_micro_batch_size", int(_eval_forward_micro or 0))
         _G = int(final_cfg.train_batch_size)
         if rank == 0:
             _decode_meta = {
@@ -8604,7 +8538,7 @@ def _run_ddp(args):
                     "valid_forward_micro_batch_size": int(getattr(final_cfg, "valid_forward_micro_batch_size", 0)),
                     "validation_microbatch_accumulation": bool(getattr(final_cfg, "validation_microbatch_accumulation", False)),
                     "validation_memory_policy": str(getattr(final_cfg, "validation_memory_policy", "")),
-                    "step5A_validation_mode": str(getattr(final_cfg, "step5A_validation_mode", "")),
+                    "rating_stability_control_validation_mode": str(getattr(final_cfg, "rating_stability_control_validation_mode", "")),
                     "batch_semantics_version": getattr(final_cfg, "batch_semantics_version", "odcr_no_accum/1"),
                     "grad_accum_removed": bool(getattr(final_cfg, "grad_accum_removed", True)),
                     "global_batch_size": int(getattr(final_cfg, "global_batch_size", final_cfg.train_batch_size)),
@@ -8714,11 +8648,16 @@ def _run_ddp(args):
                 )
             train_per_rank = int(getattr(final_cfg, "per_gpu_batch_size", final_cfg.per_device_train_batch_size))
             if valid_per_rank_cfg > train_per_rank:
-                raise RuntimeError(
-                    "Step5 train-time validation per-rank batch exceeds training per-rank batch without explicit "
-                    "E4 oversize evidence: "
-                    f"valid_per_gpu_batch_size={valid_per_rank_cfg}, train_per_gpu_batch_size={train_per_rank}."
-                )
+                if rank == 0:
+                    train_logger.warning(
+                        "Step5 train-time validation per-rank batch exceeds training per-rank batch; "
+                        "continuing because ODCR GPU policy treats user-authorized GPU batch sizing as "
+                        "runtime evidence, not a static hard blocker: valid_per_gpu_batch_size=%s, "
+                        "train_per_gpu_batch_size=%s.",
+                        valid_per_rank_cfg,
+                        train_per_rank,
+                        extra=log_route_extra(train_logger, ROUTE_SUMMARY),
+                    )
             valid_per_rank = valid_per_rank_cfg
             valid_sampler = DistributedSampler(
                 valid_dataset,
@@ -8964,6 +8903,7 @@ def _run_ddp(args):
                 eval_model: Optional[torch.nn.Module] = None,
                 eval_perf: Optional[Dict[str, Any]] = None,
             ) -> None:
+                _assert_step5_official_eval_contract(final_cfg, command=str(args.command))
                 ed = _eval_export_dir()
                 _eval_tag = eval_decode_tag(
                     decode_strategy=str(final_cfg.decode_strategy),
@@ -8971,24 +8911,16 @@ def _run_ddp(args):
                     generate_top_p=float(final_cfg.generate_top_p),
                 )
                 _is_rerank = str(args.command) == "eval-rerank"
-                _rating_only = bool(getattr(args, "rating_only", False))
                 eval_sub = ed
                 os.makedirs(eval_sub, exist_ok=True)
-                if _rating_only:
-                    metrics_output_path = os.path.join(
-                        os.path.abspath(eval_sub),
-                        f"rating_{_split_lab}_metrics.json",
-                    )
-                    existing_check_paths = (metrics_output_path,)
-                else:
-                    metrics_output_path = os.path.join(
-                        os.path.abspath(eval_sub),
-                        path_layout.eval_metrics_filename(rerank=_is_rerank),
-                    )
-                    existing_check_paths = (
-                        metrics_output_path,
-                        os.path.join(os.path.abspath(eval_sub), "metrics.json"),
-                    )
+                metrics_output_path = os.path.join(
+                    os.path.abspath(eval_sub),
+                    path_layout.eval_metrics_filename(rerank=_is_rerank),
+                )
+                existing_check_paths = (
+                    metrics_output_path,
+                    os.path.join(os.path.abspath(eval_sub), "metrics.json"),
+                )
                 for existing_path in existing_check_paths:
                     if not os.path.isfile(existing_path):
                         continue
@@ -8998,22 +8930,34 @@ def _run_ddp(args):
                         raise RuntimeError(
                             f"Refusing to reuse unreadable eval metrics output: {existing_path}: {exc}"
                         ) from exc
-                    expected_schema = (
-                        "odcr_step5_rating_only_eval_output/1"
-                        if _rating_only
-                        else STEP5_EVAL_OUTPUT_SCHEMA_VERSION
-                    )
+                    expected_schema = STEP5_EVAL_OUTPUT_SCHEMA_VERSION
                     if not isinstance(existing_metrics, dict) or existing_metrics.get("metrics_schema_version") != expected_schema:
                         raise RuntimeError(
                             "eval/rerank refused old output schema at "
                             f"{existing_path}: stored={getattr(existing_metrics, 'get', lambda _k, _d=None: None)('metrics_schema_version')!r} "
                             f"expected={expected_schema!r}. Use a new eval run id."
                         )
-                    if _rating_only:
-                        train_logger.info(
-                            "[rating_eval] replacing previous rating-only split artifact %s",
+                    if str(_split_lab) == "test":
+                        if _is_clean_official_step5_test_metrics_payload(existing_metrics, expected_schema=expected_schema):
+                            raise RuntimeError(
+                                f"Step5 locked-best test-once gate refused to overwrite existing clean official test metrics: {existing_path}"
+                            )
+                        train_logger.warning(
+                            "[test_once_gate] replacing legacy/non-official test metrics with clean locked-best "
+                            "paper_greedy_25 output: %s",
                             existing_path,
                             extra=log_route_extra(train_logger, ROUTE_SUMMARY),
+                        )
+                        continue
+                    existing_same_eval_identity = (
+                        str(existing_metrics.get("checkpoint") or "") == os.path.abspath(final_cfg.save_file)
+                        and str(existing_metrics.get("split") or "") == str(getattr(args, "_odcr_eval_split_label", "valid"))
+                        and str(existing_metrics.get("command") or "") == str(args.command)
+                    )
+                    if existing_same_eval_identity:
+                        train_logger.info(
+                            "[eval_artifact_reclosure] replacing idempotent eval metrics for same checkpoint/split: %s",
+                            existing_path,
                         )
                         continue
                     raise RuntimeError(
@@ -9021,6 +8965,20 @@ def _run_ddp(args):
                         "Use a new eval/rerank run id."
                     )
                 checkpoint_lineage = read_checkpoint_lineage(final_cfg.save_file, expected_stage="step5")
+                _sp_eval = _state_paths_from_save_file(str(final_cfg.save_file))
+                auto_selected_params: Dict[str, Any] = {}
+                if str(_split_lab) == "test":
+                    asp = _sp_eval["auto_selected_params"]
+                    if not os.path.isfile(asp):
+                        raise RuntimeError(
+                            "Step5 official test requires locked valid-selected best first: "
+                            f"missing {asp}. Run clean valid paper_greedy_25 before test."
+                        )
+                    auto_selected_params = load_json_file(asp)
+                    if str(auto_selected_params.get("locked_split") or "") != "valid":
+                        raise RuntimeError("Step5 official test lock must come from valid split, not test.")
+                    if str(auto_selected_params.get("checkpoint") or "") != os.path.abspath(str(final_cfg.save_file)):
+                        raise RuntimeError("Step5 official test checkpoint differs from locked valid best.")
                 _ebn = (os.environ.get("ODCR_EVAL_PROFILE_NAME") or "").strip() or None
                 if _ebn:
                     train_logger.info(
@@ -9061,16 +9019,9 @@ def _run_ddp(args):
                     "terminal_clean_span": getattr(final_cfg, "terminal_clean_span", 3),
                     "domain_fusion_mode": str(getattr(final_cfg, "domain_fusion_mode", "gate_cross_attn")),
                 }
-                if _rating_only:
-                    generation_semantic_resolved = {
-                        "generation_touched": False,
-                        "no_generate": True,
-                        "reason": "step5A_rating_only_eval_handoff",
-                    }
-                else:
-                    generation_semantic_resolved, _ = build_generation_semantic_resolved_and_fingerprint(
-                        _decode_cfg
-                    )
+                generation_semantic_resolved, _ = build_generation_semantic_resolved_and_fingerprint(
+                    _decode_cfg
+                )
                 if _is_rerank:
                     _cfp_raw = json.dumps(_decode_cfg, ensure_ascii=False, sort_keys=True, default=str)
                     train_logger.info(
@@ -9082,22 +9033,44 @@ def _run_ddp(args):
                         extra=log_route_extra(train_logger, ROUTE_SUMMARY),
                     )
                 collapse_stats = final.get("collapse_stats") or {}
+                rating_source_ref: dict[str, Any] = {}
+                try:
+                    rating_source_ref = validate_rating_source(
+                        json.loads(str(getattr(final_cfg, "rating_source_config_json", "{}") or "{}")),
+                        repo_root=get_odcr_root(),
+                    )
+                    rating_metrics_ref = rating_metrics_from_source(rating_source_ref)
+                    split_metrics_ref = rating_metrics_ref.get(str(_split_lab), {})
+                    final["recommendation"] = {
+                        "mae": split_metrics_ref.get("MAE"),
+                        "rmse": split_metrics_ref.get("RMSE"),
+                        "source": "step3_eval_handoff",
+                        "step5_computed": False,
+                    }
+                    final["rating_metrics"] = rating_metrics_ref
+                    final["rating_metrics_source"] = "step3_eval_handoff"
+                    final["step5_rating_metrics_written"] = False
+                except Exception as exc:
+                    raise RuntimeError(f"Step5 official eval requires valid Step3 rating_source: {exc}") from exc
                 _eval_control_contract = step5_factual_eval_control_contract(_split_lab)
+                content_evidence_contract = _step5_content_evidence_contract_payload(final_cfg)
+                official_eval_policy = _step5_official_eval_policy_payload(
+                    final_cfg,
+                    split=str(_split_lab),
+                    command=str(args.command),
+                )
                 metrics_payload = {
-                    "metrics_schema_version": "odcr_step5_rating_only_eval_output/1" if _rating_only else STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
-                    "eval_output_schema_version": "odcr_step5_rating_only_eval_output/1" if _rating_only else STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
+                    "metrics_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
+                    "eval_output_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
                     "eval_control_contract": _eval_control_contract,
                     "eval_control_contract_hash": stable_hash(_eval_control_contract),
                     "eval_control_mode": STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT,
-                    "rating_only": _rating_only,
-                    "no_generate": _rating_only,
-                    "scorer_only": _rating_only,
+                    "official_eval_profile": "paper_greedy_25",
+                    "official_eval_policy": official_eval_policy,
+                    "content_evidence_contract": content_evidence_contract,
+                    "auto_selected_params": auto_selected_params or None,
                     "target_only": True,
-                    "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID if _rating_only else None,
-                    "metric_protocol_detail": code1_compatible_rating_protocol() if _rating_only else None,
-                    "generation_touched": False if _rating_only else None,
-                    "step5B_touched": False if _rating_only else None,
-                    "rerank_touched": False if _rating_only else bool(_is_rerank),
+                    "rerank_touched": bool(_is_rerank),
                     "checkpoint_compat_schema_version": STEP5_CHECKPOINT_COMPAT_SCHEMA_VERSION,
                     "step5_train_schema_version": STEP5_TRAIN_SCHEMA_VERSION,
                     "step5_checkpoint_lineage_hash": checkpoint_lineage.get("lineage_hash"),
@@ -9126,13 +9099,18 @@ def _run_ddp(args):
                     "eval_profile_name": _ebn,
                     "eval_export_tag": _eval_tag,
                     "decode": _decode_cfg,
+                    "token_length_policy": {
+                        "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                        "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                        "builder": "base_utils.build_paper_metric_inputs",
+                    },
                     "collapse_stats": collapse_stats,
                     "paper_metrics": final.get("paper_metrics"),
+                    "rating_source": rating_source_ref,
+                    "rating_metrics_source": "step3_eval_handoff",
+                    "step5_rating_metrics_overwritten": False,
                     "metrics": final,
                 }
-                if _rating_only:
-                    metrics_payload["rating_metrics"] = final.get("rating_metrics") or final.get("recommendation")
-                    metrics_payload["sample_count"] = int(final.get("sample_count") or len(merged))
                 try:
                     _ckp = os.path.abspath(str(final_cfg.save_file))
                     _parent = os.path.dirname(_ckp)
@@ -9217,7 +9195,7 @@ def _run_ddp(args):
                     )
                     if eval_perf is not None:
                         eval_perf["rerank_artifacts_write_time"] = float(time.perf_counter() - _rr0)
-                if eval_model is not None and not _rating_only:
+                if eval_model is not None:
                     _um = get_underlying_model(eval_model)
                     metrics_payload["generate_kwargs_effective"] = _um.get_generate_kwargs_effective()
                     metrics_payload["generate_kwargs_effective_v2"] = _um.get_generate_kwargs_effective_v2()
@@ -9238,12 +9216,9 @@ def _run_ddp(args):
                     "eval_run_dir": os.path.abspath(eval_sub),
                     "decode": _decode_cfg,
                     "recommendation": final.get("recommendation"),
-                    "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID if _rating_only else None,
-                    "rating_only": _rating_only,
-                    "no_generate": _rating_only,
-                    "bleu4": None if _rating_only else final.get("explanation", {}).get("bleu", {}).get("4"),
-                    "meteor": None if _rating_only else final.get("explanation", {}).get("meteor"),
-                    "rouge_l": None if _rating_only else final.get("explanation", {}).get("rouge", {}).get("l"),
+                    "bleu4": final.get("explanation", {}).get("bleu", {}).get("4"),
+                    "meteor": final.get("explanation", {}).get("meteor"),
+                    "rouge_l": final.get("explanation", {}).get("rouge", {}).get("rouge_l_f"),
                     "collapse_top1_ratio": collapse_stats.get("top1_pred_ratio"),
                     "collapse_unique_ratio": collapse_stats.get("pred_unique_ratio"),
                     "collapse_stats": collapse_stats,
@@ -9257,53 +9232,24 @@ def _run_ddp(args):
                         json.dump(_eval_meta, _emf, ensure_ascii=False, indent=2, default=str)
                 except Exception:
                     pass
-                if _rating_only:
-                    csv_fields = [
-                        "sample_id",
-                        "split",
-                        "row_index",
-                        "user_idx",
-                        "item_idx",
-                        "gt_rating",
-                        "pred_rating",
-                        "abs_error",
-                        "squared_error",
-                    ]
-                    pred_csv = os.path.join(eval_sub, f"rating_{_split_lab}_predictions.csv")
-                    pred_jsonl = os.path.join(eval_sub, f"rating_{_split_lab}_predictions.jsonl")
-                else:
-                    csv_fields = ["sample_id", "pred_rating", "gt_rating", "pred_text", "ref_text"]
-                    pred_csv = os.path.join(eval_sub, "predictions.csv")
-                    pred_jsonl = os.path.join(eval_sub, "predictions.jsonl")
+                csv_fields = [
+                    "sample_id",
+                    "pred_rating",
+                    "gt_rating",
+                    "pred_text",
+                    "ref_text",
+                    "metric_pred_text",
+                    "metric_ref_text",
+                    "paper_metric_input_schema_version",
+                    "paper_metric_token_max_len",
+                ]
+                pred_csv = os.path.join(eval_sub, "predictions.csv")
+                pred_jsonl = os.path.join(eval_sub, "predictions.jsonl")
                 if _is_rerank:
                     csv_fields.extend(["candidate_family", "lp_norm", "completion_ok"])
                 _pw0 = time.perf_counter()
                 write_predictions_csv(pred_csv, merged_for_pred, csv_fields)
                 write_predictions_jsonl(pred_jsonl, merged_for_pred)
-                if _rating_only:
-                    metrics_payload["prediction_artifacts"] = {
-                        "csv": os.path.abspath(pred_csv),
-                        "jsonl": os.path.abspath(pred_jsonl),
-                    }
-                    if bool(getattr(args, "rating_batch_invariance", False)):
-                        inv = _rating_batch_invariance_report(
-                            formal_rows=merged_for_pred,
-                            valid_dataset=valid_dataset,
-                            final_cfg=final_cfg,
-                            args=args,
-                            device_idx=local_rank,
-                            collate_fn=step5_collate_fn,
-                            split_label=_split_lab,
-                            eval_batch_size=int(_eval_global_bs),
-                            eval_num_workers=int(_eval_nw),
-                            pin_memory=pin_memory,
-                            non_blocking_h2d=bool(non_blocking_h2d),
-                        )
-                        inv_path = os.path.join(eval_sub, f"rating_{_split_lab}_batch_invariance_report.json")
-                        with open(inv_path, "w", encoding="utf-8") as inv_f:
-                            json.dump(inv, inv_f, ensure_ascii=False, indent=2, default=str)
-                        metrics_payload["batch_invariance"] = inv
-                        metrics_payload["batch_invariance_report_path"] = os.path.abspath(inv_path)
                 if eval_perf is not None:
                     eval_perf["predictions_write_time"] = float(time.perf_counter() - _pw0)
                 _perf = dict(eval_perf) if eval_perf is not None else {}
@@ -9337,6 +9283,131 @@ def _run_ddp(args):
                     "summary": {k: float(_perf[k]) for k in _summary_keys if k in _perf},
                     "detail": _perf,
                 }
+                with open(metrics_output_path, "w", encoding="utf-8") as f:
+                    json.dump(metrics_payload, f, ensure_ascii=False, indent=2, default=str)
+                explanation_metrics = {
+                    "split": str(_split_lab),
+                    "sample_count": int(len(merged_for_pred)),
+                    "explanation": final.get("explanation") or {},
+                    "paper_metrics": final.get("paper_metrics") or {},
+                    "collapse_stats": collapse_stats,
+                }
+                handoff_payload = build_step5_explanation_handoff(
+                    task=int(final_cfg.task_idx),
+                    run_id=str(metrics_payload.get("step5_run_id") or ""),
+                    checkpoint=str(final_cfg.save_file),
+                    explanation_metrics=explanation_metrics,
+                    rating_source=rating_source_ref,
+                    generation_config=_decode_cfg,
+                    ccv_fca_report={
+                        "fca_enabled": True,
+                        "control_projection_module": "explanation_control_projection",
+                    },
+                    route_explainer_stats={
+                        "split": str(_split_lab),
+                        "eval_control_mode": STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT,
+                    },
+                )
+                official_report = {
+                    "schema_version": "odcr_step5_official_eval_report/1",
+                    "stage": "step5",
+                    "task_id": int(final_cfg.task_idx),
+                    "split": str(_split_lab),
+                    "checkpoint": os.path.abspath(str(final_cfg.save_file)),
+                    "metrics_path": os.path.abspath(metrics_output_path),
+                    "rating_metrics_source": "step3_eval_handoff",
+                    "step5_rating_metrics_overwritten": False,
+                    "metrics": final,
+                }
+                composed_paper = compose_step3_rating_step5_explanation_report(
+                    rating_source=rating_source_ref,
+                    explanation_handoff=handoff_payload,
+                )
+                composed_paper["split"] = str(_split_lab)
+                composed_paper["explanation_paper_metrics"] = final.get("paper_metrics") or {}
+                atomic_write_json(os.path.join(eval_sub, "eval_handoff.json"), handoff_payload)
+                atomic_write_json(os.path.join(eval_sub, "official_eval_report.json"), official_report)
+                atomic_write_json(os.path.join(eval_sub, "paper_metrics.json"), composed_paper)
+                if str(_split_lab) == "valid":
+                    _sp_lock = _state_paths_from_save_file(str(final_cfg.save_file))
+                    _valid_lock = {
+                        "schema_version": "odcr_step5e_auto_selected_params/1",
+                        "locked_split": "valid",
+                        "selection_basis": "valid official paper_greedy_25 metrics",
+                        "test_used_for_selection": False,
+                        "checkpoint": os.path.abspath(str(final_cfg.save_file)),
+                        "checkpoint_hash": checkpoint_file_sha256(str(final_cfg.save_file)),
+                        "global_step": (load_json_file(_sp_lock["best_event"]).get("global_step") if os.path.isfile(_sp_lock["best_event"]) else None),
+                        "epoch": (load_json_file(_sp_lock["best_event"]).get("epoch") if os.path.isfile(_sp_lock["best_event"]) else None),
+                        "valid_official_metrics": final.get("paper_metrics") or {},
+                        "decode_policy": official_eval_policy,
+                        "reference_policy": {
+                            "source": "raw_ref_text",
+                            "metric_builder": "base_utils.build_paper_metric_inputs",
+                            "max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                        },
+                        "prediction_policy": {
+                            "source": "raw_pred_text",
+                            "metric_builder": "base_utils.build_paper_metric_inputs",
+                            "max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                        },
+                        "token_length_policy": final.get("official_metric_input_policy") or {},
+                        "metrics_implementation": "base_utils.official_paper_metrics",
+                        "content_evidence_used": True,
+                        "content_evidence_contract": content_evidence_contract,
+                        "selected_params": {
+                            "best_metric_policy": "official_paper_metrics_valid_only",
+                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_required",
+                            "best_cache_policy": "token_cache_identity_content_affecting_only",
+                        },
+                        "candidates": [
+                            {
+                                "candidate_id": "current_locked_checkpoint",
+                                "checkpoint": os.path.abspath(str(final_cfg.save_file)),
+                                "valid_official_metrics": final.get("paper_metrics") or {},
+                                "selected": True,
+                                "reason": "first clean valid official paper_greedy_25 lock for this run",
+                            }
+                        ],
+                        "not_selected": [],
+                        "locked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                    os.makedirs(_sp_lock["meta_dir"], exist_ok=True)
+                    atomic_write_json(_sp_lock["auto_selected_params"], _valid_lock)
+                    _auto_report_dir = os.path.join(get_odcr_root(), "AI_analysis", "05_final_reports")
+                    os.makedirs(_auto_report_dir, exist_ok=True)
+                    atomic_write_json(
+                        os.path.join(_auto_report_dir, "step5e_auto_selection_machine_verdict.json"),
+                        {
+                            "schema_version": "odcr_step5e_auto_selection_machine_verdict/1",
+                            "status": "locked_valid_best",
+                            "test_used_for_selection": False,
+                            "auto_selected_params": _valid_lock,
+                        },
+                    )
+                samples_path = os.path.join(eval_sub, "samples.jsonl")
+                with open(samples_path, "w", encoding="utf-8") as sf:
+                    for row in list(merged_for_pred)[:200]:
+                        sf.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                metrics_payload["official_eval_outputs"] = {
+                    "eval_handoff": os.path.abspath(os.path.join(eval_sub, "eval_handoff.json")),
+                    "official_eval_report": os.path.abspath(os.path.join(eval_sub, "official_eval_report.json")),
+                    "paper_metrics": os.path.abspath(os.path.join(eval_sub, "paper_metrics.json")),
+                    "samples": os.path.abspath(samples_path),
+                }
+                if str(_split_lab) == "valid":
+                    metrics_payload["official_eval_outputs"]["auto_selected_params"] = os.path.abspath(
+                        _state_paths_from_save_file(str(final_cfg.save_file))["auto_selected_params"]
+                    )
+                try:
+                    metrics_log_path = write_post_train_eval_metrics_log(eval_sub)
+                    metrics_payload["official_eval_outputs"]["metrics_log"] = os.path.abspath(metrics_log_path)
+                except Exception as exc:
+                    train_logger.warning(
+                        "[metrics_log] failed to update post_train_eval metrics summary: %s",
+                        exc,
+                        extra=log_route_extra(train_logger, ROUTE_SUMMARY),
+                    )
                 with open(metrics_output_path, "w", encoding="utf-8") as f:
                     json.dump(metrics_payload, f, ensure_ascii=False, indent=2, default=str)
                 _cfg_eval = dict(final_cfg.to_log_dict())
@@ -9405,68 +9476,36 @@ def _run_ddp(args):
                 )
                 _eval_elapsed = time.perf_counter() - _eval_t0
                 _eval_min, _eval_sec = divmod(int(_eval_elapsed), 60)
-                if _rating_only:
-                    _rec = final.get("recommendation") or {}
-                    _lines = [
-                        "FINAL RESULTS",
-                        _task_desc,
-                        f"Started: {_eval_start_str}",
-                        (
-                            "[Recommendation] "
-                            f"MAE = {_rec.get('mae')} | RMSE = {_rec.get('rmse')} "
-                            f"| protocol={CODE1_COMPATIBLE_RATING_PROTOCOL_ID}"
-                        ),
-                        "[Rating Eval] no_generate=true scorer_only=true target_only=true",
-                    ]
-                else:
-                    _lines = format_final_results_lines(
-                        final,
-                        task_description=_task_desc,
-                        start_time=_eval_start_str,
-                        decode_cfg=_decode_cfg,
-                        collapse_stats=collapse_stats,
-                        eval_run_tag=_eval_tag,
-                    )
+                _lines = format_final_results_lines(
+                    final,
+                    task_description=_task_desc,
+                    start_time=_eval_start_str,
+                    decode_cfg=_decode_cfg,
+                    collapse_stats=collapse_stats,
+                    eval_run_tag=_eval_tag,
+                )
                 _lines.append(f"Eval elapsed: {_eval_min}m {_eval_sec}s ({_eval_elapsed:.1f}s)")
                 _lines.append(f"Eval artefacts: {eval_sub}")
                 log_final_results_block(train_logger, _lines)
                 finalize_run_log(train_logger)
                 try:
                     flush_odcr_file_handlers(train_logger)
-                    if _rating_only:
-                        _digest_p = os.path.join(eval_sub, f"rating_{_split_lab}_digest.json")
-                        with open(_digest_p, "w", encoding="utf-8") as _rdf:
-                            json.dump(
-                                {
-                                    "schema_version": "odcr_step5_rating_only_digest/1",
-                                    "split": _split_lab,
-                                    "metric_protocol": CODE1_COMPATIBLE_RATING_PROTOCOL_ID,
-                                    "recommendation": final.get("recommendation"),
-                                    "sample_count": final.get("sample_count"),
-                                    "no_generate": True,
-                                },
-                                _rdf,
-                                ensure_ascii=False,
-                                indent=2,
-                                default=str,
-                            )
-                    else:
-                        _digest_p = write_eval_digest_log(
-                            eval_subdir=eval_sub,
-                            metrics_final=final,
-                            merged_rows=merged_for_pred,
-                            final_cfg=final_cfg,
-                            decode_cfg=dict(_decode_cfg),
-                            active_log_file=(log_path or "").strip() or None,
-                            task_idx=int(final_cfg.task_idx),
-                            auxiliary=str(args.auxiliary),
-                            target=str(args.target),
-                            eval_export_tag=_eval_tag,
-                            command=str(args.command),
-                            eval_timing_summary=dict(
-                                (metrics_payload.get("eval_performance") or {}).get("summary") or {}
-                            ),
-                        )
+                    _digest_p = write_eval_digest_log(
+                        eval_subdir=eval_sub,
+                        metrics_final=final,
+                        merged_rows=merged_for_pred,
+                        final_cfg=final_cfg,
+                        decode_cfg=dict(_decode_cfg),
+                        active_log_file=(log_path or "").strip() or None,
+                        task_idx=int(final_cfg.task_idx),
+                        auxiliary=str(args.auxiliary),
+                        target=str(args.target),
+                        eval_export_tag=_eval_tag,
+                        command=str(args.command),
+                        eval_timing_summary=dict(
+                            (metrics_payload.get("eval_performance") or {}).get("summary") or {}
+                        ),
+                    )
                     train_logger.info(
                         "[eval_digest] wrote %s",
                         _digest_p,
@@ -9528,7 +9567,9 @@ def _run_ddp(args):
                     merged = merge_eval_rows_by_sample_id([rows_local], _real_n)
                     final, _, _ = _metrics_final_dict_from_rows(
                         merged,
-                        rating_only=bool(getattr(args, "rating_only", False)),
+                        tokenizer=get_step5_tokenizer(),
+                        prediction_max_length=int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                        reference_max_length=int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
                     )
                     _eval_perf["metrics_time"] = float(time.perf_counter() - _mt0)
                     _rank0_write_eval_artifacts(
@@ -9538,7 +9579,8 @@ def _run_ddp(args):
                         eval_model=eval_model,
                         eval_perf=_eval_perf,
                     )
-                dist.barrier()
+                if not eval_only:
+                    dist.barrier()
                 if rank == 0 and sanity_cmp:
                     train_logger.info(
                         "[Eval sanity] 已使用 --eval-single-process-safe，跳过 DDP/单路二次对比（请分别跑 DDP 与 safe 两次对比指标）。",
@@ -9547,7 +9589,7 @@ def _run_ddp(args):
             else:
                 eval_model = _make_model(final_cfg, args, local_rank)
                 _load_step5_checkpoint_fail_fast(eval_model, final_cfg.save_file, final_cfg, local_rank)
-                if rank == 0 and not bool(getattr(args, "rating_only", False)):
+                if rank == 0:
                     train_logger.info(
                         "[generate_kwargs_effective] %s",
                         json.dumps(
@@ -9610,7 +9652,9 @@ def _run_ddp(args):
                     merged = merge_eval_rows_by_sample_id(gathered_rows, _real_n)
                     final, _, _ = _metrics_final_dict_from_rows(
                         merged,
-                        rating_only=bool(getattr(args, "rating_only", False)),
+                        tokenizer=get_step5_tokenizer(),
+                        prediction_max_length=int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                        reference_max_length=int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
                     )
                     _eval_perf_ddp["metrics_time"] = float(time.perf_counter() - _mm0)
                     pl = (
@@ -9637,36 +9681,25 @@ def _run_ddp(args):
                             pin_memory=pin_memory,
                             collate_fn=step5_collate_fn,
                         )
-                        if bool(getattr(args, "rating_only", False)):
-                            rows_s = evalRatingOnlyModel(
-                                eval_model_s,
-                                dl_s,
-                                local_rank,
-                                split_label=str(getattr(args, "_odcr_eval_split_label", "") or "valid"),
-                                non_blocking_h2d=non_blocking_h2d,
-                            )["rows"]
-                        else:
-                            rows_s = evalModel(
-                                eval_model_s,
-                                dl_s,
-                                local_rank,
-                                step5_innov_cfg=parse_step5_innovation_config_json(
-                                    str(final_cfg.step5_innovation_config_json)
-                                ),
-                                non_blocking_h2d=non_blocking_h2d,
-                            )["rows"]
+                        rows_s = evalModel(
+                            eval_model_s,
+                            dl_s,
+                            local_rank,
+                            step5_innov_cfg=parse_step5_innovation_config_json(
+                                str(final_cfg.step5_innovation_config_json)
+                            ),
+                            non_blocking_h2d=non_blocking_h2d,
+                        )["rows"]
                         merged_s = merge_eval_rows_by_sample_id([rows_s], _real_n)
                         final_s, _, _ = _metrics_final_dict_from_rows(
                             merged_s,
-                            rating_only=bool(getattr(args, "rating_only", False)),
+                            tokenizer=get_step5_tokenizer(),
+                            prediction_max_length=int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
+                            reference_max_length=int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
                         )
                         d_mae = abs(float(final["recommendation"]["mae"]) - float(final_s["recommendation"]["mae"]))
                         d_rmse = abs(float(final["recommendation"]["rmse"]) - float(final_s["recommendation"]["rmse"]))
-                        d_bleu = (
-                            0.0
-                            if bool(getattr(args, "rating_only", False))
-                            else abs(float(final["explanation"]["bleu"]["4"]) - float(final_s["explanation"]["bleu"]["4"]))
-                        )
+                        d_bleu = abs(float(final["explanation"]["bleu"]["4"]) - float(final_s["explanation"]["bleu"]["4"]))
                         train_logger.info(
                             "[Eval sanity] DDP vs rank0-sequential | d_mae=%.6g d_rmse=%.6g d_bleu4=%.6g",
                             d_mae,
@@ -9681,7 +9714,11 @@ def _run_ddp(args):
             _sf = final_cfg.save_file
             train_logger.info("DONE（train --train-only：已跳过训练后评估；权重: %s）。", _sf)
             finalize_run_log(train_logger)
-        dist.barrier()
+        # Eval-only rank0 computes CPU text metrics and writes large artifacts after
+        # all_gather_object. Non-rank0 must not wait in NCCL here, or long metric
+        # tails can trip the watchdog after otherwise successful eval.
+        if not eval_only:
+            dist.barrier()
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

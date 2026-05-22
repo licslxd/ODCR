@@ -48,5 +48,7 @@ Step3 validation now uses the active aux runtime bridge through `./odcr`:
 
 The old direct `python code/tools/odcr_tmux_gpu_bridge.py` generic execution
 surface is retired. The wrapper may only delegate to the aux runtime bridge or
-fail fast; it must not execute `repo-command`, `repo-script`, `repo-module`,
-`command-file`, arbitrary shell, background long-run, or allocation commands.
+fail fast. Legacy mode names `repo-command`, `repo-script`, `repo-module`, and
+`command-file` stay retired; non-formal GPU dispatch uses
+`./odcr runtime bridge exec -- ...`, while ODCR formal model training remains
+blocked.

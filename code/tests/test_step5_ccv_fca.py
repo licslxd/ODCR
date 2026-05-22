@@ -13,7 +13,7 @@ from odcr_core.gather_schema import GatheredBatch  # noqa: E402
 from odcr_core.step5_innovation import (  # noqa: E402
     STEP5_EVIDENCE_FEATURE_DIM,
     build_ccv_control_packet,
-    build_step5b_explainer_gate,
+    build_step5_explanation_gate,
     evidence_basis_fca_loss,
     for_test_default_step5_innovation_config,
     parse_step5_innovation_config_json,
@@ -75,8 +75,8 @@ class TestStep5CCVFCA(unittest.TestCase):
             },
             allow_test_defaults=True,
         )
-        base_gate = build_step5b_explainer_gate(batch, base_cfg)
-        changed_gate = build_step5b_explainer_gate(batch, changed_cfg)
+        base_gate = build_step5_explanation_gate(batch, base_cfg)
+        changed_gate = build_step5_explanation_gate(batch, changed_cfg)
         self.assertGreater(
             float(changed_gate.explainer_weight[0]),
             float(base_gate.explainer_weight[0]),
@@ -97,7 +97,7 @@ class TestStep5CCVFCA(unittest.TestCase):
         cfg = for_test_default_step5_innovation_config()
         batch = _batch()
         packet = build_ccv_control_packet(batch, cfg)
-        gate = build_step5b_explainer_gate(batch, cfg)
+        gate = build_step5_explanation_gate(batch, cfg)
         torch.manual_seed(0)
         scorer_h = torch.randn(2, 4)
         explainer_h = scorer_h + 0.05 * torch.randn(2, 4)

@@ -322,200 +322,61 @@ def _step4_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
     return payload
 
 
-def _step5_pair_ready_for_merge(
-    *,
-    repo_root: Path,
-    run_root: Path,
-    run_summary: Mapping[str, Any],
-    step5_head: str,
-) -> dict[str, Any]:
-    if step5_head not in {"step5A", "step5B"}:
-        return {"ready": False, "paired_run_id": None, "reason": "not_head_run"}
-    other_head = "step5B" if step5_head == "step5A" else "step5A"
-    try:
-        numeric = run_naming.step5_numeric_slug(run_root.name)
-    except ValueError:
-        return {"ready": False, "paired_run_id": None, "reason": "run_id_invalid"}
-    other_run_id = f"{numeric}_{other_head}"
-    other_root = run_root.parent / other_run_id
-    other_summary = _load_json(other_root / "meta" / "run_summary.json", required=False)
-    other_status = str(other_summary.get("status") or "").strip().lower()
-    if other_status not in OK_RUN_SUMMARY_STATUSES:
-        return {"ready": False, "paired_run_id": other_run_id, "reason": f"paired_status={other_status or 'missing'}"}
-    if str(other_summary.get("step5_head") or run_naming.step5_head_from_run_id(other_run_id)) != other_head:
-        return {"ready": False, "paired_run_id": other_run_id, "reason": "paired_head_mismatch"}
-    lhs_sig, lhs_missing = _step5_merge_signature(run_root, run_summary)
-    rhs_sig, rhs_missing = _step5_merge_signature(other_root, other_summary)
-    if lhs_missing or rhs_missing:
-        missing = sorted({f"current.{key}" for key in lhs_missing} | {f"paired.{key}" for key in rhs_missing})
-        return {"ready": False, "paired_run_id": other_run_id, "reason": "compatibility_metadata_missing", "missing": missing}
-    for key in sorted(lhs_sig):
-        lhs = str(lhs_sig.get(key) or "").strip()
-        rhs = str(rhs_sig.get(key) or "").strip()
-        if lhs and rhs and lhs != rhs:
-            return {"ready": False, "paired_run_id": other_run_id, "reason": f"{key}_mismatch"}
-    return {
-        "ready": True,
-        "paired_run_id": other_run_id,
-        "reason": None,
-        "compatibility_keys": sorted(lhs_sig),
-    }
-
-
-def _step5_merge_signature(run_root: Path, run_summary: Mapping[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    meta = run_root / "meta"
-    resolved = _load_json(meta / "resolved_config.json", required=False)
-    source_table = _load_json(meta / "source_table.json", required=False)
-    missing: list[str] = []
-    if not resolved:
-        missing.append("resolved_config")
-    if not source_table:
-        missing.append("source_table")
-    run_block = resolved.get("run") if isinstance(resolved.get("run"), Mapping) else {}
-    tuning = resolved.get("step5_tuning") if isinstance(resolved.get("step5_tuning"), Mapping) else {}
-    sampler = resolved.get("step5_sampler") if isinstance(resolved.get("step5_sampler"), Mapping) else {}
-    prompt = resolved.get("step5_prompt_templates") if isinstance(resolved.get("step5_prompt_templates"), Mapping) else {}
-    effective_epoch = resolved.get("step5_effective_epoch") if isinstance(resolved.get("step5_effective_epoch"), Mapping) else {}
-    batch_candidates = resolved.get("step5_batch_candidates") if isinstance(resolved.get("step5_batch_candidates"), Mapping) else {}
-    sig = {
-        "from_step3": run_summary.get("from_step3") or run_block.get("from_step3"),
-        "from_step4": run_summary.get("from_step4") or run_block.get("from_step4"),
-        "selected_tuning_candidate": run_summary.get("selected_tuning_candidate") or tuning.get("selected_tuning_candidate"),
-        "fallback_tuning_candidate": run_summary.get("fallback_tuning_candidate") or tuning.get("fallback_tuning_candidate"),
-        "batch_candidate": tuning.get("batch_candidate"),
-        "fallback_batch_candidate": tuning.get("fallback_batch_candidate"),
-        "selected_budget_candidate": tuning.get("selected_budget_candidate"),
-        "sampler_contract_source": sampler.get("contract_source"),
-        "sampler_seed": sampler.get("seed"),
-        "full_audit_default_allowed": sampler.get("full_audit_default_allowed"),
-        "legacy_gold_heavy_exports_allowed": sampler.get("legacy_gold_heavy_exports_allowed"),
-        "prompt_registry": prompt.get("schema_version"),
-        "prompt_train_policy": prompt.get("train_policy"),
-        "prompt_valid_test_policy": prompt.get("valid_test_policy"),
-        "max_effective_epochs": effective_epoch.get("max_effective_epochs"),
-        "early_stopping_patience": effective_epoch.get("early_stopping_patience"),
-        "batch_selected_default": batch_candidates.get("selected_default"),
-    }
-    required = (
-        "from_step3",
-        "from_step4",
-        "selected_tuning_candidate",
-        "fallback_tuning_candidate",
-        "batch_candidate",
-        "sampler_contract_source",
-        "prompt_registry",
-    )
-    for key in required:
-        if sig.get(key) in (None, ""):
-            missing.append(key)
-    return sig, missing
-
-
 def _step5_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, Any]) -> dict[str, Any]:
     summary_status = str(run_summary.get("status") or "").strip().lower()
-    step5_head = run_naming.parse_step5_head(
-        str(run_summary.get("step5_head") or run_naming.step5_head_from_run_id(run_root.name))
+    explanation_handoff_payload = _load_json(run_root / "meta" / "explanation_handoff.json", required=False)
+    handoff_schema = str(explanation_handoff_payload.get("schema_version") or "")
+    handoff_ok = (
+        handoff_schema.startswith("odcr_step5_explanation_handoff/")
+        and str(explanation_handoff_payload.get("status") or "").strip().lower() in {"ok", "completed", "accepted"}
+        and bool(explanation_handoff_payload.get("no_rating_training_performed"))
     )
-    eval_handoff_payload = _load_json(run_root / "meta" / "eval_handoff.json", required=False)
-    eval_handoff_schema = str(eval_handoff_payload.get("schema_version") or "")
-    eval_handoff_ok = (
-        (
-            eval_handoff_schema.startswith("odcr_step5_eval_handoff/")
-            or eval_handoff_schema.startswith("odcr_step5A_rating_eval_handoff/")
-        )
-        and str(eval_handoff_payload.get("status") or "").strip().lower() in {"ok", "completed", "accepted"}
-    )
+    rating_source = explanation_handoff_payload.get("rating_source") if isinstance(explanation_handoff_payload, Mapping) else None
+    rating_source_ok = isinstance(rating_source, Mapping) and str(rating_source.get("status") or "ok").lower() in {"ok", "accepted"}
     checkpoint = path_layout.best_model_path(run_root)
     checkpoint_ok, checkpoint_error, checkpoint_lineage = _checkpoint_valid("step5", checkpoint)
     selected_checkpoint = _repo_relative(repo_root, checkpoint) if checkpoint_ok else None
     selected_checkpoint_hash = checkpoint_file_sha256(checkpoint) if checkpoint_ok and checkpoint.is_file() else None
-    selected_checkpoint_lineage = (
-        _repo_relative(repo_root, _checkpoint_lineage_path(run_root, checkpoint)) if checkpoint_ok else None
-    )
+    selected_checkpoint_lineage = _repo_relative(repo_root, _checkpoint_lineage_path(run_root, checkpoint)) if checkpoint_ok else None
+    reasons: list[str] = []
     if summary_status == "train_completed_no_eval" and checkpoint_ok:
-        final_status = "train_completed_no_eval"
-        downstream_ready = False
-        ready_for = []
-        reasons: list[str] = ["needs_eval_handoff"]
-        eval_status = "needs_eval_handoff"
-    elif summary_status in {"completed_with_eval_handoff", "eval_handoff_accepted"}:
-        final_status = "completed_with_eval_handoff" if checkpoint_ok and eval_handoff_ok else "not_ready"
-        downstream_ready = step5_head == "combined"
-        downstream_ready = downstream_ready and final_status == "completed_with_eval_handoff"
-        ready_for = ["eval", "rerank"] if downstream_ready else []
-        reasons = []
-        if not checkpoint_ok:
-            reasons.append(checkpoint_error or "checkpoint_not_valid")
-        if not eval_handoff_ok:
-            reasons.append("eval_handoff_not_accepted")
-        eval_status = "completed" if final_status == "completed_with_eval_handoff" else "not_ready"
-    elif summary_status in {"ok", "completed", "success"} and checkpoint_ok:
-        final_status = "completed"
-        downstream_ready = step5_head == "combined"
-        ready_for = ["eval", "rerank"] if downstream_ready else []
-        reasons = []
-        eval_status = "legacy_or_combined_completed"
+        final_status = "train_completed_no_explanation_handoff"
+        explanation_status = "pending"
+    elif summary_status in {"completed_with_explanation_handoff", "completed", "ok", "success"} and checkpoint_ok and handoff_ok:
+        final_status = "completed_with_explanation_handoff"
+        explanation_status = "completed"
     elif summary_status in BAD_RUN_SUMMARY_STATUSES:
         final_status = summary_status
-        downstream_ready = False
-        ready_for = []
-        reasons = [str(run_summary.get("latest_error") or summary_status)]
-        if summary_status == "train_completed_no_eval":
-            reasons = ["needs_eval_handoff"]
-        eval_status = "needs_eval_handoff" if summary_status == "train_completed_no_eval" else final_status
+        explanation_status = "failed"
+        reasons.append(str(run_summary.get("latest_error") or summary_status))
     else:
         final_status = "not_ready" if summary_status else "missing_run_summary"
-        downstream_ready = False
-        ready_for = []
-        reasons = [checkpoint_error or "checkpoint_not_valid"]
-        eval_status = "not_ready"
-    pair_gate = _step5_pair_ready_for_merge(
-        repo_root=repo_root,
-        run_root=run_root,
-        run_summary=run_summary,
-        step5_head=step5_head,
-    )
-    if step5_head in {"step5A", "step5B"} and not downstream_ready:
-        pair_reason = str(pair_gate.get("reason") or "")
-        if pair_reason:
-            reasons = [*reasons, pair_reason]
-    step5a_rating_ready = (
-        step5_head == "step5A"
-        and final_status == "completed_with_eval_handoff"
-        and eval_handoff_ok
-        and bool(eval_handoff_payload.get("paper_comparable_single_run"))
-    )
-    head_ready = (
-        step5_head in {"step5A", "step5B"}
-        and final_status == "completed_with_eval_handoff"
-        and eval_handoff_ok
-    )
+        explanation_status = "not_ready"
+        reasons.append(checkpoint_error or "checkpoint_not_valid")
+    if final_status != "completed_with_explanation_handoff":
+        if checkpoint_ok and not handoff_ok:
+            reasons.append("explanation_handoff_missing_or_unaccepted")
+    if not rating_source_ok:
+        reasons.append("rating_source_missing_or_unaccepted")
+    downstream_ready = final_status == "completed_with_explanation_handoff" and rating_source_ok
     return {
         "final_status": final_status,
+        "stage": "step5",
+        "mode": "explanation_only",
         "downstream_ready": downstream_ready,
-        "ready_for": ready_for,
+        "ready_for": ["eval", "rerank"] if downstream_ready else [],
         "status_source": "run_summary",
         "rejection_reasons": reasons,
-        "head": step5_head,
-        "step5_head": step5_head,
-        "formal_namespace": "head" if step5_head in {"step5A", "step5B"} else "combined",
-        "train_status": "completed" if final_status in {"completed", "completed_with_eval_handoff", "train_completed_no_eval"} else final_status,
-        "eval_status": eval_status,
-        "needs_eval_handoff": final_status == "train_completed_no_eval",
-        "head_ready": bool(head_ready),
-        "step5A_rating_ready": bool(step5a_rating_ready),
-        "step5B_ready": bool(step5_head == "step5B" and head_ready),
-        "combined_step5_ready": bool(downstream_ready),
-        "paper_comparable_single_run": bool(eval_handoff_payload.get("paper_comparable_single_run")) if eval_handoff_ok else False,
-        "paper_comparable_mean_std": bool(eval_handoff_payload.get("paper_comparable_mean_std")) if eval_handoff_ok else False,
-        "rerank_touched": bool(eval_handoff_payload.get("rerank_touched") or run_summary.get("rerank_touched")),
-        "generation_touched": bool(eval_handoff_payload.get("generation_touched") or run_summary.get("generation_touched")),
-        "downstream_ready_for_merge": (
-            bool(pair_gate.get("ready")) and final_status == "completed_with_eval_handoff"
-            if step5_head in {"step5A", "step5B"}
-            else False
-        ),
-        "merge_gate": pair_gate,
+        "head": "explanation",
+        "step5_head": "explanation",
+        "train_status": "completed" if checkpoint_ok else "not_ready",
+        "explanation_status": explanation_status,
+        "rating_source": rating_source if isinstance(rating_source, Mapping) else None,
+        "rating_source_status": "ok" if rating_source_ok else "missing",
+        "no_rating_training_performed": True,
+        "paper_rating_ready": rating_source_ok,
+        "paper_explanation_ready": downstream_ready,
+        "paper_comparable_mean_std": False,
         "selected_tuning_candidate": run_summary.get("selected_tuning_candidate"),
         "fallback_tuning_candidate": run_summary.get("fallback_tuning_candidate"),
         "step5_effective_samples": run_summary.get("step5_effective_samples"),
@@ -523,13 +384,9 @@ def _step5_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
         "selected_checkpoint": selected_checkpoint,
         "selected_checkpoint_hash": selected_checkpoint_hash,
         "checkpoint_lineage": selected_checkpoint_lineage,
-        "checkpoint_lineage_schema": checkpoint_lineage.get("sidecar_schema_version") if checkpoint_lineage else None,
-        "eval_handoff_status": dict(eval_handoff_payload) if eval_handoff_payload else None,
-        "supersedes": [],
-        "failure_history_preserved": bool(run_summary.get("failure_history")),
-        "do_not_use_quality_audit_as_final_truth": True,
+        "explanation_handoff": _repo_relative(repo_root, run_root / "meta" / "explanation_handoff.json") if handoff_ok else None,
+        "explanation_handoff_status": explanation_handoff_payload if handoff_ok else None,
     }
-
 
 def build_stage_status(
     *,
@@ -648,8 +505,8 @@ def build_stage_status(
     }
     for key in (
         "selected_full_audit_export",
-        "step5A_scorer_train_export",
-        "step5B_explainer_train_export",
+        "rating_stability_control_scorer_train_export",
+        "legacy_explainer_alias_explainer_train_export",
         "step5_train_manifest",
         "route_intersection_report",
         "step5_dedicated_exports_status",
@@ -669,8 +526,8 @@ def build_stage_status(
             payload[key] = stage_payload.get(key)
     for key in (
         "selected_full_audit_export",
-        "step5A_scorer_train_export",
-        "step5B_explainer_train_export",
+        "rating_stability_control_scorer_train_export",
+        "legacy_explainer_alias_explainer_train_export",
         "step5_train_manifest",
         "route_intersection_report",
         "step5_dedicated_exports_status",
@@ -695,9 +552,8 @@ def build_stage_status(
         "eval_status",
         "needs_eval_handoff",
         "head_ready",
-        "step5A_rating_ready",
-        "step5B_ready",
-        "combined_step5_ready",
+        "explanation_ready",
+        "rating_source_ok",
         "paper_comparable_single_run",
         "paper_comparable_mean_std",
         "rerank_touched",

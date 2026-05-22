@@ -3,6 +3,15 @@
 This file is mandatory reading for every Codex/GPT/AI coding agent and every
 developer before changing ODCR. These are architecture rules, not suggestions.
 
+## ODCR Reusable Skills
+
+Future Codex tasks must read these reusable skills before the task-specific
+prompt:
+
+- `docs/skills/ODCR_GPU_SKILL.md`
+- `docs/skills/ODCR_AUDIT_DELIVERY_SKILL.md`
+- `docs/skills/ODCR_CACHE_SKILL.md`
+
 ## Non-Negotiable One-Control Rules
 
 1. User-visible entrypoints are only:
@@ -78,15 +87,15 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     `C9_balanced_quantile` / `C9_bucket_balanced` CPU-preview candidates are
     superseded, and formal Step4 remains blocked until real GPU E4 validation
     completes.
-17. Step5 live semantics are Step5A/Step5B dual paths: Step5A uses
-    LCI/UCI for scorer stability on `route_scorer` samples; Step5B uses
-    CCV/FCA for controlled explanation on `route_explainer` samples. Step5
-    `lci`, `uci`, `explainer_gate`, `ccv`, `fca`, `model`, and
+17. Step5 live semantics are explanation-only. Rating metrics come from the
+    Step3 accepted scorer declared in `rating_source`, and Step5 consumes
+    Step4 `route_explainer` samples for controlled explanation training.
+    Step5 `explainer_gate`, `ccv`, `fca`, `model`, and
     `train.explainer_loss_weight` parameters are One-Control parameters under
     `configs/odcr.yaml: step5`; CCV adapter dimensions and Step5 native LoRA
     controls belong under `step5.ccv` / `step5.ccv.native_lora`. Step4
     `sample_weight_hint` is the posterior base sample weight; Step5
-    `explainer_gate.explainer_only_multiplier` is only a Step5B training
+    `explainer_gate.explainer_only_multiplier` is only an explanation training
     scheduling multiplier. Do not bypass these with hidden active defaults or
     retired `adv` / `eta` / `lambda_lci` / `lambda_fca` aliases.
 18. Cross-stage reuse is gated by lineage fingerprints. Preprocess
@@ -96,6 +105,12 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     task/domain lineage before reuse. Missing or mismatched lineage must
     fail-fast and require rerun; do not silently accept old v2.x preprocess
     artifacts, old Step3/Step4/Step5 checkpoints, or old eval/rerank schemas.
+    Reusable cache identity must be content-affecting only: factors that change
+    cached rows, bytes, token ids, labels, control tensors, generated outputs,
+    or metrics may invalidate cache; audit-only lineage such as loss weights,
+    training epochs, run ids, runtime diagnostics, GPU state, and decode knobs
+    must be recorded in manifest/source-table metadata without forcing token
+    cache rebuild unless they actually change the cached artifact content.
 19. Formal run handoff starts at `meta/run_summary.json`, with the parent
     stage/task or preprocess/unit `latest.json` pointing to it. New resolved
     config and source-table outputs are only `meta/resolved_config.json` and
@@ -119,16 +134,20 @@ developer before changing ODCR. These are architecture rules, not suggestions.
     user-created, already-entered, uniquely validated GPU pane. The only Codex
     GPU protocol is `./odcr runtime bridge discover`, `./odcr runtime bridge
     validate-only`, `./odcr runtime bridge marker-probe`, `./odcr runtime
-    bridge cuda-probe`, and registered `./odcr runtime probe --stage ... --task
-    ... --bounded` commands. `python code/tools/odcr_tmux_gpu_bridge.py` is a
-    thin compatibility wrapper only; `repo-command`, `repo-script`,
-    `repo-module`, `command-file`, arbitrary shell, and allocation commands
-    must fail fast. Runtime evidence lives under
+    bridge cuda-probe`, open non-formal `./odcr runtime bridge exec -- ...`,
+    and registered `./odcr runtime probe --stage ... --task ... --bounded`
+    commands. `python code/tools/odcr_tmux_gpu_bridge.py` is a thin
+    compatibility wrapper only; old legacy modes `repo-command`,
+    `repo-script`, `repo-module`, and `command-file` remain retired. GPU bridge
+    dispatch is no longer closed-whitelist-limited: anything except ODCR
+    formal model training may be dispatched to a fresh-validated GPU pane.
+    Runtime evidence lives under
     `AI_analysis/01_raw_logs` and `AI_analysis/05_final_reports`; validation
     and probes must not write formal run namespaces. The formal namespace guard remains mandatory: validation must
     not write formal latest pointers, formal checkpoints, Step4/Step5/eval/
-    rerank outputs, or paper metrics. Codex may only use the current tmux
-    session's real-time CUDA environment. If CUDA is not visible in the current
+    rerank outputs, or paper metrics. Formal model training remains blocked
+    unless a future explicit formal-training policy opens it. Codex may only
+    use the current tmux session's real-time CUDA environment. If CUDA is not visible in the current
     tmux, fail fast with: "Current tmux does not expose CUDA. Please manually
     run `odcr-enter-gpu <JOBID>` in this same tmux to enter the GPU node, then
     rerun the probe." Do not use a normal admin shell, a tmux session still

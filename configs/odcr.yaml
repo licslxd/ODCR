@@ -905,29 +905,7 @@ step4:
       min_content_retention: 0.45
       min_words: 3
       max_repeat_ngram_ratio: 0.72
-    step5A:
-      high:
-        require_route_scorer: true
-        min_confidence_bucket: 1
-        min_rating_stability: 0.95
-        min_content_retention: 0.94
-        max_uncertainty: 0.06
-        min_text_quality: 0.93
-        min_reliability: 0.80
-      medium:
-        min_confidence_bucket: 1
-        min_rating_stability: 0.86
-        min_content_retention: 0.82
-        max_uncertainty: 0.12
-        min_text_quality: 0.75
-        min_reliability: 0.65
-      low_weighted:
-        min_rating_stability: 0.65
-        min_content_retention: 0.60
-        max_uncertainty: 0.35
-        min_text_quality: 0.55
-        min_reliability: 0.45
-    step5B:
+    explanation:
       high:
         require_route_explainer: true
         min_confidence_bucket: 1
@@ -947,8 +925,7 @@ step4:
         max_uncertainty: 0.35
         min_text_quality: 0.55
     sampling_weight:
-      step5A: {high: 1.20, medium: 0.80, low_weighted: 0.20, reject: 0.00}
-      step5B: {high: 1.20, medium: 0.90, low_weighted: 0.30, reject: 0.00}
+      explanation: {high: 1.20, medium: 0.90, low_weighted: 0.30, reject: 0.00}
   rcr:
     cf_reliability_weights:
       content_retention: 0.36
@@ -1031,18 +1008,32 @@ step4:
     - preprocess_route_scorer_prior
     - preprocess_route_explainer_prior
 
+rating_source:
+  schema_version: odcr_rating_source/1
+  type: step3_accepted_scorer
+  task: 2
+  run: 2
+  checkpoint: runs/step3/task2/2/model/best_observed.pth
+  checkpoint_hash: 9089ac53b138c12ba1260370aed3d637b305f7f7f6a98a7bcbc7721eb5559017
+  eval_handoff: runs/step3/task2/2/meta/eval_handoff.json
+  stage_status: runs/step3/task2/2/meta/stage_status.json
+  protocol: paper_target_only_eval
+  valid_mae: 0.575
+  valid_rmse: 0.8473
+  test_mae: 0.5764
+  test_rmse: 0.8494
+
 step5:
   lifecycle:
     schema_version: odcr_step5_lifecycle/1
     formal_default_phase: train_only
     embedded_final_eval_default: false
     allow_embedded_final_eval_diagnostic: false
-    eval_handoff_required_for_downstream: true
+    explanation_handoff_required_for_downstream: true
     checkpoint_load_policy: cpu_staged
     cpu_staged_checkpoint_load_required: true
     write_latest_after_train_only: false
     e5_post_train_lifecycle_required: true
-    step5B_requires_independent_e4_e5: true
   model:
     emsize: 1024
     nlayers: 4
@@ -1092,26 +1083,7 @@ step5:
       preferred_steps_per_effective_epoch: [400, 1100]
       max_steps_per_effective_epoch: 1800
       max_replacement_rate: 0.20
-    step5A:
-      default_candidate: medium
-      target_gold_ratio: 1.00
-      aux_gold_ratio: 0.00
-      cf_ratio: 0.00
-      target_gold_tier_mix:
-        high: 0.60
-        medium: 0.40
-      aux_gold_tier_mix:
-        high: 0.70
-        medium: 0.30
-      cf_tier_mix:
-        high: 1.00
-        medium: 0.00
-        low_weighted: 0.00
-      aux_gold_weight: 0.5
-      cf_high_weight: 1.2
-      cf_medium_weight: 0.8
-      cf_low_weight: 0.2
-    step5B:
+    explanation:
       default_candidate: medium
       target_gold_ratio: 0.43
       aux_gold_ratio: 0.23
@@ -1136,48 +1108,19 @@ step5:
       pilot_fraction_candidates: [0.1, 0.2, 0.5]
   prompt_templates:
     schema_version: odcr_step5_prompt_template_registry/1
-    allowed_template_count: 4
+    allowed_template_count: 3
     train_policy: controlled_canonical_deterministic
     valid_test_policy: fixed_canonical
     input_formatting_only: true
-    score_only_step5A: true
-    explanation_only_step5B: true
-    step5A_active_templates: [A_target_gold_scorer_v1]
-    step5A_retired_templates: [A_aux_gold_scorer_v1, A_aux_cf_scorer_v1]
+    explanation_only: true
+    active_templates:
+      - Step5_target_anchor_explainer_v1
+      - Step5_aux_gold_explainer_v1
+      - Step5_aux_cf_explainer_v1
   task_decoupled_policy:
-    schema_version: odcr_step5_task_decoupled_policy/1
+    schema_version: odcr_step5_explanation_policy/1
     enabled: true
-    step5A:
-      branch: scorer_clean
-      train_components:
-        target_gold: 1.0
-        aux_gold: 0.0
-        cf: 0.0
-      forbid_aux_cf_in_scorer_loss: true
-      forbid_generation: true
-      forbid_big_model: true
-      scorer_init_required: true
-      scorer_init_source: frozen_step3_teacher
-      distillation_enabled: false
-      distillation_weight: 0.0
-      teacher:
-        checkpoint_path: runs/step3/task2/2/model/best_observed.pth
-        checkpoint_sha256: 9089ac53b138c12ba1260370aed3d637b305f7f7f6a98a7bcbc7721eb5559017
-        parity_required: true
-        parity_tolerance: 1.0e-6
-        tokenized_evidence_source: step3_tokenizer_cache
-      residual_calibration:
-        enabled: true
-        zero_init: true
-        feature_source: teacher_pred
-        lambda_gt_initial: 0.0
-        lambda_gt_final: 1.0
-        lambda_distill_initial: 1.0
-        lambda_distill_final: 0.25
-        lambda_residual: 0.05
-        regularizer: huber
-        huber_delta: 0.1
-    step5B:
+    explanation:
       branch: explainer_rich
       train_components:
         target_gold: optional_anchor
@@ -1195,26 +1138,23 @@ step5:
   batch_candidates:
     ddp_world_size: 2
     fsdp_zero_policy: not_introduced
-    selected_default: B224
+    selected_default: B192
     candidates:
       - {id: B96, per_gpu_batch_size: 96, global_batch_size: 192, role: retired_small_baseline_not_primary}
       - {id: B128, per_gpu_batch_size: 128, global_batch_size: 256, role: required_batch_ceiling_probe}
       - {id: B160, per_gpu_batch_size: 160, global_batch_size: 320, role: required_batch_ceiling_probe}
-      - {id: B192, per_gpu_batch_size: 192, global_batch_size: 384, role: fallback_quality_stability_candidate}
-      - {id: B224, per_gpu_batch_size: 224, global_batch_size: 448, role: selected_bounded_tuning_candidate}
-      - {id: B256, per_gpu_batch_size: 256, global_batch_size: 512, role: not_run_throughput_knee_guard}
+      - {id: B192, per_gpu_batch_size: 192, global_batch_size: 384, role: selected_safe_candidate}
+      - {id: B224, per_gpu_batch_size: 224, global_batch_size: 448, role: retired_oom_ceiling_history_not_active}
   tuning:
     enabled: true
-    selected_tuning_candidate: A_TARGET_ONLY+B_RATIO_0+A_NO_CF+B_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_1e-3+W0
-    fallback_tuning_candidate: A_TARGET_ONLY+B_RATIO_0+A_NO_CF+B_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
+    selected_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_1e-3+W0
+    fallback_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
     effective_samples:
-      step5A: 190646
-      step5B: 426541
+      explanation: 426541
     optimizer_steps:
-      step5A: 426
-      step5B: 953
-    batch_candidate: B224
-    fallback_batch_candidate: B192
+      explanation: 953
+    batch_candidate: B192
+    fallback_batch_candidate: B160
     selected_budget_candidate: medium
     pilot_fraction_candidates: [0.1, 0.2, 0.5]
     lr_candidates: [0.001, 0.0005, 0.0002, 0.0015]
@@ -1225,21 +1165,17 @@ step5:
       extended_primary_fraction: 0.5
       extended_backup_fraction: 0.2
     ratio_candidates:
-      step5A:
-        A_TARGET_ONLY: {target_gold: 1.00, aux_gold: 0.00, cf: 0.00}
-      step5B:
-        B_RATIO_0: {target_gold: 0.43, aux_gold: 0.23, cf: 0.34}
-        B_RATIO_1: {target_gold: 0.40, aux_gold: 0.15, cf: 0.45}
-        B_RATIO_2: {target_gold: 0.35, aux_gold: 0.15, cf: 0.50}
+      explanation:
+        STEP5_RATIO_0: {target_gold: 0.43, aux_gold: 0.23, cf: 0.34}
+        STEP5_RATIO_1: {target_gold: 0.40, aux_gold: 0.15, cf: 0.45}
+        STEP5_RATIO_2: {target_gold: 0.35, aux_gold: 0.15, cf: 0.50}
     cf_tier_mix_candidates:
-      step5A:
-        A_NO_CF: {high: 1.00, medium: 0.00, low_weighted: 0.00}
-      step5B:
-        B_CF_MIX_FORMAL_HIGH_MEDIUM: {high: 0.588235, medium: 0.411765, low_weighted: 0.00}
-        B_CF_MIX_0: {high: 0.50, medium: 0.40, low_weighted: 0.10}
-        B_CF_MIX_1: {high: 0.50, medium: 0.35, low_weighted: 0.15}
-        B_CF_MIX_2: {high: 0.45, medium: 0.40, low_weighted: 0.15}
-        B_CF_MIX_3: {high: 0.40, medium: 0.40, low_weighted: 0.20}
+      explanation:
+        STEP5_CF_MIX_FORMAL_HIGH_MEDIUM: {high: 0.588235, medium: 0.411765, low_weighted: 0.00}
+        STEP5_CF_MIX_0: {high: 0.50, medium: 0.40, low_weighted: 0.10}
+        STEP5_CF_MIX_1: {high: 0.50, medium: 0.35, low_weighted: 0.15}
+        STEP5_CF_MIX_2: {high: 0.45, medium: 0.40, low_weighted: 0.15}
+        STEP5_CF_MIX_3: {high: 0.40, medium: 0.40, low_weighted: 0.20}
     gold_tier_mix_candidates:
       target_gold:
         TG_MIX_0: {high: 0.60, medium: 0.40}
@@ -1250,11 +1186,11 @@ step5:
         AG_MIX_1: {high: 0.80, medium: 0.20}
         AG_MIX_2: {high: 0.60, medium: 0.40}
     innovation_weight_candidates:
-      - {id: W0, lci: 0.12, fca: 0.08, explainer_loss_weight: 0.005, ccv_numeric_control_weight: 1.0}
-      - {id: W1, lci: 0.10, fca: 0.08, explainer_loss_weight: 0.005, ccv_numeric_control_weight: 1.0}
-      - {id: W2, lci: 0.12, fca: 0.10, explainer_loss_weight: 0.006, ccv_numeric_control_weight: 1.1}
-      - {id: W3, lci: 0.10, fca: 0.12, explainer_loss_weight: 0.008, ccv_numeric_control_weight: 1.15}
-      - {id: W4, lci: 0.08, fca: 0.05, explainer_loss_weight: 0.003, ccv_numeric_control_weight: 1.0}
+      - {id: W0, fca: 0.08, explainer_loss_weight: 1.0, ccv_numeric_control_weight: 1.0}
+      - {id: W1, fca: 0.08, explainer_loss_weight: 1.0, ccv_numeric_control_weight: 1.0}
+      - {id: W2, fca: 0.10, explainer_loss_weight: 1.2, ccv_numeric_control_weight: 1.1}
+      - {id: W3, fca: 0.12, explainer_loss_weight: 1.5, ccv_numeric_control_weight: 1.15}
+      - {id: W4, fca: 0.05, explainer_loss_weight: 0.8, ccv_numeric_control_weight: 1.0}
   e4_bounded:
     enabled: true
     evidence_level: E4_gpu_shard_forward_bounded_formal_entry_with_validation
@@ -1268,8 +1204,7 @@ step5:
       - {id: B128, per_gpu_batch_size: 128, global_batch_size: 256}
       - {id: B160, per_gpu_batch_size: 160, global_batch_size: 320}
       - {id: B192, per_gpu_batch_size: 192, global_batch_size: 384}
-      - {id: B224, per_gpu_batch_size: 224, global_batch_size: 448}
-      - {id: B256, per_gpu_batch_size: 256, global_batch_size: 512}
+      - {id: B224, per_gpu_batch_size: 224, global_batch_size: 448, role: retired_oom_ceiling_history_not_active}
     dataloader_candidates:
       - {id: C0, workers_per_rank: 4, prefetch_factor: 2}
       - {id: C1, workers_per_rank: 5, prefetch_factor: 2}
@@ -1304,8 +1239,8 @@ step5:
     disable_use_cache_during_training: true
     empty_cache_for_measurement_only: false
   lci:
-    enabled: true
-    weight: 0.12
+    enabled: false
+    weight: 0.0
     confidence_schedule:
       high: 1.25
       medium: 0.75
@@ -1316,7 +1251,7 @@ step5:
     counterfactual_label_weight: 0.25
     robustness_weight: 0.35
   uci:
-    enabled: true
+    enabled: false
     bucket_weights:
       high: 1.25
       medium: 0.75
@@ -1332,7 +1267,7 @@ step5:
     style_shift_diversity_boost: 0.15
     min_weight: 0.0
     max_weight: 2.0
-    explainer_only_multiplier: 0.70
+    explainer_only_multiplier: 1.00
   ccv:
     enabled: true
     control_fields:
@@ -1363,7 +1298,7 @@ step5:
     control_adapter_input_blocks: 6
     native_lora:
       enabled: true
-      target_policy_id: step5_head_aware_lora_allowlist/1
+      target_policy_id: step5_explanation_lora_allowlist/1
       r: 16
       alpha: 32
       dropout: 0.05
@@ -1376,32 +1311,38 @@ step5:
     max_uncertainty: 0.62
     evidence_alignment_mode: evidence_basis
   eval:
-    valid_per_gpu_batch_size: 192
-    valid_batch_size: 384
-    valid_forward_micro_batch_size: 192
-    test_per_gpu_batch_size: 192
-    test_forward_micro_batch_size: 192
+    valid_per_gpu_batch_size: 1024
+    valid_batch_size: 2048
+    valid_forward_micro_batch_size: 1024
+    test_per_gpu_batch_size: 1024
+    test_forward_micro_batch_size: 1024
     metric_accumulation: true
     validation_memory_policy: microbatch_accumulate
-    step5A_validation_mode: scorer_only
+    validation_mode: explanation_only
     formal_entry_E4_validation_required: true
     old_eval_batch_2048_retired: true
     valid_loss_components:
-      step5A:
-        - scorer_rating_mse
-        - lci_weighted
-        - orthogonal_shared_specific
-      step5B:
+      explanation:
         - explainer_ce
-        - fca_weighted
+        - ccv
+        - fca
+  valid_loss:
+    label_max_length: 128
+  final_eval:
+    prediction_max_length: 25
+    reference_max_length: 25
+    official_profile: paper_greedy_25
+    metric_input_builder: build_paper_metric_inputs
+    metrics_implementation: official_paper_metrics
+    test_once: true
   train:
-    batch_size: 448
-    per_gpu_batch_size: 224
+    batch_size: 384
+    per_gpu_batch_size: 192
     epochs: 3
-    train_label_max_length: 36
+    label_max_length: 128
     lr: 1.0e-3
     coef: 0.5
-    explainer_loss_weight: 0.005
+    explainer_loss_weight: 1.0
     backend:
       train_precision: bf16
       per_device_eval_batch_size: 2
@@ -1410,15 +1351,15 @@ step5:
       ema_decay: 0.999
       generate_during_train: false
       full_bleu_eval: {mode: off}
-      full_bleu_decode_strategy: inherit
+      full_bleu_decode_strategy: greedy
       checkpoint_metric: valid_loss
-      checkpoint_selection_mode: valid_loss_only
+      checkpoint_selection_mode: official_paper_metrics
       min_lr_ratio: 0.1
       lambda_ortho: 0.2
       lambda_ortho_xcov: 1.0
       lambda_ortho_cos: 0.25
       lambda_ortho_step5: 0.15
-      loss_weight_batch_diversity: 0.02
+      loss_weight_batch_diversity: 0.0
       batch_diversity_warmup_epochs: 2
       batch_diversity_mode: mean_prob_neg_entropy
       batch_diversity_eps: 1.0e-8
@@ -1429,19 +1370,26 @@ step5:
       batch_diversity_ramp_epochs: 0
       batch_diversity_ramp_target_scale: 1.0
       batch_diversity_ema_init_mode: uniform
-      loss_weight_repeat_ul: 0.045
-      loss_weight_terminal_clean: 0.03
-      terminal_clean_span: 3
+      loss_weight_repeat_ul: 0.03
+      loss_weight_terminal_clean: 0.02
+      terminal_clean_span: 8
   tasks:
     1: {lr: 5.0e-4, coef: 1.0}
-    2: {lr: 1.0e-3, coef: 0.1}
+    2:
+      lr: 1.0e-3
+      coef: 0.1
+      backend:
+        loss_weight_batch_diversity: 0.01
+        batch_diversity_warmup_epochs: 0
+        batch_diversity_ramp_epochs: 1
+        batch_diversity_ramp_target_scale: 0.5
     3: {lr: 5.0e-4, coef: 0.5}
     4:
       epochs: 3
       lr: 1.0e-3
       coef: 0.5
       backend:
-        checkpoint_selection_mode: guarded_composite
+        checkpoint_selection_mode: official_paper_metrics
         checkpoint_guard_valid_loss_rel_tol: 0.01
         loss_weight_batch_diversity: 0.01
         batch_diversity_ramp_target_scale: 0.5
@@ -1451,30 +1399,42 @@ step5:
     8: {lr: 5.0e-4, coef: 1.0}
 
 eval:
-  profile: balanced_2gpu
+  profile: paper_greedy_25
+  split: valid
   profiles:
+    paper_greedy_25:
+      hardware: default
+      decode: paper_greedy_25
+      eval_batch_size: 2048
+      role: official_paper_eval
+      official: true
     fast_single_gpu:
       hardware: a100_1gpu_fast
       decode: mainline
       eval_batch_size: 1024
+      role: diagnostic_only
     balanced_2gpu:
       hardware: default
       decode: mainline
       eval_batch_size: 2048
+      role: diagnostic_only
     loss_max_2gpu:
       hardware: default
       decode: mainline
       eval_batch_size: 4096
+      role: diagnostic_only
     candidate_nucleus_2gpu:
       hardware: default
       decode: candidate_nucleus
       eval_batch_size: 2048
+      role: diagnostic_only
     rerank_quality_2gpu:
       hardware: default
       decode: candidate_nucleus
       rerank: quality
       eval_batch_size: 2048
       num_return_sequences: 3
+      role: diagnostic_only
   decode:
     default:
       decode_strategy: nucleus
@@ -1521,6 +1481,32 @@ eval:
       forbid_eos_after_open_bracket: true
       forbid_bad_terminal_tokens: true
       candidate_family: balanced
+      role: diagnostic_only
+    paper_greedy_25:
+      decode_strategy: greedy
+      decode_seed: null
+      max_explanation_length: 25
+      label_smoothing: 0.02
+      repetition_penalty: 1.0
+      generate_temperature: 1.0
+      generate_top_p: 1.0
+      no_repeat_ngram_size: null
+      min_len: null
+      soft_max_len: null
+      hard_max_len: 25
+      eos_boost_start: 9999
+      eos_boost_value: 0.0
+      tail_temperature: -1.0
+      tail_top_p: -1.0
+      forbid_eos_after_open_quote: false
+      forbid_eos_after_open_bracket: false
+      forbid_bad_terminal_tokens: true
+      decode_token_repeat_window: 4
+      decode_token_repeat_max: 2
+      candidate_family: official_paper
+      candidate_mixed_include_diverse: false
+      domain_fusion_mode: gate_cross_attn
+      role: official_paper_eval
     candidate_nucleus:
       decode_strategy: nucleus
       decode_seed: null

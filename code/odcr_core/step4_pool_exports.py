@@ -25,8 +25,7 @@ from odcr_core.gold_quality import (
 from odcr_core.index_contract import INDEX_CONTRACT_FILENAME, ODCR_ROUTING_TRAIN_CSV
 from odcr_core.step4_dedicated_exports import (
     FULL_AUDIT_PARQUET,
-    STEP5A_SCORER_TRAIN_COLUMNS,
-    STEP5B_EXPLAINER_TRAIN_COLUMNS,
+    STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS,
     STEP5_DEDICATED_SOURCE_REQUIRED_COLUMNS,
     _ParquetSink,
     _file_sha256,
@@ -38,6 +37,7 @@ from odcr_core.step4_dedicated_exports import (
 )
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST, validate_step4_export_ready
 from odcr_core.step5_pool_sampler import (
+    LEGACY_POOL_ALIASES,
     POOL_NAMES,
     POOL_PARQUET_NAMES,
     STEP5_POOL_DISTRIBUTION_REPORT,
@@ -47,6 +47,7 @@ from odcr_core.step5_pool_sampler import (
     STEP5_POOLS_DIRNAME,
     STEP5_SAMPLING_CONTRACT,
     STEP5_SAMPLING_CONTRACT_SCHEMA_VERSION,
+    required_columns_with_legacy_aliases,
 )
 from odcr_core.step5_prompt_templates import prompt_registry_manifest
 
@@ -65,15 +66,11 @@ POOL_EXTRA_COLUMNS: tuple[str, ...] = (
     "coverage_bucket",
     "cf_tier",
     "cf_tier_reason",
-    "cf_tier_step5A",
-    "cf_tier_reason_step5A",
-    "cf_tier_step5B",
-    "cf_tier_reason_step5B",
-    "cf_quality_score_step5A",
-    "cf_quality_score_step5B",
+    "cf_tier_step5_explanation",
+    "cf_tier_reason_step5_explanation",
+    "cf_quality_score_step5_explanation",
     "recommended_sampling_weight",
-    "recommended_sampling_weight_step5A",
-    "recommended_sampling_weight_step5B",
+    "recommended_sampling_weight_step5_explanation",
     "rating_bucket",
     "length_bucket",
     "explanation_length_bucket",
@@ -87,7 +84,7 @@ POOL_EXTRA_COLUMNS: tuple[str, ...] = (
 )
 
 POOL_COLUMNS: tuple[str, ...] = tuple(
-    dict.fromkeys((*STEP5A_SCORER_TRAIN_COLUMNS, *STEP5B_EXPLAINER_TRAIN_COLUMNS, *POOL_EXTRA_COLUMNS))
+    dict.fromkeys((*STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS, *POOL_EXTRA_COLUMNS))
 )
 
 
@@ -242,7 +239,7 @@ def _pool_record(repo_root: Path, path: Path, *, role: str, tier: str, row_count
 
 def _legacy_status(root: Path, run_dir: Path, legacy_dir: Path) -> dict[str, Any]:
     items: dict[str, Any] = {}
-    for name in ("step5A_scorer_train.parquet", "step5B_explainer_train.parquet", "odcr_routing_full_audit.parquet"):
+    for name in ("rating_stability_control_scorer_train.parquet", "step5_explanation_explainer_train.parquet", "odcr_routing_full_audit.parquet"):
         path = legacy_dir / name
         items[name] = {
             "path": _repo_relative(root, path),
@@ -327,8 +324,7 @@ def export_step4_pool_exports(
         "aux_gold": {"high": 0, "medium": 0, "reject": 0},
     }
     cf_tier_counts: dict[str, dict[str, int]] = {
-        "step5A": {"high": 0, "medium": 0, "low_weighted": 0, "reject": 0},
-        "step5B": {"high": 0, "medium": 0, "low_weighted": 0, "reject": 0},
+        "step5_explanation": {"high": 0, "medium": 0, "low_weighted": 0, "reject": 0},
     }
     distribution: dict[str, Any] = {
         "rating_bucket": {},
@@ -338,8 +334,8 @@ def export_step4_pool_exports(
         "text_quality": {},
         "score_summaries": {
             "gold_quality": {},
-            "cf_quality_step5A": {},
-            "cf_quality_step5B": {},
+            "cf_quality_rating_stability_control": {},
+            "cf_quality_step5_explanation": {},
             "uncertainty": {},
             "sample_weight": {},
             "text_quality": {},
@@ -361,8 +357,8 @@ def export_step4_pool_exports(
                 "confidence": {},
                 "metrics": {
                     "gold_quality": {},
-                    "cf_quality_step5A": {},
-                    "cf_quality_step5B": {},
+                    "cf_quality_rating_stability_control": {},
+                    "cf_quality_step5_explanation": {},
                     "uncertainty": {},
                     "sample_weight": {},
                     "text_quality": {},
@@ -384,8 +380,8 @@ def export_step4_pool_exports(
         "content_retention": "content_retention_score",
         "cf_reliability": "cf_reliability_score",
         "gold_quality": "gold_quality_score",
-        "cf_quality_step5A": "cf_quality_score_step5A",
-        "cf_quality_step5B": "cf_quality_score_step5B",
+        "cf_quality_rating_stability_control": "cf_quality_score_rating_stability_control",
+        "cf_quality_step5_explanation": "cf_quality_score_step5_explanation",
     }
 
     def _record_pool_distribution(name: str, frame: pd.DataFrame) -> None:
@@ -421,11 +417,11 @@ def export_step4_pool_exports(
                 for tier in ("high", "medium", "reject"):
                     count = int((mask & (chunk["gold_quality_tier"].astype(str) == tier)).sum())
                     gold_quality_counts[origin_name][tier] += count
-            for head, col in (("step5A", "cf_tier_step5A"), ("step5B", "cf_tier_step5B")):
+            for head, col in (("step5_explanation", "cf_tier_step5_explanation"),):
                 for tier in ("high", "medium", "low_weighted", "reject"):
                     cf_tier_counts[head][tier] += int((aux_cf & (chunk[col].astype(str) == tier)).sum())
 
-            for head in ("step5A", "step5B"):
+            for head in ("step5_explanation",):
                 for origin_name, mask, stem in (
                     ("target_gold", target_gold, f"{head}_target_gold_anchor"),
                     ("aux_gold", aux_gold, f"{head}_aux_gold_anchor"),
@@ -437,9 +433,9 @@ def export_step4_pool_exports(
                         sinks[name].write(gold_out)
                         pool_counts[name] += int(m.sum())
                         _record_pool_distribution(name, gold_out)
-                cf_col = "cf_tier_step5A" if head == "step5A" else "cf_tier_step5B"
-                reason_col = "cf_tier_reason_step5A" if head == "step5A" else "cf_tier_reason_step5B"
-                suffix = "cf_scorer" if head == "step5A" else "cf_explainer"
+                cf_col = "cf_tier_step5_explanation"
+                reason_col = "cf_tier_reason_step5_explanation"
+                suffix = "cf_explainer"
                 for tier in ("high", "medium", "low_weighted", "reject"):
                     m = aux_cf & (chunk[cf_col].astype(str) == tier)
                     name = f"{head}_{suffix}_{tier}"
@@ -533,11 +529,10 @@ def export_step4_pool_exports(
         "gold_quality_sanity": _gold_quality_sanity(gold_quality_counts, gold_cfg),
         "distribution": distribution,
         "high_medium_sufficiency": {
-            "step5A_cf_high_medium": int(cf_tier_counts["step5A"]["high"] + cf_tier_counts["step5A"]["medium"]),
-            "step5B_cf_high_medium_low": int(
-                cf_tier_counts["step5B"]["high"]
-                + cf_tier_counts["step5B"]["medium"]
-                + cf_tier_counts["step5B"]["low_weighted"]
+            "step5_explanation_cf_high_medium_low": int(
+                cf_tier_counts["step5_explanation"]["high"]
+                + cf_tier_counts["step5_explanation"]["medium"]
+                + cf_tier_counts["step5_explanation"]["low_weighted"]
             ),
             "recommend_rerun_step4_cf_if_insufficient": True,
         },
@@ -595,10 +590,10 @@ def export_step4_pool_exports(
         "legacy_gold_heavy_exports_allowed_by_default": False,
         "gold_default_full_route_removed": True,
         "aux_cf_full_pool_preserved": int(origin_counts.get("aux_cf", 0)) == int(
-            cf_tier_counts["step5A"]["high"]
-            + cf_tier_counts["step5A"]["medium"]
-            + cf_tier_counts["step5A"]["low_weighted"]
-            + cf_tier_counts["step5A"]["reject"]
+            cf_tier_counts["step5_explanation"]["high"]
+            + cf_tier_counts["step5_explanation"]["medium"]
+            + cf_tier_counts["step5_explanation"]["low_weighted"]
+            + cf_tier_counts["step5_explanation"]["reject"]
         ),
         "lineage": {
             "source_step4_export_lineage": lineage,
@@ -677,10 +672,20 @@ def validate_step4_pool_exports(
         if not isinstance(pools, Mapping):
             raise Step4PoolExportError("manifest missing pools")
         diagnostics_pools: dict[str, Any] = {}
+
+        def manifest_pool(name: str) -> tuple[str, Mapping[str, Any]]:
+            item = pools.get(name)
+            if isinstance(item, Mapping):
+                return name, item
+            legacy_name = LEGACY_POOL_ALIASES.get(name)
+            if legacy_name:
+                item = pools.get(legacy_name)
+                if isinstance(item, Mapping):
+                    return legacy_name, item
+            raise Step4PoolExportError(f"manifest missing pool {name}")
+
         for name in POOL_NAMES:
-            if name not in pools or not isinstance(pools[name], Mapping):
-                raise Step4PoolExportError(f"manifest missing pool {name}")
-            item = pools[name]
+            manifest_name, item = manifest_pool(name)
             path = Path(str(item.get("path") or ""))
             if not path.is_absolute():
                 path = root / path
@@ -695,17 +700,25 @@ def validate_step4_pool_exports(
                 expected_rows = -1
             if int(pf.metadata.num_rows) != int(expected_rows):
                 raise Step4PoolExportError(f"pool row_count mismatch: {name}")
-            _validate_required_columns(tuple(pf.schema_arrow.names), POOL_COLUMNS, context=f"{name} pool")
+            missing_columns = required_columns_with_legacy_aliases(POOL_COLUMNS, tuple(pf.schema_arrow.names))
+            if missing_columns:
+                raise Step4PoolExportError(
+                    f"{name} pool missing required columns: " + ", ".join(missing_columns)
+                )
             diagnostics_pools[name] = {
                 "path": _repo_relative(root, path),
                 "row_count": int(pf.metadata.num_rows),
+                "manifest_pool_name": manifest_name,
                 "role": str(item.get("role") or ""),
                 "tier": str(item.get("tier") or ""),
             }
         report_counts = report.get("pool_row_counts") if isinstance(report.get("pool_row_counts"), Mapping) else {}
         for name in POOL_NAMES:
+            manifest_name, item = manifest_pool(name)
             report_rows = report_counts.get(name)
-            pool_rows = pools[name].get("row_count")
+            if report_rows is None:
+                report_rows = report_counts.get(manifest_name)
+            pool_rows = item.get("row_count")
             if report_rows is None:
                 report_rows = -1
             if pool_rows is None:

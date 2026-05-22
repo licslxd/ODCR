@@ -1,8 +1,9 @@
 """
-Step5 主路径监控：full valid 上文本指标 + 门控 + guarded checkpoint 用复合分。
+Step5 official full-valid monitor: paper-greedy text metrics + gate.
 
-复合分基于与训练一致的 mainline decode 生成（见 config.build_mainline_alignment_monitor_override），
-纳入 BLEU-4 / ROUGE-L / METEOR / 语料级 DIST-1/2（evaluate_text）与 dirty penalty；DIST 权重保持较小。
+Official Step5_e checkpoint selection uses the same 25-token metric_pred /
+metric_ref contract as final eval. Diagnostic decode profiles may still call
+this helper, but raw pred_text/ref_text are never the preferred metric inputs.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from base_utils import evaluate_text
+from base_utils import official_paper_metrics
 from odcr_eval_dirty_text import compute_dirty_text_stats
 
 
@@ -71,10 +72,10 @@ def build_mainline_monitor_bundle_from_merged_rows(
     *,
     composite_weights: Optional[Mapping[str, float]] = None,
 ) -> Dict[str, Any]:
-    """merged_rows 须按 sample_id 0..N-1 排序且含 pred_text/ref_text；可选 pred_rating/gt_rating。"""
-    preds = [str(r.get("pred_text", "") or "") for r in merged_rows]
-    refs = [str(r.get("ref_text", "") or "") for r in merged_rows]
-    txt = evaluate_text(preds, refs)
+    """merged_rows must be sorted by sample_id and include official metric text."""
+    preds = [str(r.get("metric_pred_text", r.get("pred_text", "")) or "") for r in merged_rows]
+    refs = [str(r.get("metric_ref_text", r.get("ref_text", "")) or "") for r in merged_rows]
+    txt = official_paper_metrics(preds, refs)
     mean_ref = sum(len(x.split()) for x in refs) / max(len(refs), 1)
     dirty = compute_dirty_text_stats(preds, ref_mean_len_words=mean_ref)
     dirty_rate = float(dirty.get("hit_rate", 0.0))
@@ -90,8 +91,13 @@ def build_mainline_monitor_bundle_from_merged_rows(
     rouge = txt.get("rouge") or {}
     meteor = float(txt.get("meteor") or 0.0)
     b4 = float(bleu.get("4", 0.0))
-    rl = float(rouge.get("l", 0.0))
-    dist = txt.get("dist") or {}
+    rl = float(rouge.get("rouge_l_f", rouge.get("l", 0.0)) or 0.0)
+    distinct = txt.get("distinct_corpus") or {}
+    dist = (
+        distinct.get("scale_percent_0_100")
+        if isinstance(distinct.get("scale_percent_0_100"), Mapping)
+        else txt.get("dist") or {}
+    )
     d1 = float(dist.get("1", 0.0))
     d2 = float(dist.get("2", 0.0))
     w = dict(default_checkpoint_composite_weights())
@@ -112,6 +118,8 @@ def build_mainline_monitor_bundle_from_merged_rows(
         "rouge": rouge,
         "meteor": meteor,
         "dist": dist,
+        "official_paper_metrics": txt,
+        "official_metric_inputs_used": True,
         "dirty_hit_rate": dirty_rate,
         "dirty_stats": dirty,
         "rmse_rating": rmse,

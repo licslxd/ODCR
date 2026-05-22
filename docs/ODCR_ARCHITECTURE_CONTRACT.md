@@ -146,17 +146,16 @@ validation.
 In short: formal Step4 remains blocked whenever the only available Step4
 tuning evidence is CPU preview or CUDA transport evidence.
 
-Step5 has two active paths. Step5A is scorer-only stability optimization:
-`route_scorer` gates scorer-clean samples, UCI weights LCI with Step4 posterior
-reliability/uncertainty/confidence fields, and LCI contributes its own weighted
-loss. Step5B is explainer-only verbalization: `route_explainer` gates
-explainer-rich samples, CCV uses an explicit control packet instead of prompt
-concatenation, and FCA aligns scorer and explainer evidence bases. The public
-Step5 controls are One-Control blocks: `step5.lci`, `step5.uci`, `step5.ccv`,
-and `step5.fca`. CCV adapter dimensions and Step5 native LoRA controls are
-resolved from `step5.ccv` / `step5.ccv.native_lora`; retired `lambda_lci`,
-`lambda_fca`, prompt-concat controls, and backend LoRA keys must not form a
-parallel active path.
+Step5 has one active path: explanation-only training. Rating metrics are owned
+by the Step3 accepted scorer declared in `rating_source`; Step5 does not train
+or evaluate a rating scorer. Step5 consumes Step4 `route_explainer` samples,
+uses CCV through an explicit control packet instead of prompt concatenation,
+and uses FCA to align evidence bases for the explanation objective. The public
+Step5 controls are One-Control blocks: `step5.explainer_gate`, `step5.ccv`,
+`step5.fca`, and `rating_source`. CCV adapter dimensions and Step5 native LoRA
+controls are resolved from `step5.ccv` / `step5.ccv.native_lora`; retired
+`lambda_lci`, `lambda_fca`, prompt-concat controls, and backend LoRA keys must
+not form a parallel active path.
 
 Step5 eval/validation factual target rows may receive default control values
 only under the explicit eval contract
@@ -273,10 +272,9 @@ Runtime `.env` files and loose YAML files are not main configuration sources.
 
 Step3 structured loss weights are public One-Control parameters under
 `step3.structured_losses`. Step5 model architecture lives under `step5.model`;
-Step5B gate and explainer-only scheduling live under `step5.explainer_gate`;
-the Step5B explainer objective multiplier lives under
-`step5.train.explainer_loss_weight`. Retired `adv` and `eta` names must not be
-accepted as active Step5 aliases.
+explanation scheduling lives under `step5.explainer_gate`; the explanation
+objective multiplier lives under `step5.train.explainer_loss_weight`. Retired
+`adv` and `eta` names must not be accepted as active Step5 aliases.
 
 ## Batch Semantics
 
@@ -335,15 +333,17 @@ itself prove GPU availability. The user manually runs
 `odcr-enter-gpu <JOBID>` inside the same tmux to enter the GPU node. Codex must
 not execute `odcr-enter-gpu`, `srun`, `sbatch`, or `scancel`; must not create,
 kill, or switch tmux sessions; and must not manage GPU allocation.
-GPU use is allowed by default for repo-local validation, probe, and bounded
-runtime after fast sanity and current-pane validation. The controlled tmux GPU
-bridge at `python code/tools/odcr_tmux_gpu_bridge.py` can target only a
-user-created, already-entered, uniquely validated GPU pane and can send one
-bridge-generated command file. It is not arbitrary send-keys and is no longer
-limited by a GPU whitelist hard blocker. Its validation outputs stay under
-`AI_analysis/01_raw_logs` / `AI_analysis/05_final_reports` by default, with a
-mandatory formal namespace guard. post-edit full is not a GPU prerequisite, and
-runtime evidence takes priority over static full-suite instability.
+GPU use is allowed by default for repo-local validation, probe, bounded runtime,
+eval, rerank, diagnostics, and user-authorized fixed training/evaluation work
+after fast sanity and current-pane validation. The controlled tmux GPU bridge can
+target only a user-created, already-entered, uniquely validated GPU pane and can
+dispatch through `./odcr runtime bridge exec -- ...`. It is no longer limited by
+a GPU whitelist hard blocker or a formal-training string blocker; fresh CUDA
+validation and the formal namespace guard are the active safety contracts. Its
+validation outputs stay under `AI_analysis/01_raw_logs` /
+`AI_analysis/05_final_reports` by default. post-edit full is not a GPU
+prerequisite, and runtime evidence takes priority over static full-suite
+instability.
 
 CUDA admission checks and BGE-large use trust only the current tmux session's
 real-time CUDA environment. A normal admin shell reporting no CUDA, a tmux still

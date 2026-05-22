@@ -1,4 +1,4 @@
-"""Allowlisted tmux GPU bridge for ODCR runtime validation."""
+"""tmux GPU bridge for ODCR runtime validation and GPU dispatch."""
 
 from __future__ import annotations
 
@@ -15,7 +15,14 @@ from typing import Any, Mapping, Sequence
 
 from odcr_core.aux.evidence.ai_analysis_writer import get_writer
 from odcr_core.aux.runtime.bounded_probe import write_probe_report
-from odcr_core.aux.runtime.command_registry import LEGACY_FORBIDDEN_COMMANDS, RuntimeCommandError, require_command
+from odcr_core.aux.runtime.command_registry import (
+    FORMAL_TRAIN_DETECTOR_VERSION,
+    LEGACY_FORBIDDEN_COMMANDS,
+    RuntimeCommandError,
+    assert_not_formal_training,
+    formal_training_command_reason,
+    require_command,
+)
 from odcr_core.aux.runtime.gpu_handshake import collect_handshake, write_handshake
 from odcr_core.aux.runtime.gpu_pane_handoff import (
     HandoffError,
@@ -35,13 +42,13 @@ from odcr_core.aux.runtime.pane_discovery import (
     candidate_socket_paths,
     classify_command,
     discover_panes,
-    select_unique_pane,
+    select_preferred_pane,
 )
 from odcr_core.aux.runtime.runtime_report import write_runtime_report
 from odcr_core.aux.runtime.stage_dispatch import probe_command_name
 from odcr_core.evidence_level import (
     E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION,
-    E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE,
+    E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE,
 )
 
 
@@ -52,6 +59,7 @@ REPORT_DIR = AI_ANALYSIS / "05_final_reports"
 RUNTIME_STATUS_NAME = "aux_runtime_gpu_handshake.status.json"
 RUNTIME_LOG_NAME = "aux_runtime_gpu_handshake.log"
 RUNTIME_REPORT_NAME = "aux_runtime_gpu_validation_report.md"
+BRIDGE_EXEC_DIR_NAME = "runtime_bridge_exec"
 PROBE_STATUS_NAME = "aux_runtime_step5_e4_probe.status.json"
 PROBE_E5_STATUS_NAME = "aux_runtime_step5_e5_lifecycle_probe.status.json"
 PANE_MODE_RECOVERY_STATUS_NAME = "aux_runtime_pane_mode_recovery.json"
@@ -65,9 +73,8 @@ TARGET_SOURCE_CLI = "cli_explicit"
 TARGET_SOURCE_GLOBAL = "global_discovery"
 TARGET_SOURCE_STATE = "state_hint"
 TARGET_SOURCE_LIVE_DISCOVERY = "live_discovery_cuda_probe"
-STEP5_FRESH_HANDOFF_REQUIRED_STAGES = {"step5", "step5A", "step5B"}
+STEP5_FRESH_HANDOFF_REQUIRED_STAGES = {"step5", "rating_stability_control", "step5_explanation"}
 NO_LIVE_CUDA_AFTER_STALE = "no_live_cuda_pane_after_stale_handoff"
-AMBIGUOUS_LIVE_CUDA_PANES = "ambiguous_live_cuda_panes"
 
 
 class BridgeError(RuntimeError):
@@ -93,6 +100,14 @@ class BridgeOptions:
     all_sockets: bool = False
     all_panes: bool = False
     json_output: bool = False
+    exec_argv: tuple[str, ...] = ()
+    background: bool = False
+    require_cuda: bool = True
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    stderr_to_stdout: bool = True
+    pid_file: str | None = None
+    status_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +136,12 @@ def generated_paths(suffix: str | None = None) -> GeneratedPaths:
     )
 
 
+def _exec_dir() -> Path:
+    path = RAW_LOG_DIR / BRIDGE_EXEC_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _json_default(value: Any) -> str:
     return str(value)
 
@@ -129,10 +150,30 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _path_from_user(value: str | None, *, default: Path) -> Path:
+    raw = str(value or "").strip()
+    path = Path(raw).expanduser() if raw else default
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _clean_exec_argv(argv: Sequence[str]) -> tuple[str, ...]:
+    items = [str(item) for item in argv]
+    if items and items[0] == "--":
+        items = items[1:]
+    return tuple(item for item in items if str(item).strip())
+
+
+def _exec_command_id(argv: Sequence[str]) -> str:
+    return f"bridge_exec_{int(time.time())}_{_safe_suffix('_'.join(argv[:4]))}"
+
+
 def _normalize_probe_evidence_level(value: str | None) -> str:
     raw = str(value or "").strip()
-    if raw in {"E5", E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE}:
-        return E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
+    if raw in {"E5", E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE}:
+        return E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
     return E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION
 
 
@@ -542,7 +583,13 @@ class TmuxGpuBridge:
         payload["state_hint_path"] = str(STATE_HINT_PATH)
         payload["old_gpu_pane_state_role"] = OLD_GPU_PANE_STATE_ROLE
         payload["current_gpu_pane_json_path"] = str(CURRENT_HANDOFF_PATH)
-        payload["success"] = bool(discovery.panes) if global_mode else len(discovery.candidates) == 1
+        runnable_count = len(discovery.candidates)
+        visible_pane_count = len(discovery.panes)
+        payload["runnable_candidate_count"] = runnable_count
+        payload["visible_pane_count"] = visible_pane_count
+        payload["selection_required"] = runnable_count > 1
+        payload["non_unique_discovery_is_not_blocker"] = True
+        payload["success"] = bool(visible_pane_count if global_mode else runnable_count)
         if global_mode:
             _write_json_artifact(GLOBAL_INVENTORY_NAME, payload)
         get_writer(REPO_ROOT).runtime_diagnostic(
@@ -607,7 +654,7 @@ class TmuxGpuBridge:
         return specs
 
     def _select_target_for_spec(self, spec: Mapping[str, Any]) -> tuple[PaneCandidate, DiscoveryResult, str]:
-        target, discovery = select_unique_pane(
+        target, discovery = select_preferred_pane(
             socket=spec.get("socket") if spec.get("socket") else None,
             target=spec.get("target") if spec.get("target") else None,
             runner=self.runner,
@@ -748,7 +795,12 @@ class TmuxGpuBridge:
     ) -> dict[str, Any]:
         snapshot = status.get("nvidia-smi-compute-apps") if isinstance(status.get("nvidia-smi-compute-apps"), Mapping) else {}
         rows = _parse_compute_app_rows(snapshot)
-        safe = snapshot.get("returncode") == 0 and not rows
+        query_ok = snapshot.get("returncode") == 0
+        status_label = "pass"
+        if rows:
+            status_label = "audit_only_active_compute_apps"
+        elif not query_ok:
+            status_label = "audit_only_query_failed"
         guard = {
             "schema_version": "odcr_gpu_bridge_compute_app_guard/1",
             "generated_at": _utc_now(),
@@ -761,10 +813,12 @@ class TmuxGpuBridge:
             "device_count": status.get("torch.cuda.device_count"),
             "query": dict(snapshot),
             "rows": rows,
-            "pass": bool(safe),
-            "blocked": not bool(safe),
-            "status": "pass" if safe else "blocked_unknown_compute_apps",
+            "pass": True,
+            "blocked": False,
+            "audit_only": True,
+            "status": status_label,
             "unknown_compute_apps": rows if rows else [],
+            "would_have_blocked_before": bool(rows or not query_ok),
             "kill_attempted": False,
             "scancel_attempted": False,
         }
@@ -786,8 +840,6 @@ class TmuxGpuBridge:
         nvidia = status.get("nvidia-smi") if isinstance(status.get("nvidia-smi"), Mapping) else {}
         if nvidia.get("returncode") != 0:
             reasons.append("nvidia_smi_failed")
-        if compute_guard.get("pass") is not True:
-            reasons.append("compute_app_guard_blocked")
         return not reasons, reasons
 
     def _eligible_live_candidate(self, candidate: PaneCandidate) -> tuple[bool, list[str]]:
@@ -798,7 +850,7 @@ class TmuxGpuBridge:
             reasons.append("cwd_not_repo")
         command_class = str(candidate.command_class or classify_command(candidate.pane_command))
         if command_class not in RUNNABLE_PANE_COMMAND_CLASSES:
-            reasons.append("pane_not_allowlisted_for_child_probe")
+            reasons.append("pane_not_eligible_for_child_probe")
         return not reasons, sorted(set(reasons))
 
     def _write_candidate_ranking_report(
@@ -823,9 +875,9 @@ class TmuxGpuBridge:
                 "device_count_gte_2",
                 "cuda_visible_devices_nonempty",
                 "slurm_job_id_nonempty",
-                "compute_app_guard_pass",
+                "compute_app_guard_audit_only",
                 "cwd_match_repo",
-                "allowlisted_child_probe",
+                "eligible_child_probe",
                 "safe_pane_mode",
                 "handoff_match",
                 "current_tmux_match",
@@ -912,11 +964,62 @@ class TmuxGpuBridge:
             successful = newest_matches
         if len(successful) == 1:
             return successful[0]
-        raise BridgeError(
-            "Multiple live CUDA tmux panes passed probe and ranking could not pick one without ambiguity.",
-            stop_reason=AMBIGUOUS_LIVE_CUDA_PANES,
-            details={"stale_state_used": False, "records": list(records)},
+        selected = dict(
+            sorted(
+                successful,
+                key=lambda record: (
+                    str(((record.get("pane") or {}) if isinstance(record.get("pane"), Mapping) else {}).get("socket") or ""),
+                    str(((record.get("pane") or {}) if isinstance(record.get("pane"), Mapping) else {}).get("target") or ""),
+                    str(((record.get("pane") or {}) if isinstance(record.get("pane"), Mapping) else {}).get("pane_id") or ""),
+                ),
+            )[0]
         )
+        selected["live_cuda_ambiguity_resolved"] = True
+        selected["ambiguity_policy"] = "deterministic_first_live_cuda_candidate"
+        selected["candidate_count_after_ranking"] = len(successful)
+        return selected
+
+    def _resolve_global_runnable_target(
+        self,
+        options: BridgeOptions,
+    ) -> tuple[PaneCandidate, DiscoveryResult, str, dict[str, Any]]:
+        discovery = discover_panes(
+            runner=self.runner,
+            socket_paths=None,
+            socket_exists=self.socket_exists,
+            all_sockets=True,
+            include_filtered=bool(options.all_panes or options.global_discovery),
+            capture_hash=True,
+            repo_root=REPO_ROOT,
+        )
+        candidates = sorted(
+            list(discovery.candidates),
+            key=lambda candidate: (
+                0 if bool(candidate.active) else 1,
+                0 if bool(candidate.cwd_match_repo) else 1,
+                str(candidate.socket),
+                str(candidate.target),
+                str(candidate.pane_id),
+            ),
+        )
+        if not candidates:
+            raise BridgeError(
+                "Live tmux discovery did not find a runnable pane.",
+                stop_reason="no_runnable_tmux_pane_after_live_discovery",
+                details={"stale_state_used": False, "discovery": discovery.to_dict()},
+            )
+        selected = candidates[0]
+        selection = {
+            "schema_version": "odcr_gpu_bridge_global_runnable_selection/1",
+            "target_source": TARGET_SOURCE_GLOBAL,
+            "global_discovery_blocker_removed": True,
+            "selected": selected.to_dict(),
+            "candidate_count": len(candidates),
+            "selection_required": len(candidates) > 1,
+            "selection_policy": "deterministic_first_runnable_candidate",
+            "stale_state_used": False,
+        }
+        return selected, discovery, TARGET_SOURCE_GLOBAL, selection
 
     def _resolve_live_discovery_cuda_target(
         self,
@@ -1058,14 +1161,14 @@ class TmuxGpuBridge:
         command = Path(str(candidate.pane_command or "")).name.lower()
         command_active = any(token == command or token in command for token in ACTIVE_COMPUTE_PANE_COMMANDS)
         compute_apps = self._compute_app_snapshot()
-        safe = not command_active and not bool(compute_apps.get("active"))
         reason = "safe_mode_exit_key_allowed"
         if command_active:
-            reason = "pane_command_looks_like_active_compute_app"
+            reason = "audit_only_pane_command_looks_like_active_compute_app"
         elif bool(compute_apps.get("active")):
-            reason = "nvidia_smi_compute_apps_nonempty"
+            reason = "audit_only_nvidia_smi_compute_apps_nonempty"
         return {
-            "safe": bool(safe),
+            "safe": True,
+            "audit_only": True,
             "reason": reason,
             "pane_command": candidate.pane_command,
             "active_compute_pane_command": bool(command_active),
@@ -1133,10 +1236,6 @@ class TmuxGpuBridge:
         }
         guard = self._pane_mode_recovery_guard(candidate)
         evidence["compute_app_guard"] = guard
-        if not bool(guard.get("safe")):
-            evidence["result"] = "blocked_by_compute_app_guard"
-            self._write_pane_recovery_evidence(evidence, stage=options.stage, task=options.task_id)
-            return None, before, evidence
         last_discovery = before
         for key in PANE_MODE_EXIT_KEYS:
             sent = self._send_mode_exit_key(candidate, key)
@@ -1217,6 +1316,231 @@ class TmuxGpuBridge:
         if enter.returncode != 0:
             raise BridgeError(f"tmux send enter failed: {enter.stderr}", stop_reason="tmux_send_failed")
 
+    def _send_bridge_line(self, target: PaneCandidate, line: str) -> None:
+        result = self.runner.run(("tmux", "-S", target.socket, "send-keys", "-t", target.pane_id, "-l", line), timeout=10)
+        if result.returncode != 0:
+            raise BridgeError(f"tmux send command failed: {result.stderr}", stop_reason="tmux_send_failed")
+        enter = self.runner.run(("tmux", "-S", target.socket, "send-keys", "-t", target.pane_id, "Enter"), timeout=10)
+        if enter.returncode != 0:
+            raise BridgeError(f"tmux send enter failed: {enter.stderr}", stop_reason="tmux_send_failed")
+
+    def _write_exec_script(
+        self,
+        *,
+        command_id: str,
+        argv: Sequence[str],
+        status_path: Path,
+    ) -> Path:
+        script_path = _exec_dir() / f"{_safe_suffix(command_id)}.sh"
+        command_array = " ".join(shlex.quote(str(item)) for item in argv)
+        started_payload = {
+            "schema_version": "odcr_runtime_bridge_exec_status/1",
+            "command_id": command_id,
+            "status": "running",
+            "repo_root": str(REPO_ROOT),
+            "argv": list(argv),
+            "formal_train_detector_version": FORMAL_TRAIN_DETECTOR_VERSION,
+            "started_at_utc": None,
+        }
+        script = f"""#!/usr/bin/env bash
+set +e
+cd {shlex.quote(str(REPO_ROOT))} || exit 2
+STATUS_PATH={shlex.quote(str(status_path))}
+mkdir -p "$(dirname "$STATUS_PATH")"
+python - "$STATUS_PATH" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+path = sys.argv[1]
+payload = json.loads({json.dumps(json.dumps(started_payload, ensure_ascii=False, sort_keys=True))})
+payload["started_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    fh.write("\\n")
+PY
+cmd=({command_array})
+"${{cmd[@]}}"
+rc=$?
+python - "$STATUS_PATH" "$rc" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+path = sys.argv[1]
+rc = int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+except Exception:
+    payload = {{}}
+payload.update({{
+    "status": "completed" if rc == 0 else "failed",
+    "returncode": rc,
+    "success": rc == 0,
+    "finished_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}})
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    fh.write("\\n")
+os.replace(tmp, path)
+PY
+exit "$rc"
+"""
+        script_path.write_text(script, encoding="utf-8")
+        script_path.chmod(0o755)
+        return script_path
+
+    def _wait_optional_pid_file(self, pid_path: Path, timeout_s: int = 10) -> str | None:
+        started = self.clock()
+        while self.clock() - started <= timeout_s:
+            if pid_path.is_file():
+                text = pid_path.read_text(encoding="utf-8", errors="replace").strip()
+                return text or None
+            self.sleep(0.5)
+        return None
+
+    def run_exec_mode(self, options: BridgeOptions) -> dict[str, Any]:
+        argv = _clean_exec_argv(options.exec_argv)
+        if not argv:
+            raise BridgeError("bridge exec requires a command after --", stop_reason="empty_exec_command")
+        command_id = _exec_command_id(argv)
+        default_status = _exec_dir() / f"{command_id}.status.json"
+        default_stdout = _exec_dir() / f"{command_id}.nohup.log"
+        default_pid = _exec_dir() / f"{command_id}.pid"
+        status_path = _path_from_user(options.status_path, default=default_status)
+        stdout_path = _path_from_user(options.stdout_path, default=default_stdout)
+        pid_path = _path_from_user(options.pid_file, default=default_pid)
+        stderr_path = (
+            stdout_path
+            if bool(options.stderr_to_stdout)
+            else _path_from_user(options.stderr_path, default=_exec_dir() / f"{command_id}.stderr.log")
+        )
+        payload: dict[str, Any] = {
+            "schema_version": "odcr_runtime_bridge_exec_dispatch/1",
+            "mode": "exec",
+            "command": "bridge.exec",
+            "command_id": command_id,
+            "argv": list(argv),
+            "background": bool(options.background),
+            "require_cuda": bool(options.require_cuda),
+            "formal_train_audit_version": FORMAL_TRAIN_DETECTOR_VERSION,
+            "formal_training_blocker_removed": True,
+            "fresh_discover": True,
+            "stale_state_used": False,
+            "dry_run": bool(options.dry_run),
+            "sent": False,
+            "paths": {
+                "status": str(status_path),
+                "stdout": str(stdout_path),
+                "stderr": str(stderr_path),
+                "pid": str(pid_path),
+            },
+            "success": False,
+        }
+        live_selection: dict[str, Any] | None = None
+        if bool(options.global_discovery or options.all_sockets or options.all_panes):
+            if not options.require_cuda:
+                raise BridgeError(
+                    "bridge exec global discovery requires CUDA validation; pass a handoff or explicit target for non-CUDA exec.",
+                    stop_reason="global_exec_requires_cuda",
+                )
+            target, discovery, source, live_selection = self._resolve_live_discovery_cuda_target(
+                options,
+                stale_handoff=None,
+                timeout_s=int(options.timeout or 120),
+            )
+            recovery = None
+        else:
+            try:
+                target, discovery, source, recovery = self.resolve_target_with_recovery(options)
+            except BridgeError as exc:
+                can_live_discover = (
+                    bool(options.require_cuda)
+                    and not (options.socket or options.target)
+                    and exc.stop_reason in {STALE_HANDOFF_STOP_REASON, "missing_current_gpu_pane_handoff"}
+                )
+                if not can_live_discover:
+                    raise
+                target, discovery, source, live_selection = self._resolve_live_discovery_cuda_target(
+                    options,
+                    stale_handoff=(exc.details or {}).get("handoff") if isinstance(exc.details, Mapping) else None,
+                    timeout_s=int(options.timeout or 120),
+                )
+                recovery = None
+        payload.update({"target": target.to_dict(), "target_source": source, "discovery": discovery.to_dict()})
+        if recovery is not None:
+            payload["pane_mode_recovery"] = recovery
+        if live_selection is not None:
+            payload["live_discovery_selection"] = live_selection
+            payload["stale_handoff_detected"] = bool(live_selection.get("stale_handoff_detected"))
+            payload["stale_handoff_blocked_execution"] = False
+            payload["live_discovery_cuda_probe_success"] = bool(live_selection.get("live_discovery_cuda_probe_success"))
+        if options.dry_run or options.no_send:
+            payload["success"] = True
+            payload["no_send"] = bool(options.no_send)
+            return payload
+        if options.require_cuda:
+            preflight = self._run_handshake_on_target(
+                target,
+                mode="cuda-probe",
+                spec_name="bridge.exec.cuda_preflight",
+                require_cuda=True,
+                stage=options.stage,
+                task=options.task_id,
+                timeout_s=int(options.timeout or 120),
+                target_source=source,
+            )
+            payload["cuda_preflight"] = preflight
+            if not bool(preflight.get("success")):
+                payload["stop_reason"] = "cuda_preflight_failed"
+                payload["error"] = "bridge exec target did not pass CUDA preflight"
+                return payload
+        try:
+            status_path.unlink()
+        except FileNotFoundError:
+            pass
+        if options.background:
+            try:
+                pid_path.unlink()
+            except FileNotFoundError:
+                pass
+        script_path = self._write_exec_script(command_id=command_id, argv=argv, status_path=status_path)
+        payload["paths"]["driver_script"] = str(script_path)
+        if options.background:
+            line = (
+                f"nohup bash {shlex.quote(str(script_path))} "
+                f"> {shlex.quote(str(stdout_path))} "
+                f"2> {shlex.quote(str(stderr_path))} "
+                f"& echo $! > {shlex.quote(str(pid_path))}"
+            )
+            if stdout_path == stderr_path or bool(options.stderr_to_stdout):
+                line = (
+                    f"nohup bash {shlex.quote(str(script_path))} "
+                    f"> {shlex.quote(str(stdout_path))} 2>&1 "
+                    f"& echo $! > {shlex.quote(str(pid_path))}"
+                )
+            self._send_bridge_line(target, line)
+            payload["sent"] = True
+            payload["pid"] = self._wait_optional_pid_file(pid_path)
+            payload["pid_file_written"] = bool(payload.get("pid"))
+            payload["success"] = True
+            return payload
+        if stdout_path == stderr_path or bool(options.stderr_to_stdout):
+            line = f"bash {shlex.quote(str(script_path))} > {shlex.quote(str(stdout_path))} 2>&1"
+        else:
+            line = (
+                f"bash {shlex.quote(str(script_path))} "
+                f"> {shlex.quote(str(stdout_path))} "
+                f"2> {shlex.quote(str(stderr_path))}"
+            )
+        self._send_bridge_line(target, line)
+        payload["sent"] = True
+        timeout_s = int(options.timeout or 3600)
+        payload["timeout_s"] = timeout_s
+        status = self._wait_status(GeneratedPaths(status=status_path, log=stdout_path, report=status_path), timeout_s)
+        payload["child_status"] = status
+        payload["success"] = bool(status.get("success"))
+        payload["returncode"] = status.get("returncode")
+        return payload
+
     def _step5_handoff_admission(self, *, stage: str, socket: str | None, target: str | None) -> dict[str, Any]:
         if str(stage) not in STEP5_FRESH_HANDOFF_REQUIRED_STAGES:
             return {"required": False, "ok": True}
@@ -1264,14 +1588,11 @@ class TmuxGpuBridge:
         if not bool(handoff.get("exists")):
             return {
                 "required": True,
-                "ok": False,
-                "target_source": None,
-                "stop_reason": "missing_current_gpu_pane_handoff",
-                "error": (
-                    "AI_analysis/runtime/current_gpu_pane.json is missing. "
-                    "Please run odcr-enter-gpu <JOBID> inside the GPU tmux pane; "
-                    "that command automatically refreshes current_gpu_pane.json."
-                ),
+                "ok": True,
+                "target_source": TARGET_SOURCE_LIVE_DISCOVERY,
+                "warning_reason": "missing_current_gpu_pane_handoff",
+                "handoff_present": False,
+                "live_discovery_required": True,
                 "current_gpu_pane_json_path": str(CURRENT_HANDOFF_PATH),
                 "old_gpu_pane_state_role": OLD_GPU_PANE_STATE_ROLE,
             }
@@ -1365,6 +1686,8 @@ class TmuxGpuBridge:
 
     def run_bridge_mode(self, options: BridgeOptions) -> dict[str, Any]:
         reject_legacy_mode(options.mode)
+        if options.mode == "exec":
+            return self.run_exec_mode(options)
         mode_to_spec = {
             "discover": "bridge.discover",
             "validate-only": "bridge.validate_only",
@@ -1376,39 +1699,21 @@ class TmuxGpuBridge:
         spec = require_command(mode_to_spec[options.mode])
         if options.mode == "discover":
             return self.discover(options)
-        if bool(options.global_discovery or options.all_sockets or options.all_panes):
-            raise BridgeError(
-                "Global/default tmux target selection is retired for bridge execution; use current_gpu_pane.json handoff v2 or CLI explicit socket/target.",
-                stop_reason="global_target_selection_retired",
-            )
         paths = generated_paths()
         live_selection: dict[str, Any] | None = None
-        try:
-            target, discovery, source, recovery = self.resolve_target_with_recovery(options)
-        except BridgeError as exc:
-            if (
-                exc.stop_reason == STALE_HANDOFF_STOP_REASON
-                and not (options.socket or options.target)
-                and not options.dry_run
-                and not options.no_send
-            ):
-                try:
+        if bool(options.global_discovery or options.all_sockets or options.all_panes):
+            try:
+                if spec.requires_gpu and not options.dry_run and not options.no_send:
                     target, discovery, source, live_selection = self._resolve_live_discovery_cuda_target(
                         options,
-                        stale_handoff=(exc.details or {}).get("handoff") if isinstance(exc.details, Mapping) else None,
+                        stale_handoff=None,
                         timeout_s=int(options.timeout or max(spec.timeout_s, 120)),
                     )
                     recovery = None
-                except BridgeError as live_exc:
-                    return _write_failure_report(
-                        options.mode,
-                        str(live_exc),
-                        stage=options.stage,
-                        task=options.task_id,
-                        stop_reason=live_exc.stop_reason,
-                        details=live_exc.details,
-                    )
-            else:
+                else:
+                    target, discovery, source, live_selection = self._resolve_global_runnable_target(options)
+                    recovery = None
+            except BridgeError as exc:
                 return _write_failure_report(
                     options.mode,
                     str(exc),
@@ -1417,6 +1722,42 @@ class TmuxGpuBridge:
                     stop_reason=exc.stop_reason,
                     details=exc.details,
                 )
+        else:
+            try:
+                target, discovery, source, recovery = self.resolve_target_with_recovery(options)
+            except BridgeError as exc:
+                if (
+                    exc.stop_reason in {STALE_HANDOFF_STOP_REASON, "missing_current_gpu_pane_handoff"}
+                    and spec.requires_gpu
+                    and not (options.socket or options.target)
+                    and not options.dry_run
+                    and not options.no_send
+                ):
+                    try:
+                        target, discovery, source, live_selection = self._resolve_live_discovery_cuda_target(
+                            options,
+                            stale_handoff=(exc.details or {}).get("handoff") if isinstance(exc.details, Mapping) else None,
+                            timeout_s=int(options.timeout or max(spec.timeout_s, 120)),
+                        )
+                        recovery = None
+                    except BridgeError as live_exc:
+                        return _write_failure_report(
+                            options.mode,
+                            str(live_exc),
+                            stage=options.stage,
+                            task=options.task_id,
+                            stop_reason=live_exc.stop_reason,
+                            details=live_exc.details,
+                        )
+                else:
+                    return _write_failure_report(
+                        options.mode,
+                        str(exc),
+                        stage=options.stage,
+                        task=options.task_id,
+                        stop_reason=exc.stop_reason,
+                        details=exc.details,
+                    )
         payload: dict[str, Any] = {
             "schema_version": "odcr_runtime_bridge_dispatch/1",
             "mode": options.mode,
@@ -1504,10 +1845,7 @@ class TmuxGpuBridge:
                 "compute_app_guard": compute_guard,
                 "target_source": source,
             }
-            if compute_guard.get("pass") is not True:
-                payload["success"] = False
-                payload["stop_reason"] = "compute_app_guard_blocked"
-                payload["error"] = "Selected CUDA pane has unknown active compute-app processes; refusing to stack launch."
+            payload["compute_app_guard_audit_only"] = True
         if source == TARGET_SOURCE_HANDOFF and spec.requires_gpu and not bool(payload["success"]) and not payload.get("stop_reason"):
             payload["stop_reason"] = STALE_HANDOFF_STOP_REASON
             payload["stale_handoff"] = True
@@ -1545,7 +1883,7 @@ class TmuxGpuBridge:
             "compute_app_guard_status": bridge_result.get("compute_app_guard_status") or compute_guard.get("status"),
             "validation_e4_evidence_id": probe_result.get("validation_e4_evidence_id")
             or ((probe_result.get("all_trainable_grad") or {}).get("evidence_context") or {}).get("evidence_id"),
-            "validation_scorer_only": probe_result.get("step5A_validation_scorer_only"),
+            "validation_control_only": probe_result.get("rating_stability_control_validation_control_only"),
             "validation_oom": probe_result.get("validation_oom"),
             "stale_state_used": False,
         }
@@ -1600,7 +1938,7 @@ class TmuxGpuBridge:
         global_discovery: bool = False,
     ) -> dict[str, Any]:
         normalized_evidence_level = _normalize_probe_evidence_level(evidence_level)
-        if normalized_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE and str(stage) != "step5A":
+        if normalized_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE and str(stage) != "rating_stability_control":
             bridge_result = {
                 "schema_version": "odcr_runtime_bridge_dispatch/1",
                 "mode": "cuda-probe",
@@ -1608,8 +1946,8 @@ class TmuxGpuBridge:
                 "success": False,
                 "target_source": None,
                 "stale_state_used": False,
-                "stop_reason": "e5_only_supported_for_step5A",
-                "error": "E5_step5A_post_train_eval_lifecycle is only valid for --stage step5A.",
+                "stop_reason": "e5_only_supported_for_rating_stability_control",
+                "error": "E5_rating_stability_control_post_train_eval_lifecycle is only valid for --stage rating_stability_control.",
                 "current_gpu_pane_json_path": str(CURRENT_HANDOFF_PATH),
                 "formal_train_command_emitted": False,
                 "synthetic_batch_used_for_formal_gate": False,
@@ -1664,37 +2002,6 @@ class TmuxGpuBridge:
             payload["formal_train_command_emitted"] = False
             payload["synthetic_batch_used_for_formal_gate"] = False
             return payload
-        if bool(global_discovery or scan):
-            bridge_result = {
-                "schema_version": "odcr_runtime_bridge_dispatch/1",
-                "mode": "cuda-probe" if spec.requires_gpu else "validate-only",
-                "command": spec.name,
-                "success": False,
-                "target_source": TARGET_SOURCE_GLOBAL,
-                "stale_state_used": False,
-                "stop_reason": "global_target_selection_retired",
-                "error": (
-                    "Global/default tmux target selection is retired for bounded probes; "
-                    "use current_gpu_pane.json handoff v2 or CLI explicit socket/target."
-                ),
-                "current_gpu_pane_json_path": str(CURRENT_HANDOFF_PATH),
-                "old_gpu_pane_state_role": OLD_GPU_PANE_STATE_ROLE,
-                "formal_train_command_emitted": False,
-                "synthetic_batch_used_for_formal_gate": False,
-            }
-            payload = write_probe_report(
-                stage,
-                task,
-                handshake=None,
-                probe_result=None,
-                repo_root=REPO_ROOT,
-                target_source=bridge_result.get("target_source"),
-                stale_state_used=False,
-                handoff_admission=handoff_admission,
-            )
-            payload["bridge"] = bridge_result
-            payload["target_source"] = bridge_result.get("target_source")
-            return payload
         bridge_result = self.run_bridge_mode(
             BridgeOptions(
                 mode="cuda-probe" if spec.requires_gpu else "validate-only",
@@ -1703,14 +2010,14 @@ class TmuxGpuBridge:
                 socket=socket,
                 target=target,
                 timeout=timeout,
-                global_discovery=False,
-                all_sockets=False,
-                all_panes=False,
+                global_discovery=bool(global_discovery or scan),
+                all_sockets=bool(scan),
+                all_panes=bool(scan),
             )
         )
         handshake = bridge_result.get("child_status") if isinstance(bridge_result, dict) else None
         probe_result: dict[str, Any] | None = None
-        if str(stage) in {"step5A", "step5B"} and bool(bridge_result.get("success")):
+        if str(stage) in {"rating_stability_control", "step5_explanation"} and bool(bridge_result.get("success")):
             try:
                 selected = bridge_result.get("selected_cuda_candidate")
                 selected_pane = selected.get("pane") if isinstance(selected, Mapping) else None
@@ -1724,7 +2031,7 @@ class TmuxGpuBridge:
                         bridge_result["probe_pane_mode_recovery"] = recovery
                 status_path = RAW_LOG_DIR / (
                     PROBE_E5_STATUS_NAME
-                    if normalized_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
+                    if normalized_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
                     else PROBE_STATUS_NAME
                 )
                 try:
@@ -1735,7 +2042,7 @@ class TmuxGpuBridge:
                     str(candidate_id)
                     if candidate_id
                     else None
-                    if normalized_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE
+                    if normalized_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
                     else "A0_C0_R0"
                 )
                 command = _command_for_probe_child(
@@ -1789,7 +2096,7 @@ class TmuxGpuBridge:
         payload["selected_cuda_pane_id"] = bridge_result.get("selected_cuda_pane_id")
         payload["stale_state_used"] = bool(bridge_result.get("stale_state_used"))
         if probe_result is not None:
-            if normalized_evidence_level == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE:
+            if normalized_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE:
                 payload["step5_e5_probe"] = probe_result
             else:
                 payload["step5_e4_probe"] = probe_result
@@ -1836,7 +2143,7 @@ def run_probe_child(args: argparse.Namespace) -> int:
                 raise BridgeError("step5.e4_bounded must be configured for Step5 E4 probe child")
             hw_profile = str(((cfg_with_cli.get("hardware") or {}).get("active") or "default")).strip() or "default"
             min_per_gpu = None
-            if _normalize_probe_evidence_level(getattr(args, "evidence_level", None)) == E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE:
+            if _normalize_probe_evidence_level(getattr(args, "evidence_level", None)) == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE:
                 step5_train = ((cfg_with_cli.get("step5") or {}).get("train") or {})
                 step5_eval = ((cfg_with_cli.get("step5") or {}).get("eval") or {})
                 if isinstance(step5_train, Mapping):
@@ -1883,9 +2190,9 @@ def run_probe_child(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="odcr runtime", description="ODCR allowlisted runtime/tmux/GPU validation.")
+    parser = argparse.ArgumentParser(prog="odcr runtime", description="ODCR runtime/tmux/GPU validation and dispatch.")
     sub = parser.add_subparsers(dest="runtime_command", required=True)
-    bridge = sub.add_parser("bridge", help="discover and validate the current tmux GPU pane")
+    bridge = sub.add_parser("bridge", help="discover, validate, or dispatch to the current tmux GPU pane")
     bridge_sub = bridge.add_subparsers(dest="bridge_command", required=True)
     for name in ("discover", "validate-only", "marker-probe", "cuda-probe"):
         item = bridge_sub.add_parser(name)
@@ -1898,6 +2205,27 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--dry-run", action="store_true")
         item.add_argument("--no-send", action="store_true")
         item.add_argument("--timeout", type=int, default=None)
+    exec_p = bridge_sub.add_parser(
+        "exec",
+        help="dispatch a command to the validated GPU pane",
+        description="dispatch a command to the validated GPU pane",
+    )
+    exec_p.add_argument("--socket", default=None)
+    exec_p.add_argument("--target", default=None)
+    exec_p.add_argument("--json", dest="json_output", action="store_true")
+    exec_p.add_argument("--dry-run", action="store_true")
+    exec_p.add_argument("--no-send", action="store_true")
+    exec_p.add_argument("--timeout", type=int, default=None)
+    exec_p.add_argument("--background", action="store_true")
+    exec_p.add_argument("--require-cuda", dest="require_cuda", action="store_true", default=True)
+    exec_p.add_argument("--no-require-cuda", dest="require_cuda", action="store_false")
+    exec_p.add_argument("--stdout", dest="stdout_path", default=None)
+    exec_p.add_argument("--stderr", dest="stderr_path", default=None)
+    exec_p.add_argument("--stderr-to-stdout", dest="stderr_to_stdout", action="store_true", default=True)
+    exec_p.add_argument("--split-stderr", dest="stderr_to_stdout", action="store_false")
+    exec_p.add_argument("--pid-file", default=None)
+    exec_p.add_argument("--status-path", default=None)
+    exec_p.add_argument("exec_argv", nargs=argparse.REMAINDER)
     child = bridge_sub.add_parser("_handshake-child", help=argparse.SUPPRESS)
     child.add_argument("--kind", required=True)
     child.add_argument("--status-path", required=True)
@@ -1908,8 +2236,8 @@ def build_parser() -> argparse.ArgumentParser:
     child.add_argument("--task", default=None)
     child.add_argument("--require-cuda", action="store_true")
 
-    probe = sub.add_parser("probe", help="run a bounded allowlisted runtime probe")
-    probe.add_argument("--stage", choices=("step3", "step4", "step5", "step5A", "step5B"), required=True)
+    probe = sub.add_parser("probe", help="run a bounded runtime probe")
+    probe.add_argument("--stage", choices=("step3", "step4", "step5", "rating_stability_control", "step5_explanation"), required=True)
     probe.add_argument("--task", type=int, required=True)
     probe.add_argument("--bounded", action="store_true", required=True)
     probe.add_argument("--socket", default=None)
@@ -1921,7 +2249,7 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--from-step4-run", dest="from_step4", default=None)
     probe.add_argument(
         "--evidence-level",
-        choices=("E4", "E5", E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION, E5_STEP5A_POST_TRAIN_EVAL_LIFECYCLE),
+        choices=("E4", "E5", E4_GPU_SHARD_FORWARD_BOUNDED_FORMAL_ENTRY_WITH_VALIDATION, E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE),
         default="E4",
     )
     probe.add_argument("--scan", action="store_true")
@@ -1952,6 +2280,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     all_sockets=bool(getattr(args, "all_sockets", False)),
                     all_panes=bool(getattr(args, "all_panes", False)),
                     json_output=bool(getattr(args, "json_output", False)),
+                    exec_argv=tuple(getattr(args, "exec_argv", ()) or ()),
+                    background=bool(getattr(args, "background", False)),
+                    require_cuda=bool(getattr(args, "require_cuda", True)),
+                    stdout_path=getattr(args, "stdout_path", None),
+                    stderr_path=getattr(args, "stderr_path", None),
+                    stderr_to_stdout=bool(getattr(args, "stderr_to_stdout", True)),
+                    pid_file=getattr(args, "pid_file", None),
+                    status_path=getattr(args, "status_path", None),
                 )
             )
         elif args.runtime_command == "probe":
@@ -1973,7 +2309,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise BridgeError(f"unregistered runtime command: {args.runtime_command}", stop_reason="unregistered_command")
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default))
         return 0 if bool(result.get("success")) else 1
-    except (BridgeError, RuntimeCommandError) as exc:
+    except BridgeError as exc:
+        payload = _write_failure_report("runtime", str(exc), stop_reason=exc.stop_reason, details=exc.details)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default))
+        return 1
+    except RuntimeCommandError as exc:
         payload = _write_failure_report("runtime", str(exc))
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=_json_default))
         return 1
