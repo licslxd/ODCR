@@ -52,9 +52,11 @@ def build_generation_semantic_resolved_and_fingerprint(
     """
     人类可读的生成语义快照 + 稳定指纹（SHA256 hex）。
 
-    权威字段含 strategy / temperature / top_p / repetition_penalty / max_explanation_length /
-    label_smoothing / decode_seed / no_repeat_ngram_size / min_len / generation_semantic_family_tag；
-    缺失的整型约束在 resolved 中显式为 null（JSON）。
+    权威字段含 strategy / repetition_penalty / max_explanation_length /
+    label_smoothing / decode_seed / no_repeat_ngram_size / min_len / generation_semantic_family_tag。
+    Greedy official eval intentionally omits sampling-only fields such as
+    temperature/top_p; stochastic diagnostic strategies keep their sampling
+    fields in the resolved payload.
     """
     seed_raw = decode_cfg.get("decode_seed")
     dec_seed: Optional[int]
@@ -67,13 +69,9 @@ def build_generation_semantic_resolved_and_fingerprint(
             dec_seed = None
     _pfx = _generation_cfg_opt_int(decode_cfg.get("prefix_greedy_steps"))
     _topk = _generation_cfg_opt_int(decode_cfg.get("top_k"))
+    strategy = str(decode_cfg.get("decode_strategy", "") or "").strip().lower()
     core: Dict[str, Any] = {
-        "strategy": str(decode_cfg.get("decode_strategy", "") or "").strip().lower(),
-        "temperature": float(decode_cfg.get("generate_temperature", 0.0)),
-        "top_p": float(decode_cfg.get("generate_top_p", 0.0)),
-        "gap_threshold": float(decode_cfg.get("gap_threshold", 0.35)),
-        "prefix_greedy_steps": 4 if _pfx is None else max(0, int(_pfx)),
-        "top_k": 5 if _topk is None else max(1, int(_topk)),
+        "strategy": strategy,
         "repetition_penalty": float(decode_cfg.get("repetition_penalty", 0.0)),
         "max_explanation_length": int(decode_cfg.get("max_explanation_length", 0)),
         "label_smoothing": float(decode_cfg.get("label_smoothing", 0.0)),
@@ -84,14 +82,21 @@ def build_generation_semantic_resolved_and_fingerprint(
         "hard_max_len": _generation_cfg_opt_int(decode_cfg.get("hard_max_len")),
         "eos_boost_start": _generation_cfg_opt_int(decode_cfg.get("eos_boost_start")),
         "eos_boost_value": float(decode_cfg.get("eos_boost_value", 0.0)),
-        "tail_temperature": float(decode_cfg.get("tail_temperature", -1.0)),
-        "tail_top_p": float(decode_cfg.get("tail_top_p", -1.0)),
         "forbid_eos_after_open_quote": bool(decode_cfg.get("forbid_eos_after_open_quote", True)),
         "forbid_eos_after_open_bracket": bool(decode_cfg.get("forbid_eos_after_open_bracket", True)),
         "forbid_bad_terminal_tokens": bool(decode_cfg.get("forbid_bad_terminal_tokens", True)),
         "decode_token_repeat_window": _generation_cfg_opt_int(decode_cfg.get("decode_token_repeat_window")),
         "decode_token_repeat_max": _generation_cfg_opt_int(decode_cfg.get("decode_token_repeat_max")),
     }
+    if strategy != "greedy":
+        core["temperature"] = float(decode_cfg.get("generate_temperature", 0.0))
+        core["top_p"] = float(decode_cfg.get("generate_top_p", 0.0))
+        core["tail_temperature"] = float(decode_cfg.get("tail_temperature", -1.0))
+        core["tail_top_p"] = float(decode_cfg.get("tail_top_p", -1.0))
+    if strategy == "uncertainty_low_temp_top_k":
+        core["gap_threshold"] = float(decode_cfg.get("gap_threshold", 0.35))
+        core["prefix_greedy_steps"] = 4 if _pfx is None else max(0, int(_pfx))
+        core["top_k"] = 5 if _topk is None else max(1, int(_topk))
     resolved: Dict[str, Any] = {
         **core,
         "generation_semantic_family_tag": compute_generation_semantic_family_tag(core),

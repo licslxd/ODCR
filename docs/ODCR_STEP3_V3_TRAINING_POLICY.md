@@ -17,9 +17,9 @@ uses a short cosine restart, and disables damping during recovery.
 
 ## Phase-Wise
 
-Loss weights are scheduled by phase: `alignment_warmup`, `task_refinement`, and
-`light_regularization`. Late phases reduce heavy structure losses so rating and
-explanation objectives are not dragged by fixed all-run weights.
+Loss weights are scheduled by the active five-epoch phases:
+`alignment_warmup` and `task_refinement`. The retired long-run
+`light_regularization` phase is no longer part of the active Step3 contract.
 
 ## Conflict Audit
 
@@ -38,4 +38,3 @@ selects scorer/explainer checkpoints from paper metrics.
 The explainer downstream choice has a DIST guard. A checkpoint with strong
 MAE/RMSE but collapsed DIST is not automatically selected as the explainer
 downstream checkpoint.
-

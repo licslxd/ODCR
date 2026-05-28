@@ -177,20 +177,29 @@ def merge_eval_rows_by_sample_id(
     rows_per_rank: Sequence[Sequence[Dict[str, Any]]],
     expected_n: int,
 ) -> List[Dict[str, Any]]:
-    """DDP 各 rank 本地行合并后按 sample_id 排序；校验无重复、无缺失。"""
+    """DDP 各 rank 本地行合并后按 sample_id 排序；校验无缺失。
+
+    DistributedSampler(drop_last=False) 会在样本数不能整除 world_size 时
+    重复开头样本做 padding。重复样本可能在不同 rank 上有微小生成差异；
+    只保留 rank 顺序中的第一条，后续严格校验最终 sample_id 集合完整。
+    """
     flat: List[Dict[str, Any]] = []
     for rows in rows_per_rank:
         flat.extend(rows)
-    if len(flat) != expected_n:
-        raise RuntimeError(
-            f"eval gather 条数不一致: 期望 {expected_n}, 实际 {len(flat)}"
-        )
     by_id: Dict[int, Dict[str, Any]] = {}
+    duplicate_ids: List[int] = []
     for row in flat:
         sid = int(row["sample_id"])
         if sid in by_id:
-            raise RuntimeError(f"重复 sample_id={sid}")
+            duplicate_ids.append(sid)
+            continue
         by_id[sid] = row
+    if len(by_id) != expected_n:
+        duplicate_note = f"；重复填充={sorted(set(duplicate_ids))[:10]}" if duplicate_ids else ""
+        raise RuntimeError(
+            f"eval gather 唯一条数不一致: 期望 {expected_n}, 实际 {len(by_id)}"
+            f"（原始 gathered={len(flat)}）{duplicate_note}"
+        )
     want = set(range(expected_n))
     got = set(by_id.keys())
     if got != want:

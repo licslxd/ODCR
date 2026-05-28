@@ -96,10 +96,16 @@ class Step4PrelaunchLineageValidationTest(unittest.TestCase):
         self.assertIn("ODCR_STEP3_SELECTED_CHECKPOINT", engine_src)
         self.assertIn("best.pth alias is not a primary", engine_src)
 
-    def test_step4_cache_fingerprint_uses_selected_checkpoint(self) -> None:
+    def test_step4_cache_fingerprint_records_selected_checkpoint_as_audit_lineage_only(self) -> None:
         src = inspect.getsource(step4_engine._step4_encoded_cache_fingerprint)
+        gate_src = inspect.getsource(step4_engine._step4_encoded_cache_manifest_gate_fields)
         self.assertIn("ODCR_STEP3_SELECTED_CHECKPOINT", src)
         self.assertIn("stage_status.selected_checkpoint", src)
+        self.assertIn("lineage_metadata", src)
+        self.assertIn("excluded_from_identity", src)
+        self.assertIn("step3_checkpoint_hash", src)
+        self.assertNotIn("step3_checkpoint_hash", gate_src)
+        self.assertNotIn("step3_checkpoint_lineage_hash", gate_src)
         self.assertNotIn("model\", \"best.pth", src)
 
 

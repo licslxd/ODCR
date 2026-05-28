@@ -23,6 +23,10 @@ def test_step5_resolves_as_explanation_only() -> None:
     assert snapshot["head_gated_loss_contract"]["active_losses"] == ["explainer_ce", "ccv", "fca"]
     assert "scorer_rating_mse" not in snapshot["step5_eval"]["valid_loss_components"]
     assert snapshot["rating_source"]["type"] == "step3_accepted_scorer"
+    assert snapshot["rating_source"]["task"] == 2
+    assert snapshot["rating_source"]["run"] == 2
+    assert snapshot["rating_source"]["policy_type"] == "task_local_step3_accepted_scorer"
+    assert snapshot["rating_source"]["source"] == "upstream_step3_eval_handoff"
     assert cfg.train_label_max_length == 128
     assert cfg.valid_loss_label_max_length == 128
     assert cfg.final_eval_prediction_max_length == 25

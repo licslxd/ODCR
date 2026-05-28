@@ -131,8 +131,8 @@ class TestStep3ControlPlane(unittest.TestCase):
         self.assertEqual(snapshot["train"]["step3_batch_formula"], "global_batch_size = per_gpu_batch_size * ddp_world_size")
         self.assertEqual(snapshot["step3_eval"]["valid_micro_batch_size"], 768)
         self.assertNotIn("step3_performance_ladder", snapshot)
-        self.assertEqual(snapshot["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]["probe_only"], True)
-        self.assertEqual(snapshot["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]["formal_allowed"], False)
+        self.assertNotIn("step3_backup_profiles", snapshot)
+        self.assertNotIn("step3_exploration_profiles", snapshot)
         self.assertEqual(snapshot["step3_worker_profiles"]["W2"]["cpu_budget"], 12)
         self.assertTrue(snapshot["step3_prefetcher"]["enabled"])
         self.assertTrue(snapshot["step3_cross_rank_structured_gather"]["enabled"])
@@ -246,8 +246,8 @@ class TestStep3ControlPlane(unittest.TestCase):
         self.assertNotIn("step3_performance_ladder", formal)
         self.assertNotIn("step3_performance_probe", formal)
         self.assertNotIn("step3_short_pilot", formal)
-        self.assertIn("step3_backup_profiles", snapshot)
-        self.assertIn("step3_exploration_profiles", snapshot)
+        self.assertNotIn("step3_backup_profiles", snapshot)
+        self.assertNotIn("step3_exploration_profiles", snapshot)
         text = json.dumps(formal, ensure_ascii=False)
         self.assertNotIn("task2_g2_effective_pool_2048", text)
         self.assertNotIn("probe_only", text)
@@ -260,16 +260,12 @@ class TestStep3ControlPlane(unittest.TestCase):
         self.assertNotIn("short_pilot", table_text)
         self.assertNotIn("step5", table_text)
 
-    def test_step3_verbose_view_exposes_backup_and_g2_profile_only(self) -> None:
+    def test_step3_verbose_view_has_no_retired_backup_or_g2_profile(self) -> None:
         _cfg, _sources, snapshot = _resolve_step3_task(2)
-        self.assertIn("step3_backup_profiles", snapshot)
-        self.assertIn("step3_exploration_profiles", snapshot)
+        self.assertNotIn("step3_backup_profiles", snapshot)
+        self.assertNotIn("step3_exploration_profiles", snapshot)
         self.assertNotIn("step3_performance_probe", snapshot)
         self.assertNotIn("step3_short_pilot", snapshot)
-        self.assertTrue(snapshot["step3_backup_profiles"]["task2_g0_backup"]["backup_only"])
-        g2 = snapshot["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]
-        self.assertTrue(g2["probe_only"])
-        self.assertFalse(g2["formal_allowed"])
 
     def test_step3_no_accum_profile_and_batch_formula(self) -> None:
         cfg, _, snapshot = _resolve_step3_task()
@@ -277,18 +273,9 @@ class TestStep3ControlPlane(unittest.TestCase):
         self.assertEqual(cfg.per_device_train_batch_size, 768)
         self.assertEqual(snapshot["train"]["step3_batch_semantics"], "odcr_no_accum/1")
         self.assertEqual(snapshot["train"]["candidate"], "G1S")
-        self.assertEqual(snapshot["step3_backup_profiles"]["task2_g1_backup"]["candidate"], "G1")
         self.assertNotIn("step3_performance_ladder", snapshot)
-        g0 = snapshot["step3_backup_profiles"]["task2_g0_backup"]
-        self.assertEqual((g0["batch_size"], g0["per_gpu_batch_size"]), (1024, 512))
-        self.assertTrue(g0["backup_only"])
-        self.assertTrue(g0["manual_selection_required"])
-        self.assertFalse(g0["formal_allowed"])
-        g2 = snapshot["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]
-        self.assertTrue(g2["probe_only"])
-        self.assertFalse(g2["formal_allowed"])
-        self.assertTrue(g2["exploration_only"])
-        self.assertEqual((g2["batch_size"], g2["per_gpu_batch_size"]), (2048, 1024))
+        self.assertNotIn("step3_backup_profiles", snapshot)
+        self.assertNotIn("step3_exploration_profiles", snapshot)
         source = (_REPO_ROOT / "code" / "executors" / "step3_train_core.py").read_text(encoding="utf-8")
         self.assertNotIn("_ddp_no_sync_model", source)
         self.assertNotIn(".no_sync(", source)

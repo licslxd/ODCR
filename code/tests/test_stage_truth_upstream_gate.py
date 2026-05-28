@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 
@@ -28,8 +30,31 @@ from odcr_core.stage_promotion import promote_upstream  # noqa: E402
 from odcr_core.stage_status import build_and_write_stage_status, mark_superseded, read_stage_status  # noqa: E402
 from odcr_core.stage_truth_antiforgery import write_step3_fixture  # noqa: E402
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST  # noqa: E402
+from odcr_core.step4_pool_exports import (  # noqa: E402
+    POOL_COLUMNS,
+    validate_step4_pool_exports,
+    write_step5_pool_exports_status,
+)
+from odcr_core.step5_pool_sampler import (  # noqa: E402
+    POOL_NAMES,
+    POOL_PARQUET_NAMES,
+    STEP5_POOL_DISTRIBUTION_REPORT,
+    STEP5_POOL_MANIFEST,
+    STEP5_POOL_MANIFEST_SCHEMA_VERSION,
+    STEP5_POOLS_DIRNAME,
+    STEP5_SAMPLING_CONTRACT,
+    STEP5_SAMPLING_CONTRACT_SCHEMA_VERSION,
+)
 from odcr_core.upstream_resolver import UpstreamResolutionError, resolve_upstream  # noqa: E402
 from tools.check_one_control_guardrails import run_checks  # noqa: E402
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -53,6 +78,64 @@ def _write_step3_run(
         active=active,
         eligible=eligible,
         quality_downstream_ready=not quality_blocked,
+    )
+
+
+def _write_step5_pool_fixture(repo: Path, run: Path, *, task: int, run_id: str) -> None:
+    pool_dir = run / STEP5_POOLS_DIRNAME
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    pools: dict[str, dict[str, object]] = {}
+    empty = pd.DataFrame({column: pd.Series(dtype="object") for column in POOL_COLUMNS})
+    for name in POOL_NAMES:
+        path = pool_dir / POOL_PARQUET_NAMES[name]
+        empty.to_parquet(path, index=False)
+        tier = "low_weighted" if name.endswith("low_weighted") else name.rsplit("_", 1)[-1]
+        pools[name] = {
+            "path": path.relative_to(repo).as_posix(),
+            "sha256": _sha256(path),
+            "row_count": 0,
+            "role": "cf_pool" if "_cf_" in name else "gold_anchor_pool",
+            "tier": tier,
+            "columns": list(POOL_COLUMNS),
+        }
+    _write_json(
+        pool_dir / STEP5_SAMPLING_CONTRACT,
+        {
+            "schema_version": STEP5_SAMPLING_CONTRACT_SCHEMA_VERSION,
+            "producer_stage": "step4",
+            "consumer_stage": "step5",
+            "task_id": int(task),
+            "step4_run": str(run_id),
+        },
+    )
+    _write_json(
+        pool_dir / STEP5_POOL_DISTRIBUTION_REPORT,
+        {
+            "schema_version": "odcr_step5_pool_distribution_report/1",
+            "pool_row_counts": {name: 0 for name in POOL_NAMES},
+        },
+    )
+    _write_json(
+        pool_dir / STEP5_POOL_MANIFEST,
+        {
+            "schema_version": STEP5_POOL_MANIFEST_SCHEMA_VERSION,
+            "producer_stage": "step4",
+            "consumer_stage": "step5",
+            "task_id": int(task),
+            "step4_run": str(run_id),
+            "pools": pools,
+            "sampling_contract": (pool_dir / STEP5_SAMPLING_CONTRACT).relative_to(repo).as_posix(),
+            "distribution_report": (pool_dir / STEP5_POOL_DISTRIBUTION_REPORT).relative_to(repo).as_posix(),
+            "full_audit_default_train_forbidden": True,
+            "legacy_gold_heavy_exports_allowed_by_default": False,
+        },
+    )
+    validation = validate_step4_pool_exports(run, repo_root=repo, raise_on_error=True)
+    write_step5_pool_exports_status(
+        repo_root=repo,
+        run_dir=run,
+        validation=validation,
+        update_stage_status=False,
     )
 
 
@@ -130,6 +213,7 @@ def _write_step4_run(repo: Path, *, task: int, run_id: str, from_step3: str, act
             "from_step3": from_step3,
         },
     )
+    _write_step5_pool_fixture(repo, run, task=task, run_id=run_id)
     build_and_write_stage_status(repo_root=repo, stage="step4", task=task, run_id=run_id)
     if active:
         write_latest_pointer_json(
@@ -223,21 +307,10 @@ class StageTruthUpstreamGateTest(unittest.TestCase):
             repo = Path(tmp)
             _write_step3_run(repo, task=2, run_id="2", active=True, eligible=True, quality_blocked=True)
             _write_step4_run(repo, task=2, run_id="2_1", from_step3="2", active=True)
-            old_root = config_resolver._REPO_ROOT
-            try:
-                config_resolver._REPO_ROOT = repo
-                _cfg, _, snapshot = config_resolver.resolve_config(
-                    config_path=REPO_ROOT / "configs" / "odcr.yaml",
-                    command="step5",
-                    task_id=2,
-                    set_overrides=[],
-                    dry_run=True,
-                    from_step4="latest",
-                )
-            finally:
-                config_resolver._REPO_ROOT = old_root
-            self.assertEqual(snapshot["upstream_resolution"]["producer_stage"], "step4")
-            self.assertEqual(snapshot["upstream_resolution"]["run_id"], "2_1")
+            resolution = resolve_upstream(repo_root=repo, stage="step4", task=2, consumer_stage="step5")
+            self.assertEqual(resolution.producer_stage, "step4")
+            self.assertEqual(resolution.run_id, "2_1")
+            self.assertEqual(resolution.stage_status["step5_train_input_role"], "pool_manifest_sampling_contract")
 
     def test_step4_ready_writes_rich_latest_pointer_for_step5(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,6 +327,22 @@ class StageTruthUpstreamGateTest(unittest.TestCase):
             )
             self.assertIn("selected_export", latest["sha256s"])
             self.assertIn("stage_status", latest["sha256s"])
+
+    def test_step4_status_treats_dedicated_exports_as_legacy_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _write_step3_run(repo, task=2, run_id="2", active=True, eligible=True, quality_blocked=True)
+            run = _write_step4_run(repo, task=2, run_id="2_1", from_step3="2", active=False)
+            _write_json(
+                run / "meta" / "step5_dedicated_exports_status.json",
+                {"schema_version": "odcr_step4_step5_dedicated_exports_status/1", "ready": True},
+            )
+            status = build_and_write_stage_status(repo_root=repo, stage="step4", task=2, run_id="2_1")
+            self.assertEqual(status["step5_train_input_role"], "pool_manifest_sampling_contract")
+            self.assertTrue(status["step5_pool_exports_ready"])
+            self.assertNotIn("step5_dedicated_exports_ready", status)
+            self.assertNotIn("dedicated_export_readiness", status)
+            self.assertEqual(status["legacy_step5_dedicated_exports"]["role"], "audit_or_history_only")
 
     def test_step5_rejects_step4_run_summary_ok_when_stage_status_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

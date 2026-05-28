@@ -15,11 +15,14 @@ sys.path.insert(0, _CODE_DIR)
 from executors.step5_engine import (  # noqa: E402
     Model,
     STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+    STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+    _encode_legacy32_content_evidence,
     _drop_step5_runtime_aux_state_keys,
     _step5_batch_diversity_ema_buffer,
     _step5_explainer_ce_route_mask,
     _step5_resolve_flan_vocab_size,
     odcr_terminal_cleanliness_loss,
+    set_step5_tokenizer_override,
 )
 
 
@@ -90,6 +93,54 @@ class TestStep5ExplanationQualityContract(unittest.TestCase):
         self.assertEqual(tuple(encoder_embeds.shape), (2, 7, 3))
         self.assertTrue(torch.allclose(encoder_embeds[:, :4, :], soft))
         self.assertEqual(encoder_mask.tolist(), [[1, 1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 0, 0, 0]])
+
+        over_budget = type(
+            "Packet",
+            (),
+            {"content_evidence_ids": torch.ones(1, STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS + 1, dtype=torch.long)},
+        )()
+        with self.assertRaises(RuntimeError):
+            model._build_flan_encoder_inputs(torch.randn(1, 4, 3), over_budget)
+
+    def test_flan_encoder_legacy32_tokenizer_truncates_content_evidence(self) -> None:
+        class Tok:
+            pad_token_id = 0
+            eos_token_id = 1
+
+            def __call__(
+                self,
+                text,
+                add_special_tokens=False,
+                padding=False,
+                truncation=False,
+                max_length=None,
+                verbose=True,
+            ):
+                del add_special_tokens, padding, verbose
+                ids = [i + 2 for i, _ in enumerate(str(text).split())]
+                if truncation and max_length is not None:
+                    ids = ids[: int(max_length)]
+                return {"input_ids": ids}
+
+        set_step5_tokenizer_override(Tok())
+        try:
+            encoded = _encode_legacy32_content_evidence(
+                {
+                    "content_evidence": " ".join(f"c{i}" for i in range(20)),
+                    "item": "item-id",
+                    "user": "user-id",
+                    "step5_prompt_text": "please explain",
+                },
+                max_length=6,
+                soft_prompt_len=2,
+            )
+        finally:
+            set_step5_tokenizer_override(None)
+        self.assertEqual(encoded["legacy_max_content_tokens"], 6)
+        self.assertEqual(encoded["content_evidence_token_len"], 6)
+        self.assertEqual(encoded["input_token_len"], 8)
+        self.assertTrue(encoded["truncated"])
+        self.assertEqual(encoded["content_evidence_raw_token_len"], 20)
 
     def test_checkpoint_architecture_records_flan_encoder_input_contract(self) -> None:
         from executors import step5_engine as s5

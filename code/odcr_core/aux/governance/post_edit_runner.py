@@ -329,7 +329,7 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                     "from odcr_core.config_resolver import resolve_config; "
                     "resolve_config(config_path='configs/odcr.yaml', command='step5', "
                     "task_id=2, set_overrides=[], dry_run=True, from_step4='1', "
-                    "eval_profile='balanced_2gpu', mode='train_only')\n"
+                    "eval_profile='paper_greedy_25', mode='train_only')\n"
                 ),
             ),
             display_argv=("python", "-c", "step5 resolver dry-run"),

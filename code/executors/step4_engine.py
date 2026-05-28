@@ -60,7 +60,6 @@ from odcr_core.file_atomic import atomic_write_json
 from odcr_core.aux.artifacts.path_policy import load_json_file
 from odcr_core.training_checkpoint import (
     CheckpointLineageError,
-    current_one_control_resolved_config_hash,
     file_fingerprint,
     model_artifact_fingerprint,
     stable_hash,
@@ -83,12 +82,12 @@ _STEP4_REQUIRES_TORCHRUN_MSG = (
 )
 
 # 编码逻辑 / Processor 口径变更时递增，避免误读旧 Arrow 缓存
-_STEP4_ENCODE_CACHE_VERSION = "v5_lineage_manifest"
+_STEP4_ENCODE_CACHE_VERSION = "v6_content_identity"
 _STEP4_ENCODE_CACHE_SCHEMA_VERSION = "odcr_step4_encoded_cache/1"
 _STEP4_ENCODE_CACHE_MANIFEST = "cache_manifest.json"
 _STEP4_ENCODE_CACHE_COMPLETED_MARKER = "completed.marker"
 _STEP4_ENCODE_CACHE_FAILED_MARKER = "failed.marker"
-_STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION = "executors.step4_engine.encoded_cache/2"
+_STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION = "executors.step4_engine.encoded_cache/3"
 _STEP4_ENCODE_CACHE_REQUIRED_FIELDS = (
     "user_idx",
     "item_idx",
@@ -175,24 +174,16 @@ def _step4_encoded_cache_fingerprint(
     processor_max_length: int,
     step3_checkpoint_lineage_hash: str,
 ) -> dict[str, Any]:
-    """Hard cache identity: source hash + tokenizer artifact + resolved config lineage."""
+    """Content cache identity plus audit-only lineage for Step4 encoded inputs."""
     source_fp = file_fingerprint(aug_csv_path)
     tokenizer_fp = model_artifact_fingerprint(t5_resolved)
     required_fields_hash = stable_hash(_STEP4_ENCODE_CACHE_REQUIRED_FIELDS)
-    resolved_config_hash = current_one_control_resolved_config_hash(
-        extra={"stage": "step4", "task_id": int(task_idx), "artifact": "encoded_cache"}
-    )
     selected_checkpoint_raw = (os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT") or "").strip()
-    if not selected_checkpoint_raw:
-        raise RuntimeError(
-            "Step4 encoded cache fingerprint requires ODCR_STEP3_SELECTED_CHECKPOINT "
-            "from stage_status.selected_checkpoint; best.pth alias is secondary only."
-        )
-    selected_checkpoint = os.path.abspath(selected_checkpoint_raw)
+    selected_checkpoint = os.path.abspath(selected_checkpoint_raw) if selected_checkpoint_raw else ""
     selected_checkpoint_hash = str(os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT_HASH") or "").strip()
-    if not selected_checkpoint_hash:
+    if selected_checkpoint and not selected_checkpoint_hash:
         selected_checkpoint_hash = _step4_file_sha256(selected_checkpoint)
-    payload: dict[str, Any] = {
+    identity: dict[str, Any] = {
         "schema_version": _STEP4_ENCODE_CACHE_SCHEMA_VERSION,
         "cache_version": _STEP4_ENCODE_CACHE_VERSION,
         "stage": "step4",
@@ -219,27 +210,41 @@ def _step4_encoded_cache_fingerprint(
             "required_fields": list(_STEP4_ENCODE_CACHE_REQUIRED_FIELDS),
         },
         "max_length": int(processor_max_length),
-        "resolved_config_hash": resolved_config_hash,
-        "one_control_resolved_config_hash": resolved_config_hash,
-        "rcr_step4_config_hash": stable_hash(
-            json.loads(os.environ.get("ODCR_STEP4_RCR_CONFIG_JSON") or "{}")
-        ),
+        "index_contract_or_required_fields_hash": required_fields_hash,
+        "producer_code_version": _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION,
+    }
+    lineage_metadata: dict[str, Any] = {
+        "cache_identity_policy": "content_affecting_only",
+        "excluded_from_identity": [
+            "resolved_config_hash",
+            "rcr_step4_config_hash",
+            "training_semantic_fingerprint",
+            "generation_semantic_fingerprint",
+            "upstream_step3_run_id",
+            "step3_checkpoint_hash",
+            "step3_checkpoint_lineage_hash",
+        ],
+        "rcr_step4_config_hash": stable_hash(json.loads(os.environ.get("ODCR_STEP4_RCR_CONFIG_JSON") or "{}")),
         "upstream_step3_run_id": str(os.path.basename(os.path.abspath(os.environ.get("ODCR_STEP3_RUN_DIR") or ""))),
         "step3_checkpoint_source": os.environ.get("ODCR_STEP3_SELECTED_CHECKPOINT_SOURCE") or "stage_status.selected_checkpoint",
         "step3_selected_checkpoint_path": selected_checkpoint,
         "step3_checkpoint_hash": selected_checkpoint_hash,
         "step3_checkpoint_lineage_hash": str(step3_checkpoint_lineage_hash),
-        "index_contract_or_required_fields_hash": required_fields_hash,
-        "producer_code_version": _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION,
         "training_semantic_fingerprint": os.environ.get("ODCR_TRAINING_SEMANTIC_FINGERPRINT", ""),
         "generation_semantic_fingerprint": os.environ.get("ODCR_GENERATION_SEMANTIC_FINGERPRINT", ""),
     }
-    payload["fingerprint_hash"] = stable_hash(payload)
+    payload: dict[str, Any] = {
+        **identity,
+        "cache_identity": identity,
+        "lineage_metadata": lineage_metadata,
+        "fingerprint_hash": stable_hash(identity),
+        "cache_identity_hash": stable_hash(identity),
+    }
     return payload
 
 
 def _step4_encoded_cache_dir(task_idx: int, fingerprint: Mapping[str, Any]) -> str:
-    digest = stable_hash(dict(fingerprint), length=24)
+    digest = str(fingerprint.get("fingerprint_hash") or stable_hash(dict(fingerprint), length=24))[:24]
     return os.path.join(get_odcr_root(), "cache", "step4_encoded", str(task_idx), digest)
 
 
@@ -282,11 +287,6 @@ def _step4_encoded_cache_manifest_gate_fields(fingerprint: Mapping[str, Any]) ->
         "tokenizer_fingerprint": fingerprint.get("tokenizer_fingerprint"),
         "tokenizer_config_hash": str(fingerprint.get("tokenizer_config_hash") or ""),
         "max_length": int(fingerprint.get("max_length", -1)),
-        "resolved_config_hash": str(fingerprint.get("resolved_config_hash") or ""),
-        "rcr_step4_config_hash": str(fingerprint.get("rcr_step4_config_hash") or ""),
-        "upstream_step3_run_id": str(fingerprint.get("upstream_step3_run_id") or ""),
-        "step3_checkpoint_hash": str(fingerprint.get("step3_checkpoint_hash") or ""),
-        "step3_checkpoint_lineage_hash": str(fingerprint.get("step3_checkpoint_lineage_hash") or ""),
         "index_contract_or_required_fields_hash": str(fingerprint.get("index_contract_or_required_fields_hash") or ""),
         "producer_code_version": _STEP4_ENCODE_CACHE_PRODUCER_CODE_VERSION,
     }

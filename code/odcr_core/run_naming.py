@@ -21,7 +21,7 @@ STEP5_HEAD_CHOICES = ("explanation",)
 STEP5_LEGACY_EXPLAINER_ALIAS = "step5" + "B"
 STEP5_RETIRED_SCORER_HEAD = "step5" + "A"
 STEP5_RETIRED_COMBINED_HEAD = "combined"
-_STEP5_HEAD_BY_LOWER = {"explanation": "explanation", STEP5_LEGACY_EXPLAINER_ALIAS.lower(): "explanation"}
+_STEP5_HEAD_BY_LOWER = {"explanation": "explanation"}
 _RE_STEP5_HEAD_SLUG = re.compile(r"^(\d+(?:_\d+)*)_(explanation|step5_explanation)$", re.IGNORECASE)
 _STEP5_RUN_ID_ERROR = (
     "Step5 run-id must include consumed Step4 run prefix, e.g. 1_1, or use --run-id auto."
@@ -58,7 +58,11 @@ def parse_step5_head(raw: str | None) -> str:
     s = str(raw or "explanation").strip()
     if not s:
         s = "explanation"
-    if s.lower() in {STEP5_RETIRED_SCORER_HEAD.lower(), STEP5_RETIRED_COMBINED_HEAD.lower()}:
+    if s.lower() in {
+        STEP5_RETIRED_SCORER_HEAD.lower(),
+        STEP5_LEGACY_EXPLAINER_ALIAS.lower(),
+        STEP5_RETIRED_COMBINED_HEAD.lower(),
+    }:
         raise ValueError("Retired Step5 head: rating now uses rating_source and Step5 trains explanations only.")
     head = _STEP5_HEAD_BY_LOWER.get(s.lower())
     if head is None:

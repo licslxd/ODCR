@@ -147,12 +147,13 @@ In short: formal Step4 remains blocked whenever the only available Step4
 tuning evidence is CPU preview or CUDA transport evidence.
 
 Step5 has one active path: explanation-only training. Rating metrics are owned
-by the Step3 accepted scorer declared in `rating_source`; Step5 does not train
+by the task-local Step3 accepted scorer resolved through `rating_source`;
+Step5 does not train
 or evaluate a rating scorer. Step5 consumes Step4 `route_explainer` samples,
 uses CCV through an explicit control packet instead of prompt concatenation,
 and uses FCA to align evidence bases for the explanation objective. The public
 Step5 controls are One-Control blocks: `step5.explainer_gate`, `step5.ccv`,
-`step5.fca`, and `rating_source`. CCV adapter dimensions and Step5 native LoRA
+`step5.fca`, and the task-local `rating_source` policy. CCV adapter dimensions and Step5 native LoRA
 controls are resolved from `step5.ccv` / `step5.ccv.native_lora`; retired
 `lambda_lci`, `lambda_fca`, prompt-concat controls, and backend LoRA keys must
 not form a parallel active path.

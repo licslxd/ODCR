@@ -198,8 +198,10 @@ def build_recovery_plan(
     recovery_index: int = 1,
 ) -> dict[str, Any]:
     cfg = dict(config or {})
+    if "recovery_epochs" not in cfg:
+        raise ValueError("Step3 recovery config must include explicit recovery_epochs.")
     restart_ratio = float(cfg.get("restart_lr_ratio", 0.25))
-    recovery_epochs = int(cfg.get("recovery_epochs", 8))
+    recovery_epochs = int(cfg["recovery_epochs"])
     max_recoveries = int(cfg.get("max_recoveries", 1))
     source_scope = str(cfg.get("source_checkpoint_scope") or "best_observed")
     scheduler = str(cfg.get("recovery_scheduler") or "short_cosine")
@@ -241,8 +243,7 @@ def resolve_phase_for_epoch(
     if not phases:
         phases = [
             {"name": "alignment_warmup", "start_epoch": 1, "end_epoch": 2, "loss_multipliers": {}},
-            {"name": "task_refinement", "start_epoch": 3, "end_epoch": 24, "loss_multipliers": {}},
-            {"name": "light_regularization", "start_epoch": 25, "end_epoch": None, "loss_multipliers": {}},
+            {"name": "task_refinement", "start_epoch": 3, "end_epoch": 5, "loss_multipliers": {}},
         ]
     selected = phases[-1]
     if recovery_active:

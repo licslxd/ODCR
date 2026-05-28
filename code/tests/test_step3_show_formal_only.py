@@ -44,14 +44,15 @@ class TestStep3ShowFormalOnly(unittest.TestCase):
         self.assertNotIn("performance_probe", text)
         self.assertNotIn("short_pilot", text)
 
-    def test_task2_verbose_show_exposes_nondefault_profiles(self) -> None:
+    def test_task2_verbose_show_has_no_retired_backup_profiles(self) -> None:
         out = _run_odcr("show", "--stage", "step3", "--task", "2", "--verbose")
         payload = _first_json_object(out)
-        self.assertIn("step3_backup_profiles", payload)
-        self.assertIn("step3_exploration_profiles", payload)
-        self.assertTrue(payload["step3_backup_profiles"]["task2_g1_backup"]["backup_only"])
-        self.assertTrue(payload["step3_backup_profiles"]["task2_g0_backup"]["backup_only"])
-        self.assertTrue(payload["step3_exploration_profiles"]["task2_g2_effective_pool_2048"]["probe_only"])
+        text = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("step3_backup_profiles", payload)
+        self.assertNotIn("step3_exploration_profiles", payload)
+        self.assertNotIn("task2_g1_backup", text)
+        self.assertNotIn("task2_g0_backup", text)
+        self.assertNotIn("task2_g2_effective_pool_2048", text)
 
     def test_task2_dry_run_uses_formal_payload(self) -> None:
         out = _run_odcr("step3", "--task", "2", "--dry-run")

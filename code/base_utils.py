@@ -294,9 +294,16 @@ def _tokenizer_truncate_decode_text(text: Any, tokenizer: Any, *, max_len: int) 
     if int(max_len) <= 0:
         raise ValueError(f"official paper metric max_len must be positive, got {max_len!r}")
     raw = "" if text is None else str(text)
-    encoded = tokenizer(raw, add_special_tokens=False, truncation=False)
+    encoded = tokenizer(raw, add_special_tokens=False, truncation=False, verbose=False)
     original_ids = [int(x) for x in list(encoded.get("input_ids") or [])]
-    ids = original_ids[: int(max_len)]
+    truncated = tokenizer(
+        raw,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=int(max_len),
+        verbose=False,
+    )
+    ids = [int(x) for x in list(truncated.get("input_ids") or [])]
     try:
         decoded = tokenizer.decode(ids, skip_special_tokens=True)
     except TypeError:

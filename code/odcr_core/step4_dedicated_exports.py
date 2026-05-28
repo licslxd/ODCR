@@ -1007,7 +1007,8 @@ def validate_step4_dedicated_exports(
             "filter_rules": report.get("filter_rules"),
             "intersections": intersections,
             "full_audit_table_role": "audit_only",
-            "step5_train_input_role": "dedicated_split_exports",
+            "legacy_dedicated_export_role": "audit_or_history_only",
+            "not_default_step5_train": True,
         }
     except Exception as exc:
         result.errors.append(str(exc))
@@ -1027,19 +1028,23 @@ def step4_dedicated_stage_status_fields(
     run = (root / run).resolve() if not run.is_absolute() else run.resolve()
     validation = validation or validate_step4_dedicated_exports(run, repo_root=root)
     fields: dict[str, Any] = {
-        "step5_dedicated_exports_ready": bool(validation.ready),
-        "full_audit_table_role": "audit_only",
-        "step5_train_input_role": "dedicated_split_exports" if validation.ready else None,
-        "step5_dedicated_exports_status": _repo_relative(root, run / "meta" / STEP4_DEDICATED_EXPORTS_STATUS),
-        "step5_train_manifest": _repo_relative(root, validation.manifest_path),
-        "route_intersection_report": _repo_relative(root, validation.report_path),
-        "dedicated_export_readiness": validation.to_payload(root),
+        "legacy_step5_dedicated_exports": {
+            "ready": bool(validation.ready),
+            "role": "audit_or_history_only",
+            "not_default_step5_train": True,
+            "status": _repo_relative(root, run / "meta" / STEP4_DEDICATED_EXPORTS_STATUS),
+            "manifest": _repo_relative(root, validation.manifest_path),
+            "route_intersection_report": _repo_relative(root, validation.report_path),
+            "readiness": validation.to_payload(root),
+        }
     }
     exports = ((validation.diagnostics or {}).get("exports") or {}) if validation.ready else {}
     if isinstance(exports, Mapping):
-        fields["selected_full_audit_export"] = (exports.get("full_audit") or {}).get("path") if isinstance(exports.get("full_audit"), Mapping) else None
-        fields["rating_stability_control_scorer_train_export"] = (exports.get("rating_stability_control_scorer_train") or {}).get("path") if isinstance(exports.get("rating_stability_control_scorer_train"), Mapping) else None
-        fields["step5_explanation_explainer_train_export"] = (exports.get("step5_explanation_explainer_train") or {}).get("path") if isinstance(exports.get("step5_explanation_explainer_train"), Mapping) else None
+        legacy = fields["legacy_step5_dedicated_exports"]
+        if isinstance(legacy, dict):
+            legacy["selected_full_audit_export"] = (exports.get("full_audit") or {}).get("path") if isinstance(exports.get("full_audit"), Mapping) else None
+            legacy["rating_stability_control_scorer_train_export"] = (exports.get("rating_stability_control_scorer_train") or {}).get("path") if isinstance(exports.get("rating_stability_control_scorer_train"), Mapping) else None
+            legacy["step5_explanation_explainer_train_export"] = (exports.get("step5_explanation_explainer_train") or {}).get("path") if isinstance(exports.get("step5_explanation_explainer_train"), Mapping) else None
     return fields
 
 
@@ -1076,6 +1081,19 @@ def write_step5_dedicated_exports_status(
     atomic_write_json(status_path, payload)
     if update_stage_status and stage_status_path.is_file() and validation.ready:
         status = _load_json(stage_status_path, label="stage_status")
+        for key in (
+            "step5_dedicated_exports_ready",
+            "step5_dedicated_exports_status",
+            "step5_train_manifest",
+            "route_intersection_report",
+            "dedicated_export_readiness",
+            "selected_full_audit_export",
+            "rating_stability_control_scorer_train_export",
+            "step5_explanation_explainer_train_export",
+        ):
+            status.pop(key, None)
+        if status.get("step5_train_input_role") == "dedicated_split_exports":
+            status.pop("step5_train_input_role", None)
         status.update(fields)
         status.setdefault("artifacts", {})
         if isinstance(status["artifacts"], dict):
@@ -1099,6 +1117,19 @@ def write_step5_dedicated_exports_status(
         status["updated_at"] = _now()
         status["updated_at_utc"] = status["updated_at"]
         atomic_write_json(stage_status_path, status)
+        summary_path = meta / "run_summary.json"
+        if summary_path.is_file():
+            from odcr_core.manifests import write_latest_pointer_json
+
+            write_latest_pointer_json(
+                repo_root=root,
+                stage_unit_dir=run.parent,
+                run_id=run.name,
+                run_dir=run,
+                summary_path=summary_path,
+                status=str(status.get("final_status") or "completed"),
+                updated_at=status["updated_at"],
+            )
     return payload
 
 

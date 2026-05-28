@@ -36,6 +36,9 @@ class GatheredBatch:
     evidence_quality_prior: Optional[torch.Tensor] = None
     sampler_component_id: Optional[torch.Tensor] = None
     sampler_tier_id: Optional[torch.Tensor] = None
+    flan_encoder_raw_input_token_len: Optional[torch.Tensor] = None
+    flan_encoder_input_token_len: Optional[torch.Tensor] = None
+    flan_encoder_truncated: Optional[torch.Tensor] = None
     raw_ref_text: Optional[Sequence[str]] = None
 
     def assert_uniform_batch_dim(self) -> None:
@@ -89,6 +92,9 @@ class GatheredBatch:
             ("evidence_quality_prior", self.evidence_quality_prior),
             ("sampler_component_id", self.sampler_component_id),
             ("sampler_tier_id", self.sampler_tier_id),
+            ("flan_encoder_raw_input_token_len", self.flan_encoder_raw_input_token_len),
+            ("flan_encoder_input_token_len", self.flan_encoder_input_token_len),
+            ("flan_encoder_truncated", self.flan_encoder_truncated),
         ):
             if t is not None and int(t.shape[0]) != b:
                 raise ValueError(

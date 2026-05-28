@@ -27,6 +27,7 @@ STEP5_POOL_MANIFEST = "step5_pool_manifest.json"
 STEP5_SAMPLING_CONTRACT = "step5_sampling_contract.json"
 STEP5_POOL_DISTRIBUTION_REPORT = "step5_pool_distribution_report.json"
 STEP5_POOL_EXPORTS_STATUS = "step5_pool_exports_status.json"
+WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL = "WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1"
 
 _EXPLANATION_POOL_PREFIX = "step5_explanation"
 _LEGACY_EXPLAINER_POOL_PREFIX = "step5" + "B"
@@ -46,6 +47,27 @@ LEGACY_POOL_ALIASES: dict[str, str] = {
     name: name.replace(_EXPLANATION_POOL_PREFIX, _LEGACY_EXPLAINER_POOL_PREFIX, 1)
     for name in POOL_NAMES
 }
+
+
+def _weak_low_weighted_cf_protocol(tuning_config: Mapping[str, Any] | None) -> bool:
+    candidate = str((tuning_config or {}).get("selected_tuning_candidate") or "")
+    tokens = {part.strip() for part in candidate.split("+") if part.strip()}
+    return WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL in tokens
+
+
+def _allow_weak_low_weighted_cf_route_bypass(
+    *,
+    weak_low_weighted_cf_protocol: bool,
+    head: str,
+    component: str,
+    tier: str,
+) -> bool:
+    return (
+        bool(weak_low_weighted_cf_protocol)
+        and str(head) == "explanation"
+        and str(component) == "cf"
+        and str(tier) == "low_weighted"
+    )
 LEGACY_COLUMN_ALIASES: dict[str, str] = {
     "cf_tier_step5_explanation": f"cf_tier_{_LEGACY_EXPLAINER_POOL_PREFIX}",
     "cf_tier_reason_step5_explanation": f"cf_tier_reason_{_LEGACY_EXPLAINER_POOL_PREFIX}",
@@ -559,6 +581,7 @@ def validate_step5_formal_sample_plan_for_source(
         head_cfg = sampler_config.get(head)
         if not isinstance(head_cfg, Mapping):
             raise Step5PoolSamplerError(f"step5.sampler.{head} missing")
+        weak_low_weighted_cf_protocol = _weak_low_weighted_cf_protocol(tuning_config)
         head_bounded = bounded_max_rows
         if False and bounded_max_rows is not None:
             head_bounded = max(1, int(bounded_max_rows) // 2)
@@ -592,6 +615,7 @@ def validate_step5_formal_sample_plan_for_source(
             sampling_capacity_by_tier: dict[str, int] = {}
             active_tiers: list[str] = []
             inactive_tiers: list[str] = []
+            route_bypass_tiers: list[str] = []
             component_shortage = 0
             route_col = _route_column_for_head(head) if component == "cf" else None
             for tier in tier_keys:
@@ -601,7 +625,17 @@ def validate_step5_formal_sample_plan_for_source(
                 (active_tiers if active else inactive_tiers).append(str(tier))
                 available_raw[tier] = _pool_row_count(source, pool_name)
                 if component == "cf":
-                    route_positive = _route_compatible_count(source, head=head, pool_name=pool_name, timings=timings)
+                    route_bypass = _allow_weak_low_weighted_cf_route_bypass(
+                        weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
+                        head=head,
+                        component=component,
+                        tier=tier,
+                    )
+                    if route_bypass:
+                        route_positive = int(available_raw[tier])
+                        route_bypass_tiers.append(str(tier))
+                    else:
+                        route_positive = _route_compatible_count(source, head=head, pool_name=pool_name, timings=timings)
                     available_route[tier] = int(route_positive)
                     if requested > 0 and int(route_positive) <= 0:
                         message = (
@@ -636,6 +670,8 @@ def validate_step5_formal_sample_plan_for_source(
                     ),
                 },
                 "shortage": int(component_shortage),
+                "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol) if component == "cf" else False,
+                "route_bypass_tiers": route_bypass_tiers if component == "cf" else [],
                 "graph_safe_zero_tiers": [
                     str(tier)
                     for tier in tier_keys
@@ -661,6 +697,11 @@ def validate_step5_formal_sample_plan_for_source(
             "max_replacement_rate": float(max_replacement_rate),
             "pool_exhaustion": bool(pool_exhaustion),
             "actual_tier_counts_match_active_mix": True,
+            "sampler_protocol": (
+                WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL
+                if weak_low_weighted_cf_protocol
+                else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
+            ),
             "low_weighted_policy": (
                 "disabled_for_mainline"
                 if float((_component_mix(head_cfg, "cf")).get("low_weighted") or 0.0) == 0.0
@@ -685,7 +726,10 @@ def validate_step5_formal_sample_plan_for_source(
         "no_write": bool(no_write),
         "formal_namespace_write": False,
         "step4_sampling_contract_role": "pool_lineage_only",
-        "active_sampler_source": "configs/odcr.yaml:step5.sampler + configs/odcr.yaml:step5.tuning.selected_tuning_candidate",
+        "active_sampler_source": (
+            f"{sampler_config.get('task_override_source') or 'configs/odcr.yaml:step5.sampler'} + "
+            f"{tuning_config.get('selected_tuning_candidate_source') or 'configs/odcr.yaml:step5.tuning.selected_tuning_candidate'}"
+        ),
         "full_audit_default_forbidden": True,
         "old_dedicated_default_forbidden": True,
     }
@@ -738,6 +782,7 @@ def _apply_prompt_and_weights(
     seed: int,
     weight: float,
     effective_epoch: int,
+    weak_low_weighted_cf_protocol: bool = False,
     timings: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if df.empty:
@@ -751,6 +796,29 @@ def _apply_prompt_and_weights(
     out["sampler_weight"] = float(weight)
     out["posterior_sample_weight_hint"] = pd.to_numeric(out["sample_weight_hint"], errors="coerce").fillna(0.0)
     out["sample_weight_hint"] = out["posterior_sample_weight_hint"].astype(float) * float(weight)
+    if _allow_weak_low_weighted_cf_route_bypass(
+        weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
+        head=task_head,
+        component=component,
+        tier=tier,
+    ):
+        original_route = (
+            pd.to_numeric(out["route_explainer"], errors="coerce").fillna(0).astype(int)
+            if "route_explainer" in out.columns
+            else pd.Series([0] * len(out), index=out.index, dtype="int64")
+        )
+        original_train_keep = (
+            pd.to_numeric(out["train_keep"], errors="coerce").fillna(0).astype(int)
+            if "train_keep" in out.columns
+            else pd.Series([0] * len(out), index=out.index, dtype="int64")
+        )
+        out["posterior_route_explainer"] = original_route
+        out["posterior_train_keep"] = original_train_keep
+        out["weak_low_weighted_cf_protocol"] = True
+        out["weak_low_weighted_cf_route_override"] = original_route.ne(1)
+        out["route_explainer"] = 1
+        out["train_keep"] = 1
+        out["sample_weight_hint"] = float(weight)
     t0 = time.perf_counter()
     prompts = [
         registry.render(
@@ -795,6 +863,7 @@ def _sample_component(
     seed: int,
     epoch: int,
     columns: Sequence[str] | None,
+    weak_low_weighted_cf_protocol: bool = False,
     timings: dict[str, float] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     tier_keys = ("high", "medium") if component in {"target_gold", "aux_gold"} else ("high", "medium", "low_weighted")
@@ -808,7 +877,13 @@ def _sample_component(
         pool_name = _pool_names_for(head, component, tier)
         pool_df = _read_pool(source, pool_name, columns, timings=timings)
         available_raw[tier] = int(len(pool_df))
-        route_df = _route_compatible_pool_df(pool_df, head=head, pool_name=pool_name) if component == "cf" else pool_df
+        route_bypass = _allow_weak_low_weighted_cf_route_bypass(
+            weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
+            head=head,
+            component=component,
+            tier=tier,
+        )
+        route_df = pool_df if route_bypass else (_route_compatible_pool_df(pool_df, head=head, pool_name=pool_name) if component == "cf" else pool_df)
         pool_frames[tier] = route_df
         available[tier] = int(len(route_df))
 
@@ -873,6 +948,7 @@ def _sample_component(
             seed=int(seed),
             weight=weight,
             effective_epoch=int(epoch),
+            weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
             timings=timings,
         )
         frames.append(sampled)
@@ -889,6 +965,17 @@ def _sample_component(
             "route_column": _route_column_for_head(head) if component == "cf" else None,
             "available_raw_by_tier": available_raw,
             "available_route_compatible_by_tier": available,
+            "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol) if component == "cf" else False,
+            "route_bypass_tiers": [
+                str(tier)
+                for tier in tier_keys
+                if _allow_weak_low_weighted_cf_route_bypass(
+                    weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
+                    head=head,
+                    component=component,
+                    tier=tier,
+                )
+            ] if component == "cf" else [],
         },
         "replacement_rate_by_tier": replacement,
         "shortage_reallocated_by_tier": shortage_reallocated,
@@ -990,6 +1077,7 @@ def sample_effective_epochs_from_pools(
     if str(mode).lower() == "bounded":
         max_epochs = 1
     heads = ("explanation",)
+    weak_low_weighted_cf_protocol = _weak_low_weighted_cf_protocol(tuning_config)
     plan_t0 = time.perf_counter()
     timings: dict[str, float] = {
         "parquet_read_time_s": 0.0,
@@ -1043,6 +1131,7 @@ def sample_effective_epochs_from_pools(
                     seed=seed,
                     epoch=epoch,
                     columns=columns,
+                    weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
                     timings=timings,
                 )
                 head_frames.append(comp_df)
@@ -1133,6 +1222,12 @@ def sample_effective_epochs_from_pools(
         "max_effective_epochs": int(max_epochs),
         "planned_total_rows": int(len(train_df)),
         "epoch_reports": epoch_reports,
+        "sampler_protocol": (
+            WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL
+            if weak_low_weighted_cf_protocol
+            else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
+        ),
+        "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol),
         "prompt_registry": prompt_registry_manifest(),
         "full_audit_default_train_forbidden": True,
         "legacy_gold_heavy_exports_rejected_by_default": True,

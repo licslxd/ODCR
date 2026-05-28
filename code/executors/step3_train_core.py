@@ -5256,9 +5256,11 @@ def trainModel_ddp(
             return
         if int(recovery_state.get("count", 0) or 0) >= int(recovery_cfg.get("max_recoveries", 1) or 1):
             return
+        if "recovery_epochs" not in recovery_cfg:
+            raise RuntimeError("Step3 recovery config missing explicit recovery_epochs from One-Control payload.")
         recovery_state["count"] = int(recovery_state.get("count", 0) or 0) + 1
         recovery_state["active"] = True
-        recovery_state["remaining_epochs"] = int(recovery_cfg.get("recovery_epochs", 8) or 8)
+        recovery_state["remaining_epochs"] = int(recovery_cfg["recovery_epochs"])
         plan = build_recovery_plan(
             epoch=epoch,
             drift_record=drift_record,

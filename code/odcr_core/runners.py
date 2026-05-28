@@ -541,11 +541,16 @@ def _step5_decode_cli_args(cfg: ResolvedConfig) -> list[str]:
         str(cfg.label_smoothing),
         "--repetition-penalty",
         str(cfg.repetition_penalty),
-        "--generate-temperature",
-        str(cfg.generate_temperature),
-        "--generate-top-p",
-        str(cfg.generate_top_p),
     ]
+    if str(cfg.decode_strategy).strip().lower() != "greedy":
+        out.extend(
+            [
+                "--generate-temperature",
+                str(cfg.generate_temperature),
+                "--generate-top-p",
+                str(cfg.generate_top_p),
+            ]
+        )
     if cfg.decode_seed is not None:
         out.extend(["--decode-seed", str(cfg.decode_seed)])
     if cfg.no_repeat_ngram_size is not None:

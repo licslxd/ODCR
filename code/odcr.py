@@ -127,8 +127,8 @@ def build_parser() -> argparse.ArgumentParser:
     s4.add_argument("--max-samples", type=int, default=None)
     s4.add_argument("--validation-namespace", default=None)
     s4.add_argument("--candidate-config", default=None)
-    s4_sub = s4.add_subparsers(dest="step4_action")
-    s4_export = s4_sub.add_parser("export-step5-dedicated", parents=[common])
+    s4_sub = s4.add_subparsers(dest="step4_action", metavar="{export-step5-pools}")
+    s4_export = s4_sub.add_parser("export-step5-pools", parents=[common])
     s4_export.add_argument("--task", type=int, required=True)
     s4_export.add_argument("--from-run", required=True)
     s4_export.add_argument("--no-stage-status-update", action="store_true")
@@ -148,8 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--task", type=int, required=True)
     ev.add_argument("--from-step5", default="latest")
+    ev.add_argument("--from-step5-run", dest="from_step5_run", default=None, help="alias for --from-step5")
     ev.add_argument("--run-id", default="auto")
     ev.add_argument("--profile", dest="eval_profile", default=None)
+    ev.add_argument(
+        "--replay-step5-run-config",
+        action="store_true",
+        help="replay training-time Step5 run-local settings from meta/run_summary.json for eval-only reclosure",
+    )
 
     pl = sub.add_parser("pipeline", parents=[common])
     pl.add_argument("--task", type=int, required=True)
@@ -249,8 +255,137 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_STEP5_REPLAY_EXACT_KEYS = {
+    "step5.tuning.selected_tuning_candidate",
+    "step5.tuning.fallback_tuning_candidate",
+    "step5.tuning.batch_candidate",
+    "step5.tuning.fallback_batch_candidate",
+    "step5.train.batch_size",
+    "step5.train.per_gpu_batch_size",
+    "step5.train.epochs",
+    "step5.eval.valid_per_gpu_batch_size",
+    "step5.eval.valid_batch_size",
+    "step5.eval.valid_forward_micro_batch_size",
+    "step5.eval.test_per_gpu_batch_size",
+    "step5.eval.test_forward_micro_batch_size",
+    "eval.profiles.paper_greedy_25.eval_batch_size",
+}
+_STEP5_REPLAY_PREFIXES = (
+    "step5.tuning.effective_samples.",
+    "step5.tuning.optimizer_steps.",
+    "step5.sampler.explanation.target_gold_tier_mix.",
+    "step5.sampler.explanation.aux_gold_tier_mix.",
+    "step5.sampler.explanation.cf_tier_mix.",
+)
+
+
+def _step5_replay_run_id(args: argparse.Namespace) -> str:
+    run_id = str(getattr(args, "from_step5_run", None) or getattr(args, "from_step5", "") or "").strip()
+    if not run_id:
+        run_id = "latest"
+    if run_id != "latest":
+        return run_id
+    task = int(getattr(args, "task", 0) or 0)
+    latest = REPO_ROOT / "runs" / "step5" / f"task{task}" / "latest.json"
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise OneControlConfigError(f"cannot replay Step5 latest config; failed to read {latest}: {exc}") from exc
+    resolved = str(payload.get("latest_run_id") or payload.get("run_id") or "").strip()
+    if not resolved:
+        raise OneControlConfigError(f"cannot replay Step5 latest config; {latest} has no latest_run_id")
+    return resolved
+
+
+def _parse_step5_replay_sets_from_command(command: str, *, task: int) -> list[str]:
+    if not command.strip():
+        return []
+    tokens = shlex.split(command)
+    out: list[str] = []
+    idx = 0
+    task_lr_key = f"step5.tasks.{int(task)}.lr"
+    while idx < len(tokens):
+        token = tokens[idx]
+        value = ""
+        if token == "--set" and idx + 1 < len(tokens):
+            value = tokens[idx + 1]
+            idx += 2
+        elif token.startswith("--set="):
+            value = token.split("=", 1)[1]
+            idx += 1
+        else:
+            idx += 1
+        if not value or "=" not in value:
+            continue
+        key = value.split("=", 1)[0].strip()
+        if (
+            key in _STEP5_REPLAY_EXACT_KEYS
+            or key == task_lr_key
+            or any(key.startswith(prefix) for prefix in _STEP5_REPLAY_PREFIXES)
+        ):
+            out.append(value)
+    return out
+
+
+def _step5_run_summary_replay_sets(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
+    task = int(getattr(args, "task", 0) or 0)
+    run_id = _step5_replay_run_id(args)
+    summary_path = REPO_ROOT / "runs" / "step5" / f"task{task}" / run_id / "meta" / "run_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise OneControlConfigError(f"cannot replay Step5 run-local config; failed to read {summary_path}: {exc}") from exc
+    command = str(summary.get("command") or "")
+    replay_sets = _parse_step5_replay_sets_from_command(command, task=task)
+    seen_keys = {item.split("=", 1)[0] for item in replay_sets if "=" in item}
+
+    def add_if_missing(key: str, value: Any) -> None:
+        if key in seen_keys or value in (None, "", {}):
+            return
+        if isinstance(value, bool):
+            text = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(value)
+        replay_sets.append(f"{key}={text}")
+        seen_keys.add(key)
+
+    add_if_missing("step5.tuning.selected_tuning_candidate", summary.get("selected_tuning_candidate"))
+    add_if_missing("step5.tuning.fallback_tuning_candidate", summary.get("fallback_tuning_candidate"))
+    effective = summary.get("step5_effective_samples") if isinstance(summary.get("step5_effective_samples"), dict) else {}
+    optimizer = summary.get("step5_optimizer_steps") if isinstance(summary.get("step5_optimizer_steps"), dict) else {}
+    for name, value in effective.items():
+        add_if_missing(f"step5.tuning.effective_samples.{name}", value)
+    for name, value in optimizer.items():
+        add_if_missing(f"step5.tuning.optimizer_steps.{name}", value)
+
+    manifest = {
+        "schema_version": "odcr_step5_run_config_replay/1",
+        "enabled": True,
+        "task": task,
+        "step5_run": run_id,
+        "run_summary": str(summary_path.relative_to(REPO_ROOT)),
+        "replayed_override_count": len(replay_sets),
+        "replayed_override_keys": [item.split("=", 1)[0] for item in replay_sets],
+        "rating_source_policy": "current_task_local_resolver_not_replayed_from_step5_snapshot",
+        "source": "run_summary.command plus strict run_summary field inference",
+    }
+    if not replay_sets:
+        raise OneControlConfigError(
+            f"Step5 run-local replay found no usable overrides in {summary_path}; refusing silent eval reclosure."
+        )
+    return replay_sets, manifest
+
+
 def _merged_sets(args: argparse.Namespace) -> list[str]:
-    return list(getattr(args, "sets", []) or [])
+    sets = list(getattr(args, "sets", []) or [])
+    if getattr(args, "command", "") == "eval" and bool(getattr(args, "replay_step5_run_config", False)):
+        replay_sets, replay_manifest = _step5_run_summary_replay_sets(args)
+        existing_keys = {item.split("=", 1)[0] for item in sets if "=" in item}
+        sets = [item for item in replay_sets if item.split("=", 1)[0] not in existing_keys] + sets
+        setattr(args, "_odcr_step5_run_config_replay", replay_manifest)
+    return sets
 
 
 def _config_path(args: argparse.Namespace) -> str:
@@ -341,7 +476,7 @@ def _resolve_for_args(args: argparse.Namespace, command: str):
             ]
         elif bool(getattr(args, "train_only", False)) or bool(getattr(args, "no_embedded_final_eval", False)):
             mode = "train_only"
-    return resolve_config(
+    cfg, sources, snapshot = resolve_config(
         config_path=_config_path(args),
         command=command,
         task_id=getattr(args, "task", None),
@@ -350,12 +485,17 @@ def _resolve_for_args(args: argparse.Namespace, command: str):
         run_id=getattr(args, "run_id", None),
         from_step3=from_step3,
         from_step4=from_step4,
-        from_step5=getattr(args, "from_step5", None),
+        from_step5=getattr(args, "from_step5_run", None) or getattr(args, "from_step5", None),
         step5_head=getattr(args, "head", None),
         checkpoint=getattr(args, "checkpoint", None),
         eval_profile=getattr(args, "eval_profile", None),
         mode=mode,
     )
+    replay = getattr(args, "_odcr_step5_run_config_replay", None)
+    if isinstance(replay, dict) and replay:
+        snapshot = dict(snapshot)
+        snapshot["step5_run_config_replay"] = replay
+    return cfg, sources, snapshot
 
 
 def _assert_step3_expected_profile(snapshot: dict[str, Any], expected: str | None) -> None:
@@ -393,6 +533,11 @@ def _run_resolved(cfg, snapshot: dict[str, Any], *, dry_run: bool, console_level
         return
 
     write_resolved_config(cfg, snapshot, dry_run=dry_run)
+    replay = snapshot.get("step5_run_config_replay") if isinstance(snapshot, dict) else None
+    if isinstance(replay, dict) and replay and not dry_run:
+        replay_path = Path(cfg.manifest_dir) / "replay_manifest.json"
+        replay_path.parent.mkdir(parents=True, exist_ok=True)
+        replay_path.write_text(json.dumps(replay, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if dry_run:
         if getattr(cfg, "command", "") == "step4":
             from odcr_core.step4_runtime import validate_step4_prelaunch_lineage_for_config
@@ -535,7 +680,7 @@ def cmd_preprocess(args: argparse.Namespace) -> None:
     PreprocessRuntime(config).run()
 
 
-def cmd_step4_export_step5_dedicated(args: argparse.Namespace) -> None:
+def cmd_step4_export_step5_pools(args: argparse.Namespace) -> None:
     pool_cfg, gold_quality_cfg, cf_tier_cfg, sampler_cfg, _sources = resolve_step4_step5_pool_exports_config(
         config_path=_config_path(args),
         set_overrides=_merged_sets(args),
@@ -854,7 +999,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         pools = step4_doctor_snapshot.get("step4_step5_pool_exports") or {}
         gold_quality = step4_doctor_snapshot.get("step4_gold_quality") or {}
         cf_tiers = step4_doctor_snapshot.get("step4_cf_tiers") or {}
-        print("Step4 dedicated Step5 export controls:")
+        print("Step4 legacy dedicated Step5 export controls (disabled; audit-only):")
         print(
             "  enabled=%s output_dir_name=%s full_audit_role=%s write_gold_cf_subsplits=%s chunk_rows=%s"
             % (
@@ -873,7 +1018,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 sources.get("step4_step5_dedicated_exports"),
             )
         )
-        checks.append("step4 dedicated Step5 export controls resolve from configs/odcr.yaml")
+        checks.append("step4 legacy dedicated export controls resolve disabled/audit-only from configs/odcr.yaml")
         print("Step4 Step5 pool export controls:")
         print(
             "  enabled=%s output_dir_name=%s full_audit_role=%s legacy_role=%s chunk_rows=%s"
@@ -972,7 +1117,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             print("Step5 official eval policy:")
             print(
                 "  profile=%s prediction_max_length=%s reference_max_length=%s "
-                "builder=%s metrics=%s test_once=%s eval_batch=%s per_gpu=%s"
+                "builder=%s metrics=%s test_once=%s eval_batch=%s per_gpu=%s source=%s"
                 % (
                     step5_final_eval.get("official_profile"),
                     step5_final_eval.get("prediction_max_length"),
@@ -982,6 +1127,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                     step5_final_eval.get("test_once"),
                     step5_eval.get("valid_global_batch_size"),
                     step5_eval.get("valid_per_gpu_batch_size"),
+                    sources.get("step5_eval"),
                 )
             )
             print(
@@ -1367,8 +1513,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "preprocess":
             cmd_preprocess(args)
-        elif args.command == "step4" and getattr(args, "step4_action", None) == "export-step5-dedicated":
-            cmd_step4_export_step5_dedicated(args)
+        elif args.command == "step4" and getattr(args, "step4_action", None) == "export-step5-pools":
+            cmd_step4_export_step5_pools(args)
         elif args.command in ("step3", "step4", "step5", "eval"):
             cmd_stage(args, args.command)
         elif args.command == "step3-rating":

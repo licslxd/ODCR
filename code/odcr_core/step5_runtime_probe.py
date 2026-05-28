@@ -956,7 +956,10 @@ def _finite_scalar(value: torch.Tensor) -> bool:
 
 def _loss_float(value: torch.Tensor | float | int) -> float:
     if isinstance(value, torch.Tensor):
-        out = float(value.detach().float().item())
+        detached = value.detach().float()
+        if detached.numel() != 1:
+            detached = detached.mean()
+        out = float(detached.item())
     else:
         out = float(value)
     if math.isnan(out) or math.isinf(out):
@@ -2874,10 +2877,10 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
             "total_loss": total_loss,
             "main_control_loss": loss_factual,
             "explainer_loss": loss_counterfactual,
-            "lci_raw_loss": l_lci,
+            "lci_raw_loss": l_lci if l_lci is not None else lci_weighted_zero,
             "lci_weighted_loss": lci_weighted_loss,
-            "uci_weight_mean": lci_bundle.uci_weight_mean,
-            "scorer_weight_mean": lci_bundle.scorer_weight_mean,
+            "uci_weight_mean": gate_a.uci_weight.mean(),
+            "scorer_weight_mean": gate_a.scorer_weight.mean(),
             "fca_raw_loss": l_fca,
             "fca_weighted_loss": fca_weighted_loss,
             "fca_weight_mean": 0.0 if is_rating_stability_control_probe else fca_bundle.fca_weight_mean,
@@ -3284,10 +3287,10 @@ def _run_rank_probe(args: argparse.Namespace) -> int:
                     "total_loss": total_loss,
                     "main_control_loss": loss_factual,
                     "explainer_loss": loss_counterfactual,
-                    "lci_raw_loss": _l_lci,
+                    "lci_raw_loss": _l_lci if _l_lci is not None else lci_weighted_zero,
                     "lci_weighted_loss": lci_weighted_loss,
-                    "uci_weight_mean": lci_bundle.uci_weight_mean,
-                    "scorer_weight_mean": lci_bundle.scorer_weight_mean,
+                    "uci_weight_mean": gate_a.uci_weight.mean(),
+                    "scorer_weight_mean": gate_a.scorer_weight.mean(),
                     "fca_raw_loss": _l_fca,
                     "fca_weighted_loss": fca_weighted_loss,
                     "fca_weight_mean": 0.0 if is_rating_stability_control_probe else fca_bundle.fca_weight_mean,

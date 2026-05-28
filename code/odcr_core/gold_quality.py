@@ -197,35 +197,8 @@ def default_cf_tier_config(raw: Mapping[str, Any] | None = None) -> dict[str, An
             "max_repeat_ngram_ratio": 0.72,
         },
     )
-    cfg.setdefault(
-        "rating_stability_control",
-        {
-            "high": {
-                "require_route_scorer": True,
-                "min_confidence_bucket": 1,
-                "min_rating_stability": 0.95,
-                "min_content_retention": 0.94,
-                "max_uncertainty": 0.06,
-                "min_text_quality": 0.93,
-                "min_reliability": 0.80,
-            },
-            "medium": {
-                "min_confidence_bucket": 1,
-                "min_rating_stability": 0.86,
-                "min_content_retention": 0.82,
-                "max_uncertainty": 0.12,
-                "min_text_quality": 0.75,
-                "min_reliability": 0.65,
-            },
-            "low_weighted": {
-                "min_rating_stability": 0.65,
-                "min_content_retention": 0.60,
-                "max_uncertainty": 0.35,
-                "min_text_quality": 0.55,
-                "min_reliability": 0.45,
-            },
-        },
-    )
+    if "step5_explanation" not in cfg and isinstance(cfg.get("explanation"), Mapping):
+        cfg["step5_explanation"] = dict(cfg["explanation"])
     cfg.setdefault(
         "step5_explanation",
         {
@@ -252,13 +225,11 @@ def default_cf_tier_config(raw: Mapping[str, Any] | None = None) -> dict[str, An
             },
         },
     )
-    cfg.setdefault(
-        "sampling_weight",
-        {
-            "rating_stability_control": {"high": 1.20, "medium": 0.80, "low_weighted": 0.20, "reject": 0.0},
-            "step5_explanation": {"high": 1.20, "medium": 0.90, "low_weighted": 0.30, "reject": 0.0},
-        },
-    )
+    weights = dict(cfg.get("sampling_weight") or {})
+    if "step5_explanation" not in weights and isinstance(weights.get("explanation"), Mapping):
+        weights["step5_explanation"] = dict(weights["explanation"])
+    weights.setdefault("step5_explanation", {"high": 1.20, "medium": 0.90, "low_weighted": 0.30, "reject": 0.0})
+    cfg["sampling_weight"] = weights
     return cfg
 
 
@@ -588,25 +559,13 @@ def assign_cf_tiers(chunk: pd.DataFrame, cfg: Mapping[str, Any] | None = None) -
             )
         return _clip01(score), high.fillna(False), medium.fillna(False), low.fillna(False)
 
-    score_a, high_a, med_a, low_a = _tier("rating_stability_control", rs)
     score_b, high_b, med_b, low_b = _tier("step5_explanation", re)
     hard = hard_bad.fillna(False).astype(bool)
-    out["cf_quality_score_rating_stability_control"] = score_a.astype(float)
     out["cf_quality_score_step5_explanation"] = score_b.astype(float)
-    out["cf_tier_rating_stability_control"] = np.select(
-        [hard.to_numpy(), high_a.to_numpy(), med_a.to_numpy(), low_a.to_numpy()],
-        ["reject", "high", "medium", "low_weighted"],
-        default="reject",
-    )
     out["cf_tier_step5_explanation"] = np.select(
         [hard.to_numpy(), high_b.to_numpy(), med_b.to_numpy(), low_b.to_numpy()],
         ["reject", "high", "medium", "low_weighted"],
         default="reject",
-    )
-    out["cf_tier_reason_rating_stability_control"] = np.select(
-        [hard.to_numpy(), high_a.to_numpy(), med_a.to_numpy(), low_a.to_numpy()],
-        ["hard_quality_reject", "scorer_high_quality_route", "scorer_medium_quality", "scorer_low_weighted_quality"],
-        default="scorer_reject_low_quality",
     )
     out["cf_tier_reason_step5_explanation"] = np.select(
         [hard.to_numpy(), high_b.to_numpy(), med_b.to_numpy(), low_b.to_numpy()],
@@ -614,9 +573,10 @@ def assign_cf_tiers(chunk: pd.DataFrame, cfg: Mapping[str, Any] | None = None) -
         default="explainer_reject_low_quality",
     )
     weights = dict(cfg["sampling_weight"])
-    for head, col in (("rating_stability_control", "cf_tier_rating_stability_control"), ("step5_explanation", "cf_tier_step5_explanation")):
-        mapping = {k: float(v) for k, v in dict(weights[head]).items()}
-        out[f"recommended_sampling_weight_{head}"] = out[col].astype(str).map(mapping).fillna(0.0).astype(float)
+    mapping = {k: float(v) for k, v in dict(weights["step5_explanation"]).items()}
+    out["recommended_sampling_weight_step5_explanation"] = (
+        out["cf_tier_step5_explanation"].astype(str).map(mapping).fillna(0.0).astype(float)
+    )
     out["cf_tier"] = ""
     out["cf_tier_reason"] = ""
     return out

@@ -19,6 +19,7 @@ from executors.decode_controller import (  # noqa: E402
 )
 from odcr_core.bleu_runtime import build_explanation_bleu_rows_for_indices  # noqa: E402
 from odcr_core.gather_schema import GatheredBatch  # noqa: E402
+from odcr_core.step5_innovation import for_test_default_step5_innovation_config  # noqa: E402
 
 
 def _minimal_final_cfg(*, full_bleu_decode_strategy: str = "greedy") -> FinalTrainingConfig:
@@ -47,6 +48,17 @@ def _minimal_final_cfg(*, full_bleu_decode_strategy: str = "greedy") -> FinalTra
         evidence_max_length=48,
         valid_batch_size=8,
         valid_micro_batch_size=8,
+        valid_per_gpu_batch_size=8,
+        valid_global_batch_size=8,
+        valid_forward_micro_batch_size=8,
+        test_per_gpu_batch_size=8,
+        test_forward_micro_batch_size=8,
+        validation_microbatch_accumulation=False,
+        validation_memory_policy="single_forward",
+        step5_validation_mode="legacy32",
+        formal_entry_E4_validation_required=False,
+        old_eval_batch_2048_retired=True,
+        valid_loss_components_json="{}",
         train_batch_size=8,
         global_batch_size=8,
         batch_size_global=8,
@@ -135,6 +147,7 @@ class _OneRowDs:
             "item_idx": torch.tensor(2, dtype=torch.long),
             "rating": torch.tensor(4.0, dtype=torch.float32),
             "explanation_idx": torch.tensor([11, 12], dtype=torch.long),
+            "raw_ref_text": "reference text",
             "domain_idx": torch.tensor(0, dtype=torch.long),
             "sample_id": torch.tensor(0, dtype=torch.long),
             "exp_sample_weight": torch.tensor(1.0, dtype=torch.float32),
@@ -150,8 +163,11 @@ class _RecordingModel(torch.nn.Module):
     def _make_generate_config(self) -> GenerateConfig:
         return GenerateConfig(strategy=str(self.decode_strategy))
 
-    def gather(self, batch, device):
-        user_idx, item_idx, rating, tgt_output, domain_idx, sample_id, exp_sample_weight = batch
+    def gather(self, batch, device, *, non_blocking_h2d=False):
+        user_idx, item_idx, rating, tgt_output, domain_idx, sample_id, exp_sample_weight, raw_ref_text = batch
+        bsz = int(user_idx.size(0))
+        ones = torch.ones((bsz,), dtype=torch.float32, device=device)
+        ids = torch.ones((bsz, 1), dtype=torch.long, device=device)
         return GatheredBatch(
             user_idx=user_idx.to(device),
             item_idx=item_idx.to(device),
@@ -161,15 +177,34 @@ class _RecordingModel(torch.nn.Module):
             domain_idx=domain_idx.to(device),
             sample_id=sample_id.to(device),
             exp_sample_weight=exp_sample_weight.to(device),
+            route_scorer_mask=ones,
+            route_explainer_mask=ones,
+            uncertainty_score=torch.zeros((bsz,), dtype=torch.float32, device=device),
+            confidence_bucket=ones,
+            content_anchor_score=ones,
+            style_anchor_score=ones,
+            evidence_features=torch.ones((bsz, 8), dtype=torch.float32, device=device),
+            content_evidence_ids=ids,
+            style_evidence_ids=ids,
+            domain_style_anchor_ids=ids,
+            local_style_hint_ids=ids,
+            polarity_ids=ids,
+            raw_ref_text=raw_ref_text,
         )
 
-    def generate(self, user_idx, item_idx, domain_idx, *, cfg_override=None):
+    def generate(self, user_idx, item_idx, domain_idx, *, cfg_override=None, ccv_control_packet=None):
         self.last_cfg_override = cfg_override
         bsz = int(user_idx.size(0))
         return (torch.full((bsz, 2), 7, dtype=torch.long, device=user_idx.device),)
 
 
 class _Tok:
+    def __call__(self, text, add_special_tokens=False, truncation=False, verbose=False, **kwargs):
+        return {"input_ids": [1, 2]}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "x"
+
     def batch_decode(self, ids, skip_special_tokens=True):
         t = ids.detach().cpu()
         return ["x"] * int(t.size(0))
@@ -219,6 +254,7 @@ class TestFullBleuMonitorDecode(unittest.TestCase):
         m = _RecordingModel()
         ds = _OneRowDs()
         tok = _Tok()
+        step5_innov_cfg = for_test_default_step5_innovation_config()
         build_explanation_bleu_rows_for_indices(
             m,
             tok,
@@ -231,6 +267,8 @@ class TestFullBleuMonitorDecode(unittest.TestCase):
             dataloader_num_workers=0,
             dataloader_prefetch_factor=None,
             cfg_override={"strategy": "greedy"},
+            step5_innov_cfg=step5_innov_cfg,
+            non_blocking_h2d=False,
         )
         self.assertIsNotNone(m.last_cfg_override)
         self.assertEqual(m.last_cfg_override.get("strategy"), "greedy")
@@ -247,6 +285,8 @@ class TestFullBleuMonitorDecode(unittest.TestCase):
             logger=None,
             dataloader_num_workers=0,
             dataloader_prefetch_factor=None,
+            step5_innov_cfg=step5_innov_cfg,
+            non_blocking_h2d=False,
         )
         self.assertIsNone(m2.last_cfg_override)
 

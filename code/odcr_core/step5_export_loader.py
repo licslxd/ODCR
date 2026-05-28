@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -593,6 +594,7 @@ def _pool_sampler_tuning_identity(tuning_config: Mapping[str, Any] | None) -> di
 
     tuning = dict(tuning_config or {})
     return {
+        "selected_tuning_candidate": tuning.get("selected_tuning_candidate"),
         "selected_budget_candidate": tuning.get("selected_budget_candidate"),
         "batch_candidate": tuning.get("batch_candidate"),
         "effective_samples": dict(tuning.get("effective_samples") or {})
@@ -1103,12 +1105,43 @@ def load_step5_pool_train_table(
     stats = dict(sampled.stats)
     if cache_dir is not None and cache_identity is not None and cache_lineage is not None and cache_key is not None:
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        lock_dir = cache_dir.with_name(f"{cache_dir.name}.lock")
+        lock_acquired = False
+        for _attempt in range(200):
+            cached = _load_pool_sample_cache(
+                cache_dir,
+                expected_identity=cache_identity,
+                expected_cache_key=cache_key,
+                source=source,
+                pool_source=pool_source,
+                stale_policy=stale_policy_norm,
+            )
+            if cached is not None:
+                return cached
+            try:
+                lock_dir.mkdir(parents=False, exist_ok=False)
+                lock_acquired = True
+                break
+            except FileExistsError:
+                time.sleep(0.05)
+        if not lock_acquired:
+            raise Step5ExportLoaderError(f"timed out acquiring Step5 pool cache lock: {lock_dir}")
         tmp_dir = cache_dir.with_name(f"{cache_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
         tmp_dir.mkdir(parents=True, exist_ok=False)
         tmp_path = tmp_dir / "train_sampled.parquet"
         try:
+            cached = _load_pool_sample_cache(
+                cache_dir,
+                expected_identity=cache_identity,
+                expected_cache_key=cache_key,
+                source=source,
+                pool_source=pool_source,
+                stale_policy=stale_policy_norm,
+            )
+            if cached is not None:
+                return cached
             train_df.to_parquet(tmp_path, index=False)
             manifest_payload = _pool_sample_cache_manifest_payload(
                 cache_key=cache_key,
@@ -1120,25 +1153,24 @@ def load_step5_pool_train_table(
                 stats=stats,
             )
             atomic_write_json(tmp_dir / "cache_manifest.json", manifest_payload)
-            for attempt in range(2):
-                if cache_dir.exists():
-                    if cache_dir.is_dir():
-                        shutil.rmtree(cache_dir, ignore_errors=True)
-                    else:
-                        try:
-                            cache_dir.unlink()
-                        except FileNotFoundError:
-                            pass
-                try:
-                    os.replace(str(tmp_dir), str(cache_dir))
-                    break
-                except FileExistsError:
-                    if attempt >= 1:
-                        raise
+            if cache_dir.exists():
+                if cache_dir.is_dir():
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                else:
+                    try:
+                        cache_dir.unlink()
+                    except FileNotFoundError:
+                        pass
+            os.replace(str(tmp_dir), str(cache_dir))
             cache_manifest_path = cache_dir / "cache_manifest.json"
         finally:
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            if lock_acquired:
+                try:
+                    lock_dir.rmdir()
+                except OSError:
+                    shutil.rmtree(lock_dir, ignore_errors=True)
     return Step5TrainTableLoadResult(
         train_df=train_df,
         audit_raw_df=sampled.audit_raw_df,

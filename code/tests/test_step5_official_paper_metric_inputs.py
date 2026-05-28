@@ -9,9 +9,19 @@ from base_utils import build_paper_metric_inputs, official_paper_metrics  # noqa
 
 
 class TinyTokenizer:
-    def __call__(self, text, add_special_tokens=False, truncation=False):
-        del add_special_tokens, truncation
-        return {"input_ids": [int(x) for x in str(text).split() if str(x).strip()]}
+    def __call__(
+        self,
+        text,
+        add_special_tokens=False,
+        truncation=False,
+        max_length=None,
+        verbose=True,
+    ):
+        del add_special_tokens, verbose
+        ids = [int(x) for x in str(text).split() if str(x).strip()]
+        if truncation and max_length is not None:
+            ids = ids[: int(max_length)]
+        return {"input_ids": ids}
 
     def decode(self, ids, skip_special_tokens=True):
         del skip_special_tokens

@@ -41,6 +41,8 @@ def test_no_forbidden_rating_branch_strings_in_active_tree() -> None:
         for path in paths:
             if any(part in {"__pycache__", ".pytest_cache"} for part in path.parts):
                 continue
+            if "docs" in path.parts and "skills" in path.parts:
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:

@@ -478,7 +478,12 @@ STEP5_TOKENIZE_CACHE_LINEAGE = "token_cache_lineage.json"
 STEP5_TOKENIZE_CACHE_COMPLETED = "_SUCCESS"
 STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/5"
 STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_tokenize_cache_identity/2"
-STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION = "odcr_step5_flan_encoder_input/2_soft_prompt_plus_content_evidence"
+STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION = (
+    "odcr_step5_flan_encoder_input/2_soft_prompt_plus_content_evidence"
+)
+STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS = 32
+STEP5_CONTROL_TEXT_MAX_LENGTH = STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS
+STEP5_ENCODER_AUDIT_SCHEMA_VERSION = "odcr_step5_encoder_input_token_audit/legacy32"
 
 
 def _sha256_file(path: str) -> str:
@@ -804,7 +809,7 @@ def _require_content_evidence_frame(df: pd.DataFrame, *, ctx: str) -> None:
     if "content_evidence" not in df.columns:
         raise ValueError(
             f"{ctx} missing required content_evidence field; official Step5_e train/eval requires "
-            "Flan encoder input contract soft_prompt_plus_content_evidence."
+            "Flan encoder input contract soft_prompt_plus_content_evidence_legacy32."
         )
     vals = df["content_evidence"]
     missing = vals.isna() | (vals.astype(str).str.strip() == "")
@@ -886,17 +891,88 @@ def _move_to_device(
     return moved.to(dtype=dtype) if dtype is not None else moved
 
 
-def _control_text_to_ids(text: Any, *, max_length: int) -> torch.Tensor:
+def _tokenizer_input_ids(
+    text: Any,
+    *,
+    max_length: int,
+    truncation: bool,
+    add_special_tokens: bool = True,
+) -> List[int]:
     raw = "" if _is_missing_sample_value(text) else str(text)
     ids = get_step5_tokenizer()(
         raw,
+        add_special_tokens=bool(add_special_tokens),
         padding=False,
         max_length=max(1, int(max_length)),
-        truncation=True,
+        truncation=bool(truncation),
+        verbose=False,
     )["input_ids"]
+    return [int(x) for x in list(ids or [])]
+
+
+def _control_text_to_ids(text: Any, *, max_length: int) -> torch.Tensor:
+    ids = _tokenizer_input_ids(text, max_length=max_length, truncation=True)
     if not ids:
         ids = [0]
     return torch.tensor(ids, dtype=torch.long)
+
+
+def _sample_text_value(sample: Mapping[str, Any], *names: str) -> str:
+    for name in names:
+        if name in sample and not _is_missing_sample_value(sample.get(name)):
+            raw = str(sample.get(name)).strip()
+            if raw:
+                return raw
+    return ""
+
+
+def _legacy32_content_evidence_max_length(label_max_length: int) -> int:
+    return max(4, min(STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS, int(label_max_length)))
+
+
+def _tokenizer_input_ids_untruncated(text: Any, *, add_special_tokens: bool = True) -> List[int]:
+    raw = "" if _is_missing_sample_value(text) else str(text)
+    tok = get_step5_tokenizer()
+    prev_model_max_length = getattr(tok, "model_max_length", None)
+    try:
+        if prev_model_max_length is not None:
+            tok.model_max_length = max(int(prev_model_max_length or 0), 1_000_000)
+        ids = tok(
+            raw,
+            add_special_tokens=bool(add_special_tokens),
+            padding=False,
+            truncation=False,
+            verbose=False,
+        )["input_ids"]
+    finally:
+        if prev_model_max_length is not None:
+            tok.model_max_length = prev_model_max_length
+    return [int(x) for x in list(ids or [])]
+
+
+def _encode_legacy32_content_evidence(
+    sample: Mapping[str, Any],
+    *,
+    max_length: int,
+    soft_prompt_len: int = 16,
+) -> Dict[str, Any]:
+    max_len = _legacy32_content_evidence_max_length(max_length)
+    text = _sample_text_value(sample, "content_evidence")
+    raw_ids = _tokenizer_input_ids_untruncated(text, add_special_tokens=True)
+    kept = _control_text_to_ids(text, max_length=max_len)
+    kept_len = int(kept.numel())
+    raw_len = int(len(raw_ids))
+    return {
+        "ids": kept,
+        "raw_input_token_len": int(soft_prompt_len) + raw_len,
+        "input_token_len": int(soft_prompt_len) + kept_len,
+        "truncated": bool(raw_len > kept_len),
+        "text_token_len": kept_len,
+        "content_evidence_token_len": kept_len,
+        "content_evidence_raw_token_len": raw_len,
+        "legacy_max_content_tokens": int(max_len),
+        "soft_prompt_len": int(soft_prompt_len),
+    }
 
 
 def _dummy_control_ids() -> torch.Tensor:
@@ -952,10 +1028,18 @@ class CustomTransformerEncoder(nn.Module):
         return output, attns
 
 class Processor():
-    def __init__(self, auxiliary, target, max_length: int = 25):
+    def __init__(
+        self,
+        auxiliary,
+        target,
+        max_length: int = 25,
+        flan_soft_prompt_len: int = 16,
+    ):
         self.max_length = int(max_length)
         self.auxiliary = auxiliary
         self.target = target
+        self.flan_soft_prompt_len = int(flan_soft_prompt_len)
+        self.control_text_max_length = STEP5_CONTROL_TEXT_MAX_LENGTH
 
     def __call__(self, sample):
         if GLOBAL_COL_USER not in sample or GLOBAL_COL_ITEM not in sample:
@@ -1015,7 +1099,12 @@ class Processor():
             ],
             dtype=torch.float32,
         )
-        control_max_len = max(4, min(32, int(self.max_length)))
+        control_max_len = _legacy32_content_evidence_max_length(self.max_length)
+        encoder_content = _encode_legacy32_content_evidence(
+            sample,
+            max_length=self.max_length,
+            soft_prompt_len=self.flan_soft_prompt_len,
+        )
         return {
             "user_idx": user_idx,
             "item_idx": item_idx,
@@ -1032,11 +1121,18 @@ class Processor():
             "content_anchor_score": content_anchor_score,
             "style_anchor_score": style_anchor_score,
             "evidence_features": evf,
-            "content_evidence_ids": _control_text_to_ids(sample["content_evidence"], max_length=control_max_len),
+            "content_evidence_ids": encoder_content["ids"],
             "style_evidence_ids": _control_text_to_ids(sample["style_evidence"], max_length=control_max_len),
             "domain_style_anchor_ids": _control_text_to_ids(sample["domain_style_anchor"], max_length=control_max_len),
             "local_style_hint_ids": _control_text_to_ids(sample["local_style_residual_hint"], max_length=control_max_len),
             "polarity_ids": _control_text_to_ids(sample["polarity_anchor"], max_length=control_max_len),
+            "flan_encoder_raw_input_token_len": torch.tensor(
+                int(encoder_content["raw_input_token_len"]), dtype=torch.long
+            ),
+            "flan_encoder_input_token_len": torch.tensor(
+                int(encoder_content["input_token_len"]), dtype=torch.long
+            ),
+            "flan_encoder_truncated": torch.tensor(int(bool(encoder_content["truncated"])), dtype=torch.long),
             "evidence_quality_prior": torch.tensor(float(evidence_quality_prior), dtype=torch.float32),
             "sampler_component_id": _sample_category_id(sample, "sampler_component", _STEP5_SAMPLER_COMPONENT_IDS),
             "sampler_tier_id": _sample_category_id(sample, "sampler_tier", _STEP5_SAMPLER_TIER_IDS),
@@ -1096,6 +1192,39 @@ def _step5_collate_dynamic(
     sampler_tier_id = torch.stack(
         [torch.as_tensor(x.get("sampler_tier_id", torch.tensor(-1)), dtype=torch.long) for x in batch], dim=0
     )
+    flan_encoder_raw_input_token_len = torch.stack(
+        [
+            torch.as_tensor(
+                x.get("flan_encoder_raw_input_token_len", torch.tensor(0)),
+                dtype=torch.long,
+            )
+            for x in batch
+        ],
+        dim=0,
+    )
+    flan_encoder_input_token_len = torch.stack(
+        [
+            torch.as_tensor(
+                x.get(
+                    "flan_encoder_input_token_len",
+                    torch.tensor(int(torch.as_tensor(x["content_evidence_ids"]).view(-1).numel())),
+                ),
+                dtype=torch.long,
+            )
+            for x in batch
+        ],
+        dim=0,
+    )
+    flan_encoder_truncated = torch.stack(
+        [
+            torch.as_tensor(
+                x.get("flan_encoder_truncated", torch.tensor(0)),
+                dtype=torch.long,
+            )
+            for x in batch
+        ],
+        dim=0,
+    )
     raw_ref_text = [str(x["raw_ref_text"]) for x in batch]
 
     def _pad_ids(name: str) -> torch.Tensor:
@@ -1145,6 +1274,9 @@ def _step5_collate_dynamic(
         evidence_quality_prior,
         sampler_component_id,
         sampler_tier_id,
+        flan_encoder_raw_input_token_len,
+        flan_encoder_input_token_len,
+        flan_encoder_truncated,
         raw_ref_text,
     )
 
@@ -1706,6 +1838,12 @@ class Model(nn.Module):
                 "content_evidence_ids batch size does not match soft prompt batch: "
                 f"{int(text_ids.shape[0])} vs {int(soft_embeds.shape[0])}"
             )
+        if int(text_ids.shape[1]) > int(STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS):
+            raise RuntimeError(
+                "content_evidence_ids exceeds the legacy32 Flan encoder content budget; Processor must "
+                "tokenize content_evidence with truncation=True and max_length=max(4,min(32,label_max_length)). "
+                f"text_tokens={int(text_ids.shape[1])}, legacy_content_budget={STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS}."
+            )
         embed_getter = getattr(self.flan_explainer, "get_input_embeddings", None)
         input_embeddings = embed_getter() if callable(embed_getter) else getattr(self.flan_explainer, "shared", None)
         if input_embeddings is None:
@@ -1776,9 +1914,13 @@ class Model(nn.Module):
             "decode_strategy": self.decode_strategy,
             "max_explanation_length": self.max_explanation_length,
             "repetition_penalty": self.repetition_penalty,
-            "generate_temperature": self.generate_temperature,
-            "generate_top_p": self.generate_top_p,
         }
+        if str(self.decode_strategy).strip().lower() == "greedy":
+            out["do_sample"] = False
+        else:
+            out["do_sample"] = True
+            out["generate_temperature"] = self.generate_temperature
+            out["generate_top_p"] = self.generate_top_p
         if self.decode_seed is not None:
             out["decode_seed"] = self.decode_seed
         if self.decoder_eos_id >= 0:
@@ -2309,6 +2451,7 @@ class Model(nn.Module):
             "out_logits_materialized": True,
             "word_dist_returned": True,
             "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+            "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
             "flan_encoder_tokens": int(encoder_embeds.shape[1]),
         }
         word_dist = logits
@@ -2316,9 +2459,9 @@ class Model(nn.Module):
         return control_score, context_dist, word_dist
     
     def gather(self, batch, device, *, non_blocking_h2d: bool | None = None):
-        if len(batch) not in (20, 22, 23, 24):
+        if len(batch) not in (20, 22, 23, 24, 26, 27):
             raise ValueError(
-                f"batch 须含 20、22、23 或 24 项（含 UCI/anchor/evidence/CCV control，可含 evidence prior / sampler tier metadata / raw ref text），当前 {len(batch)}。"
+                f"batch 须含 20、22、23、24、26 或 27 项（含 UCI/anchor/evidence/CCV control，可含 evidence prior / sampler tier metadata / encoder stats / raw ref text），当前 {len(batch)}。"
                 "请确认 DataLoader 与新版 Processor 一致。"
             )
         if non_blocking_h2d is None:
@@ -2375,16 +2518,27 @@ class Model(nn.Module):
         local_style_hint_ids = _move_to_device(local_style_hint_ids, device, non_blocking=_nb).long()
         polarity_ids = _move_to_device(polarity_ids, device, non_blocking=_nb).long()
         evidence_quality_prior = None
-        if len(sampler_meta) == 3:
+        flan_encoder_raw_input_token_len = None
+        flan_encoder_input_token_len = None
+        flan_encoder_truncated = None
+        encoder_meta = []
+        if len(sampler_meta) >= 3:
             evidence_quality_prior = _move_to_device(sampler_meta[0], device, non_blocking=_nb).float()
             sampler_component_id = _move_to_device(sampler_meta[1], device, non_blocking=_nb).long()
             sampler_tier_id = _move_to_device(sampler_meta[2], device, non_blocking=_nb).long()
+            encoder_meta = list(sampler_meta[3:])
         elif len(sampler_meta) == 2:
             sampler_component_id = _move_to_device(sampler_meta[0], device, non_blocking=_nb).long()
             sampler_tier_id = _move_to_device(sampler_meta[1], device, non_blocking=_nb).long()
+            encoder_meta = []
         else:
             sampler_component_id = None
             sampler_tier_id = None
+            encoder_meta = list(sampler_meta)
+        if len(encoder_meta) >= 3:
+            flan_encoder_raw_input_token_len = _move_to_device(encoder_meta[0], device, non_blocking=_nb).long()
+            flan_encoder_input_token_len = _move_to_device(encoder_meta[1], device, non_blocking=_nb).long()
+            flan_encoder_truncated = _move_to_device(encoder_meta[2], device, non_blocking=_nb).long()
         tgt_input = T5_shift_right(tgt_output)
         return GatheredBatch(
             user_idx=user_idx,
@@ -2411,6 +2565,9 @@ class Model(nn.Module):
             evidence_quality_prior=evidence_quality_prior,
             sampler_component_id=sampler_component_id,
             sampler_tier_id=sampler_tier_id,
+            flan_encoder_raw_input_token_len=flan_encoder_raw_input_token_len,
+            flan_encoder_input_token_len=flan_encoder_input_token_len,
+            flan_encoder_truncated=flan_encoder_truncated,
             raw_ref_text=raw_ref_text,
         )
 
@@ -3161,8 +3318,6 @@ def normalize_step5_task_head(raw: Any) -> str:
     head = str(raw or "explanation").strip()
     if not head:
         head = "explanation"
-    if head.lower() == ("step5" + "b").lower():
-        return "explanation"
     if head != "explanation":
         raise RuntimeError("invalid Step5 task head: Step5 now trains explanations only")
     return "explanation"
@@ -4331,7 +4486,7 @@ def trainModel_ddp(
                                 "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
                                 "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
                                 "best_metric_policy": "official_paper_metrics_valid_only",
-                                "best_content_evidence_policy": "soft_prompt_plus_content_evidence_required",
+                                "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
                             },
                         },
                     )
@@ -4849,7 +5004,7 @@ def trainModel_ddp(
                             "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
                             "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
                             "best_metric_policy": str(ckpt_mode),
-                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_required",
+                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
                         },
                         "checkpoint_guard_valid_loss_rel_tol": float(
                             final_cfg.checkpoint_guard_valid_loss_rel_tol
@@ -5074,6 +5229,9 @@ def _slice_gathered_batch(gb: GatheredBatch, start: int, end: int) -> GatheredBa
         evidence_quality_prior=_sl(gb.evidence_quality_prior),
         sampler_component_id=_sl(gb.sampler_component_id),
         sampler_tier_id=_sl(gb.sampler_tier_id),
+        flan_encoder_raw_input_token_len=_sl(gb.flan_encoder_raw_input_token_len),
+        flan_encoder_input_token_len=_sl(gb.flan_encoder_input_token_len),
+        flan_encoder_truncated=_sl(gb.flan_encoder_truncated),
         raw_ref_text=None if gb.raw_ref_text is None else list(gb.raw_ref_text[start:end]),
     )
 
@@ -5290,6 +5448,21 @@ def evalModel(
                 )
                 gr = rating.detach().cpu().tolist()
                 sids = sample_id.detach().cpu().tolist()
+                enc_raw_lens = (
+                    mb.flan_encoder_raw_input_token_len.detach().cpu().tolist()
+                    if mb.flan_encoder_raw_input_token_len is not None
+                    else [None] * len(sids)
+                )
+                enc_lens = (
+                    mb.flan_encoder_input_token_len.detach().cpu().tolist()
+                    if mb.flan_encoder_input_token_len is not None
+                    else [None] * len(sids)
+                )
+                enc_truncated = (
+                    mb.flan_encoder_truncated.detach().cpu().tolist()
+                    if mb.flan_encoder_truncated is not None
+                    else [None] * len(sids)
+                )
                 for i in range(len(sids)):
                     batch_rows.append(
                         {
@@ -5300,6 +5473,11 @@ def evalModel(
                             "ref_text": ref_texts[i],
                             "pred_token_ids": pred_exps[i].detach().cpu().tolist(),
                             "ref_token_ids": tgt_output[i].detach().cpu().tolist(),
+                            "encoder_raw_input_token_len": (
+                                None if enc_raw_lens[i] is None else int(enc_raw_lens[i])
+                            ),
+                            "encoder_input_token_len": None if enc_lens[i] is None else int(enc_lens[i]),
+                            "encoder_truncated": None if enc_truncated[i] is None else bool(int(enc_truncated[i])),
                         }
                     )
             decode_wall += _time_perf.perf_counter() - _t0
@@ -6583,6 +6761,13 @@ def _build_tokenize_cache_fingerprint(
     semantic_source_files = {key: _step5_semantic_file_fingerprint(value) for key, value in source_files.items()}
     semantic_tokenizer = _step5_semantic_model_fingerprint(tokenizer_fp, identity=_tokenizer_cache_identity(tok))
     prompt_manifest = prompt_registry_manifest()
+    step5_innov_payload = effective_payload.get("step5_innovation")
+    if not isinstance(step5_innov_payload, Mapping):
+        step5_innov_payload = {}
+    ccv_payload = step5_innov_payload.get("ccv")
+    if not isinstance(ccv_payload, Mapping):
+        ccv_payload = {}
+    flan_soft_prompt_len = int(ccv_payload.get("soft_prompt_len") or 16)
     formal_candidate = effective_payload.get("step5_formal_active_candidate")
     if not isinstance(formal_candidate, Mapping):
         formal_candidate = {}
@@ -6605,7 +6790,7 @@ def _build_tokenize_cache_fingerprint(
             "processor": "executors.step5_engine.Processor/2",
             "prompt_registry_schema": prompt_manifest.get("schema_version"),
             "prompt_manifest_hash": stable_hash(prompt_manifest),
-            "control_text_max_len_policy": "max(4,min(32,max_length))",
+            "control_text_max_len_policy": f"max(4,min({STEP5_CONTROL_TEXT_MAX_LENGTH},max_length))",
             "domain_mapping": {"auxiliary": 0, "target": 1},
             "sampler_component_ids": dict(_STEP5_SAMPLER_COMPONENT_IDS),
             "sampler_tier_ids": dict(_STEP5_SAMPLER_TIER_IDS),
@@ -6695,6 +6880,16 @@ def _build_tokenize_cache_fingerprint(
             "max_length": int(max_length),
             "dynamic_padding": "collate_time",
             "required_fields": list(_STEP5_TOKENIZE_REQUIRED_FIELDS),
+            "version": "Processor/2",
+            "cache_identity_contract": "Processor2/v10/legacy32",
+            "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+            "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+            "flan_soft_prompt_len": flan_soft_prompt_len,
+            "encoder_input_policy": "legacy32_content_evidence_only",
+            "encoder_input_tokenizer_kwargs": {
+                "truncation": True,
+                "max_length_policy": "max(4,min(32,max_length))",
+            },
         },
         "max_length": int(max_length),
         "resolved_step5_config_hash": resolved_config_compatibility_hash,
@@ -7386,8 +7581,8 @@ def _rank0_step5_train_data_audit(
     tok_lens: List[int] = []
     truncated = 0
     word_lens: List[int] = []
-    # 审计需统计「未按 train_label 截断」的原始 token 数；若超过 T5 默认 model_max_length（512），
-    # HF 会对 truncation=False 打告警。训练路径中 Processor 已 truncation=True，不会把超长序列喂进模型。
+    # 审计需统计「未按 train_label 截断」的原始 token 数；临时放宽 tokenizer.model_max_length
+    # 只用于计数，训练路径中 Processor 已 truncation=True，不会把超长序列喂进模型。
     if tokenizer_free_control_probe:
         for _, row in filt_df.iterrows():
             ct = str(row.get("clean_text", "") or "")
@@ -7396,7 +7591,7 @@ def _rank0_step5_train_data_audit(
         truncated = 0
     else:
         _tok_audit = get_step5_tokenizer()
-        _prev_mml = int(getattr(_tok_audit, "model_max_length", 512) or 512)
+        _prev_mml = getattr(_tok_audit, "model_max_length", None)
         try:
             _tok_audit.model_max_length = 1_000_000
             for _, row in filt_df.iterrows():
@@ -7408,7 +7603,8 @@ def _rank0_step5_train_data_audit(
                 if L > train_label_max_length:
                     truncated += 1
         finally:
-            _tok_audit.model_max_length = _prev_mml
+            if _prev_mml is not None:
+                _tok_audit.model_max_length = _prev_mml
 
     if tok_lens:
         arr = np.asarray(tok_lens, dtype=np.int64)
@@ -7974,7 +8170,13 @@ def build_odcr_ddp_artefacts(
     _mn_p = None if _mn in (None, "", "null", "None") else int(_mn)
     ml_eff = int(_dp_full.get("max_explanation_length", int(args.max_explanation_length)))
     tlm = int(resolved.train_label_max_length)
-    processor = Processor(args.auxiliary, args.target, max_length=tlm)
+    _processor_innov_cfg = parse_step5_innovation_config_json(str(resolved.step5_innovation_config_json))
+    processor = Processor(
+        args.auxiliary,
+        args.target,
+        max_length=tlm,
+        flan_soft_prompt_len=int(_processor_innov_cfg.ccv.soft_prompt_len),
+    )
     _step5_tok = get_step5_tokenizer()
     base_final = replace(
         resolved,
@@ -8302,6 +8504,7 @@ def _metrics_final_dict_from_rows(
     collapse = compute_collapse_stats(metric_pred_tx, metric_ref_tx, top_k_file=20)
     ref_mean = float((ext.get("corpus_level") or {}).get("mean_ref_len_words") or 0.0)
     dirty = compute_dirty_text_stats(metric_pred_tx, ref_mean_len_words=ref_mean or None)
+    encoder_input_audit = _summarize_step5_encoder_input_rows(merged)
     final = {
         "metrics_schema_version": "odcr_step5_official_metrics/3.0",
         "recommendation": {"mae": None, "rmse": None, "source": "step3_eval_handoff_pending"},
@@ -8322,19 +8525,81 @@ def _metrics_final_dict_from_rows(
         },
         "collapse_stats": collapse,
         "dirty_text": dirty,
+        "encoder_input_token_audit": encoder_input_audit,
     }
     return final, metric_pred_tx, metric_ref_tx
 
 
-def _step5_content_evidence_contract_payload(final_cfg: FinalTrainingConfig) -> Dict[str, Any]:
+def _step5_percentile(values: Sequence[int], q: float) -> int | None:
+    if not values:
+        return None
+    arr = sorted(int(v) for v in values)
+    if len(arr) == 1:
+        return arr[0]
+    pos = (len(arr) - 1) * float(q)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return arr[lo]
+    return int(round(arr[lo] + (arr[hi] - arr[lo]) * (pos - lo)))
+
+
+def _summarize_step5_encoder_input_rows(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    final_lens = [
+        int(r["encoder_input_token_len"])
+        for r in rows
+        if r.get("encoder_input_token_len") is not None
+    ]
+    raw_lens = [
+        int(r["encoder_raw_input_token_len"])
+        for r in rows
+        if r.get("encoder_raw_input_token_len") is not None
+    ]
+    truncated = [bool(r.get("encoder_truncated")) for r in rows if r.get("encoder_truncated") is not None]
+    n = int(len(final_lens))
+
+    def _dist(vals: Sequence[int]) -> Dict[str, Any]:
+        if not vals:
+            return {"count": 0}
+        return {
+            "count": int(len(vals)),
+            "min": int(min(vals)),
+            "p50": _step5_percentile(vals, 0.50),
+            "p75": _step5_percentile(vals, 0.75),
+            "p90": _step5_percentile(vals, 0.90),
+            "p95": _step5_percentile(vals, 0.95),
+            "p99": _step5_percentile(vals, 0.99),
+            "max": int(max(vals)),
+        }
+
+    truncated_count = int(sum(1 for x in truncated if x))
+    denom = int(len(truncated)) or n
     return {
-        "schema_version": "odcr_step5_content_evidence_encoder_contract/1",
+        "schema_version": STEP5_ENCODER_AUDIT_SCHEMA_VERSION,
+        "encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "content_evidence_token_policy": "max(4,min(32,label_max_length))",
+        "sample_count": n,
+        "encoder_truncated_count": truncated_count,
+        "encoder_truncated_rate": (float(truncated_count) / float(denom)) if denom else 0.0,
+        "final_input_token_length": _dist(final_lens),
+        "raw_input_token_length": _dist(raw_lens),
+    }
+
+
+def _step5_content_evidence_contract_payload(final_cfg: FinalTrainingConfig) -> Dict[str, Any]:
+    soft_len = int(parse_step5_innovation_config_json(str(final_cfg.step5_innovation_config_json)).ccv.soft_prompt_len)
+    return {
+        "schema_version": "odcr_step5_content_evidence_encoder_contract/legacy32",
         "content_evidence_used": True,
         "content_evidence_field": "content_evidence",
-        "content_evidence_token_len": max(4, min(32, int(getattr(final_cfg, "valid_loss_label_max_length", getattr(final_cfg, "train_label_max_length", 64))))),
+        "content_evidence_token_len": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
         "soft_prompt_used": True,
-        "encoder_input_contract": "soft_prompt_plus_content_evidence",
+        "encoder_input_contract": "soft_prompt_plus_content_evidence_legacy32",
         "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+        "flan_soft_prompt_len": soft_len,
+        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "tokenizer_kwargs": {"truncation": True, "max_length_policy": "max(4,min(32,label_max_length))"},
         "soft_prompt_only_allowed": False,
     }
 
@@ -8356,6 +8621,44 @@ def _step5_official_eval_policy_payload(final_cfg: FinalTrainingConfig, *, split
         "metric_input_builder": "base_utils.build_paper_metric_inputs",
         "rerank_allowed": False,
     }
+
+
+def _step5_decode_artifact_payload(final_cfg: FinalTrainingConfig) -> Dict[str, Any]:
+    strategy = str(final_cfg.decode_strategy).strip().lower()
+    out: Dict[str, Any] = {
+        "decode_strategy": final_cfg.decode_strategy,
+        "do_sample": strategy != "greedy",
+        "decode_seed": final_cfg.decode_seed,
+        "repetition_penalty": final_cfg.repetition_penalty,
+        "max_explanation_length": final_cfg.max_explanation_length,
+        "label_smoothing": final_cfg.label_smoothing,
+        "no_repeat_ngram_size": final_cfg.no_repeat_ngram_size,
+        "min_len": final_cfg.min_len,
+        "soft_max_len": getattr(final_cfg, "soft_max_len", None),
+        "hard_max_len": getattr(final_cfg, "hard_max_len", None),
+        "eos_boost_start": getattr(final_cfg, "eos_boost_start", 9999),
+        "eos_boost_value": getattr(final_cfg, "eos_boost_value", 0.0),
+        "forbid_eos_after_open_quote": getattr(final_cfg, "forbid_eos_after_open_quote", True),
+        "forbid_eos_after_open_bracket": getattr(final_cfg, "forbid_eos_after_open_bracket", True),
+        "forbid_bad_terminal_tokens": getattr(final_cfg, "forbid_bad_terminal_tokens", True),
+        "decode_token_repeat_window": getattr(final_cfg, "decode_token_repeat_window", 4),
+        "decode_token_repeat_max": getattr(final_cfg, "decode_token_repeat_max", 2),
+        "candidate_family": getattr(final_cfg, "candidate_family", "official_paper"),
+        "loss_weight_repeat_ul": getattr(final_cfg, "loss_weight_repeat_ul", 0.0),
+        "loss_weight_terminal_clean": getattr(final_cfg, "loss_weight_terminal_clean", 0.0),
+        "terminal_clean_span": getattr(final_cfg, "terminal_clean_span", 3),
+        "domain_fusion_mode": str(getattr(final_cfg, "domain_fusion_mode", "gate_cross_attn")),
+    }
+    if strategy != "greedy":
+        out["generate_temperature"] = final_cfg.generate_temperature
+        out["generate_top_p"] = final_cfg.generate_top_p
+        out["tail_temperature"] = getattr(final_cfg, "tail_temperature", -1.0)
+        out["tail_top_p"] = getattr(final_cfg, "tail_top_p", -1.0)
+    if strategy == "uncertainty_low_temp_top_k":
+        out["gap_threshold"] = float(getattr(final_cfg, "gap_threshold", 0.35))
+        out["prefix_greedy_steps"] = int(getattr(final_cfg, "prefix_greedy_steps", 4))
+        out["decode_top_k"] = int(getattr(final_cfg, "decode_top_k", 5))
+    return out
 
 
 def _assert_step5_official_eval_contract(final_cfg: FinalTrainingConfig, *, command: str) -> None:
@@ -8382,10 +8685,16 @@ def _is_clean_official_step5_test_metrics_payload(metrics: Mapping[str, Any], *,
     token_policy = metrics.get("token_length_policy") if isinstance(metrics.get("token_length_policy"), Mapping) else {}
     official_policy = metrics.get("official_eval_policy") if isinstance(metrics.get("official_eval_policy"), Mapping) else {}
     content_contract = metrics.get("content_evidence_contract") if isinstance(metrics.get("content_evidence_contract"), Mapping) else {}
+    rating_source = metrics.get("rating_source") if isinstance(metrics.get("rating_source"), Mapping) else {}
+    task_idx = int(metrics.get("task_idx") or 0)
     return (
         metrics.get("metrics_schema_version") == expected_schema
         and str(metrics.get("split") or "") == "test"
         and str(metrics.get("command") or "") == "test"
+        and task_idx > 0
+        and int(rating_source.get("task") or 0) == task_idx
+        and str(rating_source.get("source") or "") == "upstream_step3_eval_handoff"
+        and str(rating_source.get("policy_type") or "") == "task_local_step3_accepted_scorer"
         and str(metrics.get("eval_profile_name") or "") == "paper_greedy_25"
         and str(official_policy.get("profile") or "") == "paper_greedy_25"
         and str(decode.get("decode_strategy") or "") == "greedy"
@@ -8395,7 +8704,7 @@ def _is_clean_official_step5_test_metrics_payload(metrics: Mapping[str, Any], *,
         and int(token_policy.get("prediction_max_length") or 0) == 25
         and int(token_policy.get("reference_max_length") or 0) == 25
         and content_contract.get("content_evidence_used") is True
-        and str(content_contract.get("encoder_input_contract") or "") == "soft_prompt_plus_content_evidence"
+        and str(content_contract.get("encoder_input_contract") or "") == "soft_prompt_plus_content_evidence_legacy32"
     )
 
 
@@ -8480,19 +8789,8 @@ def _run_ddp(args):
         if rank == 0:
             _decode_meta = {
                 "command": args.command,
-                "label_smoothing": final_cfg.label_smoothing,
-                "repetition_penalty": final_cfg.repetition_penalty,
-                "generate_temperature": final_cfg.generate_temperature,
-                "generate_top_p": final_cfg.generate_top_p,
-                "gap_threshold": float(getattr(final_cfg, "gap_threshold", 0.35)),
-                "prefix_greedy_steps": int(getattr(final_cfg, "prefix_greedy_steps", 4)),
-                "decode_top_k": int(getattr(final_cfg, "decode_top_k", 5)),
-                "max_explanation_length": final_cfg.max_explanation_length,
+                **_step5_decode_artifact_payload(final_cfg),
                 "train_label_max_length": int(getattr(final_cfg, "train_label_max_length", 128)),
-                "decode_strategy": final_cfg.decode_strategy,
-                "decode_seed": final_cfg.decode_seed,
-                "no_repeat_ngram_size": final_cfg.no_repeat_ngram_size,
-                "min_len": final_cfg.min_len,
                 "ntoken_resolved": final_cfg.ntoken,
                 "nhead": final_cfg.nhead,
                 "nhid": final_cfg.nhid,
@@ -8905,11 +9203,14 @@ def _run_ddp(args):
             ) -> None:
                 _assert_step5_official_eval_contract(final_cfg, command=str(args.command))
                 ed = _eval_export_dir()
-                _eval_tag = eval_decode_tag(
-                    decode_strategy=str(final_cfg.decode_strategy),
-                    generate_temperature=float(final_cfg.generate_temperature),
-                    generate_top_p=float(final_cfg.generate_top_p),
-                )
+                if str(final_cfg.decode_strategy).strip().lower() == "greedy":
+                    _eval_tag = "greedy"
+                else:
+                    _eval_tag = eval_decode_tag(
+                        decode_strategy=str(final_cfg.decode_strategy),
+                        generate_temperature=float(final_cfg.generate_temperature),
+                        generate_top_p=float(final_cfg.generate_top_p),
+                    )
                 _is_rerank = str(args.command) == "eval-rerank"
                 eval_sub = ed
                 os.makedirs(eval_sub, exist_ok=True)
@@ -8992,33 +9293,7 @@ def _run_ddp(args):
                         int(getattr(final_cfg, "ddp_world_size", 1) or 1),
                         extra=log_route_extra(train_logger, ROUTE_SUMMARY),
                     )
-                _decode_cfg = {
-                    "decode_strategy": final_cfg.decode_strategy,
-                    "decode_seed": final_cfg.decode_seed,
-                    "repetition_penalty": final_cfg.repetition_penalty,
-                    "generate_temperature": final_cfg.generate_temperature,
-                    "generate_top_p": final_cfg.generate_top_p,
-                    "max_explanation_length": final_cfg.max_explanation_length,
-                    "label_smoothing": final_cfg.label_smoothing,
-                    "no_repeat_ngram_size": final_cfg.no_repeat_ngram_size,
-                    "min_len": final_cfg.min_len,
-                    "soft_max_len": getattr(final_cfg, "soft_max_len", None),
-                    "hard_max_len": getattr(final_cfg, "hard_max_len", None),
-                    "eos_boost_start": getattr(final_cfg, "eos_boost_start", 9999),
-                    "eos_boost_value": getattr(final_cfg, "eos_boost_value", 0.0),
-                    "tail_temperature": getattr(final_cfg, "tail_temperature", -1.0),
-                    "tail_top_p": getattr(final_cfg, "tail_top_p", -1.0),
-                    "forbid_eos_after_open_quote": getattr(final_cfg, "forbid_eos_after_open_quote", True),
-                    "forbid_eos_after_open_bracket": getattr(final_cfg, "forbid_eos_after_open_bracket", True),
-                    "forbid_bad_terminal_tokens": getattr(final_cfg, "forbid_bad_terminal_tokens", True),
-                    "decode_token_repeat_window": getattr(final_cfg, "decode_token_repeat_window", 4),
-                    "decode_token_repeat_max": getattr(final_cfg, "decode_token_repeat_max", 2),
-                    "candidate_family": getattr(final_cfg, "candidate_family", "balanced"),
-                    "loss_weight_repeat_ul": getattr(final_cfg, "loss_weight_repeat_ul", 0.0),
-                    "loss_weight_terminal_clean": getattr(final_cfg, "loss_weight_terminal_clean", 0.0),
-                    "terminal_clean_span": getattr(final_cfg, "terminal_clean_span", 3),
-                    "domain_fusion_mode": str(getattr(final_cfg, "domain_fusion_mode", "gate_cross_attn")),
-                }
+                _decode_cfg = _step5_decode_artifact_payload(final_cfg)
                 generation_semantic_resolved, _ = build_generation_semantic_resolved_and_fingerprint(
                     _decode_cfg
                 )
@@ -9035,10 +9310,14 @@ def _run_ddp(args):
                 collapse_stats = final.get("collapse_stats") or {}
                 rating_source_ref: dict[str, Any] = {}
                 try:
+                    _rating_source_raw = json.loads(str(getattr(final_cfg, "rating_source_config_json", "{}") or "{}"))
                     rating_source_ref = validate_rating_source(
-                        json.loads(str(getattr(final_cfg, "rating_source_config_json", "{}") or "{}")),
+                        _rating_source_raw,
                         repo_root=get_odcr_root(),
                     )
+                    for _policy_key in ("policy_schema_version", "policy_type", "task_local_required", "source"):
+                        if _policy_key in _rating_source_raw:
+                            rating_source_ref[_policy_key] = _rating_source_raw[_policy_key]
                     rating_metrics_ref = rating_metrics_from_source(rating_source_ref)
                     split_metrics_ref = rating_metrics_ref.get(str(_split_lab), {})
                     final["recommendation"] = {
@@ -9059,6 +9338,7 @@ def _run_ddp(args):
                     split=str(_split_lab),
                     command=str(args.command),
                 )
+                encoder_input_audit = final.get("encoder_input_token_audit") or _summarize_step5_encoder_input_rows(merged)
                 metrics_payload = {
                     "metrics_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
                     "eval_output_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
@@ -9068,6 +9348,9 @@ def _run_ddp(args):
                     "official_eval_profile": "paper_greedy_25",
                     "official_eval_policy": official_eval_policy,
                     "content_evidence_contract": content_evidence_contract,
+                    "encoder_input_token_audit": encoder_input_audit,
+                    "encoder_truncated_count": int(encoder_input_audit.get("encoder_truncated_count", 0) or 0),
+                    "encoder_truncated_rate": float(encoder_input_audit.get("encoder_truncated_rate", 0.0) or 0.0),
                     "auto_selected_params": auto_selected_params or None,
                     "target_only": True,
                     "rerank_touched": bool(_is_rerank),
@@ -9102,6 +9385,7 @@ def _run_ddp(args):
                     "token_length_policy": {
                         "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
                         "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
+                        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
                         "builder": "base_utils.build_paper_metric_inputs",
                     },
                     "collapse_stats": collapse_stats,
@@ -9317,6 +9601,7 @@ def _run_ddp(args):
                     "metrics_path": os.path.abspath(metrics_output_path),
                     "rating_metrics_source": "step3_eval_handoff",
                     "step5_rating_metrics_overwritten": False,
+                    "encoder_input_token_audit": encoder_input_audit,
                     "metrics": final,
                 }
                 composed_paper = compose_step3_rating_step5_explanation_report(
@@ -9355,9 +9640,10 @@ def _run_ddp(args):
                         "metrics_implementation": "base_utils.official_paper_metrics",
                         "content_evidence_used": True,
                         "content_evidence_contract": content_evidence_contract,
+                        "encoder_input_token_audit": encoder_input_audit,
                         "selected_params": {
                             "best_metric_policy": "official_paper_metrics_valid_only",
-                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_required",
+                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
                             "best_cache_policy": "token_cache_identity_content_affecting_only",
                         },
                         "candidates": [

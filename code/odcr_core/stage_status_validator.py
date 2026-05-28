@@ -16,7 +16,6 @@ from typing import Any, Mapping
 from odcr_core import path_layout, run_naming
 from odcr_core.index_contract import INDEX_CONTRACT_SCHEMA_VERSION, load_index_contract
 from odcr_core.stage_status import BAD_FINAL_STATUSES, STAGE_STATUS_SCHEMA_VERSION
-from odcr_core.step4_dedicated_exports import validate_step4_dedicated_exports
 from odcr_core.step4_pool_exports import validate_step4_pool_exports
 from odcr_core.step3_eval_handoff import EVAL_HANDOFF_SCHEMA_VERSION, PAPER_TARGET_ONLY_EVAL
 from odcr_core.training_checkpoint import (
@@ -579,7 +578,10 @@ def _validate_step4_step5_ready(
     _require(payload.get("downstream_ready") is True, "downstream_ready must be true for accepted Step4 handoff")
     ready_for = {str(item) for item in payload.get("ready_for") or []}
     _require("step5" in ready_for, "ready_for must include step5")
-    _require(str(payload.get("status_source") or "") == "step4_export_readiness_validator", "status_source must be step4_export_readiness_validator")
+    _require(
+        str(payload.get("status_source") or "") == "step4_export_readiness_and_pool_manifest_validator",
+        "status_source must be step4_export_readiness_and_pool_manifest_validator",
+    )
     _require(
         payload.get("do_not_use_quality_audit_as_final_truth") is True,
         "do_not_use_quality_audit_as_final_truth must be true",
@@ -702,42 +704,23 @@ def _validate_step4_step5_ready(
         require_latest=require_latest,
         final_status=final_status,
     )
-    dedicated_validation = None
     pool_validation = None
     train_input_role = str(payload.get("step5_train_input_role") or "")
-    if train_input_role == "pool_manifest_sampling_contract" or payload.get("step5_pool_exports_ready") is not None:
-        pool_validation = validate_step4_pool_exports(run_dir, repo_root=repo_root)
-        if not pool_validation.ready:
-            raise StageStatusValidationError(
-                "Step5 pool exports failed validation: "
-                + "; ".join(pool_validation.errors or ["unknown"])
-            )
-        _require(payload.get("step5_pool_exports_ready") is True, "step5_pool_exports_ready must be true")
-        _require(
-            train_input_role == "pool_manifest_sampling_contract",
-            "step5_train_input_role must be pool_manifest_sampling_contract",
+    _require(
+        train_input_role == "pool_manifest_sampling_contract",
+        "step5_train_input_role must be pool_manifest_sampling_contract",
+    )
+    pool_validation = validate_step4_pool_exports(run_dir, repo_root=repo_root)
+    if not pool_validation.ready:
+        raise StageStatusValidationError(
+            "Step5 pool exports failed validation: "
+            + "; ".join(pool_validation.errors or ["unknown"])
         )
-        _require(
-            payload.get("full_audit_default_train_forbidden") is True,
-            "full_audit_default_train_forbidden must be true",
-        )
-    elif payload.get("step5_dedicated_exports_ready") is not None or payload.get("step5_train_input_role"):
-        dedicated_validation = validate_step4_dedicated_exports(
-            run_dir,
-            repo_root=repo_root,
-            expected_source_full_export_sha256=str(expected_hashes["selected_export"]),
-        )
-        if not dedicated_validation.ready:
-            raise StageStatusValidationError(
-                "dedicated Step5 exports failed validation: "
-                + "; ".join(dedicated_validation.errors or ["unknown"])
-            )
-        _require(payload.get("step5_dedicated_exports_ready") is True, "step5_dedicated_exports_ready must be true")
-        _require(str(payload.get("full_audit_table_role") or "") == "audit_only", "full_audit_table_role must be audit_only")
-        _require(
-            str(payload.get("step5_train_input_role") or "") == "dedicated_split_exports",
-            "step5_train_input_role must be dedicated_split_exports",
-        )
+    _require(payload.get("step5_pool_exports_ready") is True, "step5_pool_exports_ready must be true")
+    _require(
+        payload.get("full_audit_default_train_forbidden") is True,
+        "full_audit_default_train_forbidden must be true",
+    )
     return StageStatusValidation(
         stage="step4",
         task=int(task),
@@ -752,7 +735,6 @@ def _validate_step4_step5_ready(
         latest_warnings=latest_warnings,
         diagnostics={
             "step4_export_readiness": dict(readiness),
-            "step4_dedicated_exports_readiness": dedicated_validation.to_payload(repo_root) if dedicated_validation else None,
             "step4_pool_exports_readiness": pool_validation.to_payload(repo_root) if pool_validation else None,
             "read_time_validation": "manifest/index_contract rehashed; selected_export stat and recorded sha verified through refreshed index_contract",
             "selected_export": _repo_relative(repo_root, selected_export_path),

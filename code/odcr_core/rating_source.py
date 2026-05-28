@@ -9,7 +9,24 @@ from odcr_core.config_schema import OneControlConfigError
 
 RATING_SOURCE_SCHEMA_VERSION = "odcr_rating_source/1"
 RATING_SOURCE_TYPE = "step3_accepted_scorer"
+RATING_SOURCE_POLICY_SCHEMA_VERSION = "odcr_rating_source_policy/1"
+RATING_SOURCE_POLICY_TYPE = "task_local_step3_accepted_scorer"
 STEP3_EVAL_HANDOFF_SCHEMA_VERSION = "odcr_step3_eval_handoff/1"
+
+_RETIRED_CONCRETE_CONFIG_FIELDS = frozenset(
+    {
+        "task",
+        "run",
+        "checkpoint",
+        "checkpoint_hash",
+        "eval_handoff",
+        "stage_status",
+        "valid_mae",
+        "valid_rmse",
+        "test_mae",
+        "test_rmse",
+    }
+)
 
 
 class RatingSourceError(OneControlConfigError):
@@ -106,6 +123,73 @@ def resolve_rating_source_config(raw: Mapping[str, Any] | None, *, repo_root: st
     if out["protocol"] != "paper_target_only_eval":
         raise RatingSourceError("rating_source.protocol must be paper_target_only_eval")
     return out
+
+
+def resolve_task_local_rating_source_config(
+    raw: Mapping[str, Any] | None,
+    *,
+    task_id: int,
+    step3_run: str | int | None,
+    repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    root = _repo_root(repo_root)
+    if not isinstance(raw, Mapping):
+        raise RatingSourceError("configs/odcr.yaml:rating_source must be a mapping")
+    if _RETIRED_CONCRETE_CONFIG_FIELDS.intersection(raw):
+        retired = ", ".join(sorted(_RETIRED_CONCRETE_CONFIG_FIELDS.intersection(raw)))
+        raise RatingSourceError(
+            "configs/odcr.yaml:rating_source may not pin a concrete Step3 artifact; "
+            f"retired fixed fields found: {retired}"
+        )
+    schema = str(raw.get("schema_version") or "").strip()
+    if schema != RATING_SOURCE_POLICY_SCHEMA_VERSION:
+        raise RatingSourceError(f"rating_source.schema_version must be {RATING_SOURCE_POLICY_SCHEMA_VERSION}")
+    source_type = str(raw.get("type") or "").strip()
+    if source_type != RATING_SOURCE_POLICY_TYPE:
+        raise RatingSourceError(f"rating_source.type must be {RATING_SOURCE_POLICY_TYPE}")
+    if str(raw.get("source") or "").strip() != "upstream_step3_eval_handoff":
+        raise RatingSourceError("rating_source.source must be upstream_step3_eval_handoff")
+    if bool(raw.get("task_local_required")) is not True:
+        raise RatingSourceError("rating_source.task_local_required must be true")
+    protocol = str(raw.get("protocol") or "").strip()
+    if protocol != "paper_target_only_eval":
+        raise RatingSourceError("rating_source.protocol must be paper_target_only_eval")
+    run = str(step3_run or "").strip()
+    if not run or run == "latest":
+        raise RatingSourceError("Step5 rating_source requires an explicit task-local upstream Step3 run")
+    run_dir = root / "runs" / "step3" / f"task{int(task_id)}" / run
+    eval_handoff_path = run_dir / "meta" / "eval_handoff.json"
+    stage_status_path = run_dir / "meta" / "stage_status.json"
+    handoff = _load_json(eval_handoff_path, label="task-local rating source eval_handoff")
+    if str(handoff.get("schema_version") or "") != STEP3_EVAL_HANDOFF_SCHEMA_VERSION:
+        raise RatingSourceError("task-local rating source eval_handoff schema is not odcr_step3_eval_handoff/1")
+    if int(handoff.get("task_id")) != int(task_id) or str(handoff.get("run_id") or "") != run:
+        raise RatingSourceError("task-local rating source eval_handoff task/run mismatch")
+    if str(handoff.get("paper_eval_protocol") or "") != protocol:
+        raise RatingSourceError("task-local rating source eval_handoff protocol mismatch")
+    payload = {
+        "schema_version": RATING_SOURCE_SCHEMA_VERSION,
+        "type": RATING_SOURCE_TYPE,
+        "task": int(task_id),
+        "run": int(run),
+        "checkpoint": str(handoff.get("checkpoint_path") or ""),
+        "checkpoint_hash": str(handoff.get("checkpoint_hash") or ""),
+        "eval_handoff": _display_path(eval_handoff_path, repo_root=root),
+        "stage_status": _display_path(stage_status_path, repo_root=root),
+        "protocol": protocol,
+        "valid_mae": _metric(handoff, "valid", "MAE"),
+        "valid_rmse": _metric(handoff, "valid", "RMSE"),
+        "test_mae": _metric(handoff, "test", "MAE"),
+        "test_rmse": _metric(handoff, "test", "RMSE"),
+    }
+    resolved = validate_rating_source(payload, repo_root=root)
+    return {
+        **resolved,
+        "policy_schema_version": schema,
+        "policy_type": source_type,
+        "task_local_required": True,
+        "source": "upstream_step3_eval_handoff",
+    }
 
 
 def validate_rating_source(payload: Mapping[str, Any], *, repo_root: str | Path | None = None) -> dict[str, Any]:

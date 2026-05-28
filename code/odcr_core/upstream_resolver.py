@@ -276,19 +276,8 @@ def _artifact_missing_reasons(repo_root: Path, status: Mapping[str, Any], *, con
                     reasons.append(f"{key}_missing")
                 elif item.get("exists") is not True:
                     reasons.append(f"{key}_missing")
-        elif status.get("step5_train_input_role") == "dedicated_split_exports":
-            for key in (
-                "rating_stability_control_scorer_train_export",
-                "step5_explanation_explainer_train_export",
-                "step5_train_manifest",
-                "route_intersection_report",
-                "step5_dedicated_exports_status",
-            ):
-                item = artifacts.get(key)
-                if not isinstance(item, Mapping) or not item.get("path"):
-                    reasons.append(f"{key}_missing")
-                elif item.get("exists") is not True:
-                    reasons.append(f"{key}_missing")
+        else:
+            reasons.append("step5_train_input_role_must_be_pool_manifest_sampling_contract")
     return reasons
 
 

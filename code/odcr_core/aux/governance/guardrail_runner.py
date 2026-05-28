@@ -557,9 +557,10 @@ def _check_step5_explanation_only_contract(repo_root: Path) -> RuleResult:
     config = _read(repo_root / "configs" / "odcr.yaml")
     required = (
         "rating_source:",
-        "type: step3_accepted_scorer",
-        "valid_mae: 0.575",
-        "test_rmse: 0.8494",
+        "schema_version: odcr_rating_source_policy/1",
+        "type: task_local_step3_accepted_scorer",
+        "source: upstream_step3_eval_handoff",
+        "task_local_required: true",
         "mode: explanation_only",
         "STEP5_RATIO_0",
         "STEP5_CF_MIX_FORMAL_HIGH_MEDIUM",
@@ -575,6 +576,9 @@ def _check_step5_explanation_only_contract(repo_root: Path) -> RuleResult:
         "scorer_rating_mse",
         "lambda_lci",
         "lambda_fca",
+        "checkpoint: runs/step3/task2/2",
+        "valid_mae:",
+        "test_rmse:",
     )
     for needle in forbidden:
         if needle in config:
@@ -639,7 +643,9 @@ def _check_step5_rating_source_and_explanation_handoff(repo_root: Path) -> RuleR
     required_by_file = {
         "code/odcr_core/rating_source.py": (
             "validate_rating_source",
+            "resolve_task_local_rating_source_config",
             "step3_accepted_scorer",
+            "task_local_step3_accepted_scorer",
             "paper_target_only_eval",
             "target_only",
         ),

@@ -573,12 +573,12 @@ changes must preserve the S2-R split:
   YAML, schema, resolver, show/doctor, tests, guardrail, docs, and the
   AI_analysis ledger together.
 - Step3 paper tasks must use isolated `step3.task_profiles`; task2 remains the
-  first paper task and must not be remapped to task1. Active performance
-  candidates are G0/G1 only. G2 2048-pool lives under
-  `step3.exploration_profiles` with `probe_only=true` and
-  `formal_allowed=false`. Historical S1/S2/M*/N*/C* candidates must not return
-  as active Step3 probe or formal candidates. Worker profiles W0-W4 remain CPU
-  worker candidate surfaces.
+  first paper task and must not be remapped to task1. The active formal train
+  window is capped at `max_epochs=5` and `min_epochs=2`; longer 40-epoch
+  windows, task2 G0/G1 backup blocks, and G2 2048-pool exploration blocks must
+  not return as active or verbose-only Step3 candidates. Historical
+  S1/S2/M*/N*/C* candidates must not return as active Step3 probe or formal
+  candidates. Worker profiles W0-W4 remain CPU worker candidate surfaces.
 - Governed `step3-performance-probe` and `step3-short-pilot` modes must keep a
   fixed command shape, AI_analysis-only outputs, no formal latest/checkpoint or
   formal cache writes, and no downstream-consumable pilot checkpoints.

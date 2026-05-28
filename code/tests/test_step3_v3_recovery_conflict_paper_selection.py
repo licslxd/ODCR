@@ -82,7 +82,7 @@ class Step3V3RecoveryConflictPaperSelectionTest(unittest.TestCase):
         plan = build_recovery_plan(
             epoch=3,
             drift_record={"status": "severe_objective_drift", "valid_loss": 5.9},
-            config={"enabled": True, "restart_lr_ratio": 0.25, "recovery_epochs": 8, "max_recoveries": 1},
+            config={"enabled": True, "restart_lr_ratio": 0.25, "recovery_epochs": 2, "max_recoveries": 1},
             best_observed_checkpoint="model/best_observed.pth",
             latest_checkpoint="model/latest.pth",
         )
@@ -96,8 +96,10 @@ class Step3V3RecoveryConflictPaperSelectionTest(unittest.TestCase):
     def test_phase_schedule_resolves_and_reduces_late_structure_losses(self) -> None:
         _cfg, _sources, snapshot = _resolve_step3()
         schedule = snapshot["step3_phase_loss_schedule"]
-        phase = resolve_phase_for_epoch(epoch=30, config=schedule)
-        self.assertEqual(phase["phase"], "light_regularization")
+        phase_names = [item["name"] for item in schedule["phases"]]
+        self.assertEqual(phase_names, ["alignment_warmup", "task_refinement"])
+        phase = resolve_phase_for_epoch(epoch=5, config=schedule)
+        self.assertEqual(phase["phase"], "task_refinement")
         weights = {"L_specific_separation": 0.16, "L_variance": 0.10, "L_light_explainer": 0.03}
         adjusted = apply_loss_multipliers(weights, phase["loss_multipliers"])
         self.assertLess(adjusted["L_specific_separation"], weights["L_specific_separation"])

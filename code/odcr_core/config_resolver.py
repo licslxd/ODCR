@@ -14,6 +14,9 @@ from odcr_core.config_schema import (
     ResolvedConfig,
     SAFE_DECODE_PLACEHOLDER,
     SourceRecord,
+    STEP5_TASK_EVAL_OVERRIDE_KEYS,
+    STEP5_TASK_SAMPLER_OVERRIDE_KEYS,
+    STEP5_TASK_TUNING_OVERRIDE_KEYS,
     TOP_LEVEL_BLOCKS,
     TRAIN_PRECISION_CHOICES,
     fingerprint,
@@ -21,8 +24,7 @@ from odcr_core.config_schema import (
 )
 from odcr_core.rating_source import (
     RATING_SOURCE_TYPE,
-    resolve_rating_source_config,
-    validate_rating_source,
+    resolve_task_local_rating_source_config,
 )
 from odcr_core.training_diagnostics import runtime_diagnostics_fingerprint_source
 from odcr_core.step3_quality import (
@@ -183,6 +185,9 @@ _RETIRED_ACCUM_ENV = frozenset(
 _STEP5_RETIRED_TRAIN_FIELDS = frozenset({"adv", "eta", "train_label_max_length"})
 _STEP5_FORMAL_RATIO_ID = "STEP5_RATIO_0"
 _STEP5_FORMAL_CF_MIX_ID = "STEP5_CF_MIX_FORMAL_HIGH_MEDIUM"
+_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID = "WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1"
+_STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID = "TG_MIX_WEAK_MEDIUM_ONLY"
+_STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID = "AG_MIX_WEAK_MEDIUM_ONLY"
 _STEP5_HISTORICAL_CF_MIX_SEMANTICS: dict[tuple[str, str], dict[str, float]] = {}
 
 
@@ -365,12 +370,12 @@ def _validate_step3_config_shape(cfg: Mapping[str, Any]) -> None:
         if isinstance(item, Mapping):
             _validate_step3_profile_shape(item, f"step3.task_profiles.{name}")
     _validate_step3_named_runtime_profiles(
-        _mapping(raw.get("backup_profiles"), "step3.backup_profiles"),
+        _mapping(raw.get("backup_profiles") or {}, "step3.backup_profiles"),
         "step3.backup_profiles",
         kind="backup",
     )
     _validate_step3_named_runtime_profiles(
-        _mapping(raw.get("exploration_profiles"), "step3.exploration_profiles"),
+        _mapping(raw.get("exploration_profiles") or {}, "step3.exploration_profiles"),
         "step3.exploration_profiles",
         kind="exploration",
     )
@@ -448,7 +453,38 @@ def _stage_task_override(stage_cfg: Mapping[str, Any], task_id: int) -> dict[str
     if not isinstance(raw, Mapping):
         return {}
     item = raw.get(str(task_id), raw.get(task_id, {}))
-    return dict(item) if isinstance(item, Mapping) else {}
+    if not isinstance(item, Mapping):
+        return {}
+    # Nested task-local Step5 controls are resolved by their own resolvers, not
+    # merged into the training row.
+    return {str(k): deepcopy(v) for k, v in item.items() if str(k) not in {"eval", "sampler", "tuning"}}
+
+
+def _step5_task_block(cfg: Mapping[str, Any], task_id: int, block: str) -> dict[str, Any]:
+    raw_tasks = _get(cfg, "step5.tasks", {})
+    if not isinstance(raw_tasks, Mapping):
+        return {}
+    raw_task = raw_tasks.get(str(task_id), raw_tasks.get(task_id, {}))
+    if not isinstance(raw_task, Mapping):
+        return {}
+    raw_block = raw_task.get(block, {})
+    if raw_block in (None, ""):
+        return {}
+    if not isinstance(raw_block, Mapping):
+        raise OneControlConfigError(f"step5.tasks.{task_id}.{block} must be a mapping")
+    return dict(raw_block)
+
+
+def _step5_task_eval_override(cfg: Mapping[str, Any], task_id: int) -> dict[str, Any]:
+    raw_eval = _step5_task_block(cfg, task_id, "eval")
+    if not raw_eval:
+        return {}
+    _reject_unknown_keys(
+        raw_eval,
+        set(STEP5_TASK_EVAL_OVERRIDE_KEYS),
+        f"step5.tasks.{task_id}.eval",
+    )
+    return dict(raw_eval)
 
 
 def _set_nested(obj: dict[str, Any], dotted: str, value: Any) -> None:
@@ -1120,8 +1156,12 @@ def _resolve_step4_cf_tiers_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step5.sampler"), "step5.sampler")
+def _resolve_step5_sampler_config(cfg: Mapping[str, Any], *, task_id: int | None = None) -> dict[str, Any]:
+    raw_base = _mapping(_get(cfg, "step5.sampler"), "step5.sampler")
+    task_sampler = _step5_task_block(cfg, int(task_id), "sampler") if task_id is not None else {}
+    if task_sampler:
+        _reject_unknown_keys(task_sampler, set(STEP5_TASK_SAMPLER_OVERRIDE_KEYS), f"step5.tasks.{int(task_id)}.sampler")
+    raw = _merge_dicts(raw_base, task_sampler)
     allowed = {
         "enabled",
         "contract_source",
@@ -1284,6 +1324,7 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
             "aux_cf": "enabled",
         },
         "explanation": _explanation(),
+        "task_override_source": f"step5.tasks.{int(task_id)}.sampler over step5.sampler" if task_sampler else "step5.sampler",
         "epochs": {
             "max_effective_epochs": _rcr_int(epochs.get("max_effective_epochs"), "step5.sampler.epochs.max_effective_epochs", min_value=1),
             "early_stopping_patience": _rcr_int(epochs.get("early_stopping_patience"), "step5.sampler.epochs.early_stopping_patience", min_value=0),
@@ -1772,7 +1813,7 @@ def _resolve_eval_profile(cfg: Mapping[str, Any], profile_name: str | None) -> t
     eval_cfg = _get(cfg, "eval", {})
     if not isinstance(eval_cfg, Mapping):
         raise OneControlConfigError("eval must be a mapping")
-    name = str(profile_name or eval_cfg.get("profile") or "balanced_2gpu")
+    name = str(profile_name or eval_cfg.get("profile") or "paper_greedy_25")
     profiles = eval_cfg.get("profiles", {})
     if not isinstance(profiles, Mapping) or name not in profiles:
         raise OneControlConfigError(f"eval profile {name!r} not found under eval.profiles")
@@ -1792,12 +1833,44 @@ def _resolve_decode(cfg: Mapping[str, Any], name: str | None, *, need_decode: bo
     base = decode_cfg.get("default", {})
     if not isinstance(base, Mapping):
         raise OneControlConfigError("eval.decode.default must be a mapping")
-    stem = str(name or "mainline")
+    stem = str(name or "paper_greedy_25")
     overlay = decode_cfg.get(stem, {})
     if stem != "default" and not isinstance(overlay, Mapping):
         raise OneControlConfigError(f"eval.decode.{stem} must be a mapping")
     merged = _merge_dicts(base, overlay if stem != "default" else {})
+    strategy = str(merged.get("decode_strategy") or "").strip().lower()
+    if strategy == "greedy":
+        declared_sampling = {
+            key
+            for raw in (base, overlay if stem != "default" else {})
+            if isinstance(raw, Mapping)
+            for key in ("generate_temperature", "generate_top_p")
+            if key in raw
+        }
+        if declared_sampling:
+            raise OneControlConfigError(
+                "Step5 official paper_greedy_25 decode must not declare sampling parameters: "
+                f"{sorted(declared_sampling)}"
+            )
+        # Internal transport defaults keep the frozen ResolvedConfig schema stable;
+        # the official greedy runner/artifacts do not pass or publish them.
+        merged["generate_temperature"] = 1.0
+        merged["generate_top_p"] = 1.0
+    else:
+        for required in ("generate_temperature", "generate_top_p"):
+            if required not in merged:
+                raise OneControlConfigError(f"eval.decode.{stem}.{required} is required for non-greedy decode")
     return stem, merged
+
+
+def _public_decode_snapshot(decode: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(decode)
+    if str(out.get("decode_strategy") or "").strip().lower() == "greedy":
+        out.pop("generate_temperature", None)
+        out.pop("generate_top_p", None)
+        out.pop("tail_temperature", None)
+        out.pop("tail_top_p", None)
+    return out
 
 
 def _resolve_rerank(cfg: Mapping[str, Any], name: str | None, *, need_rerank: bool) -> tuple[str, dict[str, Any]]:
@@ -2209,11 +2282,13 @@ def _resolve_step3_recovery_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     scheduler = str(raw.get("recovery_scheduler") or "short_cosine")
     if scheduler != "short_cosine":
         raise OneControlConfigError("step3.recovery.recovery_scheduler must be short_cosine.")
+    if "recovery_epochs" not in raw:
+        raise OneControlConfigError("step3.recovery.recovery_epochs is required.")
     return {
         "enabled": _bool(raw.get("enabled", True)),
         "trigger": str(raw.get("trigger") or "severe_objective_drift"),
         "restart_lr_ratio": _rcr_float(raw.get("restart_lr_ratio", 0.25), "step3.recovery.restart_lr_ratio", min_value=0.0),
-        "recovery_epochs": _positive_int(raw.get("recovery_epochs", 8), "step3.recovery.recovery_epochs"),
+        "recovery_epochs": _positive_int(raw.get("recovery_epochs"), "step3.recovery.recovery_epochs"),
         "max_recoveries": _positive_int(raw.get("max_recoveries", 1), "step3.recovery.max_recoveries"),
         "source_checkpoint_scope": source_scope,
         "save_drift_checkpoint": _bool(raw.get("save_drift_checkpoint", True)),
@@ -2246,9 +2321,9 @@ def _resolve_step3_phase_loss_schedule_config(cfg: Mapping[str, Any]) -> dict[st
             }
         )
     names = {phase["name"] for phase in phases}
-    required = {"alignment_warmup", "task_refinement", "light_regularization"}
+    required = {"alignment_warmup", "task_refinement"}
     if not required.issubset(names):
-        raise OneControlConfigError("step3.phase_loss_schedule must define alignment_warmup, task_refinement, and light_regularization.")
+        raise OneControlConfigError("step3.phase_loss_schedule must define alignment_warmup and task_refinement.")
     return {
         "enabled": _bool(raw.get("enabled", True)),
         "transition": str(raw.get("transition") or "epoch_or_objective_drift"),
@@ -2458,7 +2533,7 @@ def _resolve_step3_eval_config(train: Mapping[str, Any], stage_cfg: Mapping[str,
 
 
 def _resolve_step3_backup_profiles_config(cfg: Mapping[str, Any], ddp_world_size: int) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.backup_profiles"), "step3.backup_profiles")
+    raw = _mapping(_get(cfg, "step3.backup_profiles") or {}, "step3.backup_profiles")
     out: dict[str, Any] = {}
     for name, item in raw.items():
         if not isinstance(item, Mapping):
@@ -2502,7 +2577,7 @@ def _resolve_step3_backup_profiles_config(cfg: Mapping[str, Any], ddp_world_size
 
 
 def _resolve_step3_exploration_profiles_config(cfg: Mapping[str, Any], ddp_world_size: int) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.exploration_profiles"), "step3.exploration_profiles")
+    raw = _mapping(_get(cfg, "step3.exploration_profiles") or {}, "step3.exploration_profiles")
     out: dict[str, Any] = {}
     for name, item in raw.items():
         if not isinstance(item, Mapping):
@@ -3218,18 +3293,17 @@ def _resolve_step5_e4_bounded_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
 def _resolve_step5_eval_config(
     cfg: Mapping[str, Any],
     *,
+    task_id: int,
     ddp_world_size: int,
     train_per_gpu_batch_size: int,
 ) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step5.eval"), "step5.eval")
+    raw_base = _mapping(_get(cfg, "step5.eval"), "step5.eval")
+    task_eval = _step5_task_eval_override(cfg, task_id)
+    raw = _merge_dicts(raw_base, task_eval)
     _reject_unknown_keys(
         raw,
         {
-            "valid_per_gpu_batch_size",
-            "valid_batch_size",
-            "valid_forward_micro_batch_size",
-            "test_per_gpu_batch_size",
-            "test_forward_micro_batch_size",
+            *STEP5_TASK_EVAL_OVERRIDE_KEYS,
             "metric_accumulation",
             "validation_memory_policy",
             "validation_mode",
@@ -3239,11 +3313,12 @@ def _resolve_step5_eval_config(
         },
         "step5.eval",
     )
-    valid_per_gpu = _rcr_int(raw.get("valid_per_gpu_batch_size"), "step5.eval.valid_per_gpu_batch_size", min_value=1)
-    valid_global = _rcr_int(raw.get("valid_batch_size"), "step5.eval.valid_batch_size", min_value=1)
-    valid_forward = _rcr_int(raw.get("valid_forward_micro_batch_size"), "step5.eval.valid_forward_micro_batch_size", min_value=1)
-    test_per_gpu = _rcr_int(raw.get("test_per_gpu_batch_size"), "step5.eval.test_per_gpu_batch_size", min_value=1)
-    test_forward = _rcr_int(raw.get("test_forward_micro_batch_size"), "step5.eval.test_forward_micro_batch_size", min_value=1)
+    source = f"step5.tasks.{task_id}.eval over step5.eval" if task_eval else "step5.eval"
+    valid_per_gpu = _rcr_int(raw.get("valid_per_gpu_batch_size"), f"{source}.valid_per_gpu_batch_size", min_value=1)
+    valid_global = _rcr_int(raw.get("valid_batch_size"), f"{source}.valid_batch_size", min_value=1)
+    valid_forward = _rcr_int(raw.get("valid_forward_micro_batch_size"), f"{source}.valid_forward_micro_batch_size", min_value=1)
+    test_per_gpu = _rcr_int(raw.get("test_per_gpu_batch_size"), f"{source}.test_per_gpu_batch_size", min_value=1)
+    test_forward = _rcr_int(raw.get("test_forward_micro_batch_size"), f"{source}.test_forward_micro_batch_size", min_value=1)
     if valid_global != valid_per_gpu * ddp_world_size:
         raise OneControlConfigError("step5.eval.valid_batch_size must equal valid_per_gpu_batch_size * ddp_world_size")
     if valid_forward > valid_per_gpu:
@@ -3273,6 +3348,7 @@ def _resolve_step5_eval_config(
         "old_eval_batch_2048_retired": _bool(raw.get("old_eval_batch_2048_retired")),
         "valid_loss_components": {"explanation": explanation_components},
         "valid_loss_components_json": json_dumps({"explanation": explanation_components}),
+        "source_path": source,
     }
 
 
@@ -3465,8 +3541,20 @@ def _resolve_step5_batch_candidates_config(cfg: Mapping[str, Any]) -> dict[str, 
 def _resolve_step5_tuning_config(
     cfg: Mapping[str, Any],
     batch_candidates_config: Mapping[str, Any],
+    *,
+    task_id: int | None = None,
 ) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step5.tuning"), "step5.tuning")
+    raw_base = _mapping(_get(cfg, "step5.tuning"), "step5.tuning")
+    task_tuning = _step5_task_block(cfg, int(task_id), "tuning") if task_id is not None else {}
+    if task_tuning:
+        _reject_unknown_keys(
+            task_tuning,
+            {
+                *STEP5_TASK_TUNING_OVERRIDE_KEYS,
+            },
+            f"step5.tasks.{int(task_id)}.tuning",
+        )
+    raw = _merge_dicts(raw_base, task_tuning)
     _reject_unknown_keys(
         raw,
         {
@@ -3595,6 +3683,17 @@ def _resolve_step5_tuning_config(
             "target_gold": _mix_candidates("gold_tier_mix_candidates", {"high", "medium"}, "target_gold"),
             "aux_gold": _mix_candidates("gold_tier_mix_candidates", {"high", "medium"}, "aux_gold"),
         },
+        "task_override_source": f"step5.tasks.{int(task_id)}.tuning over step5.tuning" if task_tuning else "step5.tuning",
+        "selected_tuning_candidate_source": (
+            f"step5.tasks.{int(task_id)}.tuning.selected_tuning_candidate"
+            if task_tuning and "selected_tuning_candidate" in task_tuning
+            else "step5.tuning.selected_tuning_candidate"
+        ),
+        "fallback_tuning_candidate_source": (
+            f"step5.tasks.{int(task_id)}.tuning.fallback_tuning_candidate"
+            if task_tuning and "fallback_tuning_candidate" in task_tuning
+            else "step5.tuning.fallback_tuning_candidate"
+        ),
         "search_strategy": {
             "stage_a_fraction": _rcr_float(strategy.get("stage_a_fraction"), "step5.tuning.search_strategy.stage_a_fraction", min_value=0.0, max_value=1.0),
             "stage_b_fraction": _rcr_float(strategy.get("stage_b_fraction"), "step5.tuning.search_strategy.stage_b_fraction", min_value=0.0, max_value=1.0),
@@ -3607,15 +3706,20 @@ def _resolve_step5_tuning_config(
 def _step5_candidate_tokens(candidate: str) -> dict[str, str]:
     tokens = {str(part).strip() for part in str(candidate or "").split("+") if str(part).strip()}
     out: dict[str, str] = {}
-    for prefixes, key, label in (
-        (("STEP5_RATIO_",), "ratio", "STEP5_RATIO_"),
-        (("STEP5_CF_MIX_",), "cf_mix", "STEP5_CF_MIX_"),
-        (("TG_MIX_",), "target_gold_mix", "TG_MIX_"),
-        (("AG_MIX_",), "aux_gold_mix", "AG_MIX_"),
-        (("LR_",), "lr", "LR_"),
-        (("W",), "weight", "W"),
+    for matcher, key, label in (
+        (lambda token: token.startswith("STEP5_RATIO_"), "ratio", "STEP5_RATIO_"),
+        (
+            lambda token: token.startswith("STEP5_CF_MIX_")
+            or token == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID,
+            "cf_mix",
+            "STEP5_CF_MIX_ or WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1",
+        ),
+        (lambda token: token.startswith("TG_MIX_"), "target_gold_mix", "TG_MIX_"),
+        (lambda token: token.startswith("AG_MIX_"), "aux_gold_mix", "AG_MIX_"),
+        (lambda token: token.startswith("LR_"), "lr", "LR_"),
+        (lambda token: token.startswith("W") and token[1:].isdigit(), "weight", "W<digits>"),
     ):
-        matches = sorted(token for token in tokens if any(token.startswith(prefix) for prefix in prefixes))
+        matches = sorted(token for token in tokens if matcher(token))
         if len(matches) != 1:
             raise OneControlConfigError(
                 f"step5.tuning.selected_tuning_candidate must contain exactly one {label} token; got {candidate!r}"
@@ -3643,6 +3747,8 @@ def _assert_close_mapping(actual: Mapping[str, Any], expected: Mapping[str, Any]
 
 def _assert_step5_selected_candidate_consistency(
     *,
+    task_id: int,
+    scenario: str,
     row: Mapping[str, Any],
     sampler_config: Mapping[str, Any],
     tuning_config: Mapping[str, Any],
@@ -3651,7 +3757,21 @@ def _assert_step5_selected_candidate_consistency(
     tokens = _step5_candidate_tokens(str(tuning_config.get("selected_tuning_candidate") or ""))
     if tokens.get("ratio") != _STEP5_FORMAL_RATIO_ID:
         raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_RATIO_ID}")
-    if tokens.get("cf_mix") != _STEP5_FORMAL_CF_MIX_ID:
+    weak_task_allowed = str(scenario) == "weak_cross_platform" and int(task_id) in {7, 8}
+    if tokens.get("cf_mix") == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID:
+        if not weak_task_allowed:
+            raise OneControlConfigError(
+                f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} is only allowed for task7/task8 weak_cross_platform Step5."
+            )
+        if tokens.get("target_gold_mix") != _STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID:
+            raise OneControlConfigError(
+                f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} requires {_STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID}."
+            )
+        if tokens.get("aux_gold_mix") != _STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID:
+            raise OneControlConfigError(
+                f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} requires {_STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID}."
+            )
+    elif tokens.get("cf_mix") != _STEP5_FORMAL_CF_MIX_ID:
         raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_CF_MIX_ID}")
     explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
     ratio = _candidate_row_by_id(
@@ -3680,6 +3800,28 @@ def _assert_step5_selected_candidate_consistency(
         fields=("high", "medium", "low_weighted"),
         label="step5.sampler.explanation.cf_tier_mix",
     )
+    target_gold_mix = _candidate_row_by_id(
+        (tuning_config.get("gold_tier_mix_candidates") or {}).get("target_gold"),
+        tokens["target_gold_mix"],
+        "step5.tuning.gold_tier_mix_candidates.target_gold",
+    )
+    _assert_close_mapping(
+        _mapping(explanation_cfg.get("target_gold_tier_mix"), "step5.sampler.explanation.target_gold_tier_mix"),
+        target_gold_mix,
+        fields=("high", "medium"),
+        label="step5.sampler.explanation.target_gold_tier_mix",
+    )
+    aux_gold_mix = _candidate_row_by_id(
+        (tuning_config.get("gold_tier_mix_candidates") or {}).get("aux_gold"),
+        tokens["aux_gold_mix"],
+        "step5.tuning.gold_tier_mix_candidates.aux_gold",
+    )
+    _assert_close_mapping(
+        _mapping(explanation_cfg.get("aux_gold_tier_mix"), "step5.sampler.explanation.aux_gold_tier_mix"),
+        aux_gold_mix,
+        fields=("high", "medium"),
+        label="step5.sampler.explanation.aux_gold_tier_mix",
+    )
     selected_lr = float(str(tokens["lr"])[len("LR_") :])
     if abs(float(row.get("lr")) - selected_lr) > 1e-12:
         raise OneControlConfigError(f"step5.train.lr={row.get('lr')} does not match selected candidate {tokens['lr']}")
@@ -3706,9 +3848,16 @@ def _step5_formal_active_candidate_payload(
     explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
     explanation_mix = dict(_mapping(explanation_cfg.get("cf_tier_mix"), "step5.sampler.explanation.cf_tier_mix"))
     low_weighted_disabled = float(explanation_mix.get("low_weighted") or 0.0) == 0.0
+    sampler_protocol = (
+        _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
+        if tokens["cf_mix"] == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
+        else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
+    )
     return {
         "schema_version": "odcr_step5_formal_active_candidate/2",
         "mode": "explanation_only",
+        "sampler_protocol": sampler_protocol,
+        "weak_cross_platform_protocol": tokens["cf_mix"] == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID,
         "selected_tuning_candidate": str(tuning_config.get("selected_tuning_candidate") or ""),
         "candidate_parts": {
             "ratio_id": tokens["ratio"],
@@ -3720,6 +3869,14 @@ def _step5_formal_active_candidate_payload(
         },
         "explanation_cf_mix_id": tokens["cf_mix"],
         "explanation_cf_mix": explanation_mix,
+        "target_gold_tier_mix_id": tokens["target_gold_mix"],
+        "target_gold_tier_mix": dict(
+            _mapping(explanation_cfg.get("target_gold_tier_mix"), "step5.sampler.explanation.target_gold_tier_mix")
+        ),
+        "aux_gold_tier_mix_id": tokens["aux_gold_mix"],
+        "aux_gold_tier_mix": dict(
+            _mapping(explanation_cfg.get("aux_gold_tier_mix"), "step5.sampler.explanation.aux_gold_tier_mix")
+        ),
         "lr": float(row.get("lr") or 0.0),
         "weights_id": tokens["weight"],
         "batch_candidate": str(tuning_config.get("batch_candidate") or ""),
@@ -3729,7 +3886,10 @@ def _step5_formal_active_candidate_payload(
         "full_audit_default_forbidden": bool(sampler_config.get("full_audit_default_allowed") is False),
         "old_dedicated_default_forbidden": bool(sampler_config.get("legacy_gold_heavy_exports_allowed") is False),
         "step4_sampling_contract_role": "pool_lineage_only",
-        "active_sampler_source": "configs/odcr.yaml:step5.sampler + configs/odcr.yaml:step5.tuning.selected_tuning_candidate",
+        "active_sampler_source": (
+            f"{sampler_config.get('task_override_source') or 'step5.sampler'} + "
+            f"{tuning_config.get('selected_tuning_candidate_source') or 'step5.tuning.selected_tuning_candidate'}"
+        ),
         "ai_analysis_runtime_config_source": "evidence_only_not_runtime_config",
     }
 
@@ -3862,7 +4022,10 @@ def resolve_config(
     direction = str(task.get("direction") or "unspecified")
 
     stage_for_train = "step5" if command == "eval" else command
-    step5_head_norm = run_naming.parse_step5_head(step5_head if command == "step5" else "explanation")
+    try:
+        step5_head_norm = run_naming.parse_step5_head(step5_head if command == "step5" else "explanation")
+    except ValueError as exc:
+        raise OneControlConfigError(str(exc)) from exc
     stage_cfg = _get(cfg, stage_for_train, {})
     if not isinstance(stage_cfg, Mapping):
         stage_cfg = {}
@@ -4024,6 +4187,9 @@ def resolve_config(
     need_decode = needs_decode_layer(command, step5_train_only=step5_train_only_resolved)
     decode_name = str(eval_profile_obj.get("decode")) if eval_profile_obj.get("decode") else None
     decode_id, decode = _resolve_decode(cfg, decode_name, need_decode=need_decode)
+    decode_snapshot = decode
+    if stage_for_train == "step5" and not need_decode and decode_name:
+        _snapshot_decode_id, decode_snapshot = _resolve_decode(cfg, decode_name, need_decode=True)
     need_rerank = command == "eval" and bool(eval_profile_obj.get("rerank"))
     rerank_name = str(eval_profile_obj.get("rerank")) if eval_profile_obj.get("rerank") else None
     rerank_id, rerank = _resolve_rerank(cfg, rerank_name, need_rerank=need_rerank)
@@ -4214,7 +4380,12 @@ def resolve_config(
     step4_gold_quality_config = _resolve_step4_gold_quality_config(cfg)
     step4_cf_tiers_config = _resolve_step4_cf_tiers_config(cfg)
     rating_source_config = (
-        validate_rating_source(resolve_rating_source_config(_get(cfg, "rating_source"), repo_root=repo_root), repo_root=repo_root)
+        resolve_task_local_rating_source_config(
+            _get(cfg, "rating_source"),
+            task_id=tid,
+            step3_run=from_run,
+            repo_root=repo_root,
+        )
         if stage_for_train == "step5"
         else {}
     )
@@ -4254,14 +4425,14 @@ def resolve_config(
     step5_ddp_config = _resolve_step5_ddp_config(cfg) if stage_for_train == "step5" else {}
     step5_export_loader_config = _resolve_step5_export_loader_config(cfg) if stage_for_train == "step5" else {}
     step5_data_pipeline_config = _resolve_step5_data_pipeline_config(cfg, ddp_world_size=ddp_world_size) if stage_for_train == "step5" else {}
-    step5_sampler_config = _resolve_step5_sampler_config(cfg) if stage_for_train == "step5" else {}
+    step5_sampler_config = _resolve_step5_sampler_config(cfg, task_id=tid) if stage_for_train == "step5" else {}
     if stage_for_train == "step5":
         step5_sampler_config["task_decoupled_policy"] = dict(step5_task_decoupled_policy_config)
     step5_prompt_templates_config = _resolve_step5_prompt_templates_config(cfg) if stage_for_train == "step5" else {}
     step5_effective_epoch_config = _resolve_step5_effective_epoch_config(cfg) if stage_for_train == "step5" else {}
     step5_batch_candidates_config = _resolve_step5_batch_candidates_config(cfg) if stage_for_train == "step5" else {}
     step5_tuning_config = (
-        _resolve_step5_tuning_config(cfg, step5_batch_candidates_config)
+        _resolve_step5_tuning_config(cfg, step5_batch_candidates_config, task_id=tid)
         if stage_for_train == "step5"
         else {}
     )
@@ -4271,6 +4442,7 @@ def resolve_config(
     step5_eval_config = (
         _resolve_step5_eval_config(
             cfg,
+            task_id=tid,
             ddp_world_size=ddp_world_size,
             train_per_gpu_batch_size=int(row["per_gpu_batch_size"]),
         )
@@ -4427,6 +4599,8 @@ def resolve_config(
             min_value=0.0,
         )
         _assert_step5_selected_candidate_consistency(
+            task_id=tid,
+            scenario=scenario,
             row=row,
             sampler_config=step5_sampler_config,
             tuning_config=step5_tuning_config,
@@ -4555,6 +4729,11 @@ def resolve_config(
     domain_fusion_mode = str(decode.get("domain_fusion_mode", "gate_cross_attn"))
     if decode_strategy not in ("greedy", "nucleus", "uncertainty_low_temp_top_k"):
         raise OneControlConfigError(f"unsupported decode_strategy: {decode_strategy!r}")
+    step5_eval_source = (
+        str(step5_eval_config.get("source_path") or "step5.eval")
+        if stage_for_train == "step5" and step5_eval_config
+        else "step5.eval"
+    )
 
     hw_semantic = {
         k: v
@@ -4588,7 +4767,7 @@ def resolve_config(
         "step4_step5_pool_exports": "step4.step5_pool_exports",
         "step4_gold_quality": "step4.gold_quality",
         "step4_cf_tiers": "step4.cf_tiers",
-        "rating_source": "rating_source" if stage_for_train == "step5" else None,
+        "rating_source": "rating_source + upstream Step3 eval_handoff" if stage_for_train == "step5" else None,
         "step3_structured_losses": "step3.structured_losses",
         "step3_loss_semantics": "step3.loss_semantics",
         "step3_ddp_find_unused_parameters": "step3.ddp.find_unused_parameters",
@@ -4628,8 +4807,12 @@ def resolve_config(
         "step3_eval_split": "step3.eval.split" if stage_for_train == "step3" else None,
         "step3_eval_batch_candidates": "step3.eval.batch_candidates" if stage_for_train == "step3" else None,
         "step3_eval_paper_protocol": f"step3.eval.{PAPER_TARGET_ONLY_EVAL}" if stage_for_train == "step3" else None,
-        "step3_backup_profiles": "step3.backup_profiles" if stage_for_train == "step3" else None,
-        "step3_exploration_profiles": "step3.exploration_profiles" if stage_for_train == "step3" else None,
+        "step3_backup_profiles": (
+            "step3.backup_profiles" if stage_for_train == "step3" and step3_backup_profiles_config else None
+        ),
+        "step3_exploration_profiles": (
+            "step3.exploration_profiles" if stage_for_train == "step3" and step3_exploration_profiles_config else None
+        ),
         "step3_worker_profiles": "step3.worker_profiles" if stage_for_train == "step3" else None,
         "step3_prefetcher": "step3.prefetcher" if stage_for_train == "step3" else None,
         "step3_checkpoint_policy": "step3.checkpoint_policy" if stage_for_train == "step3" else None,
@@ -4667,30 +4850,39 @@ def resolve_config(
         "step5_model": "step5.model",
         "step5_export_loader": "step5.export_loader",
         "step5_data_pipeline": "step5.data_pipeline",
-        "step5_sampler": "step5.sampler",
+        "step5_sampler": (
+            str(step5_sampler_config.get("task_override_source") or "step5.sampler")
+            if stage_for_train == "step5"
+            else "step5.sampler"
+        ),
         "step5_task_decoupled_policy": "step5.task_decoupled_policy",
         "step5_model_factory_policy": "derived from step5.task_decoupled_policy + CLI --head",
         "step5_prompt_templates": "step5.prompt_templates",
         "step5_effective_epoch": "step5.effective_epoch",
         "step5_batch_candidates": "step5.batch_candidates",
-        "step5_tuning": "step5.tuning",
+        "step5_tuning": (
+            str(step5_tuning_config.get("task_override_source") or "step5.tuning")
+            if stage_for_train == "step5"
+            else "step5.tuning"
+        ),
         "step5_formal_active_candidate": (
-            "configs/odcr.yaml:step5.tuning.selected_tuning_candidate + configs/odcr.yaml:step5.sampler"
+            f"{step5_tuning_config.get('selected_tuning_candidate_source') or 'step5.tuning.selected_tuning_candidate'} + "
+            f"{step5_sampler_config.get('task_override_source') or 'step5.sampler'}"
             if stage_for_train == "step5"
             else None
         ),
         "step5_formal_active_candidate.explanation_cf_mix_id": (
-            "configs/odcr.yaml:step5.tuning.selected_tuning_candidate"
+            str(step5_tuning_config.get("selected_tuning_candidate_source") or "step5.tuning.selected_tuning_candidate")
             if stage_for_train == "step5"
             else None
         ),
         "step5_formal_active_candidate.explanation_cf_mix": (
-            "configs/odcr.yaml:step5.sampler.explanation.cf_tier_mix"
+            str(step5_sampler_config.get("task_override_source") or "step5.sampler")
             if stage_for_train == "step5"
             else None
         ),
         "step5_formal_active_candidate.active_sampler_source": (
-            "configs/odcr.yaml:step5.sampler + configs/odcr.yaml:step5.tuning.selected_tuning_candidate"
+            str(step5_formal_active_candidate_config.get("active_sampler_source") or "")
             if stage_for_train == "step5"
             else None
         ),
@@ -4714,21 +4906,21 @@ def resolve_config(
         ),
         "step5_allow_embedded_final_eval": "step5.lifecycle embedded-final-eval diagnostic gates" if command == "step5" else None,
         "step5_checkpoint_load_policy": "step5.lifecycle.checkpoint_load_policy" if stage_for_train == "step5" else None,
-        "step5_eval": "step5.eval" if stage_for_train == "step5" else None,
+        "step5_eval": step5_eval_source if stage_for_train == "step5" else None,
         "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
         "train_per_gpu_batch_size": "step5.train.per_gpu_batch_size" if stage_for_train == "step5" else None,
-        "valid_per_gpu_batch_size": "step5.eval.valid_per_gpu_batch_size" if stage_for_train == "step5" else None,
-        "valid_global_batch_size": "step5.eval.valid_batch_size" if stage_for_train == "step5" else None,
-        "valid_forward_micro_batch_size": "step5.eval.valid_forward_micro_batch_size" if stage_for_train == "step5" else None,
-        "validation_microbatch_accumulation": "step5.eval.metric_accumulation" if stage_for_train == "step5" else None,
-        "validation_memory_policy": "step5.eval.validation_memory_policy" if stage_for_train == "step5" else None,
-        "step5_validation_mode": "step5.eval.validation_mode" if stage_for_train == "step5" else None,
+        "valid_per_gpu_batch_size": f"{step5_eval_source}.valid_per_gpu_batch_size" if stage_for_train == "step5" else None,
+        "valid_global_batch_size": f"{step5_eval_source}.valid_batch_size" if stage_for_train == "step5" else None,
+        "valid_forward_micro_batch_size": f"{step5_eval_source}.valid_forward_micro_batch_size" if stage_for_train == "step5" else None,
+        "validation_microbatch_accumulation": f"{step5_eval_source}.metric_accumulation" if stage_for_train == "step5" else None,
+        "validation_memory_policy": f"{step5_eval_source}.validation_memory_policy" if stage_for_train == "step5" else None,
+        "step5_validation_mode": f"{step5_eval_source}.validation_mode" if stage_for_train == "step5" else None,
         "formal_entry_E4_validation_required": (
-            "step5.eval.formal_entry_E4_validation_required" if stage_for_train == "step5" else None
+            f"{step5_eval_source}.formal_entry_E4_validation_required" if stage_for_train == "step5" else None
         ),
-        "old_eval_batch_2048_retired": "step5.eval.old_eval_batch_2048_retired" if stage_for_train == "step5" else None,
-        "valid_loss_components": "step5.eval.valid_loss_components" if stage_for_train == "step5" else None,
+        "old_eval_batch_2048_retired": f"{step5_eval_source}.old_eval_batch_2048_retired" if stage_for_train == "step5" else None,
+        "valid_loss_components": f"{step5_eval_source}.valid_loss_components" if stage_for_train == "step5" else None,
         "validation_flans_logits_materialized": "not_applicable_explanation_only" if stage_for_train == "step5" else None,
         "validation_e4_evidence_id": "AI_analysis formal-entry E4 with validation evidence" if stage_for_train == "step5" else None,
         "validation_oom_guard_status": (
@@ -4947,7 +5139,7 @@ def resolve_config(
         "old_eval_batch_2048_retired",
         "valid_loss_components",
     ):
-        field_sources[f"step5_eval.{key}"] = f"step5.eval.{key}"
+        field_sources[f"step5_eval.{key}"] = f"{step5_eval_source}.{key}"
     for key in (
         "enabled",
         "evidence_level",
@@ -5004,7 +5196,7 @@ def resolve_config(
         "step4_runtime": "step4.runtime",
         "step4_step5_dedicated_exports": "step4.step5_dedicated_exports",
         "step4_step5_pool_exports": "step4.step5_pool_exports",
-        "rating_source": "rating_source" if stage_for_train == "step5" else None,
+        "rating_source": "rating_source + upstream Step3 eval_handoff" if stage_for_train == "step5" else None,
         "step5_data_pipeline": "step5.data_pipeline" if stage_for_train == "step5" else None,
         "upstream_resolution": upstream_resolution_payload if upstream_resolution_payload else None,
         "active_stage_status": active_stage_status_payload if active_stage_status_payload else None,
@@ -5019,8 +5211,12 @@ def resolve_config(
         "step3_evidence": "step3.evidence + scenario profile evidence + isolated task profile evidence" if stage_for_train == "step3" else None,
         "step3_scheduler": "step3.scheduler" if stage_for_train == "step3" else None,
         "step3_eval": "step3.eval" if stage_for_train == "step3" else None,
-        "step3_backup_profiles": "step3.backup_profiles" if stage_for_train == "step3" else None,
-        "step3_exploration_profiles": "step3.exploration_profiles" if stage_for_train == "step3" else None,
+        "step3_backup_profiles": (
+            "step3.backup_profiles" if stage_for_train == "step3" and step3_backup_profiles_config else None
+        ),
+        "step3_exploration_profiles": (
+            "step3.exploration_profiles" if stage_for_train == "step3" and step3_exploration_profiles_config else None
+        ),
         "step3_worker_profiles": "step3.worker_profiles" if stage_for_train == "step3" else None,
         "step3_prefetcher": "step3.prefetcher" if stage_for_train == "step3" else None,
         "step3_checkpoint_policy": "step3.checkpoint_policy" if stage_for_train == "step3" else None,
@@ -5080,21 +5276,42 @@ def resolve_config(
         ),
         "step5_export_loader": "step5.export_loader" if stage_for_train == "step5" else None,
         "step5_data_pipeline": "step5.data_pipeline" if stage_for_train == "step5" else None,
-        "step5_sampler": "step5.sampler" if stage_for_train == "step5" else None,
+        "step5_sampler": (
+            str(step5_sampler_config.get("task_override_source") or "step5.sampler")
+            if stage_for_train == "step5"
+            else None
+        ),
         "step5_prompt_templates": "step5.prompt_templates" if stage_for_train == "step5" else None,
         "step5_effective_epoch": "step5.effective_epoch" if stage_for_train == "step5" else None,
         "step5_batch_candidates": "step5.batch_candidates" if stage_for_train == "step5" else None,
-        "step5_tuning": "step5.tuning" if stage_for_train == "step5" else None,
+        "step5_tuning": (
+            str(step5_tuning_config.get("task_override_source") or "step5.tuning")
+            if stage_for_train == "step5"
+            else None
+        ),
         "step5_formal_active_candidate": (
-            "configs/odcr.yaml:step5.tuning.selected_tuning_candidate + configs/odcr.yaml:step5.sampler"
+            f"{step5_tuning_config.get('selected_tuning_candidate_source') or 'step5.tuning.selected_tuning_candidate'} + "
+            f"{step5_sampler_config.get('task_override_source') or 'step5.sampler'}"
             if stage_for_train == "step5"
             else None
         ),
         "step5_head": "CLI --head" if command == "step5" else None,
-        "selected_tuning_candidate": "step5.tuning.selected_tuning_candidate" if stage_for_train == "step5" else None,
-        "fallback_tuning_candidate": "step5.tuning.fallback_tuning_candidate" if stage_for_train == "step5" else None,
-        "step5_effective_samples": "step5.tuning.effective_samples" if stage_for_train == "step5" else None,
-        "step5_optimizer_steps": "step5.tuning.optimizer_steps" if stage_for_train == "step5" else None,
+        "selected_tuning_candidate": (
+            str(step5_tuning_config.get("selected_tuning_candidate_source") or "step5.tuning.selected_tuning_candidate")
+            if stage_for_train == "step5"
+            else None
+        ),
+        "fallback_tuning_candidate": (
+            str(step5_tuning_config.get("fallback_tuning_candidate_source") or "step5.tuning.fallback_tuning_candidate")
+            if stage_for_train == "step5"
+            else None
+        ),
+        "step5_effective_samples": (
+            f"step5.tasks.{tid}.tuning.effective_samples" if stage_for_train == "step5" and "effective_samples" in _step5_task_block(cfg, tid, "tuning") else ("step5.tuning.effective_samples" if stage_for_train == "step5" else None)
+        ),
+        "step5_optimizer_steps": (
+            f"step5.tasks.{tid}.tuning.optimizer_steps" if stage_for_train == "step5" and "optimizer_steps" in _step5_task_block(cfg, tid, "tuning") else ("step5.tuning.optimizer_steps" if stage_for_train == "step5" else None)
+        ),
         "step5_e4_bounded": "step5.e4_bounded" if stage_for_train == "step5" else None,
         "step5_lifecycle": "step5.lifecycle" if stage_for_train == "step5" else None,
         "step5_lifecycle_phase": (
@@ -5251,7 +5468,7 @@ def resolve_config(
                 if stage_for_train == "step5"
                 else {}
             ),
-            "decode": decode,
+            "decode": _public_decode_snapshot(decode_snapshot),
             "rerank": rerank if rerank else None,
             "rerank_source_table": (
                 {
@@ -5280,8 +5497,14 @@ def resolve_config(
         "step3_evidence": step3_evidence_config if stage_for_train == "step3" else None,
         "step3_scheduler": step3_scheduler_config if stage_for_train == "step3" else None,
         "step3_eval": step3_eval_config if stage_for_train == "step3" else None,
-        "step3_backup_profiles": step3_backup_profiles_config if stage_for_train == "step3" else None,
-        "step3_exploration_profiles": step3_exploration_profiles_config if stage_for_train == "step3" else None,
+        "step3_backup_profiles": (
+            step3_backup_profiles_config if stage_for_train == "step3" and step3_backup_profiles_config else None
+        ),
+        "step3_exploration_profiles": (
+            step3_exploration_profiles_config
+            if stage_for_train == "step3" and step3_exploration_profiles_config
+            else None
+        ),
         "step3_worker_profiles": step3_worker_profiles_config if stage_for_train == "step3" else None,
         "step3_prefetcher": step3_prefetcher_config if stage_for_train == "step3" else None,
         "step3_checkpoint_policy": step3_checkpoint_policy_config if stage_for_train == "step3" else None,
@@ -5430,6 +5653,9 @@ def resolve_config(
         },
         "field_sources": field_sources,
     }
+    for retired_empty_key in ("step3_backup_profiles", "step3_exploration_profiles"):
+        if resolved_snapshot.get(retired_empty_key) is None:
+            resolved_snapshot.pop(retired_empty_key, None)
 
     cfg_obj = ResolvedConfig(
         command="eval-rerank" if command == "eval" and need_rerank else command,

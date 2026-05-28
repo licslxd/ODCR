@@ -112,7 +112,7 @@ AUX_RULE_DESCRIPTIONS: dict[str, str] = {
     "R133": "evidence levels must not overclaim E4/E5 gates",
     "R134": "runtime bridge target selection must use handoff v2 or CLI explicit",
     "R135": "legacy code and bridge branches must be purged from active runtime",
-    "R136": "Step5 explanation-only One-Control contract must include Step3 rating_source",
+    "R136": "Step5 explanation-only One-Control contract must include task-local Step3 rating_source policy",
     "R137": "Step5 production model must delete retired recommender/hidden2token/soft-prompt fallback modules",
     "R138": "Step5 native LoRA must be head-aware allowlist-only",
     "R139": "Step5 native LoRA must never wrap nn.MultiheadAttention.out_proj",

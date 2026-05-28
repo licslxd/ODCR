@@ -295,13 +295,15 @@ long benchmarks are outside Codex's GPU work boundary unless explicitly
 authorized.
 
 Step5 is explanation-only. Rating metrics come from the Step3 accepted scorer
-declared in `configs/odcr.yaml: rating_source`; Step5 does not train or
+resolved from the task-local Step3 eval handoff by `configs/odcr.yaml: rating_source`;
+Step5 does not train or
 evaluate a rating scorer. Step5 consumes `route_explainer` rows through a
 structured CCV control packet built from content/style evidence, route
 decisions, reliability, uncertainty, confidence, and sample weights. FCA aligns
 evidence bases for the explanation objective. Step5 parameters live under
 `configs/odcr.yaml`: `step5.explainer_gate`, `step5.ccv`, `step5.fca`,
-`step5.model`, `step5.train.explainer_loss_weight`, and `rating_source`. Step4
+`step5.model`, `step5.train.explainer_loss_weight`, and task-local `rating_source`.
+Step4
 `sample_weight_hint` remains the posterior base sample weight. CCV control
 adapter dimensions and native LoRA controls are owned by `step5.ccv`, including
 `step5.ccv.native_lora`. Retired `adv`, `eta`, `lambda_lci` / `lambda_fca`,

@@ -658,14 +658,11 @@ def build_candidate_generation_specs(
 
 
 def build_generate_kwargs_effective_v2(cfg: GenerateConfig, *, eos_token_id: int) -> Dict[str, Any]:
+    strategy = str(cfg.strategy or "").strip().lower()
     out: Dict[str, Any] = {
         "schema_version": PAPER_DECODE_CONTROLLER_SCHEMA,
         "strategy": cfg.strategy,
-        "temperature": cfg.temperature,
-        "top_p": cfg.top_p,
-        "gap_threshold": cfg.gap_threshold,
-        "prefix_greedy_steps": cfg.prefix_greedy_steps,
-        "top_k": cfg.top_k,
+        "do_sample": strategy != "greedy",
         "repetition_penalty": cfg.repetition_penalty,
         "no_repeat_ngram_size": cfg.no_repeat_ngram_size,
         "min_len": cfg.min_len,
@@ -673,8 +670,6 @@ def build_generate_kwargs_effective_v2(cfg: GenerateConfig, *, eos_token_id: int
         "hard_max_len": cfg.hard_max_len,
         "eos_boost_start": cfg.eos_boost_start,
         "eos_boost_value": cfg.eos_boost_value,
-        "tail_temperature": cfg.tail_temperature,
-        "tail_top_p": cfg.tail_top_p,
         "forbid_eos_after_open_quote": cfg.forbid_eos_after_open_quote,
         "forbid_eos_after_open_bracket": cfg.forbid_eos_after_open_bracket,
         "forbid_bad_terminal_tokens": cfg.forbid_bad_terminal_tokens,
@@ -684,6 +679,15 @@ def build_generate_kwargs_effective_v2(cfg: GenerateConfig, *, eos_token_id: int
         "decode_seed": cfg.decode_seed,
         "uncertainty_entropy_eps": float(cfg.uncertainty_entropy_eps),
     }
+    if strategy != "greedy":
+        out["temperature"] = cfg.temperature
+        out["top_p"] = cfg.top_p
+        out["tail_temperature"] = cfg.tail_temperature
+        out["tail_top_p"] = cfg.tail_top_p
+    if strategy == "uncertainty_low_temp_top_k":
+        out["gap_threshold"] = cfg.gap_threshold
+        out["prefix_greedy_steps"] = cfg.prefix_greedy_steps
+        out["top_k"] = cfg.top_k
     if eos_token_id >= 0:
         out["eos_token_id"] = eos_token_id
     if cfg.decode_backend is not None:

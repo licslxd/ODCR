@@ -307,7 +307,8 @@ consumer compatibility for Step5.
 Step5 has one active path: explanation-only training.
 
 Rating metrics come from the Step3 accepted scorer declared in
-`configs/odcr.yaml: rating_source`. Step5 consumes Step4 posterior
+the task-local Step3 eval handoff through `configs/odcr.yaml: rating_source`.
+Step5 consumes Step4 posterior
 `route_explainer` samples, uses CCV through an explicit control packet, and
 uses FCA for evidence-basis alignment. Step5 does not train a rating scorer and
 does not write rating MAE/RMSE.
@@ -346,6 +347,12 @@ pollution, resolver bypass, or missing required fields. PyTorch reserved memory
 is a caching-allocator diagnostic only. `max_memory_reserved_gb`,
 `reserved_minus_allocated_gb`, and fragmentation hints may be reported for
 debugging, but they must not select, skip, reject, or block a candidate.
+
+Step5 task-local official eval may replay run-local settings from the consumed
+Step5 run's `meta/run_summary.json`; the replay is limited to Step5
+train/sampler/tuning/eval sizing controls. Rating source is never replayed from
+the Step5 run snapshot. It is always re-resolved from the current task-local
+Step3 accepted `eval_handoff.json`.
 
 ## Active Lineage, Cache, And DDP Guards
 
@@ -422,6 +429,9 @@ The following are retired and must not become active control surfaces:
 - prompt concatenation as Step5 control
 - `content_preserve_score`
 - old public LoRA params outside `step5.ccv.native_lora`
+- `./odcr step4 export-step5-dedicated`
+- user-facing Step5 rating-letter heads and the combined-head form; only
+  `--head explanation` is active.
 - top-level `logs/`, `code/log.out`, `nohup*.log`, fallback/mirror logs,
   timestamp logs, and legacy shell log fallback chains
 
@@ -457,13 +467,13 @@ uses `global_batch_size=1536`, `per_gpu_batch_size=768`, and
 `ddp_world_size=2`, so
 `global_batch_size = per_gpu_batch_size * ddp_world_size`. Four paper tasks
 live under isolated `step3.task_profiles`; the first paper task remains
-engineering task2, not a remapped task1. `step3.backup_profiles` keeps manual
-backup candidates, `step3.performance_candidates.batch_ladder` records
-probe-only tuning candidates, and
-`step3.exploration_profiles.task2_g2_effective_pool_2048` is probe-only and
-formal-disallowed until manually promoted by future evidence.
-Retired S1/S2/M*/N*/C* candidates are history-only or fail-fast. `step3.worker_profiles`
-owns CPU worker candidates W0-W4 under the 12-core budget.
+engineering task2, not a remapped task1. The active Step3 train window is capped
+at `max_epochs=5` with `min_epochs=2`, matching the task2 evidence that the
+downstream checkpoint selected epoch 2. Retired task2 G0/G1 backup and G2
+exploration profile blocks are removed from active config rather than carried as
+verbose-only alternatives. Retired S1/S2/M*/N*/C* candidates are history-only or
+fail-fast. `step3.worker_profiles` owns CPU worker candidates W0-W4 under the
+12-core budget.
 
 Formal Step3 training and governed performance modes use
 `Step3CUDAPrefetcher` for CUDA double buffering when enabled. The prefetcher

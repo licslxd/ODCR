@@ -22,7 +22,11 @@ from odcr_core.step4_export_validator import (
 )
 from odcr_core.step4_dedicated_exports import (
     STEP4_DEDICATED_EXPORTS_STATUS,
-    step4_dedicated_stage_status_fields,
+)
+from odcr_core.step4_pool_exports import (
+    STEP4_LEGACY_DEDICATED_EXPORTS_STATUS,
+    STEP5_POOL_EXPORTS_STATUS,
+    step4_pool_stage_status_fields,
 )
 from odcr_core.training_checkpoint import CheckpointLineageError, checkpoint_file_sha256, read_checkpoint_lineage
 
@@ -285,11 +289,22 @@ def _step4_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
     summary_status = str(run_summary.get("status") or "").strip().lower()
     train_csv = run_root / ODCR_ROUTING_TRAIN_CSV
     validation = validate_step4_export_ready(run_root, repo_root=repo_root)
-    if summary_status in OK_RUN_SUMMARY_STATUSES and validation.ready:
+    pool_status = run_root / "meta" / STEP5_POOL_EXPORTS_STATUS
+    pool_fields: dict[str, Any] = {}
+    pool_ready = False
+    if pool_status.is_file():
+        pool_fields = step4_pool_stage_status_fields(repo_root=repo_root, run_dir=run_root)
+        pool_ready = bool(pool_fields.get("step5_pool_exports_ready"))
+    if summary_status in OK_RUN_SUMMARY_STATUSES and validation.ready and pool_ready:
         final_status = "completed"
         downstream_ready = True
         ready_for = ["step5"]
         reasons: list[str] = []
+    elif summary_status in OK_RUN_SUMMARY_STATUSES and validation.ready:
+        final_status = "completed"
+        downstream_ready = False
+        ready_for = []
+        reasons = ["step5_pool_manifest_missing_or_not_ready"]
     elif summary_status in BAD_RUN_SUMMARY_STATUSES:
         final_status = summary_status
         downstream_ready = False
@@ -304,7 +319,7 @@ def _step4_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
         "final_status": final_status,
         "downstream_ready": downstream_ready,
         "ready_for": ready_for,
-        "status_source": "step4_export_readiness_validator",
+        "status_source": "step4_export_readiness_and_pool_manifest_validator",
         "rejection_reasons": reasons,
         "selected_export": _repo_relative(repo_root, train_csv),
         "export_manifest": _repo_relative(repo_root, run_root / STEP4_EXPORT_MANIFEST),
@@ -316,9 +331,18 @@ def _step4_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
         "failure_history_preserved": bool(run_summary.get("failure_history")),
         "do_not_use_quality_audit_as_final_truth": True,
     }
+    if pool_fields:
+        payload.update(pool_fields)
     dedicated_status = run_root / "meta" / STEP4_DEDICATED_EXPORTS_STATUS
     if dedicated_status.is_file():
-        payload.update(step4_dedicated_stage_status_fields(repo_root=repo_root, run_dir=run_root))
+        payload["legacy_step5_dedicated_exports"] = {
+            "role": "audit_or_history_only",
+            "not_default_step5_train": True,
+            "status": _repo_relative(repo_root, dedicated_status),
+        }
+    legacy_old_filter = run_root / "step5_exports" / STEP4_LEGACY_DEDICATED_EXPORTS_STATUS
+    if legacy_old_filter.is_file():
+        payload["legacy_old_filter_exports_status"] = _repo_relative(repo_root, legacy_old_filter)
     return payload
 
 
@@ -509,8 +533,6 @@ def build_stage_status(
         "legacy_explainer_alias_explainer_train_export",
         "step5_train_manifest",
         "route_intersection_report",
-        "step5_dedicated_exports_status",
-        "step5_dedicated_exports_ready",
         "step5_pool_manifest",
         "step5_sampling_contract",
         "step5_pool_distribution_report",
@@ -519,8 +541,9 @@ def build_stage_status(
         "full_audit_default_train_forbidden",
         "full_audit_table_role",
         "step5_train_input_role",
-        "dedicated_export_readiness",
         "pool_export_readiness",
+        "legacy_step5_dedicated_exports",
+        "legacy_old_filter_exports_status",
     ):
         if key in stage_payload:
             payload[key] = stage_payload.get(key)
@@ -530,11 +553,11 @@ def build_stage_status(
         "legacy_explainer_alias_explainer_train_export",
         "step5_train_manifest",
         "route_intersection_report",
-        "step5_dedicated_exports_status",
         "step5_pool_manifest",
         "step5_sampling_contract",
         "step5_pool_distribution_report",
         "step5_pool_exports_status",
+        "legacy_old_filter_exports_status",
     ):
         if payload.get(key):
             payload["artifacts"][key] = _artifact_status(root, payload.get(key))

@@ -33,3 +33,27 @@ def test_retired_rating_head_fails_fast() -> None:
     assert proc.returncode != 0
     assert "rating now uses rating_source" in output
     assert "explanations only" in output
+
+
+def test_legacy_step5b_head_fails_fast() -> None:
+    proc = _run("step5", "--task", "2", "--from-step4-run", "1", "--head", "step5" + "B", "--dry-run")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "rating now uses rating_source" in output
+    assert "explanations only" in output
+
+
+def test_legacy_grouped_head_fails_fast() -> None:
+    proc = _run("step5", "--task", "2", "--from-step4-run", "1", "--head", "combined", "--dry-run")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "rating now uses rating_source" in output
+    assert "explanations only" in output
+
+
+def test_retired_step4_dedicated_export_alias_is_not_user_reachable() -> None:
+    proc = _run("step4", "export-step5-dedicated", "--help")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0
+    assert "export-step5-dedicated" in output
+    assert "invalid choice" in output

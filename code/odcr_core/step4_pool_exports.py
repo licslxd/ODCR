@@ -239,7 +239,11 @@ def _pool_record(repo_root: Path, path: Path, *, role: str, tier: str, row_count
 
 def _legacy_status(root: Path, run_dir: Path, legacy_dir: Path) -> dict[str, Any]:
     items: dict[str, Any] = {}
-    for name in ("rating_stability_control_scorer_train.parquet", "step5_explanation_explainer_train.parquet", "odcr_routing_full_audit.parquet"):
+    for name in (
+        "rating_stability_control_scorer_train.parquet",
+        "step5_explanation_explainer_train.parquet",
+        "odcr_routing_full_audit.parquet",
+    ):
         path = legacy_dir / name
         items[name] = {
             "path": _repo_relative(root, path),
@@ -334,7 +338,6 @@ def export_step4_pool_exports(
         "text_quality": {},
         "score_summaries": {
             "gold_quality": {},
-            "cf_quality_rating_stability_control": {},
             "cf_quality_step5_explanation": {},
             "uncertainty": {},
             "sample_weight": {},
@@ -357,7 +360,6 @@ def export_step4_pool_exports(
                 "confidence": {},
                 "metrics": {
                     "gold_quality": {},
-                    "cf_quality_rating_stability_control": {},
                     "cf_quality_step5_explanation": {},
                     "uncertainty": {},
                     "sample_weight": {},
@@ -380,7 +382,6 @@ def export_step4_pool_exports(
         "content_retention": "content_retention_score",
         "cf_reliability": "cf_reliability_score",
         "gold_quality": "gold_quality_score",
-        "cf_quality_rating_stability_control": "cf_quality_score_rating_stability_control",
         "cf_quality_step5_explanation": "cf_quality_score_step5_explanation",
     }
 
@@ -798,7 +799,26 @@ def write_step5_pool_exports_status(
     atomic_write_json(status_path, payload)
     if update_stage_status and stage_status_path.is_file() and validation.ready:
         status = _load_json(stage_status_path, label="stage_status")
+        for key in (
+            "step5_dedicated_exports_ready",
+            "step5_dedicated_exports_status",
+            "step5_train_manifest",
+            "route_intersection_report",
+            "dedicated_export_readiness",
+            "selected_full_audit_export",
+            "rating_stability_control_scorer_train_export",
+            "step5_explanation_explainer_train_export",
+        ):
+            status.pop(key, None)
+        if status.get("step5_train_input_role") == "dedicated_split_exports":
+            status.pop("step5_train_input_role", None)
         status.update(fields)
+        status["downstream_ready"] = True
+        status["ready_for"] = ["step5"]
+        status["rejection_reasons"] = []
+        status["status_source"] = "step4_export_readiness_and_pool_manifest_validator"
+        if not str(status.get("final_status") or "").strip():
+            status["final_status"] = "completed"
         status.setdefault("artifacts", {})
         if isinstance(status["artifacts"], dict):
             for key in (
@@ -821,6 +841,19 @@ def write_step5_pool_exports_status(
         status["updated_at"] = _now()
         status["updated_at_utc"] = status["updated_at"]
         atomic_write_json(stage_status_path, status)
+        summary_path = meta / "run_summary.json"
+        if summary_path.is_file():
+            from odcr_core.manifests import write_latest_pointer_json
+
+            write_latest_pointer_json(
+                repo_root=root,
+                stage_unit_dir=run.parent,
+                run_id=run.name,
+                run_dir=run,
+                summary_path=summary_path,
+                status=str(status.get("final_status") or "completed"),
+                updated_at=status["updated_at"],
+            )
     _fsync_parent(status_path)
     return payload
 

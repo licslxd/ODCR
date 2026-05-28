@@ -48,6 +48,28 @@ HARDWARE_PROFILE_THREAD_ENV_KEYS: tuple[str, ...] = (
 TRAIN_PRECISION_CHOICES: tuple[str, ...] = ("bf16", "fp16", "fp32")
 """Resolver-owned train precision values transported to children."""
 
+STEP5_TASK_EVAL_OVERRIDE_KEYS: tuple[str, ...] = (
+    "valid_per_gpu_batch_size",
+    "valid_batch_size",
+    "valid_forward_micro_batch_size",
+    "test_per_gpu_batch_size",
+    "test_forward_micro_batch_size",
+)
+"""Task-local Step5 eval batch overrides allowed under step5.tasks.<task>.eval."""
+
+STEP5_TASK_TUNING_OVERRIDE_KEYS: tuple[str, ...] = (
+    "selected_tuning_candidate",
+    "fallback_tuning_candidate",
+    "effective_samples",
+    "optimizer_steps",
+    "batch_candidate",
+    "fallback_batch_candidate",
+)
+"""Task-local Step5 tuning overrides allowed under step5.tasks.<task>.tuning."""
+
+STEP5_TASK_SAMPLER_OVERRIDE_KEYS: tuple[str, ...] = ("explanation",)
+"""Task-local Step5 sampler overrides allowed under step5.tasks.<task>.sampler."""
+
 PREPROCESS_CPU_GPU_ONE_CONTROL_KEYS: dict[str, tuple[str, ...]] = {
     "preprocess.b": (
         "tokenizer_parallelism_enabled",

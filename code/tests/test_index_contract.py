@@ -413,6 +413,7 @@ class TestIndexContract(unittest.TestCase):
                         "item_idx": torch.tensor(1, dtype=torch.long),
                         "rating": torch.tensor(3.0, dtype=torch.float32),
                         "explanation_idx": torch.tensor([1, 2], dtype=torch.long),
+                        "raw_ref_text": "gold explanation",
                         "domain_idx": torch.tensor(1, dtype=torch.long),
                         "sample_id": torch.tensor(0, dtype=torch.long),
                         "exp_sample_weight": torch.tensor(1.0, dtype=torch.float32),
