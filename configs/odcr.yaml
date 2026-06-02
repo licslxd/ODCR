@@ -1098,9 +1098,13 @@ step5:
         STEP5_RATIO_0: {target_gold: 0.43, aux_gold: 0.23, cf: 0.34}
         STEP5_RATIO_1: {target_gold: 0.40, aux_gold: 0.15, cf: 0.45}
         STEP5_RATIO_2: {target_gold: 0.35, aux_gold: 0.15, cf: 0.50}
+        STEP5_RATIO_T8_GOLD_DOM_CF_CAP: {target_gold: 0.70, aux_gold: 0.25, cf: 0.05}
+        STEP5_RATIO_T8_ODCR_NATIVE_CF_CAP: {target_gold: 0.64, aux_gold: 0.31, cf: 0.05}
+        STEP5_RATIO_TARGET_GOLD_ONLY: {target_gold: 1.00, aux_gold: 0.00, cf: 0.00}
     cf_tier_mix_candidates:
       explanation:
         STEP5_CF_MIX_FORMAL_HIGH_MEDIUM: {high: 0.588235, medium: 0.411765, low_weighted: 0.00}
+        STEP5_CF_MIX_T8_ROUTE_CAP: {high: 0.00392, medium: 0.03032, low_weighted: 0.96576}
         WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1: {high: 0.00, medium: 0.00, low_weighted: 1.00}
         STEP5_CF_MIX_0: {high: 0.50, medium: 0.40, low_weighted: 0.10}
         STEP5_CF_MIX_1: {high: 0.50, medium: 0.35, low_weighted: 0.15}
@@ -1232,14 +1236,15 @@ step5:
     native_lora:
       enabled: true
       target_policy_id: step5_explanation_lora_allowlist/1
-      r: 16
-      alpha: 32
+      r: 32
+      alpha: 64
       dropout: 0.05
       target_modules:
         - __HEAD_AWARE_STEP5_DEFAULT__
   fca:
     enabled: true
     weight: 0.08
+    anchor_coverage_weight: 0.06
     min_reliability: 0.50
     max_uncertainty: 0.62
     evidence_alignment_mode: evidence_basis
@@ -1264,11 +1269,57 @@ step5:
   final_eval:
     prediction_max_length: 25
     reference_max_length: 25
-    official_profile: paper_greedy_25
+    official_profile: odcr_no_ref_k5_25
+    generation_input_policy: history_conditioned_no_reference_evidence
+    content_evidence_policy: train_only_history
+    reference_usage: metric_only_after_generation
+    neutral_content_evidence: "keywords none ; aspects none ; entities none"
+    forbid_current_eval_fields_in_generation:
+      - explanation
+      - review
+      - clean_text
+      - raw_ref_text
+      - ref_text
+      - metric_ref_text
+      - content_evidence
+      - style_evidence
     metric_input_builder: build_paper_metric_inputs
     metrics_implementation: official_paper_metrics
     test_once: true
+  no_ref_evidence:
+    schema_version: odcr_step5_no_ref_evidence_config/4_evidence_v3_phrase
+    diagnostic_only: false
+    formal_allowed: true
+    paper_table_allowed: true
+    input_protocol: route_weighted_item_phrase_v2_no_ref
+    allowed_input_protocols:
+      - neutral_core_no_ref
+      - text_clean_item_only_no_ref
+      - text_clean_item_user_no_ref
+      - route_weighted_item_phrase_v2_no_ref
+      - soft_prefix_light_no_ref
+    cache_namespace: step5_no_ref_history
+    train_scope: selected_effective_epoch
+    selected_effective_epochs: 1
+    context_label: ""
+    concise_prompt: "Write one concise review reason using the evidence."
+    phrase_prompt: "Write one concise review reason using the evidence."
+    encoder_content_token_budget: 96
+    fallback_encoder_content_token_budget: 96
+    evidence_top_k: 6
+    user_history_top_k: 6
+    item_history_top_k: 6
+    domain_prior_top_n: 128
+    domain_prior_display_top_k: 6
+    min_df: 3
+    stopword_policy: english_core_v1
+    term_token_limit: 64
+    neutral_content_evidence: "keywords none ; aspects none ; entities none"
+    smoke_cache_identity_includes_max_rows: true
   train:
+    generation_input_policy: history_conditioned_no_reference_evidence
+    content_evidence_policy: train_only_history
+    reference_usage: label_only
     batch_size: 128
     per_gpu_batch_size: 64
     epochs: 1
@@ -1366,38 +1417,54 @@ step5:
     8:
       batch_size: 64
       per_gpu_batch_size: 32
+      generation_input_policy: history_conditioned_no_reference_evidence
+      content_evidence_policy: train_only_history
       epochs: 1
-      label_max_length: 128
-      lr: 1.0e-3
+      label_max_length: 48
+      lr: 5.0e-4
+      warmup_ratio: 0.03
+      label_smoothing: 0.01
       coef: 1.0
       tuning:
-        selected_tuning_candidate: STEP5_RATIO_0+WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1+TG_MIX_WEAK_MEDIUM_ONLY+AG_MIX_WEAK_MEDIUM_ONLY+LR_1e-3+W0
-        fallback_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
+        selected_tuning_candidate: STEP5_RATIO_T8_ODCR_NATIVE_CF_CAP+STEP5_CF_MIX_T8_ROUTE_CAP+TG_MIX_0+AG_MIX_0+LR_5e-4+W0
+        fallback_tuning_candidate: STEP5_RATIO_T8_GOLD_DOM_CF_CAP+STEP5_CF_MIX_T8_ROUTE_CAP+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
         batch_candidate: B32
         fallback_batch_candidate: B32
-        effective_samples: {explanation: 426496}
-        optimizer_steps: {explanation: 6664}
+        effective_samples: {explanation: 250000}
+        optimizer_steps: {explanation: 3907}
       sampler:
         explanation:
-          target_gold_tier_mix: {high: 0.0, medium: 1.0}
-          aux_gold_tier_mix: {high: 0.0, medium: 1.0}
-          cf_tier_mix: {high: 0.0, medium: 0.0, low_weighted: 1.0}
+          target_gold_ratio: 0.64
+          aux_gold_ratio: 0.31
+          cf_ratio: 0.05
+          target_gold_tier_mix: {high: 0.6, medium: 0.4}
+          aux_gold_tier_mix: {high: 0.7, medium: 0.3}
+          cf_tier_mix: {high: 0.00392, medium: 0.03032, low_weighted: 0.96576}
       eval:
-        valid_per_gpu_batch_size: 128
-        valid_batch_size: 256
-        valid_forward_micro_batch_size: 128
-        test_per_gpu_batch_size: 128
-        test_forward_micro_batch_size: 128
+        valid_per_gpu_batch_size: 32
+        valid_batch_size: 64
+        valid_forward_micro_batch_size: 32
+        test_per_gpu_batch_size: 32
+        test_forward_micro_batch_size: 32
 
 eval:
-  profile: paper_greedy_25
+  profile: odcr_no_ref_k5_25
   split: valid
+  max_rows: null
   profiles:
     paper_greedy_25:
       hardware: default
       decode: paper_greedy_25
       eval_batch_size: 2048
       role: official_paper_eval
+      official: true
+    odcr_no_ref_k5_25:
+      hardware: default
+      decode: odcr_no_ref_k5_25
+      rerank: odcr_no_ref_fca_anchor
+      num_return_sequences: 5
+      eval_batch_size: 2048
+      role: official_odcr_no_ref_reference_free_rerank_eval
       official: true
   decode:
     default:
@@ -1422,3 +1489,60 @@ eval:
       domain_fusion_mode: gate_cross_attn
     paper_greedy_25:
       role: official_paper_eval
+    odcr_no_ref_k5_25:
+      role: official_odcr_no_ref_reference_free_rerank_eval
+      decode_strategy: nucleus
+      decode_seed: 3407
+      max_explanation_length: 25
+      label_smoothing: 0.02
+      repetition_penalty: 1.08
+      no_repeat_ngram_size: 3
+      min_len: 6
+      soft_max_len: 18
+      hard_max_len: 25
+      eos_boost_start: 20
+      eos_boost_value: 0.4
+      forbid_eos_after_open_quote: true
+      forbid_eos_after_open_bracket: true
+      forbid_bad_terminal_tokens: true
+      decode_token_repeat_window: 4
+      decode_token_repeat_max: 2
+      candidate_family: mixed
+      candidate_mixed_include_diverse: true
+      domain_fusion_mode: gate_cross_attn
+      generate_temperature: 0.75
+      generate_top_p: 0.92
+      tail_temperature: 0.62
+      tail_top_p: 0.88
+  rerank:
+    default:
+      rerank_method: rule_v3
+      num_return_sequences: 5
+      rerank_top_k: 1
+      rerank_weight_logprob: 0.35
+      rerank_weight_length: 0.10
+      rerank_weight_repeat: 0.16
+      rerank_weight_dirty: 0.20
+      rerank_target_len_ratio: 1.10
+      export_examples_mode: head50
+      rerank_malformed_tail_penalty: 0.15
+      rerank_malformed_token_penalty: 0.18
+      schema_version: odcr_rerank_v3/1.0
+      hard_min_pred_words: 6
+      hard_max_malformed_token_reasons: 3
+      hard_min_source_coverage: 0.08
+      length_target_words: 12.0
+      length_sigma_words: 4.0
+      w_lp_norm: 0.75
+      w_completion: 0.55
+      w_well_formed: 0.45
+      w_source_coverage: 1.25
+      w_repeat_v2: 0.35
+      w_malformed_tail: 0.40
+      w_malformed_token: 0.45
+      w_generic_template: 0.45
+      debug_generic_template_penalty: true
+      w_entity_drift: 0.40
+      w_length_v2: 0.22
+    odcr_no_ref_fca_anchor:
+      role: official_odcr_no_ref_reference_free_rerank_eval

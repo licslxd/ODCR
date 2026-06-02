@@ -13,6 +13,8 @@ import logging
 import shutil
 import gc
 import re
+import threading
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 # 离线模式：禁止从网络加载
@@ -65,6 +67,11 @@ from odcr_core.step5_export_loader import (
     Step5ExportLoaderError,
     load_step5_pool_train_table,
 )
+from odcr_core.step5_no_ref_history_cache import (
+    TEXT_CLEAN_ITEM_ONLY_NO_REF,
+    build_or_load_no_ref_evidence_for_frame,
+    normalise_no_ref_evidence_config,
+)
 from odcr_core.step5_prompt_templates import default_prompt_registry, prompt_registry_manifest
 from odcr_core.aux.artifacts.path_policy import load_json_file
 import torch
@@ -108,7 +115,7 @@ from dataclasses import replace
 from datetime import datetime
 from collections import Counter
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 from tqdm import tqdm
 from torch.optim import lr_scheduler as lr_sched
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
@@ -187,6 +194,7 @@ from odcr_core.step5_word_losses import (
 )
 from odcr_core.odcr_losses import build_orthogonal_losses
 from odcr_core.rating_source import rating_metrics_from_source, validate_rating_source
+from odcr_core.stage_status import build_and_write_stage_status
 from odcr_core.step5_explanation_handoff import build_step5_explanation_handoff
 from odcr_core.step5_explanation_control_projection import ExplanationControlProjection
 from odcr_core.step5_eval_summary import write_post_train_eval_metrics_log
@@ -471,19 +479,22 @@ def get_step5_tokenizer() -> Any:
 
 # HuggingFace tokenize 磁盘缓存：cache_identity 只包含会改变 tokenized tensors 的字段；
 # training/generation/runtime knobs live in lineage_metadata for audit only.
-ODCR_TOKENIZE_CACHE_VERSION = "v10_step5_content_metric_ref_identity"
+ODCR_TOKENIZE_CACHE_VERSION = "v22_step5_compact96_anchor_card"
 STEP5_TOKENIZE_CACHE_SCHEMA_VERSION = "odcr_step5_tokenize_cache/4"
 STEP5_TOKENIZE_CACHE_MANIFEST = "cache_manifest.json"
 STEP5_TOKENIZE_CACHE_LINEAGE = "token_cache_lineage.json"
 STEP5_TOKENIZE_CACHE_COMPLETED = "_SUCCESS"
-STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/5"
-STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_tokenize_cache_identity/2"
+STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/11_compact96_anchor"
+STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_tokenize_cache_identity/4_compact_anchor"
 STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION = (
-    "odcr_step5_flan_encoder_input/2_soft_prompt_plus_content_evidence"
+    "odcr_step5_flan_encoder_input/7_compact96_anchor_card"
 )
-STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS = 32
-STEP5_CONTROL_TEXT_MAX_LENGTH = STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS
-STEP5_ENCODER_AUDIT_SCHEMA_VERSION = "odcr_step5_encoder_input_token_audit/legacy32"
+STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS = 32
+STEP5_ENCODER_CONTENT_TOKEN_BUDGET = 96
+STEP5_FALLBACK_ENCODER_CONTENT_TOKEN_BUDGET = 96
+STEP5_CONTROL_TEXT_MAX_LENGTH = STEP5_ENCODER_CONTENT_TOKEN_BUDGET
+STEP5_ENCODER_AUDIT_SCHEMA_VERSION = "odcr_step5_encoder_input_token_audit/compact96_anchor_card"
+STEP5_EVIDENCE_CARD_SCHEMA_VERSION = "odcr_step5_compact_anchor_evidence_card/2"
 
 
 def _sha256_file(path: str) -> str:
@@ -533,6 +544,12 @@ def _step5_model_architecture_lineage(final_cfg: FinalTrainingConfig, model: nn.
             "target_modules": list(getattr(final_cfg, "lora_target_modules", ()) or ()),
         },
         "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
+        "encoder_content_token_budget": int(
+            normalise_no_ref_evidence_config(
+                json.loads(str(getattr(final_cfg, "step5_no_ref_evidence_config_json", "") or "{}")),
+                neutral_content_evidence=STEP5_NEUTRAL_CONTENT_EVIDENCE,
+            ).get("encoder_content_token_budget", STEP5_ENCODER_CONTENT_TOKEN_BUDGET)
+        ),
     }
 
 
@@ -708,6 +725,160 @@ STEP5_CONTROL_MODE_RCR_POSTERIOR = "rcr_posterior"
 _STEP5_CONTROL_MODE_COLUMN = "step5_control_mode"
 _STEP5_CONTROL_SOURCE_COLUMN = "step5_control_source"
 _STEP5_CONTROL_CONTRACT_COLUMN = "step5_control_contract_version"
+STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT = "user_item_conditioned_counterfactual_training"
+STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT = "neutral_constant"
+STEP5_GENERATION_INPUT_POLICY_ODCR_NATIVE = "odcr_native_controlled_verbalizer"
+STEP5_CONTENT_EVIDENCE_POLICY_EASD_CONTENT_PLAN = "easd_content_plan"
+STEP5_GENERATION_INPUT_POLICY_NO_REF = "history_conditioned_no_reference_evidence"
+STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY = "train_only_history"
+STEP5_REFERENCE_USAGE_LABEL_ONLY = "label_only"
+STEP5_REFERENCE_USAGE_METRIC_ONLY = "metric_only_after_generation"
+STEP5_NEUTRAL_CONTENT_EVIDENCE = "keywords none ; aspects none ; entities none"
+STEP5_NO_REF_HISTORY_SCHEMA_VERSION = "odcr_step5_train_only_history_evidence/6_evidence_v3_phrase_quality"
+STEP5_EVAL_PROGRESS_SCHEMA_VERSION = "odcr_step5_eval_progress/1"
+STEP5_EVAL_HEARTBEAT_BATCH_INTERVAL = 5
+STEP5_EVAL_STALL_AFTER_SEC = 900.0
+STEP5_CONTROL_CARD_INPUT_ROLE = "easd_hss_rcr_no_ref_control_card"
+STEP5_HSS_STYLE_STATE_SOURCE = "target_train_style_state_by_rating_polarity"
+_STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS = (
+    "explanation",
+    "review",
+    "clean_text",
+    "raw_ref_text",
+    "ref_text",
+    "metric_ref_text",
+    "content_evidence",
+    "style_evidence",
+)
+_STEP5_HSS_STYLE_PROTOTYPE_CACHE: Dict[Tuple[str, str], Tuple[Dict[str, Dict[str, str]], Dict[str, Any]]] = {}
+
+
+def _rating_to_polarity_anchor(value: Any) -> str:
+    try:
+        rating = float(value)
+    except Exception:
+        rating = 3.0
+    if rating >= 4.0:
+        return "positive"
+    if rating <= 2.0:
+        return "negative"
+    return "neutral"
+
+
+def _mode_text(values: Iterable[Any], *, default: str) -> str:
+    counts: Counter[str] = Counter()
+    for raw in values:
+        text = str(raw or "").strip()
+        if text:
+            counts[text] += 1
+    if not counts:
+        return default
+    return counts.most_common(1)[0][0]
+
+
+def _target_train_hss_style_prototypes(target: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any]]:
+    target_name = str(target or "").strip()
+    data_root = os.path.abspath(get_data_dir())
+    cache_key = (data_root, target_name)
+    cached = _STEP5_HSS_STYLE_PROTOTYPE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    train_path = Path(data_root) / target_name / "train.csv"
+    default_by_pol = {
+        pol: {
+            "style_evidence": (
+                "markers none ; template_family plain_statement ; "
+                f"polarity {pol} ; length medium ; "
+                f"domain_style_anchor {target_name or 'target'}:plain_statement:medium:{pol} ; "
+                "local_style_residual_hint perspective=external;intensity=steady;discourse=direct;punctuation=flat"
+            ),
+            "domain_style_anchor": f"{target_name or 'target'}:plain_statement:medium:{pol}",
+            "local_style_residual_hint": "perspective=external;intensity=steady;discourse=direct;punctuation=flat",
+            "polarity_anchor": pol,
+        }
+        for pol in ("positive", "neutral", "negative")
+    }
+    manifest: Dict[str, Any] = {
+        "schema_version": "odcr_step5_hss_train_style_state/1",
+        "source": STEP5_HSS_STYLE_STATE_SOURCE,
+        "target": target_name,
+        "train_csv": str(train_path),
+        "train_csv_fingerprint": file_fingerprint(train_path),
+        "row_count": 0,
+        "fallback_used": True,
+    }
+    if not train_path.is_file():
+        _STEP5_HSS_STYLE_PROTOTYPE_CACHE[cache_key] = (default_by_pol, manifest)
+        return default_by_pol, manifest
+    header = pd.read_csv(train_path, nrows=0)
+    cols = [
+        c
+        for c in (
+            "rating",
+            "style_evidence",
+            "domain_style_anchor",
+            "local_style_residual_hint",
+            "polarity_anchor",
+        )
+        if c in header.columns
+    ]
+    if not cols:
+        _STEP5_HSS_STYLE_PROTOTYPE_CACHE[cache_key] = (default_by_pol, manifest)
+        return default_by_pol, manifest
+    frame = pd.read_csv(train_path, usecols=cols)
+    if "rating" in frame.columns:
+        pol_series = frame["rating"].map(_rating_to_polarity_anchor)
+    elif "polarity_anchor" in frame.columns:
+        pol_series = frame["polarity_anchor"].fillna("").astype(str).str.strip().str.lower()
+        pol_series = pol_series.where(pol_series.isin({"positive", "neutral", "negative"}), "neutral")
+    else:
+        pol_series = pd.Series(["neutral"] * len(frame), index=frame.index)
+    frame = frame.assign(_odcr_rating_polarity=pol_series)
+    prototypes: Dict[str, Dict[str, str]] = {}
+    for pol, default in default_by_pol.items():
+        group = frame.loc[frame["_odcr_rating_polarity"] == pol]
+        if len(group) == 0:
+            prototypes[pol] = dict(default)
+            continue
+        prototypes[pol] = {
+            "style_evidence": _mode_text(group.get("style_evidence", []), default=default["style_evidence"]),
+            "domain_style_anchor": _mode_text(group.get("domain_style_anchor", []), default=default["domain_style_anchor"]),
+            "local_style_residual_hint": _mode_text(
+                group.get("local_style_residual_hint", []),
+                default=default["local_style_residual_hint"],
+            ),
+            "polarity_anchor": pol,
+        }
+    manifest.update(
+        {
+            "row_count": int(len(frame)),
+            "fallback_used": False,
+            "prototype_polarities": sorted(prototypes),
+            "prototype_hash": stable_hash(prototypes),
+        }
+    )
+    _STEP5_HSS_STYLE_PROTOTYPE_CACHE[cache_key] = (prototypes, manifest)
+    return prototypes, manifest
+
+
+def _apply_step5_train_only_hss_style_state(
+    out: pd.DataFrame,
+    *,
+    target: str,
+) -> pd.DataFrame:
+    prototypes, manifest = _target_train_hss_style_prototypes(target)
+    rating = pd.to_numeric(out.get("rating", pd.Series([3.0] * len(out), index=out.index)), errors="coerce").fillna(3.0)
+    polarities = rating.map(_rating_to_polarity_anchor)
+    style_rows = [prototypes.get(str(pol), prototypes["neutral"]) for pol in polarities.tolist()]
+    out["style_evidence"] = [row["style_evidence"] for row in style_rows]
+    out["domain_style_anchor"] = [row["domain_style_anchor"] for row in style_rows]
+    out["local_style_residual_hint"] = [row["local_style_residual_hint"] for row in style_rows]
+    out["polarity_anchor"] = polarities.astype(str).tolist()
+    out["hss_style_state_source"] = STEP5_HSS_STYLE_STATE_SOURCE
+    out["hss_style_state_schema_version"] = str(manifest["schema_version"])
+    out["hss_style_state_hash"] = str(manifest.get("prototype_hash") or stable_hash(prototypes))
+    out.attrs["step5_hss_style_state_manifest"] = manifest
+    return out
 
 
 def step5_factual_eval_control_contract(split_label: str | None = None) -> dict[str, Any]:
@@ -745,9 +916,330 @@ def _require_step5_rcr_posterior_controls(df: pd.DataFrame, *, ctx: str) -> None
             )
 
 
-def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label: str) -> pd.DataFrame:
+def _step5_final_eval_no_ref_config() -> Dict[str, Any]:
+    payload = current_effective_payload(required=True)
+    cfg = payload.get("step5_final_eval")
+    if not isinstance(cfg, Mapping):
+        cfg = {}
+    out = dict(cfg)
+    out.setdefault("generation_input_policy", STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT)
+    out.setdefault("content_evidence_policy", STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT)
+    out.setdefault("reference_usage", STEP5_REFERENCE_USAGE_METRIC_ONLY)
+    out.setdefault("neutral_content_evidence", STEP5_NEUTRAL_CONTENT_EVIDENCE)
+    out.setdefault("forbid_current_eval_fields_in_generation", list(_STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS))
+    return out
+
+
+def _step5_no_ref_evidence_config() -> Dict[str, Any]:
+    try:
+        payload = current_effective_payload(required=False)
+    except Exception:
+        payload = {}
+    cfg = payload.get("step5_no_ref_evidence") if isinstance(payload, Mapping) else {}
+    if not isinstance(cfg, Mapping):
+        cfg = {}
+    return normalise_no_ref_evidence_config(
+        cfg,
+        neutral_content_evidence=STEP5_NEUTRAL_CONTENT_EVIDENCE,
+    )
+
+
+def _assert_step5_no_ref_policy_config(cfg: Mapping[str, Any], *, ctx: str) -> None:
+    if str(cfg.get("generation_input_policy") or "") != STEP5_GENERATION_INPUT_POLICY_NO_REF:
+        raise RuntimeError(f"{ctx} requires generation_input_policy={STEP5_GENERATION_INPUT_POLICY_NO_REF}")
+    if str(cfg.get("content_evidence_policy") or "") != STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY:
+        raise RuntimeError(f"{ctx} requires content_evidence_policy={STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY}")
+    forbidden = {str(x).strip() for x in (cfg.get("forbid_current_eval_fields_in_generation") or [])}
+    missing = sorted(set(_STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS) - forbidden)
+    if missing:
+        raise RuntimeError(f"{ctx} no-reference policy missing forbidden eval fields: {missing}")
+
+
+def _assert_step5_paper_compatible_policy_config(cfg: Mapping[str, Any], *, ctx: str) -> None:
+    if str(cfg.get("generation_input_policy") or "") != STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT:
+        raise RuntimeError(
+            f"{ctx} requires generation_input_policy={STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT}; "
+            f"{STEP5_GENERATION_INPUT_POLICY_NO_REF} is diagnostic-only."
+        )
+    if str(cfg.get("content_evidence_policy") or "") != STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT:
+        raise RuntimeError(
+            f"{ctx} requires content_evidence_policy={STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT}"
+        )
+    if str(cfg.get("reference_usage") or "") != STEP5_REFERENCE_USAGE_METRIC_ONLY:
+        raise RuntimeError(f"{ctx} requires reference_usage={STEP5_REFERENCE_USAGE_METRIC_ONLY}")
+    forbidden = {str(x).strip() for x in (cfg.get("forbid_current_eval_fields_in_generation") or [])}
+    missing = sorted(set(_STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS) - forbidden)
+    if missing:
+        raise RuntimeError(f"{ctx} paper-compatible policy missing forbidden eval fields: {missing}")
+
+
+def _assert_step5_formal_eval_policy_config(cfg: Mapping[str, Any], *, ctx: str) -> None:
+    generation_policy = str(cfg.get("generation_input_policy") or "")
+    content_policy = str(cfg.get("content_evidence_policy") or "")
+    if generation_policy == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT:
+        _assert_step5_paper_compatible_policy_config(cfg, ctx=ctx)
+        return
+    if generation_policy == STEP5_GENERATION_INPUT_POLICY_NO_REF:
+        _assert_step5_no_ref_policy_config(cfg, ctx=ctx)
+        if content_policy != STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY:
+            raise RuntimeError(
+                f"{ctx} requires content_evidence_policy={STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY}"
+            )
+        if str(cfg.get("reference_usage") or "") != STEP5_REFERENCE_USAGE_METRIC_ONLY:
+            raise RuntimeError(f"{ctx} requires reference_usage={STEP5_REFERENCE_USAGE_METRIC_ONLY}")
+        return
+    raise RuntimeError(
+        f"{ctx} unsupported generation_input_policy={generation_policy!r}; "
+        f"expected {STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT!r} or {STEP5_GENERATION_INPUT_POLICY_NO_REF!r}."
+    )
+
+
+def _build_train_only_history_evidence_for_frame(
+    out: pd.DataFrame,
+    *,
+    split_label: str,
+    auxiliary: str,
+    target: str,
+    neutral_content_evidence: str,
+    task_id: int | None = None,
+    max_rows: int | None = None,
+    no_ref_evidence_config: Mapping[str, Any] | None = None,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    cfg = normalise_no_ref_evidence_config(
+        dict(no_ref_evidence_config or _step5_no_ref_evidence_config()),
+        neutral_content_evidence=neutral_content_evidence,
+    )
+    texts, metas, manifest = build_or_load_no_ref_evidence_for_frame(
+        out,
+        split_label=split_label,
+        task_id=int(task_id or 0),
+        auxiliary=auxiliary,
+        target=target,
+        config=cfg,
+        data_root=get_data_dir(),
+        cache_root=os.path.join(get_odcr_root(), "cache", str(cfg.get("cache_namespace") or "step5_no_ref_history")),
+        max_rows=max_rows,
+    )
+    out.attrs["step5_no_ref_evidence_cache_manifest"] = manifest
+    return [(text, dict(meta)) for text, meta in zip(texts, metas)]
+
+
+def _assert_no_current_eval_evidence_leakage(
+    out: pd.DataFrame,
+    *,
+    split_label: str,
+    extra_forbidden_values: Mapping[Any, Sequence[Any]] | None = None,
+) -> None:
+    required_flags = {
+        "reference_before_generation": False,
+        "current_eval_row_reference_used_in_generation": False,
+        "current_eval_row_review_used_in_generation": False,
+        "current_eval_row_content_evidence_used_in_generation": False,
+        "reference_after_generation_metric_only": True,
+    }
+    for col, expected in required_flags.items():
+        if col not in out.columns:
+            raise RuntimeError(f"Step5 no-reference official {split_label} eval missing guard column {col}")
+        if not bool((out[col] == expected).all()):
+            raise RuntimeError(f"Step5 no-reference official {split_label} eval guard failed for {col}")
+    if "content_evidence_source" not in out.columns:
+        raise RuntimeError(f"Step5 no-reference official {split_label} eval missing content_evidence_source")
+    bad_source = out["content_evidence_source"].astype(str).str.contains("current_eval_row|oracle", case=False, regex=True)
+    if bool(bad_source.any()):
+        raise RuntimeError(f"Step5 official {split_label} eval attempted to use oracle/current-row content evidence")
+    generated_inputs = out["content_evidence"].fillna("").astype(str) if "content_evidence" in out.columns else pd.Series([""] * len(out))
+    for col in _STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS:
+        if col in {"content_evidence", "style_evidence"}:
+            continue
+        if col not in out.columns:
+            continue
+        for idx, raw_value in out[col].fillna("").astype(str).items():
+            value = raw_value.strip()
+            if len(value) < 16:
+                continue
+            if value in str(generated_inputs.loc[idx]):
+                raise RuntimeError(
+                    f"Step5 no-reference official {split_label} eval generation input leaked current-row field {col!r}"
+                )
+    if extra_forbidden_values:
+        neutral = STEP5_NEUTRAL_CONTENT_EVIDENCE.strip()
+        for idx, values in extra_forbidden_values.items():
+            generated = str(generated_inputs.loc[idx])
+            for raw_value in values:
+                value = str(raw_value or "").strip()
+                if len(value) < 16 or value == neutral:
+                    continue
+                if value not in generated:
+                    continue
+                raise RuntimeError(
+                    f"Step5 no-reference official {split_label} eval generation input leaked original content/style evidence"
+                )
+
+
+def _normalise_no_ref_guard_text(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return " ".join(raw.split())
+
+
+def _no_ref_guard_contains_forbidden(generated: Any, forbidden_values: Sequence[Any]) -> bool:
+    generated_norm = _normalise_no_ref_guard_text(generated)
+    if not generated_norm:
+        return False
+    neutral = _normalise_no_ref_guard_text(STEP5_NEUTRAL_CONTENT_EVIDENCE)
+    for raw_value in forbidden_values:
+        value = _normalise_no_ref_guard_text(raw_value)
+        if len(value) < 16 or value == neutral:
+            continue
+        if value in generated_norm:
+            return True
+    return False
+
+
+def _apply_step5_no_ref_train_controls(
+    df: pd.DataFrame,
+    *,
+    split_label: str,
+    auxiliary: str,
+    target: str,
+    neutral_content_evidence: str,
+    task_id: int | None = None,
+    no_ref_evidence_config: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
     out = df.copy()
-    _require_content_evidence_frame(out, ctx=f"Step5 official {split_label} eval source")
+    generated = _build_train_only_history_evidence_for_frame(
+        out,
+        split_label=split_label,
+        auxiliary=auxiliary,
+        target=target,
+        neutral_content_evidence=neutral_content_evidence,
+        task_id=task_id,
+        no_ref_evidence_config=no_ref_evidence_config,
+    )
+    out["content_evidence"] = [text for text, _meta in generated]
+    out["content_evidence_source"] = [meta["content_evidence_source"] for _text, meta in generated]
+    out["no_ref_input_protocol"] = [meta.get("input_protocol", TEXT_CLEAN_ITEM_ONLY_NO_REF) for _text, meta in generated]
+    out = _apply_step5_train_only_hss_style_state(out, target=target)
+    out["generation_input_policy"] = STEP5_GENERATION_INPUT_POLICY_NO_REF
+    out["content_evidence_policy"] = STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY
+    out["reference_usage"] = STEP5_REFERENCE_USAGE_LABEL_ONLY
+    out["reference_before_generation"] = False
+    out["reference_after_generation_metric_only"] = False
+    out["current_sample_reference_used_in_generation"] = False
+    out["step5_prompt_input_role"] = STEP5_CONTROL_CARD_INPUT_ROLE
+    out["step5_control_card_schema_version"] = STEP5_EVIDENCE_CARD_SCHEMA_VERSION
+    return out
+
+
+def _apply_step5_paper_compatible_train_controls(
+    df: pd.DataFrame,
+    *,
+    neutral_content_evidence: str,
+) -> pd.DataFrame:
+    """D4C-compatible formal train input: user/item/domain controls, no prompt evidence.
+
+    ODCR counterfactual innovation stays in the Step4/Step5 sampled labels, route weights,
+    confidence fields, and regularizers.  The Flan encoder still needs text ids for the
+    active architecture, so every row receives the same neutral constant rather than
+    train-history or current-row evidence.
+    """
+    out = df.copy()
+    neutral = str(neutral_content_evidence or STEP5_NEUTRAL_CONTENT_EVIDENCE).strip()
+    if not neutral:
+        raise RuntimeError("paper-compatible Step5 train requires a non-empty neutral content evidence string")
+    out["content_evidence"] = neutral
+    out["content_evidence_source"] = "neutral_constant_paper_compatible"
+    out["no_ref_input_protocol"] = "not_applicable_paper_compatible"
+    out["generation_input_policy"] = STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    out["content_evidence_policy"] = STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+    out["reference_usage"] = STEP5_REFERENCE_USAGE_LABEL_ONLY
+    out["reference_before_generation"] = False
+    out["reference_after_generation_metric_only"] = False
+    out["current_sample_reference_used_in_generation"] = False
+    out["style_evidence"] = ""
+    return out
+
+
+def _apply_step5_odcr_native_train_controls(
+    df: pd.DataFrame,
+    *,
+    neutral_content_evidence: str,
+) -> pd.DataFrame:
+    """Task-native formal train input: keep Step4 EASD/HSS/RCR control evidence.
+
+    This path does not add external text. It makes the existing ODCR control
+    columns visible to CCV instead of replacing them with the neutral constant.
+    """
+    out = df.copy()
+    neutral = str(neutral_content_evidence or STEP5_NEUTRAL_CONTENT_EVIDENCE).strip()
+    if not neutral:
+        raise RuntimeError("ODCR-native Step5 train requires a non-empty neutral fallback evidence string")
+
+    if "content_evidence" in out.columns:
+        raw_content = out["content_evidence"].fillna("").astype(str).str.strip()
+    else:
+        raw_content = pd.Series([""] * len(out), index=out.index, dtype="object")
+    has_content = raw_content.astype(bool)
+    out["content_evidence"] = raw_content.where(has_content, neutral)
+    if "content_evidence_source" in out.columns:
+        src = out["content_evidence_source"].fillna("").astype(str).str.strip()
+        out["content_evidence_source"] = src.where(src.astype(bool), "step4_easd_content_plan")
+    else:
+        out["content_evidence_source"] = np.where(
+            has_content.to_numpy(),
+            "step4_easd_content_plan",
+            "neutral_fallback_missing_easd_content_plan",
+        )
+
+    for col, default in (
+        ("style_evidence", ""),
+        ("domain_style_anchor", ""),
+        ("local_style_residual_hint", ""),
+    ):
+        if col not in out.columns:
+            out[col] = default
+        out[col] = out[col].fillna("").astype(str)
+    if "domain_style_anchor" in out.columns:
+        domain_series = out["domain_style_anchor"].fillna("").astype(str).str.strip()
+        if "domain" in out.columns:
+            fallback_domain = out["domain"].fillna("").astype(str).str.strip()
+        else:
+            fallback_domain = pd.Series(["target"] * len(out), index=out.index, dtype="object")
+        out["domain_style_anchor"] = domain_series.where(domain_series.astype(bool), fallback_domain)
+
+    if "polarity_anchor" not in out.columns:
+        rating = pd.to_numeric(out.get("rating", pd.Series([3.0] * len(out), index=out.index)), errors="coerce").fillna(3.0)
+        out["polarity_anchor"] = np.where(rating >= 4.0, "positive", np.where(rating <= 2.0, "negative", "neutral"))
+    else:
+        pol = out["polarity_anchor"].fillna("").astype(str).str.strip()
+        rating = pd.to_numeric(out.get("rating", pd.Series([3.0] * len(out), index=out.index)), errors="coerce").fillna(3.0)
+        fallback_pol = pd.Series(np.where(rating >= 4.0, "positive", np.where(rating <= 2.0, "negative", "neutral")), index=out.index)
+        out["polarity_anchor"] = pol.where(pol.astype(bool), fallback_pol)
+
+    out["no_ref_input_protocol"] = "not_applicable_odcr_native_train"
+    out["step5_prompt_input_role"] = "odcr_native_easd_hss_rcr_controls"
+    out["generation_input_policy"] = STEP5_GENERATION_INPUT_POLICY_ODCR_NATIVE
+    out["content_evidence_policy"] = STEP5_CONTENT_EVIDENCE_POLICY_EASD_CONTENT_PLAN
+    out["reference_usage"] = STEP5_REFERENCE_USAGE_LABEL_ONLY
+    out["reference_before_generation"] = False
+    out["reference_after_generation_metric_only"] = False
+    out["current_sample_reference_used_in_generation"] = False
+    return out
+
+
+def _apply_step5_factual_eval_default_controls(
+    df: pd.DataFrame,
+    *,
+    split_label: str,
+    auxiliary: str,
+    target: str,
+    final_eval_config: Mapping[str, Any] | None = None,
+    task_id: int | None = None,
+    max_rows: int | None = None,
+    no_ref_evidence_config: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+    eval_cfg = dict(final_eval_config or _step5_final_eval_no_ref_config())
+    _assert_step5_no_ref_policy_config(eval_cfg, ctx=f"Step5 official {split_label} eval")
     contract = step5_factual_eval_control_contract(split_label)
     out["sample_weight_hint"] = 1.0
     out["route_scorer"] = int(contract["route_scorer"])
@@ -760,6 +1252,10 @@ def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label:
     out["step5_control_is_rcr_posterior"] = False
     out["step5_control_is_train_route"] = False  # internal-only eval contract label
     out["step5_control_is_step4_export_posterior"] = False
+    raw_ref = out["explanation"].fillna("").astype(str) if "explanation" in out.columns else pd.Series([""] * len(out))
+    old_content = out["content_evidence"].fillna("").astype(str) if "content_evidence" in out.columns else pd.Series([""] * len(out))
+    old_style = out["style_evidence"].fillna("").astype(str) if "style_evidence" in out.columns else pd.Series([""] * len(out))
+    out["raw_ref_text"] = raw_ref
     out["style_evidence"] = ""
     out["domain_style_anchor"] = "target"
     out["local_style_residual_hint"] = ""
@@ -800,24 +1296,189 @@ def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label:
         "step5_prompt_text",
     ):
         out[_key] = [p[_key] for p in prompts]
-    out["step5_prompt_input_role"] = "content_evidence_prefix"
-    out["content_evidence"] = out["step5_prompt_text"].astype(str) + "\n" + out["content_evidence"].fillna("").astype(str)
+    neutral = str(eval_cfg.get("neutral_content_evidence") or STEP5_NEUTRAL_CONTENT_EVIDENCE)
+    generated = _build_train_only_history_evidence_for_frame(
+        out,
+        split_label=split_label,
+        auxiliary=auxiliary,
+        target=target,
+        neutral_content_evidence=neutral,
+        task_id=task_id,
+        max_rows=max_rows,
+        no_ref_evidence_config=no_ref_evidence_config,
+    )
+    history_text = [text for text, _meta in generated]
+    history_meta = [dict(meta) for _text, meta in generated]
+    overlap_guard_suppressed: List[bool] = []
+    for pos, idx in enumerate(out.index):
+        forbidden_values = [
+            raw_ref.loc[idx] if idx in raw_ref.index else "",
+            out.loc[idx, "review"] if "review" in out.columns else "",
+            out.loc[idx, "clean_text"] if "clean_text" in out.columns else "",
+            old_content.loc[idx] if idx in old_content.index else "",
+            old_style.loc[idx] if idx in old_style.index else "",
+        ]
+        candidate_input = history_text[pos]
+        suppressed = _no_ref_guard_contains_forbidden(candidate_input, forbidden_values)
+        overlap_guard_suppressed.append(bool(suppressed))
+        if suppressed:
+            history_text[pos] = neutral
+            history_meta[pos] = {
+                **history_meta[pos],
+                "content_evidence_source": "neutral_guarded_current_eval_overlap",
+                "history_available": False,
+                "no_ref_overlap_guard_suppressed": True,
+            }
+    out = _apply_step5_train_only_hss_style_state(out, target=target)
+    out["step5_prompt_input_role"] = STEP5_CONTROL_CARD_INPUT_ROLE
+    out["step5_control_card_schema_version"] = STEP5_EVIDENCE_CARD_SCHEMA_VERSION
+    out["content_evidence"] = pd.Series(history_text, index=out.index).astype(str)
+    out["content_evidence_source"] = [m["content_evidence_source"] for m in history_meta]
+    out["no_ref_input_protocol"] = [m.get("input_protocol", TEXT_CLEAN_ITEM_ONLY_NO_REF) for m in history_meta]
+    out["no_ref_overlap_guard_suppressed"] = overlap_guard_suppressed
+    out["generation_input_policy"] = STEP5_GENERATION_INPUT_POLICY_NO_REF
+    out["content_evidence_policy"] = STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY
+    out["reference_usage"] = STEP5_REFERENCE_USAGE_METRIC_ONLY
+    out["reference_before_generation"] = False
+    out["current_eval_row_reference_used_in_generation"] = False
+    out["current_eval_row_review_used_in_generation"] = False
+    out["current_eval_row_content_evidence_used_in_generation"] = False
+    out["reference_after_generation_metric_only"] = True
+    out["paper_table_allowed"] = True
+    out["old_eval_row_content_evidence_sha256"] = [
+        hashlib.sha256(str(v).encode("utf-8")).hexdigest() if str(v).strip() else ""
+        for v in old_content.tolist()
+    ]
+    out["old_eval_row_style_evidence_sha256"] = [
+        hashlib.sha256(str(v).encode("utf-8")).hexdigest() if str(v).strip() else ""
+        for v in old_style.tolist()
+    ]
+    _assert_no_current_eval_evidence_leakage(
+        out,
+        split_label=split_label,
+        extra_forbidden_values={
+            idx: (old_content.loc[idx], old_style.loc[idx])
+            for idx in out.index
+        },
+    )
     return out
 
 
-def _require_content_evidence_frame(df: pd.DataFrame, *, ctx: str) -> None:
+def _apply_step5_paper_compatible_eval_default_controls(
+    df: pd.DataFrame,
+    *,
+    split_label: str,
+    auxiliary: str,
+    target: str,
+    final_eval_config: Mapping[str, Any] | None = None,
+) -> pd.DataFrame:
+    del auxiliary, target
+    out = df.copy()
+    eval_cfg = dict(final_eval_config or _step5_final_eval_no_ref_config())
+    _assert_step5_paper_compatible_policy_config(eval_cfg, ctx=f"Step5 official {split_label} eval")
+    contract = step5_factual_eval_control_contract(split_label)
+    out["sample_weight_hint"] = 1.0
+    out["route_scorer"] = int(contract["route_scorer"])
+    out["route_explainer"] = int(contract["route_explainer"])
+    out["route_reason_scorer"] = STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT
+    out["route_reason_explainer"] = STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT
+    out[_STEP5_CONTROL_MODE_COLUMN] = STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT
+    out[_STEP5_CONTROL_SOURCE_COLUMN] = "step5_valid_test_target_split"
+    out[_STEP5_CONTROL_CONTRACT_COLUMN] = STEP5_FACTUAL_EVAL_CONTROL_SCHEMA_VERSION
+    out["step5_control_is_rcr_posterior"] = False
+    out["step5_control_is_train_route"] = False
+    out["step5_control_is_step4_export_posterior"] = False
+    raw_ref = out["explanation"].fillna("").astype(str) if "explanation" in out.columns else pd.Series([""] * len(out))
+    old_content = out["content_evidence"].fillna("").astype(str) if "content_evidence" in out.columns else pd.Series([""] * len(out))
+    old_style = out["style_evidence"].fillna("").astype(str) if "style_evidence" in out.columns else pd.Series([""] * len(out))
+    neutral = str(eval_cfg.get("neutral_content_evidence") or STEP5_NEUTRAL_CONTENT_EVIDENCE).strip()
+    out["raw_ref_text"] = raw_ref
+    out["content_evidence"] = neutral
+    out["content_evidence_source"] = "neutral_constant_paper_compatible"
+    out["no_ref_input_protocol"] = "not_applicable_paper_compatible"
+    out["style_evidence"] = ""
+    out["domain_style_anchor"] = "target"
+    out["local_style_residual_hint"] = ""
+    out["polarity_anchor"] = np.where(out["rating"].astype(float) >= 3.0, "positive", "negative")
+    for _col, _dv in (
+        ("entropy_score", 0.25),
+        ("uncertainty_score", 0.25),
+        ("confidence_bucket", 1.0),
+        ("content_anchor_score", 0.5),
+        ("style_anchor_score", 0.5),
+        ("evidence_quality_prior", 0.5),
+        ("cf_reliability_score", 1.0),
+        ("content_retention_score", 1.0),
+        ("style_shift_score", 0.0),
+        ("rating_stability_score", 1.0),
+        ("text_quality_score", 1.0),
+    ):
+        if _col not in out.columns:
+            out[_col] = _dv
+    registry = default_prompt_registry()
+    prompts = [
+        registry.render(
+            sample=row,
+            task_head="explanation",
+            sample_origin="target_gold",
+            seed=0,
+            split=split_label,
+        )
+        for row in out.to_dict("records")
+    ]
+    for _key in (
+        "step5_prompt_template_id",
+        "step5_prompt_instance_id",
+        "step5_prompt_family",
+        "step5_prompt_version",
+        "step5_prompt_mode",
+        "step5_prompt_seed",
+        "step5_prompt_text",
+    ):
+        out[_key] = [p[_key] for p in prompts]
+    out["step5_prompt_input_role"] = "user_item_conditioned_counterfactual_training"
+    out["no_ref_overlap_guard_suppressed"] = False
+    out["generation_input_policy"] = STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    out["content_evidence_policy"] = STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+    out["reference_usage"] = STEP5_REFERENCE_USAGE_METRIC_ONLY
+    out["reference_before_generation"] = False
+    out["current_eval_row_reference_used_in_generation"] = False
+    out["current_eval_row_review_used_in_generation"] = False
+    out["current_eval_row_content_evidence_used_in_generation"] = False
+    out["reference_after_generation_metric_only"] = True
+    out["paper_table_allowed"] = True
+    out["old_eval_row_content_evidence_sha256"] = [
+        hashlib.sha256(str(v).encode("utf-8")).hexdigest() if str(v).strip() else ""
+        for v in old_content.tolist()
+    ]
+    out["old_eval_row_style_evidence_sha256"] = [
+        hashlib.sha256(str(v).encode("utf-8")).hexdigest() if str(v).strip() else ""
+        for v in old_style.tolist()
+    ]
+    _assert_no_current_eval_evidence_leakage(
+        out,
+        split_label=split_label,
+        extra_forbidden_values={
+            idx: (old_content.loc[idx], old_style.loc[idx])
+            for idx in out.index
+        },
+    )
+    return out
+
+
+def _require_no_ref_content_evidence_frame(df: pd.DataFrame, *, ctx: str) -> None:
     if "content_evidence" not in df.columns:
         raise ValueError(
-            f"{ctx} missing required content_evidence field; official Step5_e train/eval requires "
-            "Flan encoder input contract soft_prompt_plus_content_evidence_legacy32."
+            f"{ctx} missing required no-reference content_evidence field; official Step5_e train/eval "
+            "requires train-only history or neutral evidence."
         )
     vals = df["content_evidence"]
     missing = vals.isna() | (vals.astype(str).str.strip() == "")
     if bool(missing.any()):
         bad = int(missing.sum())
         raise ValueError(
-            f"{ctx} has {bad} rows with empty content_evidence; official Step5_e train/eval must fail fast "
-            "instead of using a soft-prompt-only or clean_text fallback."
+            f"{ctx} has {bad} rows with empty no-reference content_evidence; official Step5_e train/eval "
+            "must fail fast instead of using current-row evidence, soft-prompt-only, or clean_text fallback."
         )
 
 
@@ -926,8 +1587,159 @@ def _sample_text_value(sample: Mapping[str, Any], *names: str) -> str:
     return ""
 
 
-def _legacy32_content_evidence_max_length(label_max_length: int) -> int:
-    return max(4, min(STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS, int(label_max_length)))
+def _step5_content_evidence_max_length(label_max_length: int, *, configured_budget: int | None = None) -> int:
+    del label_max_length
+    budget = int(configured_budget or STEP5_ENCODER_CONTENT_TOKEN_BUDGET)
+    return max(4, min(budget, STEP5_ENCODER_CONTENT_TOKEN_BUDGET))
+
+
+def _compact_field_text(value: Any, *, default: str = "none") -> str:
+    if _is_missing_sample_value(value):
+        return default
+    text = " ".join(str(value).replace("\n", " ").split())
+    return text if text else default
+
+
+def _compact_float_text(value: Any, *, default: str = "n/a") -> str:
+    if _is_missing_sample_value(value):
+        return default
+    try:
+        number = float(value)
+    except Exception:
+        return default
+    return f"{number:.3f}".rstrip("0").rstrip(".")
+
+
+def _compact_route_bool(value: Any) -> str:
+    try:
+        return "yes" if float(value) >= 0.5 else "no"
+    except Exception:
+        return "n/a"
+
+
+def _compact_confidence_text(value: Any) -> str:
+    try:
+        bucket = int(float(value))
+    except Exception:
+        return "n/a"
+    if bucket >= 2:
+        return "high"
+    if bucket == 1:
+        return "medium"
+    return "low"
+
+
+_STEP5_CARD_GENERIC_PHRASES = {
+    "good food",
+    "great food",
+    "nice food",
+    "good service",
+    "great service",
+    "nice service",
+    "good place",
+    "great place",
+    "this place",
+}
+_STEP5_CARD_GENERIC_TOKENS = {
+    "good",
+    "great",
+    "nice",
+    "food",
+    "service",
+    "place",
+    "restaurant",
+    "overall",
+    "generic",
+    "none",
+}
+
+
+def _step5_clean_anchor_phrase(raw: Any) -> str:
+    text = " ".join(str(raw or "").replace("\n", " ").split()).strip(" .;:|,")
+    if not text:
+        return ""
+    low = text.lower()
+    if low.startswith(("item evidence", "domain prior", "user preference", "task")):
+        _, _, text = text.partition(":")
+        text = text.strip(" .;:|,")
+        low = text.lower()
+    if low in _STEP5_CARD_GENERIC_PHRASES:
+        return ""
+    toks = [t.strip("'\"()[]{}").lower() for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_'-]*", text)]
+    if not toks:
+        return ""
+    concrete = [t for t in toks if len(t) >= 3 and t not in _STEP5_CARD_GENERIC_TOKENS]
+    if not concrete:
+        return ""
+    return " ".join(toks[:4])
+
+
+def _step5_compact_anchor_phrases_from_content(content: Any, *, max_phrases: int = 4) -> List[str]:
+    raw = str(content or "")
+    if not raw.strip():
+        return []
+    pieces: List[str] = []
+    for line in raw.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if low.startswith("task:"):
+            continue
+        if ":" in line:
+            _head, _sep, body = line.partition(":")
+            line = body
+        line = line.replace(".", ";")
+        for part in line.split(";"):
+            part = part.strip()
+            if part:
+                pieces.append(part)
+    if not pieces:
+        pieces = [raw]
+    out: List[str] = []
+    seen: set[str] = set()
+    for piece in pieces:
+        cleaned = _step5_clean_anchor_phrase(piece)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= int(max_phrases):
+            break
+    return out
+
+
+def _step5_style_state_short(sample: Mapping[str, Any]) -> str:
+    domain_style = _compact_field_text(sample.get("domain_style_anchor"), default="target")
+    polarity = _compact_field_text(sample.get("polarity_anchor"), default="neutral")
+    confidence = _compact_confidence_text(sample.get("confidence_bucket"))
+    return f"{domain_style} {polarity} {confidence} plain"
+
+
+def _build_step5_easd_hss_rcr_evidence_card(sample: Mapping[str, Any]) -> str:
+    anchors = _step5_compact_anchor_phrases_from_content(sample.get("content_evidence"), max_phrases=4)
+    content = " | ".join(anchors) if anchors else "none"
+    style = _step5_style_state_short(sample)
+    origin = _compact_field_text(sample.get("sample_origin"), default="unknown")
+    control_mode = _compact_field_text(sample.get(_STEP5_CONTROL_MODE_COLUMN), default=STEP5_CONTROL_MODE_RCR_POSTERIOR)
+    route = "exp" if _compact_route_bool(sample.get("route_explainer")) == "yes" else "weak"
+    try:
+        reliability = max(0.0, min(1.0, float(sample.get("cf_reliability_score", 1.0))))
+    except Exception:
+        reliability = 1.0
+    try:
+        uncertainty = max(0.0, min(1.0, float(sample.get("uncertainty_score", 0.25))))
+    except Exception:
+        uncertainty = 0.25
+    return (
+        f"C: {content}\n"
+        f"S: {style}\n"
+        f"R: rel={reliability:.2f} unc={uncertainty:.2f} route={route} mode={control_mode} src={origin}\n"
+        "Y: write 10-14 words; copy one C phrase; avoid generic food service"
+    )
 
 
 def _tokenizer_input_ids_untruncated(text: Any, *, add_special_tokens: bool = True) -> List[int]:
@@ -950,14 +1762,15 @@ def _tokenizer_input_ids_untruncated(text: Any, *, add_special_tokens: bool = Tr
     return [int(x) for x in list(ids or [])]
 
 
-def _encode_legacy32_content_evidence(
+def _encode_compact_content_evidence(
     sample: Mapping[str, Any],
     *,
     max_length: int,
     soft_prompt_len: int = 16,
+    configured_budget: int | None = None,
 ) -> Dict[str, Any]:
-    max_len = _legacy32_content_evidence_max_length(max_length)
-    text = _sample_text_value(sample, "content_evidence")
+    max_len = _step5_content_evidence_max_length(max_length, configured_budget=configured_budget)
+    text = _build_step5_easd_hss_rcr_evidence_card(sample)
     raw_ids = _tokenizer_input_ids_untruncated(text, add_special_tokens=True)
     kept = _control_text_to_ids(text, max_length=max_len)
     kept_len = int(kept.numel())
@@ -970,7 +1783,9 @@ def _encode_legacy32_content_evidence(
         "text_token_len": kept_len,
         "content_evidence_token_len": kept_len,
         "content_evidence_raw_token_len": raw_len,
-        "legacy_max_content_tokens": int(max_len),
+        "encoder_content_token_budget": int(max_len),
+        "evidence_card_schema_version": STEP5_EVIDENCE_CARD_SCHEMA_VERSION,
+        "retired_legacy32_max_content_tokens": STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
         "soft_prompt_len": int(soft_prompt_len),
     }
 
@@ -1034,12 +1849,16 @@ class Processor():
         target,
         max_length: int = 25,
         flan_soft_prompt_len: int = 16,
+        encoder_content_token_budget: int | None = None,
     ):
         self.max_length = int(max_length)
         self.auxiliary = auxiliary
         self.target = target
         self.flan_soft_prompt_len = int(flan_soft_prompt_len)
-        self.control_text_max_length = STEP5_CONTROL_TEXT_MAX_LENGTH
+        self.encoder_content_token_budget = int(
+            encoder_content_token_budget or STEP5_ENCODER_CONTENT_TOKEN_BUDGET
+        )
+        self.control_text_max_length = self.encoder_content_token_budget
 
     def __call__(self, sample):
         if GLOBAL_COL_USER not in sample or GLOBAL_COL_ITEM not in sample:
@@ -1099,11 +1918,15 @@ class Processor():
             ],
             dtype=torch.float32,
         )
-        control_max_len = _legacy32_content_evidence_max_length(self.max_length)
-        encoder_content = _encode_legacy32_content_evidence(
+        control_max_len = _step5_content_evidence_max_length(
+            self.max_length,
+            configured_budget=self.encoder_content_token_budget,
+        )
+        encoder_content = _encode_compact_content_evidence(
             sample,
             max_length=self.max_length,
             soft_prompt_len=self.flan_soft_prompt_len,
+            configured_budget=self.encoder_content_token_budget,
         )
         return {
             "user_idx": user_idx,
@@ -1787,6 +2610,12 @@ class Model(nn.Module):
         domain_style_lat = self._mean_control_embedding(control_packet.domain_style_anchor_ids)
         local_style_lat = self._mean_control_embedding(control_packet.local_style_hint_ids)
         polarity_lat = self._mean_control_embedding(control_packet.polarity_ids)
+        if not bool(getattr(self, "ccv_enabled", True)):
+            content_lat = torch.zeros_like(content_lat)
+            style_lat = torch.zeros_like(style_lat)
+            domain_style_lat = torch.zeros_like(domain_style_lat)
+            local_style_lat = torch.zeros_like(local_style_lat)
+            polarity_lat = torch.zeros_like(polarity_lat)
         style_basis = 0.50 * style_lat + 0.30 * domain_style_lat + 0.20 * local_style_lat
         numeric_controls = control_packet.numeric_controls().to(device=shared_latent.device, dtype=shared_latent.dtype)
         if int(numeric_controls.shape[-1]) != int(self.ccv_numeric_control_dim):
@@ -1794,6 +2623,8 @@ class Model(nn.Module):
                 f"CCV numeric_controls dim={int(numeric_controls.shape[-1])} "
                 f"does not match step5.ccv.numeric_control_dim={int(self.ccv_numeric_control_dim)}."
             )
+        if not bool(getattr(self, "ccv_enabled", True)):
+            numeric_controls = torch.zeros_like(numeric_controls)
         numeric_basis = self.ccv_numeric_adapter(numeric_controls) * float(self.ccv_numeric_control_weight)
         # CCV interface: content_lat controls what must be said, style_basis controls how it is phrased,
         # numeric_basis carries route/reliability/UCI tone without text prompt concatenation.
@@ -1816,6 +2647,7 @@ class Model(nn.Module):
             "ccv_confidence_mean": float(control_packet.confidence_bucket.detach().float().mean().item()),
             "ccv_content_anchor_mean": float(control_packet.content_anchor_score.detach().float().mean().item()),
             "ccv_style_anchor_mean": float(control_packet.style_anchor_score.detach().float().mean().item()),
+            "ccv_disabled_zero_control": bool(not getattr(self, "ccv_enabled", True)),
         }
         return soft_flat, stats, content_lat.to(dtype=shared_latent.dtype)
 
@@ -1838,11 +2670,12 @@ class Model(nn.Module):
                 "content_evidence_ids batch size does not match soft prompt batch: "
                 f"{int(text_ids.shape[0])} vs {int(soft_embeds.shape[0])}"
             )
-        if int(text_ids.shape[1]) > int(STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS):
+        if int(text_ids.shape[1]) > int(STEP5_ENCODER_CONTENT_TOKEN_BUDGET):
             raise RuntimeError(
-                "content_evidence_ids exceeds the legacy32 Flan encoder content budget; Processor must "
-                "tokenize content_evidence with truncation=True and max_length=max(4,min(32,label_max_length)). "
-                f"text_tokens={int(text_ids.shape[1])}, legacy_content_budget={STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS}."
+                "content_evidence_ids exceeds the active Flan encoder content budget; Processor must "
+                "tokenize compact no-ref evidence with truncation=True and the resolved "
+                "step5.no_ref_evidence.encoder_content_token_budget. "
+                f"text_tokens={int(text_ids.shape[1])}, content_budget={STEP5_ENCODER_CONTENT_TOKEN_BUDGET}."
             )
         embed_getter = getattr(self.flan_explainer, "get_input_embeddings", None)
         input_embeddings = embed_getter() if callable(embed_getter) else getattr(self.flan_explainer, "shared", None)
@@ -2451,7 +3284,8 @@ class Model(nn.Module):
             "out_logits_materialized": True,
             "word_dist_returned": True,
             "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-            "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+            "encoder_content_token_budget": STEP5_ENCODER_CONTENT_TOKEN_BUDGET,
+            "retired_legacy32_max_content_tokens": STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
             "flan_encoder_tokens": int(encoder_embeds.shape[1]),
         }
         word_dist = logits
@@ -2756,6 +3590,61 @@ def graph_tied_zero(ref: torch.Tensor) -> torch.Tensor:
 def graph_tied_zero_like(ref: torch.Tensor) -> torch.Tensor:
     """Elementwise zero with the same shape as ``ref`` and an autograd edge."""
     return ref * 0.0
+
+
+_STEP5_ANCHOR_STOP_TOKEN_IDS: Optional[set[int]] = None
+
+
+def _step5_anchor_stop_token_ids() -> set[int]:
+    global _STEP5_ANCHOR_STOP_TOKEN_IDS
+    if _STEP5_ANCHOR_STOP_TOKEN_IDS is not None:
+        return set(_STEP5_ANCHOR_STOP_TOKEN_IDS)
+    stop_text = (
+        "C S R Y rel unc route mode src write words copy one phrase avoid generic food service "
+        "target positive negative neutral medium high low plain none"
+    )
+    ids = set(_tokenizer_input_ids(stop_text, max_length=64, truncation=True, add_special_tokens=False))
+    ids.update({0, 1, 2})
+    _STEP5_ANCHOR_STOP_TOKEN_IDS = set(int(x) for x in ids)
+    return set(_STEP5_ANCHOR_STOP_TOKEN_IDS)
+
+
+def odcr_anchor_coverage_loss_per_sample_from_logp(
+    word_logp: torch.Tensor,
+    tgt: torch.Tensor,
+    content_evidence_ids: Optional[torch.Tensor],
+    *,
+    max_anchor_tokens: int = 24,
+    pad_id: int = 0,
+) -> torch.Tensor:
+    """Reference-free token coverage pressure: target positions should assign mass to card anchors."""
+    if content_evidence_ids is None:
+        return graph_tied_zero_like(word_logp[:, 0, 0])
+    B, T, _V = word_logp.shape
+    target_mask = (tgt != int(pad_id)).to(device=word_logp.device, dtype=torch.bool)
+    stop_ids = _step5_anchor_stop_token_ids()
+    losses: List[torch.Tensor] = []
+    for b in range(B):
+        raw_ids = [int(x) for x in content_evidence_ids[b].detach().view(-1).tolist()]
+        anchors: List[int] = []
+        seen: set[int] = set()
+        for tid in raw_ids:
+            if tid in stop_ids or tid <= 2 or tid in seen:
+                continue
+            seen.add(tid)
+            anchors.append(tid)
+            if len(anchors) >= int(max_anchor_tokens):
+                break
+        if not anchors or not bool(target_mask[b].any().item()):
+            losses.append(graph_tied_zero(word_logp[b]))
+            continue
+        idx = torch.tensor(anchors, device=word_logp.device, dtype=torch.long)
+        lp = word_logp[b].index_select(-1, idx)
+        m = target_mask[b].view(T, 1)
+        prob = torch.where(m, lp.exp(), torch.zeros_like(lp))
+        present_prob = prob.max(dim=0).values.clamp(min=1e-8)
+        losses.append(-present_prob.log().mean())
+    return torch.stack(losses, dim=0)
 
 
 def _step5_trainable_parameters(model: nn.Module) -> List[nn.Parameter]:
@@ -3296,10 +4185,11 @@ def compose_step5_total_loss(
     batch_diversity_weight: float,
     lci_weighted_loss: torch.Tensor,
     fca_weighted_loss: torch.Tensor,
+    anchor_coverage_weighted_loss: torch.Tensor,
     ortho_keep_loss: torch.Tensor,
     ortho_keep_weight: float,
 ) -> torch.Tensor:
-    """Single Step5 train loss composer; LCI/FCA weighted terms enter exactly once."""
+    """Single Step5 train loss composer; LCI/FCA/anchor weighted terms enter exactly once."""
     loss = (
         loss_factual
         + loss_counterfactual
@@ -3308,6 +4198,7 @@ def compose_step5_total_loss(
         + float(batch_diversity_weight) * loss_batch_diversity
         + lci_weighted_loss
         + fca_weighted_loss
+        + anchor_coverage_weighted_loss
     )
     if float(ortho_keep_weight) > 0.0:
         loss = loss + float(ortho_keep_weight) * ortho_keep_loss
@@ -3469,6 +4360,20 @@ def run_step5_find_unused_parameters_preflight(
                 gate_b.explainer_weight.to(dtype=explainer_only.dtype),
                 explainer_route_mask,
             )
+            loss_anchor_cov_weighted = graph_tied_zero(word_dist)
+            anchor_cov_weight = float(getattr(step5_innov_cfg.fca, "anchor_coverage_weight", 0.0))
+            if anchor_cov_weight > 0.0:
+                word_logp = F.log_softmax(word_dist, dim=-1)
+                loss_anchor_cov_ps = odcr_anchor_coverage_loss_per_sample_from_logp(
+                    word_logp,
+                    batch.tgt_output,
+                    batch.content_evidence_ids,
+                )
+                loss_anchor_cov_weighted = anchor_cov_weight * route_weighted_mean(
+                    loss_anchor_cov_ps,
+                    gate_b.explainer_weight.to(dtype=loss_anchor_cov_ps.dtype),
+                    explainer_route_mask,
+                )
             shared_lat = _model._last_shared_latent
             spec_lat = _model._last_specific_latent
             fca_bundle = evidence_basis_fca_loss(
@@ -3517,6 +4422,7 @@ def run_step5_find_unused_parameters_preflight(
                 batch_diversity_weight=0.0,
                 lci_weighted_loss=lci_weighted_loss,
                 fca_weighted_loss=fca_weighted_loss,
+                anchor_coverage_weighted_loss=loss_anchor_cov_weighted,
                 ortho_keep_loss=loss_ortho_keep,
                 ortho_keep_weight=float(final_cfg.lambda_ortho_step5),
             )
@@ -4034,6 +4940,19 @@ def trainModel_ddp(
                         explainer_w,
                         explainer_route_mask,
                     )
+                    loss_anchor_cov_weighted = graph_tied_zero(word_dist)
+                    anchor_cov_weight = float(getattr(step5_innov_cfg.fca, "anchor_coverage_weight", 0.0))
+                    if anchor_cov_weight > 0.0:
+                        loss_anchor_cov_ps = odcr_anchor_coverage_loss_per_sample_from_logp(
+                            word_logp,
+                            tgt_output,
+                            gb.content_evidence_ids,
+                        )
+                        loss_anchor_cov_weighted = anchor_cov_weight * route_weighted_mean(
+                            loss_anchor_cov_ps,
+                            explainer_w.to(dtype=loss_anchor_cov_ps.dtype),
+                            explainer_route_mask,
+                        )
                     spec_lat = _model._last_specific_latent
                     shared_lat = _model._last_shared_latent
                     fca_bundle = evidence_basis_fca_loss(
@@ -4196,6 +5115,7 @@ def trainModel_ddp(
                         batch_diversity_weight=w_bd_eff,
                         lci_weighted_loss=lci_weighted_loss,
                         fca_weighted_loss=fca_weighted_loss,
+                        anchor_coverage_weighted_loss=loss_anchor_cov_weighted,
                         ortho_keep_loss=loss_ortho_keep,
                         ortho_keep_weight=lambda_ortho_step5,
                     )
@@ -4296,6 +5216,10 @@ def trainModel_ddp(
                         }
                     _extra["loss_fca"] = float(l_fca.detach().item())
                     _extra["loss_fca_weighted"] = float(fca_weighted_loss.detach().item())
+                    _extra["loss_anchor_coverage_weighted"] = float(loss_anchor_cov_weighted.detach().item())
+                    _extra["anchor_coverage_weight"] = float(
+                        getattr(step5_innov_cfg.fca, "anchor_coverage_weight", 0.0)
+                    )
                     _extra["step5b_fca_weight"] = float(fca_bundle.fca_weight_mean.detach().item())
                     _extra["step5b_explainer_weight"] = float(step5b_gate.explainer_weight.detach().mean().item())
                     _extra.update(getattr(_model, "_last_ccv_control_stats", {}) or {})
@@ -4486,7 +5410,7 @@ def trainModel_ddp(
                                 "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
                                 "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
                                 "best_metric_policy": "official_paper_metrics_valid_only",
-                                "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
+                                "best_content_evidence_policy": "neutral_constant_user_item_conditioned",
                             },
                         },
                     )
@@ -5004,7 +5928,7 @@ def trainModel_ddp(
                             "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
                             "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
                             "best_metric_policy": str(ckpt_mode),
-                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
+                            "best_content_evidence_policy": "neutral_constant_user_item_conditioned",
                         },
                         "checkpoint_guard_valid_loss_rel_tol": float(
                             final_cfg.checkpoint_guard_valid_loss_rel_tol
@@ -5063,6 +5987,7 @@ def trainModel_ddp(
                     valid_loss_total_epoch=current_valid_loss,
                     valid_loss_e_epoch=valid_loss_e_epoch,
                     optional_regularizers=(["orthogonal_keep"] if float(lambda_ortho_step5) > 0.0 else []),
+                    step5_innov_cfg=step5_innov_cfg,
                 )
 
             if odcr_ddp_epoch_end_barrier():
@@ -5343,6 +6268,20 @@ def validModel(
                 loss_counterfactual = explainer_w_scalar * route_weighted_mean(
                     explainer_only, explainer_w, explainer_route_mask
                 )
+                loss_anchor_cov_weighted = graph_tied_zero(word_dist)
+                anchor_cov_weight = float(getattr(step5_innov_cfg.fca, "anchor_coverage_weight", 0.0))
+                if anchor_cov_weight > 0.0:
+                    word_logp = F.log_softmax(word_dist, dim=-1)
+                    loss_anchor_cov_ps = odcr_anchor_coverage_loss_per_sample_from_logp(
+                        word_logp,
+                        tgt_output,
+                        mb.content_evidence_ids,
+                    )
+                    loss_anchor_cov_weighted = anchor_cov_weight * route_weighted_mean(
+                        loss_anchor_cov_ps,
+                        explainer_w.to(dtype=loss_anchor_cov_ps.dtype),
+                        explainer_route_mask,
+                    )
                 shared_lat = _model._last_shared_latent
                 spec_lat = _model._last_specific_latent
                 fca_bundle = evidence_basis_fca_loss(
@@ -5383,6 +6322,7 @@ def validModel(
                     batch_diversity_weight=0.0,
                     lci_weighted_loss=lci_zero,
                     fca_weighted_loss=fca_weighted_loss,
+                    anchor_coverage_weighted_loss=loss_anchor_cov_weighted,
                     ortho_keep_loss=loss_ortho_keep,
                     ortho_keep_weight=float(lambda_ortho_step5),
                 )
@@ -5398,6 +6338,203 @@ def validModel(
     return loss_sum, n_samples, loss_e_sum
 
 
+def _step5_eval_run_dir() -> str:
+    path = (os.environ.get("ODCR_EVAL_RUN_DIR") or "").strip()
+    return os.path.abspath(path) if path else ""
+
+
+def _step5_eval_meta_dir() -> str:
+    run_dir = _step5_eval_run_dir()
+    return os.path.join(run_dir, "meta") if run_dir else ""
+
+
+def _step5_gpu_memory_gb(device: Any) -> Tuple[float | None, float | None]:
+    if not torch.cuda.is_available():
+        return None, None
+    try:
+        idx = int(device) if not isinstance(device, torch.device) else int(device.index or 0)
+    except Exception:
+        idx = int(torch.cuda.current_device())
+    try:
+        return (
+            float(torch.cuda.memory_allocated(idx) / (1024**3)),
+            float(torch.cuda.memory_reserved(idx) / (1024**3)),
+        )
+    except Exception:
+        return None, None
+
+
+def _step5_write_eval_partial_outputs(eval_dir: str, rows: Sequence[Mapping[str, Any]]) -> None:
+    if not eval_dir or not rows:
+        return
+    os.makedirs(eval_dir, exist_ok=True)
+    sample_rows = list(rows)[-200:]
+    samples_path = os.path.join(eval_dir, "samples.partial.jsonl")
+    tmp_samples = f"{samples_path}.{os.getpid()}.tmp"
+    with open(tmp_samples, "w", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "schema_version": "odcr_step5_eval_partial_samples/1",
+                    "complete": False,
+                    "paper_table_allowed": False,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            + "\n"
+        )
+        for row in sample_rows:
+            fh.write(json.dumps(dict(row), ensure_ascii=False, default=str) + "\n")
+    os.replace(tmp_samples, samples_path)
+    pred_path = os.path.join(eval_dir, "predictions.partial.csv")
+    partial_records = []
+    for row in sample_rows:
+        partial_records.append(
+            {
+                "complete": False,
+                "paper_table_allowed": False,
+                "sample_id": row.get("sample_id"),
+                "pred_rating": row.get("pred_rating"),
+                "gt_rating": row.get("gt_rating"),
+                "pred_text": row.get("pred_text"),
+                "ref_text": row.get("ref_text"),
+            }
+        )
+    tmp_pred = f"{pred_path}.{os.getpid()}.tmp"
+    pd.DataFrame(partial_records).to_csv(tmp_pred, index=False)
+    os.replace(tmp_pred, pred_path)
+
+
+class _Step5EvalStallWatchdog:
+    def __init__(
+        self,
+        *,
+        meta_dir: str,
+        split: str,
+        task: int,
+        run_id: str,
+        rank: int,
+        device: Any,
+        stall_after_sec: float,
+    ) -> None:
+        self.meta_dir = meta_dir
+        self.split = split
+        self.task = int(task)
+        self.run_id = str(run_id)
+        self.rank = int(rank)
+        self.device = device
+        self.stall_after_sec = float(stall_after_sec)
+        self.last_progress_time = time.time()
+        self.current_stage = "init"
+        self.batch_idx = -1
+        self.rows_done = 0
+        self._stop = threading.Event()
+        self._last_written_for_progress = -1.0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.meta_dir or self.stall_after_sec <= 0:
+            return
+        self._thread = threading.Thread(target=self._run, name="step5-eval-stall-watchdog", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def mark(self, *, stage: str, batch_idx: int, rows_done: int) -> None:
+        self.current_stage = str(stage)
+        self.batch_idx = int(batch_idx)
+        self.rows_done = int(rows_done)
+        self.last_progress_time = time.time()
+
+    def _run(self) -> None:
+        while not self._stop.wait(min(30.0, max(1.0, self.stall_after_sec / 10.0))):
+            idle = time.time() - self.last_progress_time
+            if idle < self.stall_after_sec:
+                continue
+            if self.last_progress_time == self._last_written_for_progress:
+                continue
+            self._last_written_for_progress = self.last_progress_time
+            allocated, reserved = _step5_gpu_memory_gb(self.device)
+            frame = sys._current_frames().get(threading.main_thread().ident or 0)
+            stack = "".join(traceback.format_stack(frame)) if frame is not None else ""
+            payload = {
+                "schema_version": "odcr_step5_eval_stall_diagnostics/1",
+                "task": self.task,
+                "run_id": self.run_id,
+                "split": self.split,
+                "rank": self.rank,
+                "pid": os.getpid(),
+                "current_stage": self.current_stage,
+                "batch_idx": self.batch_idx,
+                "rows_done": self.rows_done,
+                "last_progress_time": datetime.fromtimestamp(self.last_progress_time, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "idle_sec": float(idle),
+                "gpu_allocated_gb": allocated,
+                "gpu_reserved_gb": reserved,
+                "stack": stack[-20000:],
+                "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            path = os.path.join(self.meta_dir, f"eval_stall_diagnostics_rank{self.rank}.json")
+            atomic_write_json(path, payload)
+            if self.rank == 0:
+                atomic_write_json(os.path.join(self.meta_dir, "eval_stall_diagnostics.json"), payload)
+
+
+def _step5_write_eval_progress(
+    *,
+    meta_dir: str,
+    split: str,
+    task: int,
+    run_id: str,
+    rank: int,
+    batch_idx: int,
+    total_batches: int | None,
+    rows_done: int,
+    elapsed_sec: float,
+    last_batch_decode_sec: float,
+    device: Any,
+    stage: str,
+) -> Dict[str, Any]:
+    allocated, reserved = _step5_gpu_memory_gb(device)
+    payload = {
+        "schema_version": STEP5_EVAL_PROGRESS_SCHEMA_VERSION,
+        "task": int(task),
+        "run_id": str(run_id),
+        "split": str(split),
+        "stage": str(stage),
+        "rank": int(rank),
+        "pid": os.getpid(),
+        "batch_idx": int(batch_idx),
+        "total_batches": None if total_batches is None else int(total_batches),
+        "rows_done": int(rows_done),
+        "elapsed_sec": float(elapsed_sec),
+        "last_batch_decode_sec": float(last_batch_decode_sec),
+        "samples_per_sec": float(rows_done / elapsed_sec) if elapsed_sec > 0 else 0.0,
+        "gpu_allocated_gb": allocated,
+        "gpu_reserved_gb": reserved,
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if meta_dir:
+        atomic_write_json(os.path.join(meta_dir, f"eval_progress_rank{rank}.json"), payload)
+        if int(rank) == 0:
+            atomic_write_json(os.path.join(meta_dir, "eval_progress.json"), payload)
+    return payload
+
+
+def _step5_dist_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    raw = str(os.environ.get("RANK") or "0").strip()
+    try:
+        return int(raw or "0")
+    except ValueError:
+        return 0
+
+
 def evalModel(
     model,
     test_dataloader,
@@ -5406,6 +6543,7 @@ def evalModel(
     step5_innov_cfg,
     non_blocking_h2d: bool | None = None,
     eval_forward_micro_batch_size: int | None = None,
+    eval_context: Mapping[str, Any] | None = None,
 ):
     """逐 batch 推理，返回带 sample_id 的行列表（用于 DDP gather 后按 id 排序）。"""
     import time as _time_perf
@@ -5416,9 +6554,36 @@ def evalModel(
         raise RuntimeError("evalModel requires non_blocking_h2d from resolved FinalTrainingConfig.")
     rows: List[dict] = []
     decode_wall = 0.0
+    rank = _step5_dist_rank()
+    total_batches = len(test_dataloader) if hasattr(test_dataloader, "__len__") else None
+    ctx = dict(eval_context or {})
+    split = str(ctx.get("split") or getattr(test_dataloader, "split", "") or "")
+    if not split:
+        split = str(getattr(getattr(test_dataloader, "dataset", None), "split", "") or "")
+    split = split or str(os.environ.get("ODCR_EVAL_SPLIT", "") or "")
+    task_idx = int(ctx.get("task") or os.environ.get("ODCR_TASK_ID", "0") or 0)
+    run_id = str(ctx.get("run_id") or os.environ.get("ODCR_STEP5_RUN_ID", "") or "")
+    meta_dir = str(ctx.get("meta_dir") or _step5_eval_meta_dir())
+    eval_dir = str(ctx.get("eval_dir") or _step5_eval_run_dir())
+    heartbeat_interval = int(ctx.get("heartbeat_interval") or STEP5_EVAL_HEARTBEAT_BATCH_INTERVAL)
+    heartbeat_interval = max(1, heartbeat_interval)
+    stall_after_sec = float(ctx.get("stall_after_sec") or STEP5_EVAL_STALL_AFTER_SEC)
+    eval_started = _time_perf.perf_counter()
+    rows_done = 0
+    watchdog = _Step5EvalStallWatchdog(
+        meta_dir=meta_dir,
+        split=split,
+        task=task_idx,
+        run_id=run_id,
+        rank=rank,
+        device=device,
+        stall_after_sec=stall_after_sec,
+    )
+    watchdog.start()
     with torch.no_grad():
-        for batch in test_dataloader:
+        for batch_idx, batch in enumerate(test_dataloader, start=1):
             _t0 = _time_perf.perf_counter()
+            watchdog.mark(stage="dataloader_batch_ready", batch_idx=batch_idx, rows_done=rows_done)
             gb = require_gathered_batch(_model.gather(batch, device, non_blocking_h2d=bool(non_blocking_h2d)))
             full_bsz = int(gb.user_idx.size(0))
             micro = int(eval_forward_micro_batch_size or full_bsz)
@@ -5435,6 +6600,7 @@ def evalModel(
                 domain_idx = mb.domain_idx
                 sample_id = mb.sample_id
                 ccv_packet = build_ccv_control_packet(mb, step5_innov_cfg)
+                watchdog.mark(stage="decode", batch_idx=batch_idx, rows_done=rows_done)
                 with odcr_cuda_bf16_autocast():
                     pred_exps, *_ = _model.generate(
                         user_idx, item_idx, domain_idx, ccv_control_packet=ccv_packet
@@ -5480,8 +6646,36 @@ def evalModel(
                             "encoder_truncated": None if enc_truncated[i] is None else bool(int(enc_truncated[i])),
                         }
                     )
-            decode_wall += _time_perf.perf_counter() - _t0
+            last_batch_decode = _time_perf.perf_counter() - _t0
+            decode_wall += last_batch_decode
             rows.extend(batch_rows)
+            rows_done += int(len(batch_rows))
+            watchdog.mark(stage="batch_complete", batch_idx=batch_idx, rows_done=rows_done)
+            if batch_idx == 1 or batch_idx % heartbeat_interval == 0 or (
+                total_batches is not None and batch_idx == int(total_batches)
+            ):
+                progress = _step5_write_eval_progress(
+                    meta_dir=meta_dir,
+                    split=split,
+                    task=task_idx,
+                    run_id=run_id,
+                    rank=rank,
+                    batch_idx=batch_idx,
+                    total_batches=total_batches,
+                    rows_done=rows_done,
+                    elapsed_sec=float(_time_perf.perf_counter() - eval_started),
+                    last_batch_decode_sec=float(last_batch_decode),
+                    device=device,
+                    stage="decode",
+                )
+                logging.getLogger(LOGGER_NAME).info(
+                    "[eval_heartbeat] %s",
+                    json.dumps(progress, ensure_ascii=False, sort_keys=True, default=str),
+                    extra=log_route_extra(logging.getLogger(LOGGER_NAME), ROUTE_SUMMARY),
+                )
+                if rank == 0:
+                    _step5_write_eval_partial_outputs(eval_dir, rows)
+    watchdog.stop()
     return {"rows": rows, "timings": {"decode_time": float(decode_wall)}}
 
 
@@ -5557,7 +6751,12 @@ def evalModelWithRerank(
     feature_wall = 0.0
     score_wall = 0.0
     base_decode_seed = _m.decode_seed if _m.decode_seed is not None else int(cli_seed)
-    review_rows = list(review_by_sample_id or [])
+    if review_by_sample_id:
+        logging.getLogger(LOGGER_NAME).warning(
+            "eval-rerank received review_by_sample_id but official no-reference rerank uses compact "
+            "content_evidence_ids only; current eval review rows are ignored.",
+            extra=log_route_extra(logging.getLogger(LOGGER_NAME), ROUTE_SUMMARY),
+        )
     with torch.no_grad():
         for batch in test_dataloader:
             gb = require_gathered_batch(_m.gather(batch, device, non_blocking_h2d=bool(non_blocking_h2d)))
@@ -5574,6 +6773,12 @@ def evalModelWithRerank(
                 if len(raw_refs) == int(tgt_output.shape[0])
                 else get_step5_tokenizer().batch_decode(tgt_output, skip_special_tokens=True)
             )
+            if gb.content_evidence_ids is not None:
+                source_texts = get_step5_tokenizer().batch_decode(
+                    gb.content_evidence_ids, skip_special_tokens=True
+                )
+            else:
+                source_texts = [""] * int(tgt_output.shape[0])
             B = int(user_idx.size(0))
             candidates_per_row: List[List[Dict[str, Any]]] = [[] for _ in range(B)]
             _tdecode0 = _time_perf.perf_counter()
@@ -5621,9 +6826,8 @@ def evalModelWithRerank(
                 ref = ref_texts[i]
                 ref_w = max(len(ref.split()), 1)
                 ref_mean_dirty = float(ref_w)
-                sid = int(sids[i])
-                review_txt = review_rows[sid] if 0 <= sid < len(review_rows) else ""
-                review_kw = keywords_from_source_text(review_txt)
+                source_txt = source_texts[i] if i < len(source_texts) else ""
+                source_kw = keywords_from_source_text(source_txt)
                 for rank_before, c in enumerate(candidates_per_row[i]):
                     if rm == "rule_v3":
                         feats = extract_rerank_features_for_v3(
@@ -5633,10 +6837,12 @@ def evalModelWithRerank(
                             ref_mean_len_words=18.0,
                         )
                         feats_out = dict(feats)
+                        feats_out["rerank_source"] = "decoded_compact96_anchor_card"
+                        feats_out["source_keyword_count"] = int(len(source_kw))
                         ok_hard, hard_rs, sc, bkd = score_candidates_rule_v3(
                             c["text"],
                             feats,
-                            review_keywords=review_kw,
+                            review_keywords=source_kw,
                             lp_norm=float(c["lp_norm"]),
                             profile=v3_prof,
                         )
@@ -5724,6 +6930,9 @@ def evalModelWithRerank(
                 sel_text = best[4]["text"]
                 cand_payload = []
                 selected_rank = int(best[0])
+                selected_source_keyword_count = int(
+                    len(keywords_from_source_text(source_texts[i] if i < len(source_texts) else ""))
+                )
                 for rank_before, feats_out, sc, _len_pen, cdict in scored:
                     entry = {
                         "candidate_rank_before_rerank": rank_before,
@@ -5796,6 +7005,9 @@ def evalModelWithRerank(
                                 "text": candidates_per_row[i][best_lp_rank]["text"],
                                 "avg_logprob": candidates_per_row[i][best_lp_rank]["avg_logprob"],
                             },
+                            "rerank_reference_free": True,
+                            "rerank_source": "decoded_compact96_anchor_card",
+                            "source_keyword_count": selected_source_keyword_count,
                         },
                     }
                 )
@@ -6081,6 +7293,13 @@ def _eval_rows_local(
         step5_innov_cfg=step5_innov_cfg,
         non_blocking_h2d=bool(non_blocking_h2d),
         eval_forward_micro_batch_size=int(getattr(args, "_odcr_eval_forward_micro_batch_size", 0) or 0) or None,
+        eval_context={
+            "split": str(getattr(args, "_odcr_eval_split_label", "") or ""),
+            "task": int(getattr(args, "_odcr_task_idx", 0) or 0),
+            "run_id": str(getattr(args, "_odcr_step5_run_id", "") or ""),
+            "eval_dir": _step5_eval_run_dir(),
+            "meta_dir": _step5_eval_meta_dir(),
+        },
     )
     return out_m["rows"], dict(out_m.get("timings") or {})
 
@@ -6557,8 +7776,17 @@ def load_step5_checkpoint_cpu_staged(
 ) -> dict[str, Any]:
     lineage = read_checkpoint_lineage(checkpoint_path, expected_stage="step5")
     expected = _current_step5_checkpoint_expectation(final_cfg, model)
+    no_ref_replay_policy_mismatches: Dict[str, Any] = {}
     for key, expected_value in expected.items():
         if lineage.get(key) != expected_value:
+            if key == "content_evidence_contract":
+                no_ref_replay_policy_mismatches[key] = {
+                    "checkpoint": lineage.get(key),
+                    "current_eval": expected_value,
+                    "decision": "allowed_for_no_ref_eval_replay_only",
+                    "paper_status": "transition_diagnostic_requires_no_ref_retrain",
+                }
+                continue
             raise CheckpointLineageError(
                 f"Step5 eval/rerank refused checkpoint due to compatibility mismatch for {key}: "
                 f"checkpoint={lineage.get(key)!r} current={expected_value!r}"
@@ -6599,6 +7827,13 @@ def load_step5_checkpoint_cpu_staged(
         "device_idx": int(device_idx),
         "memory_before": before,
         "memory_after": after,
+        "no_ref_replay_policy_mismatches": no_ref_replay_policy_mismatches,
+        "train_eval_policy_mismatch": bool(no_ref_replay_policy_mismatches),
+        "paper_status": (
+            "transition_diagnostic_requires_no_ref_retrain"
+            if no_ref_replay_policy_mismatches
+            else "train_eval_policy_matched"
+        ),
     }
     logging.getLogger(LOGGER_NAME).info(
         "[Step5 checkpoint load] %s",
@@ -6731,6 +7966,7 @@ def _build_tokenize_cache_fingerprint(
     step5_sampler_summary: Mapping[str, Any] | None = None,
     step5_runtime_diagnostics: Mapping[str, Any] | None = None,
     task_head: str = "explanation",
+    eval_subset_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     split_norm = str(split_label).strip().lower()
     if split_norm == "train" and not eval_only:
@@ -6756,6 +7992,37 @@ def _build_tokenize_cache_fingerprint(
         tokenizer_path = require_step5_text_model_dir()
         tokenizer_fp = model_artifact_fingerprint(tokenizer_path)
     effective_payload = current_effective_payload(required=True)
+    final_eval_payload = effective_payload.get("step5_final_eval")
+    if not isinstance(final_eval_payload, Mapping):
+        final_eval_payload = {}
+    train_generation_policy = str(
+        effective_payload.get("step5_train_generation_input_policy")
+        or STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    )
+    train_content_policy = str(
+        effective_payload.get("step5_train_content_evidence_policy")
+        or STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+    )
+    eval_generation_policy = str(
+        final_eval_payload.get("generation_input_policy") or STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    )
+    eval_content_policy = str(
+        final_eval_payload.get("content_evidence_policy") or STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+    )
+    active_generation_policy = eval_generation_policy if eval_only else train_generation_policy
+    active_content_policy = eval_content_policy if eval_only else train_content_policy
+    no_ref_evidence_payload = effective_payload.get("step5_no_ref_evidence")
+    if not isinstance(no_ref_evidence_payload, Mapping):
+        no_ref_evidence_payload = {}
+    no_ref_history_sources: Dict[str, Any] = {}
+    aux_name = str(effective_payload.get("auxiliary") or "")
+    target_name = str(effective_payload.get("target") or "")
+    if (not aux_name or not target_name) and 1 <= int(task_idx) <= len(tasks):
+        aux_name, target_name = tasks[int(task_idx) - 1]
+    for _role, _dataset in (("auxiliary_train_history", aux_name), ("target_train_history", target_name)):
+        if _dataset:
+            _hp = os.path.join(get_data_dir(), _dataset, "train.csv")
+            no_ref_history_sources[_role] = file_fingerprint(_hp)
     semantic_sampler = _step5_semantic_sampler_payload(step5_sampler_summary or {})
     runtime_diagnostics = dict(step5_runtime_diagnostics or {})
     semantic_source_files = {key: _step5_semantic_file_fingerprint(value) for key, value in source_files.items()}
@@ -6787,14 +8054,42 @@ def _build_tokenize_cache_fingerprint(
         "max_output_length": int(max_length),
         "train_valid_split_fingerprint": semantic_source_files,
         "input_formatting_version": {
-            "processor": "executors.step5_engine.Processor/2",
+            "processor": "executors.step5_engine.Processor/11_compact96_anchor_card",
             "prompt_registry_schema": prompt_manifest.get("schema_version"),
             "prompt_manifest_hash": stable_hash(prompt_manifest),
             "control_text_max_len_policy": f"max(4,min({STEP5_CONTROL_TEXT_MAX_LENGTH},max_length))",
+            "encoder_content_token_budget": int(
+                (no_ref_evidence_payload or {}).get("encoder_content_token_budget")
+                or STEP5_ENCODER_CONTENT_TOKEN_BUDGET
+            ),
             "domain_mapping": {"auxiliary": 0, "target": 1},
             "sampler_component_ids": dict(_STEP5_SAMPLER_COMPONENT_IDS),
             "sampler_tier_ids": dict(_STEP5_SAMPLER_TIER_IDS),
+            "generation_input_policy": active_generation_policy,
+            "content_evidence_policy": active_content_policy,
+            "train_generation_input_policy": train_generation_policy,
+            "train_content_evidence_policy": train_content_policy,
+            "eval_generation_input_policy": eval_generation_policy,
+            "eval_content_evidence_policy": eval_content_policy,
+            "evidence_card_schema_version": STEP5_EVIDENCE_CARD_SCHEMA_VERSION,
+            "evidence_card_input_role": (
+                STEP5_CONTROL_CARD_INPUT_ROLE
+                if active_generation_policy == STEP5_GENERATION_INPUT_POLICY_NO_REF
+                else active_generation_policy
+            ),
+            "hss_style_state_source": (
+                STEP5_HSS_STYLE_STATE_SOURCE
+                if active_generation_policy == STEP5_GENERATION_INPUT_POLICY_NO_REF
+                else "not_applicable"
+            ),
+            "history_evidence_schema": STEP5_NO_REF_HISTORY_SCHEMA_VERSION,
+            "no_ref_evidence_config": dict(no_ref_evidence_payload),
+            "current_eval_overlap_guard": "neutral_constant_for_d4c_or_train_only_no_ref_guard",
         },
+        "no_ref_history_source_files": {
+            key: _step5_semantic_file_fingerprint(value) for key, value in no_ref_history_sources.items()
+        },
+        "eval_subset_identity": dict(eval_subset_identity or {}),
         "required_fields_hash": stable_hash(_STEP5_TOKENIZE_REQUIRED_FIELDS),
     }
     if eval_only and split_norm in {"valid", "test"}:
@@ -6854,6 +8149,8 @@ def _build_tokenize_cache_fingerprint(
         "split_label": str(split_label),
         "eval_only": bool(eval_only),
         "source_files": source_files,
+        "no_ref_history_source_files": no_ref_history_sources,
+        "eval_subset_identity": dict(eval_subset_identity or {}),
         "cache_identity": identity_payload,
         "cache_identity_hash": identity_payload_hash,
         "lineage_metadata": lineage_metadata,
@@ -6880,15 +8177,21 @@ def _build_tokenize_cache_fingerprint(
             "max_length": int(max_length),
             "dynamic_padding": "collate_time",
             "required_fields": list(_STEP5_TOKENIZE_REQUIRED_FIELDS),
-            "version": "Processor/2",
-            "cache_identity_contract": "Processor2/v10/legacy32",
+            "version": "Processor/11_compact96_anchor_card",
+            "cache_identity_contract": "Processor11/v22/compact96_anchor_card",
             "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-            "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+            "encoder_content_token_budget": int(
+                (no_ref_evidence_payload or {}).get("encoder_content_token_budget")
+                or STEP5_ENCODER_CONTENT_TOKEN_BUDGET
+            ),
+            "retired_legacy32_max_content_tokens": STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
             "flan_soft_prompt_len": flan_soft_prompt_len,
-            "encoder_input_policy": "legacy32_content_evidence_only",
+            "encoder_input_policy": str(
+                active_generation_policy
+            ),
             "encoder_input_tokenizer_kwargs": {
                 "truncation": True,
-                "max_length_policy": "max(4,min(32,max_length))",
+                "max_length_policy": "max(4,min(step5.no_ref_evidence.encoder_content_token_budget,compact_card_budget))",
             },
         },
         "max_length": int(max_length),
@@ -6925,6 +8228,7 @@ def _build_step5_cache_dir(
     step5_sampler_summary: Mapping[str, Any] | None = None,
     step5_runtime_diagnostics: Mapping[str, Any] | None = None,
     task_head: str = "explanation",
+    eval_subset_identity: Mapping[str, Any] | None = None,
 ) -> Tuple[str, str, dict[str, Any]]:
     fp_payload = _build_tokenize_cache_fingerprint(
         train_path=train_path,
@@ -6940,6 +8244,7 @@ def _build_step5_cache_dir(
         step5_sampler_summary=step5_sampler_summary,
         step5_runtime_diagnostics=step5_runtime_diagnostics,
         task_head=task_head,
+        eval_subset_identity=eval_subset_identity,
     )
     prefix = "hf_cache_step5_eval" if eval_only else "hf_cache_step5"
     fp = f"{cache_version}_{str(fp_payload.get('fingerprint_hash') or stable_hash(fp_payload))[:16]}"
@@ -7913,13 +9218,26 @@ def _write_step5_loss_contract(
     valid_loss_total_epoch: float | None = None,
     valid_loss_e_epoch: float | None = None,
     optional_regularizers: Sequence[str] = (),
+    step5_innov_cfg: Any | None = None,
 ) -> None:
     os.makedirs(meta_dir, exist_ok=True)
+    active_losses = ["explainer_ce"]
+    disabled_losses: List[str] = []
+    if step5_innov_cfg is None or bool(getattr(getattr(step5_innov_cfg, "ccv", None), "enabled", True)):
+        active_losses.append("ccv")
+    else:
+        disabled_losses.append("ccv")
+    fca_cfg = getattr(step5_innov_cfg, "fca", None)
+    if step5_innov_cfg is None or (bool(getattr(fca_cfg, "enabled", True)) and float(getattr(fca_cfg, "weight", 0.0)) > 0.0):
+        active_losses.append("fca")
+    else:
+        disabled_losses.append("fca")
     payload = {
         "schema_version": "odcr_step5_explanation_loss_contract/2",
         "step5_mode": "explanation_only",
         "rating_training": False,
-        "active_losses": ["explainer_ce", "ccv", "fca"],
+        "active_losses": active_losses,
+        "disabled_losses": disabled_losses,
         "optional_active_regularizers": list(optional_regularizers),
         "retired_losses_absent_from_total": [
             "loss" + "_r",
@@ -7991,7 +9309,10 @@ def build_odcr_ddp_artefacts(
         raise FileNotFoundError(f"缺少 Step4 训练 CSV: {train_path}")
     valid_path = os.path.join(path, "valid.csv")
     test_path = os.path.join(path, "test.csv")
-    if command == "test":
+    requested_eval_split = str(getattr(args, "eval_split", "") or "").strip().lower()
+    if command == "eval-rerank" and requested_eval_split not in {"", "valid", "test"}:
+        raise ValueError(f"eval-rerank received invalid --eval-split={requested_eval_split!r}")
+    if command == "test" or (command == "eval-rerank" and requested_eval_split == "test"):
         if not os.path.isfile(test_path):
             raise FileNotFoundError(f"缺少测试集 CSV（--command test）: {test_path}")
         eval_data_path = test_path
@@ -8114,13 +9435,52 @@ def build_odcr_ddp_artefacts(
         )
     except Step5ExportLoaderError as exc:
         raise RuntimeError(str(exc)) from exc
+    _active_effective_epochs = max(1, int(getattr(resolved, "epochs", 1) or 1))
     if command == "train":
         train_df = train_table.train_df
+        if "effective_epoch" in train_df.columns:
+            _epoch_series = pd.to_numeric(train_df["effective_epoch"], errors="coerce").fillna(0).astype(int)
+            _before_selected_rows = int(len(train_df))
+            train_df = train_df.loc[_epoch_series < _active_effective_epochs].copy()
+            if rank == 0:
+                logging.getLogger(LOGGER_NAME).info(
+                    "[step5 no-ref selected evidence] selected_effective_epochs=%s rows=%s/%s",
+                    _active_effective_epochs,
+                    len(train_df),
+                    _before_selected_rows,
+                    extra=log_route_extra(logging.getLogger(LOGGER_NAME), ROUTE_SUMMARY),
+                )
         if GLOBAL_COL_USER not in train_df.columns or GLOBAL_COL_ITEM not in train_df.columns:
             raise ValueError(
                 f"训练 CSV 须含 {GLOBAL_COL_USER}/{GLOBAL_COL_ITEM}（Step4 index_contract 管线）。path={train_path}"
             )
-        _require_content_evidence_frame(train_df, ctx=f"Step5 training CSV {train_path}")
+        _final_eval_cfg = _step5_final_eval_no_ref_config()
+        _no_ref_evidence_cfg = _step5_no_ref_evidence_config()
+        _neutral_evidence = str(_final_eval_cfg.get("neutral_content_evidence") or STEP5_NEUTRAL_CONTENT_EVIDENCE)
+        _train_generation_policy = str(getattr(resolved, "step5_train_generation_input_policy", "") or "")
+        if _train_generation_policy == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT:
+            train_df = _apply_step5_paper_compatible_train_controls(
+                train_df,
+                neutral_content_evidence=_neutral_evidence,
+            )
+        elif _train_generation_policy == STEP5_GENERATION_INPUT_POLICY_ODCR_NATIVE:
+            train_df = _apply_step5_odcr_native_train_controls(
+                train_df,
+                neutral_content_evidence=_neutral_evidence,
+            )
+        elif _train_generation_policy == STEP5_GENERATION_INPUT_POLICY_NO_REF:
+            train_df = _apply_step5_no_ref_train_controls(
+                train_df,
+                split_label="train",
+                auxiliary=str(args.auxiliary),
+                target=str(args.target),
+                neutral_content_evidence=_neutral_evidence,
+                task_id=int(task_idx),
+                no_ref_evidence_config=_no_ref_evidence_cfg,
+            )
+            _require_no_ref_content_evidence_frame(train_df, ctx=f"Step5 no-reference training CSV {train_path}")
+        else:
+            raise RuntimeError(f"Unsupported Step5 train generation_input_policy={_train_generation_policy!r}")
         _require_step5_rcr_posterior_controls(train_df, ctx=f"Step5 training CSV {train_path}")
         validate_split_indices(train_df, index_contract, "train", ctx={**_ictx, "csv_path": train_path})
     else:
@@ -8171,11 +9531,22 @@ def build_odcr_ddp_artefacts(
     ml_eff = int(_dp_full.get("max_explanation_length", int(args.max_explanation_length)))
     tlm = int(resolved.train_label_max_length)
     _processor_innov_cfg = parse_step5_innovation_config_json(str(resolved.step5_innovation_config_json))
+    _processor_no_ref_cfg = normalise_no_ref_evidence_config(
+        json.loads(str(resolved.step5_no_ref_evidence_config_json or "{}")),
+        neutral_content_evidence=STEP5_NEUTRAL_CONTENT_EVIDENCE,
+    )
     processor = Processor(
         args.auxiliary,
         args.target,
         max_length=tlm,
         flan_soft_prompt_len=int(_processor_innov_cfg.ccv.soft_prompt_len),
+        encoder_content_token_budget=int(
+            getattr(
+                resolved,
+                "step5_no_ref_encoder_content_token_budget",
+                _processor_no_ref_cfg["encoder_content_token_budget"],
+            )
+        ),
     )
     _step5_tok = get_step5_tokenizer()
     base_final = replace(
@@ -8193,7 +9564,7 @@ def build_odcr_ddp_artefacts(
         nhead=int(resolved.nhead),
         nhid=int(resolved.nhid),
         dropout=float(resolved.dropout),
-        label_smoothing=float(_dp_full["label_smoothing"]),
+        label_smoothing=float(resolved.label_smoothing if not eval_only else _dp_full["label_smoothing"]),
         repetition_penalty=float(_dp_full["repetition_penalty"]),
         generate_temperature=float(_dp_full["generate_temperature"]),
         generate_top_p=float(_dp_full["generate_top_p"]),
@@ -8207,6 +9578,11 @@ def build_odcr_ddp_artefacts(
     )
     setattr(args, "_odcr_eval_split_label", split_label)
     setattr(args, "_odcr_eval_data_path", eval_data_path)
+    setattr(args, "_odcr_task_idx", int(task_idx))
+    try:
+        setattr(args, "_odcr_step5_run_id", os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(save_file)))))
+    except Exception:
+        setattr(args, "_odcr_step5_run_id", "")
 
     if eval_only:
         ev_df = pd.read_csv(eval_data_path)
@@ -8214,6 +9590,10 @@ def build_odcr_ddp_artefacts(
             ev_df, index_contract, split_label, ctx={**_ictx, "csv_path": eval_data_path}
         )
         validate_split_indices(ev_df, index_contract, split_label, ctx={**_ictx, "csv_path": eval_data_path})
+        _eval_max_rows_raw = (os.environ.get("ODCR_EVAL_MAX_ROWS") or "").strip()
+        _eval_max_rows = int(_eval_max_rows_raw) if _eval_max_rows_raw else 0
+        if _eval_max_rows > 0:
+            ev_df = ev_df.head(_eval_max_rows).copy()
         if rank == 0 and getattr(args, "log_file", None):
             _meta_dir = os.path.dirname(os.path.abspath(args.log_file))
             _write_step5_explanation_projection_role_audit(_meta_dir)
@@ -8233,7 +9613,41 @@ def build_odcr_ddp_artefacts(
         ev_df = ev_df.reset_index(drop=True)
         ev_df["sample_id"] = np.arange(len(ev_df), dtype=np.int64)
         ev_df["clean_text"] = ev_df["explanation"].fillna("").astype(str)
-        ev_df = _apply_step5_factual_eval_default_controls(ev_df, split_label=split_label)
+        _eval_subset_identity = {
+            "schema_version": "odcr_step5_eval_subset_identity/1",
+            "split": split_label,
+            "bounded_diagnostic": bool(_eval_max_rows > 0),
+            "max_rows": int(_eval_max_rows) if _eval_max_rows > 0 else None,
+            "row_selection_policy": "head(max_rows)_before_token_cache" if _eval_max_rows > 0 else "full_split",
+            "row_count": int(len(ev_df)),
+            "sample_id_hash": stable_hash(ev_df["sample_id"].astype(int).tolist()),
+        }
+        if rank == 0:
+            logging.getLogger(LOGGER_NAME).info(
+                "[eval_subset] %s",
+                json.dumps(_eval_subset_identity, ensure_ascii=False, sort_keys=True),
+                extra=log_route_extra(logging.getLogger(LOGGER_NAME), ROUTE_SUMMARY),
+            )
+        _eval_policy_cfg = _step5_final_eval_no_ref_config()
+        if str(_eval_policy_cfg.get("generation_input_policy") or "") == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT:
+            ev_df = _apply_step5_paper_compatible_eval_default_controls(
+                ev_df,
+                split_label=split_label,
+                auxiliary=str(args.auxiliary),
+                target=str(args.target),
+                final_eval_config=_eval_policy_cfg,
+            )
+        else:
+            ev_df = _apply_step5_factual_eval_default_controls(
+                ev_df,
+                split_label=split_label,
+                auxiliary=str(args.auxiliary),
+                target=str(args.target),
+                final_eval_config=_eval_policy_cfg,
+                task_id=int(task_idx),
+                max_rows=_eval_max_rows if _eval_max_rows > 0 else None,
+                no_ref_evidence_config=_step5_no_ref_evidence_config(),
+            )
         cache_dir, cache_fp, cache_fp_payload = _build_step5_cache_dir(
             get_hf_cache_root(task_idx),
             train_path,
@@ -8248,6 +9662,7 @@ def build_odcr_ddp_artefacts(
             step5_sampler_summary=None,
             step5_runtime_diagnostics=None,
             task_head=_task_head,
+            eval_subset_identity=_eval_subset_identity,
         )
         if rank == 0:
             _log_step5_tokenize_line(
@@ -8298,13 +9713,32 @@ def build_odcr_ddp_artefacts(
             _write_step5_loss_contract(
                 _meta_dir,
                 optional_regularizers=(["orthogonal_keep"] if float(getattr(resolved, "lambda_ortho_step5", 0.0)) > 0.0 else []),
+                step5_innov_cfg=_processor_innov_cfg,
             )
         _mm_eval_split = _idx_mm(valid_df)
         valid_df["domain"] = "target"
         valid_df = valid_df.reset_index(drop=True)
         valid_df["sample_id"] = np.arange(len(valid_df), dtype=np.int64)
         valid_df["clean_text"] = valid_df["explanation"].fillna("").astype(str)
-        valid_df = _apply_step5_factual_eval_default_controls(valid_df, split_label="valid")
+        _eval_policy_cfg = _step5_final_eval_no_ref_config()
+        if str(_eval_policy_cfg.get("generation_input_policy") or "") == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT:
+            valid_df = _apply_step5_paper_compatible_eval_default_controls(
+                valid_df,
+                split_label="valid",
+                auxiliary=str(args.auxiliary),
+                target=str(args.target),
+                final_eval_config=_eval_policy_cfg,
+            )
+        else:
+            valid_df = _apply_step5_factual_eval_default_controls(
+                valid_df,
+                split_label="valid",
+                auxiliary=str(args.auxiliary),
+                target=str(args.target),
+                final_eval_config=_eval_policy_cfg,
+                task_id=int(task_idx),
+                no_ref_evidence_config=_step5_no_ref_evidence_config(),
+            )
 
         train_raw = train_table.audit_raw_df
         train_df = train_df.reset_index(drop=True)
@@ -8421,12 +9855,20 @@ def build_odcr_ddp_artefacts(
         train_dataset = encoded_data["train"]
         _sampler_stats = dict(train_table.stats or {})
         _eff_n = int(_sampler_stats.get("effective_samples_per_epoch") or len(train_dataset))
-        _planned_epochs = int(_sampler_stats.get("max_effective_epochs") or 1)
+        _eff_n = min(int(_eff_n), int(len(train_dataset))) if len(train_dataset) > 0 else int(_eff_n)
+        _planned_epochs = min(int(_sampler_stats.get("max_effective_epochs") or 1), _active_effective_epochs)
+        _sampler_stats["active_effective_epochs"] = int(_active_effective_epochs)
         train_dataset = _Step5EffectiveEpochDataset(
             train_dataset,
             effective_samples_per_epoch=_eff_n,
             planned_epochs=_planned_epochs,
         )
+    eval_generation_input_frame = ev_df.copy() if eval_only else valid_df.copy()
+    setattr(
+        args,
+        "_odcr_generation_input_frame_records",
+        eval_generation_input_frame.to_dict(orient="records"),
+    )
     valid_dataset = encoded_data["valid"]
     _collate_audit = partial(
         _step5_collate_dynamic,
@@ -8577,8 +10019,9 @@ def _summarize_step5_encoder_input_rows(rows: Sequence[Mapping[str, Any]]) -> Di
     return {
         "schema_version": STEP5_ENCODER_AUDIT_SCHEMA_VERSION,
         "encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
-        "content_evidence_token_policy": "max(4,min(32,label_max_length))",
+        "encoder_content_token_budget": STEP5_ENCODER_CONTENT_TOKEN_BUDGET,
+        "retired_legacy32_max_content_tokens": STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "content_evidence_token_policy": "max(4,min(step5.no_ref_evidence.encoder_content_token_budget,compact_card_budget))",
         "sample_count": n,
         "encoder_truncated_count": truncated_count,
         "encoder_truncated_rate": (float(truncated_count) / float(denom)) if denom else 0.0,
@@ -8587,29 +10030,211 @@ def _summarize_step5_encoder_input_rows(rows: Sequence[Mapping[str, Any]]) -> Di
     }
 
 
+def _build_step5_generation_input_samples(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    eval_frame: pd.DataFrame,
+    split_label: str,
+    split_csv: str,
+    no_ref_input_protocol: str,
+    max_samples: int = 100,
+    encoder_content_token_budget: int = STEP5_ENCODER_CONTENT_TOKEN_BUDGET,
+) -> List[Dict[str, Any]]:
+    """Capture human-readable no-ref encoder input examples after generation."""
+    if "sample_id" not in eval_frame.columns:
+        return []
+    frame_by_id = eval_frame.set_index("sample_id", drop=False)
+    tok = get_step5_tokenizer()
+    out: List[Dict[str, Any]] = []
+    for row in list(rows)[: int(max_samples)]:
+        try:
+            sid = int(row.get("sample_id"))
+        except Exception:
+            continue
+        if sid not in frame_by_id.index:
+            continue
+        src = frame_by_id.loc[sid]
+        if isinstance(src, pd.DataFrame):
+            src = src.iloc[0]
+        raw_prompt = _build_step5_easd_hss_rcr_evidence_card(src.to_dict() if hasattr(src, "to_dict") else src)
+        enc = tok(
+            raw_prompt,
+            padding=False,
+            max_length=int(encoder_content_token_budget),
+            truncation=True,
+        )
+        ids = [int(x) for x in enc.get("input_ids", [])]
+        final_input = tok.decode(ids, skip_special_tokens=True).strip()
+        out.append(
+            {
+                "sample_id": sid,
+                "split": str(split_label),
+                "split_csv": str(split_csv),
+                "row_lineage": {
+                    "sample_id": sid,
+                    "source_dataset": str(src.get("source_dataset", "") or ""),
+                    "source_split": str(src.get("source_split", "") or ""),
+                    "source_row_id": str(src.get("source_row_id", "") or ""),
+                    "sample_origin": str(src.get("sample_origin", "") or ""),
+                },
+                "no_ref_input_protocol": str(no_ref_input_protocol),
+                "content_evidence_source": str(src.get("content_evidence_source", "") or ""),
+                "raw_prompt": raw_prompt,
+                "final_input": final_input,
+                "raw_prompt_token_len": int(row.get("encoder_raw_input_token_len") or len(ids)),
+                "final_input_token_len": int(row.get("encoder_input_token_len") or len(ids)),
+                "encoder_truncated": bool(row.get("encoder_truncated")),
+                "prediction": str(row.get("pred_text", "") or ""),
+                "reference_metric_only": str(row.get("raw_ref_text", row.get("ref_text", "")) or ""),
+                "reference_before_generation": False,
+                "current_eval_row_review_used_in_generation": False,
+                "current_eval_row_reference_used_in_generation": False,
+                "current_eval_row_content_evidence_used_in_generation": False,
+            }
+        )
+    return out
+
+
 def _step5_content_evidence_contract_payload(final_cfg: FinalTrainingConfig) -> Dict[str, Any]:
     soft_len = int(parse_step5_innovation_config_json(str(final_cfg.step5_innovation_config_json)).ccv.soft_prompt_len)
+    final_eval_cfg = {}
+    no_ref_cfg: Dict[str, Any] = {}
+    try:
+        final_eval_cfg = json.loads(str(getattr(final_cfg, "step5_final_eval_config_json", "") or "{}"))
+    except json.JSONDecodeError:
+        final_eval_cfg = {}
+    try:
+        no_ref_cfg = normalise_no_ref_evidence_config(
+            json.loads(str(getattr(final_cfg, "step5_no_ref_evidence_config_json", "") or "{}")),
+            neutral_content_evidence=STEP5_NEUTRAL_CONTENT_EVIDENCE,
+        )
+    except Exception:
+        no_ref_cfg = {"encoder_content_token_budget": STEP5_ENCODER_CONTENT_TOKEN_BUDGET}
+    budget = int(no_ref_cfg.get("encoder_content_token_budget") or STEP5_ENCODER_CONTENT_TOKEN_BUDGET)
+    generation_policy = str(
+        final_eval_cfg.get("generation_input_policy") or STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    )
+    content_policy = str(
+        final_eval_cfg.get("content_evidence_policy") or STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+    )
+    train_generation_policy = str(
+        getattr(final_cfg, "step5_train_generation_input_policy", "") or generation_policy
+    )
+    train_content_policy = str(
+        getattr(final_cfg, "step5_train_content_evidence_policy", "") or content_policy
+    )
+    paper_compat = generation_policy == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    no_ref_card = generation_policy == STEP5_GENERATION_INPUT_POLICY_NO_REF
     return {
-        "schema_version": "odcr_step5_content_evidence_encoder_contract/legacy32",
+        "schema_version": (
+            "odcr_step5_content_evidence_encoder_contract/d4c_paper_compatible_v1"
+            if paper_compat
+            else "odcr_step5_control_card_contract/no_ref_easd_hss_rcr_card_v1"
+        ),
         "content_evidence_used": True,
         "content_evidence_field": "content_evidence",
-        "content_evidence_token_len": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "content_evidence_source": (
+            "neutral_constant_paper_compatible"
+            if paper_compat
+            else "train_only_history_or_neutral"
+        ),
+        "evidence_card_schema_version": STEP5_EVIDENCE_CARD_SCHEMA_VERSION,
+        "evidence_card_input_role": (
+            "user_item_conditioned_counterfactual_training"
+            if paper_compat
+            else STEP5_CONTROL_CARD_INPUT_ROLE
+        ),
+        "train_generation_input_policy": train_generation_policy,
+        "train_content_evidence_policy": train_content_policy,
+        "train_eval_policy_matched": bool(
+            train_generation_policy == generation_policy and train_content_policy == content_policy
+        ),
+        "hss_style_state_source": (
+            "neutral_constant_paper_compatible"
+            if paper_compat
+            else STEP5_HSS_STYLE_STATE_SOURCE
+        ),
+        "rcr_eval_control_mode": (
+            STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT if no_ref_card else "not_applicable"
+        ),
+        "allowed_content_evidence_sources": [
+            "neutral_constant_paper_compatible",
+            "compact_train_only_history",
+            "train_only_history_or_neutral",
+            "compact_domain_prior",
+            "neutral_no_train_history",
+            "neutral_guarded_current_eval_overlap",
+            "neutral_core_no_ref",
+            "item_phrase_v3_train_history",
+            "item_user_phrase_v3_train_history",
+            "route_weighted_item_phrase_v3_history",
+            "phrase_v3_domain_prior",
+        ],
+        "forbidden_content_evidence_sources": ["current_eval_row", "oracle_content", "current_eval_reference"],
+        "generation_input_policy": generation_policy,
+        "content_evidence_policy": content_policy,
+        "reference_usage": str(final_eval_cfg.get("reference_usage") or STEP5_REFERENCE_USAGE_METRIC_ONLY),
+        "reference_before_generation": False,
+        "reference_after_generation_metric_only": True,
+        "current_eval_row_reference_used_in_generation": False,
+        "current_eval_row_review_used_in_generation": False,
+        "current_eval_row_content_evidence_used_in_generation": False,
+        "content_evidence_token_len": budget,
         "soft_prompt_used": True,
-        "encoder_input_contract": "soft_prompt_plus_content_evidence_legacy32",
+        "encoder_input_contract": (
+            "soft_prompt_plus_neutral_constant_user_item_conditioned"
+            if paper_compat
+            else "soft_prompt_plus_compact96_anchor_card"
+        ),
         "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
         "flan_soft_prompt_len": soft_len,
-        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
-        "tokenizer_kwargs": {"truncation": True, "max_length_policy": "max(4,min(32,label_max_length))"},
+        "encoder_content_token_budget": budget,
+        "retired_legacy32_max_content_tokens": STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "tokenizer_kwargs": {
+            "truncation": True,
+            "max_length_policy": "max(4,min(step5.no_ref_evidence.encoder_content_token_budget,compact_card_budget))",
+        },
         "soft_prompt_only_allowed": False,
     }
 
 
 def _step5_official_eval_policy_payload(final_cfg: FinalTrainingConfig, *, split: str, command: str) -> Dict[str, Any]:
+    final_eval_cfg = {}
+    try:
+        final_eval_cfg = json.loads(str(getattr(final_cfg, "step5_final_eval_config_json", "") or "{}"))
+    except json.JSONDecodeError:
+        final_eval_cfg = {}
+    generation_policy = str(
+        final_eval_cfg.get("generation_input_policy") or STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+    )
+    content_policy = str(
+        final_eval_cfg.get("content_evidence_policy") or STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+    )
+    profile = str(final_eval_cfg.get("official_profile") or "paper_greedy_25")
+    is_k5 = profile == "odcr_no_ref_k5_25"
     return {
-        "schema_version": "odcr_step5_official_eval_policy/1",
-        "profile": "paper_greedy_25",
+        "schema_version": (
+            "odcr_step5_official_eval_policy/3_d4c_paper_compatible"
+            if generation_policy == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+            else ("odcr_step5_official_eval_policy/5_odcr_native_no_ref_k5" if is_k5 else "odcr_step5_official_eval_policy/4_odcr_native_no_ref")
+        ),
+        "profile": profile,
         "split": str(split),
         "command": str(command),
+        "generation_input_policy": generation_policy,
+        "content_evidence_policy": content_policy,
+        "reference_usage": str(final_eval_cfg.get("reference_usage") or STEP5_REFERENCE_USAGE_METRIC_ONLY),
+        "neutral_content_evidence": str(
+            final_eval_cfg.get("neutral_content_evidence") or STEP5_NEUTRAL_CONTENT_EVIDENCE
+        ),
+        "forbid_current_eval_fields_in_generation": list(
+            final_eval_cfg.get("forbid_current_eval_fields_in_generation") or _STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS
+        ),
+        "reference_before_generation": False,
+        "current_eval_row_reference_used_in_generation": False,
+        "current_eval_row_review_used_in_generation": False,
+        "current_eval_row_content_evidence_used_in_generation": False,
+        "reference_after_generation_metric_only": True,
         "decode_strategy": str(final_cfg.decode_strategy),
         "do_sample": False,
         "max_new_tokens": int(final_cfg.max_explanation_length),
@@ -8619,7 +10244,11 @@ def _step5_official_eval_policy_payload(final_cfg: FinalTrainingConfig, *, split
         "repetition_penalty": float(final_cfg.repetition_penalty),
         "official_paper_metrics": "base_utils.official_paper_metrics",
         "metric_input_builder": "base_utils.build_paper_metric_inputs",
-        "rerank_allowed": False,
+        "rerank_allowed": bool(is_k5),
+        "rerank_reference_free": bool(is_k5),
+        "rerank_reference_source": "forbidden",
+        "rerank_source": "decoded_compact96_anchor_card" if is_k5 else "not_applicable",
+        "rerank_top_k": 5 if is_k5 else 1,
     }
 
 
@@ -8662,20 +10291,42 @@ def _step5_decode_artifact_payload(final_cfg: FinalTrainingConfig) -> Dict[str, 
 
 
 def _assert_step5_official_eval_contract(final_cfg: FinalTrainingConfig, *, command: str) -> None:
-    if str(command) == "eval-rerank":
-        raise RuntimeError("Step5 official paper eval forbids rerank; rerank profiles are diagnostic_only.")
-    if str(final_cfg.decode_strategy).strip().lower() != "greedy":
-        raise RuntimeError("Step5 official paper eval requires decode_strategy=greedy (paper_greedy_25).")
+    try:
+        final_eval_cfg = json.loads(str(getattr(final_cfg, "step5_final_eval_config_json", "") or "{}"))
+    except json.JSONDecodeError:
+        final_eval_cfg = {}
+    profile = str(final_eval_cfg.get("official_profile") or "paper_greedy_25")
+    if profile == "odcr_no_ref_k5_25":
+        if str(command) != "eval-rerank":
+            raise RuntimeError("Step5 official odcr_no_ref_k5_25 eval requires eval-rerank command.")
+        if str(final_eval_cfg.get("generation_input_policy") or "") != STEP5_GENERATION_INPUT_POLICY_NO_REF:
+            raise RuntimeError("Step5 official odcr_no_ref_k5_25 requires no-reference generation policy.")
+        if str(final_eval_cfg.get("content_evidence_policy") or "") != STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY:
+            raise RuntimeError("Step5 official odcr_no_ref_k5_25 requires train_only_history content evidence.")
+        if str(final_cfg.decode_strategy).strip().lower() not in {"nucleus", "uncertainty_low_temp_top_k"}:
+            raise RuntimeError("Step5 official odcr_no_ref_k5_25 requires stochastic candidate decode.")
+    else:
+        if str(command) == "eval-rerank":
+            raise RuntimeError("Step5 official paper_greedy_25 eval forbids rerank; rerank profiles are diagnostic_only.")
+        if str(final_cfg.decode_strategy).strip().lower() != "greedy":
+            raise RuntimeError("Step5 official paper eval requires decode_strategy=greedy (paper_greedy_25).")
     if int(final_cfg.max_explanation_length) != 25:
         raise RuntimeError("Step5 official paper eval requires max_explanation_length=25.")
     if int(getattr(final_cfg, "hard_max_len", 25) or 25) != 25:
         raise RuntimeError("Step5 official paper eval requires hard_max_len=25.")
-    if float(final_cfg.repetition_penalty) != 1.0:
+    if profile != "odcr_no_ref_k5_25" and float(final_cfg.repetition_penalty) != 1.0:
         raise RuntimeError("Step5 official paper eval requires repetition_penalty=1.0.")
     if int(getattr(final_cfg, "final_eval_prediction_max_length", 25)) != 25:
         raise RuntimeError("Step5 official paper eval requires step5.final_eval.prediction_max_length=25.")
     if int(getattr(final_cfg, "final_eval_reference_max_length", 25)) != 25:
         raise RuntimeError("Step5 official paper eval requires step5.final_eval.reference_max_length=25.")
+    try:
+        final_eval_cfg = json.loads(str(getattr(final_cfg, "step5_final_eval_config_json", "") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Step5 final_eval no-reference config is invalid JSON: {exc}") from exc
+    _assert_step5_formal_eval_policy_config(final_eval_cfg, ctx="Step5 official eval")
+    if str(final_eval_cfg.get("reference_usage") or "") != STEP5_REFERENCE_USAGE_METRIC_ONLY:
+        raise RuntimeError("Step5 official paper eval requires reference_usage=metric_only_after_generation.")
 
 
 def _is_clean_official_step5_test_metrics_payload(metrics: Mapping[str, Any], *, expected_schema: str) -> bool:
@@ -8704,7 +10355,23 @@ def _is_clean_official_step5_test_metrics_payload(metrics: Mapping[str, Any], *,
         and int(token_policy.get("prediction_max_length") or 0) == 25
         and int(token_policy.get("reference_max_length") or 0) == 25
         and content_contract.get("content_evidence_used") is True
-        and str(content_contract.get("encoder_input_contract") or "") == "soft_prompt_plus_content_evidence_legacy32"
+        and str(content_contract.get("generation_input_policy") or "") in {
+            STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT,
+            STEP5_GENERATION_INPUT_POLICY_NO_REF,
+        }
+        and str(content_contract.get("content_evidence_policy") or "") in {
+            STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT,
+            STEP5_CONTENT_EVIDENCE_POLICY_TRAIN_ONLY_HISTORY,
+        }
+        and content_contract.get("reference_before_generation") is False
+        and content_contract.get("reference_after_generation_metric_only") is True
+        and content_contract.get("current_eval_row_reference_used_in_generation") is False
+        and content_contract.get("current_eval_row_review_used_in_generation") is False
+        and content_contract.get("current_eval_row_content_evidence_used_in_generation") is False
+        and str(content_contract.get("encoder_input_contract") or "") in {
+            "soft_prompt_plus_neutral_constant_user_item_conditioned",
+            "soft_prompt_plus_compact96_train_only_evidence",
+        }
     )
 
 
@@ -9146,10 +10813,12 @@ def _run_ddp(args):
             _review_meta: Dict[str, Any] = {"fast_path": "not_used", "review_rows_count": 0}
             _review_t0 = time.perf_counter()
             if str(args.command) == "eval-rerank":
-                if rank == 0:
-                    _review_rows, _review_meta = _load_review_by_sample_id(
-                        str(getattr(args, "_odcr_eval_data_path", "") or "")
-                    )
+                _review_meta = {
+                    "fast_path": "disabled_no_reference_anchor_rerank",
+                    "review_rows_count": 0,
+                    "current_eval_review_used": False,
+                    "rerank_source": "decoded_compact96_anchor_card",
+                }
                 gathered_review: List[Any] = [_review_rows, _review_meta]
                 dist.broadcast_object_list(gathered_review, src=0)
                 _review_rows = list(gathered_review[0] or [])
@@ -9260,15 +10929,37 @@ def _run_ddp(args):
                             "[eval_artifact_reclosure] replacing idempotent eval metrics for same checkpoint/split: %s",
                             existing_path,
                         )
-                        continue
-                    raise RuntimeError(
-                        f"Refusing to overwrite existing eval metrics output: {existing_path}. "
-                        "Use a new eval/rerank run id."
-                    )
+                    else:
+                        raise RuntimeError(
+                            f"Refusing to overwrite existing eval metrics output: {existing_path}. "
+                            "Use a new eval/rerank run id."
+                        )
                 checkpoint_lineage = read_checkpoint_lineage(final_cfg.save_file, expected_stage="step5")
+                content_evidence_contract = _step5_content_evidence_contract_payload(final_cfg)
+                checkpoint_content_contract = (
+                    checkpoint_lineage.get("content_evidence_contract")
+                    if isinstance(checkpoint_lineage.get("content_evidence_contract"), Mapping)
+                    else {}
+                )
+                checkpoint_train_eval_policy_mismatch = checkpoint_content_contract != content_evidence_contract
+                _bounded_max_rows = int((os.environ.get("ODCR_EVAL_MAX_ROWS") or "0").strip() or 0)
+                _bounded_diagnostic = bool(_bounded_max_rows > 0 or (os.environ.get("ODCR_EVAL_BOUNDED_DIAGNOSTIC") or "0") == "1")
+                _odcr_native_no_ref_eval = (
+                    str(content_evidence_contract.get("generation_input_policy") or "")
+                    == STEP5_GENERATION_INPUT_POLICY_NO_REF
+                )
+                if checkpoint_train_eval_policy_mismatch:
+                    _paper_status = "checkpoint_policy_mismatch_requires_matching_step5_retrain"
+                elif _bounded_diagnostic:
+                    _paper_status = "bounded_diagnostic_not_paper_result"
+                elif _odcr_native_no_ref_eval:
+                    _paper_status = "odcr_native_no_ref_candidate"
+                else:
+                    _paper_status = "paper_compatible_candidate"
+                _paper_table_allowed = bool((not checkpoint_train_eval_policy_mismatch) and (not _bounded_diagnostic))
                 _sp_eval = _state_paths_from_save_file(str(final_cfg.save_file))
                 auto_selected_params: Dict[str, Any] = {}
-                if str(_split_lab) == "test":
+                if str(_split_lab) == "test" and _paper_table_allowed:
                     asp = _sp_eval["auto_selected_params"]
                     if not os.path.isfile(asp):
                         raise RuntimeError(
@@ -9280,6 +10971,16 @@ def _run_ddp(args):
                         raise RuntimeError("Step5 official test lock must come from valid split, not test.")
                     if str(auto_selected_params.get("checkpoint") or "") != os.path.abspath(str(final_cfg.save_file)):
                         raise RuntimeError("Step5 official test checkpoint differs from locked valid best.")
+                elif str(_split_lab) == "test":
+                    auto_selected_params = {
+                        "schema_version": "odcr_step5e_auto_selected_params/1",
+                        "selection_basis": "transition_diagnostic_no_paper_lock",
+                        "test_used_for_selection": False,
+                        "checkpoint": os.path.abspath(str(final_cfg.save_file)),
+                        "paper_status": _paper_status,
+                        "paper_table_allowed": _paper_table_allowed,
+                        "bounded_diagnostic": _bounded_diagnostic,
+                    }
                 _ebn = (os.environ.get("ODCR_EVAL_PROFILE_NAME") or "").strip() or None
                 if _ebn:
                     train_logger.info(
@@ -9332,13 +11033,107 @@ def _run_ddp(args):
                 except Exception as exc:
                     raise RuntimeError(f"Step5 official eval requires valid Step3 rating_source: {exc}") from exc
                 _eval_control_contract = step5_factual_eval_control_contract(_split_lab)
-                content_evidence_contract = _step5_content_evidence_contract_payload(final_cfg)
+                checkpoint_replay_policy = {
+                    "schema_version": "odcr_step5_checkpoint_replay_policy/3_odcr_native_no_ref",
+                    "train_eval_policy_mismatch": bool(checkpoint_train_eval_policy_mismatch),
+                    "checkpoint_content_evidence_contract": checkpoint_content_contract,
+                    "current_eval_content_evidence_contract": content_evidence_contract,
+                    "paper_status": _paper_status,
+                    "paper_table_allowed": _paper_table_allowed,
+                    "bounded_diagnostic": _bounded_diagnostic,
+                    "bounded_max_rows": _bounded_max_rows or None,
+                }
                 official_eval_policy = _step5_official_eval_policy_payload(
                     final_cfg,
                     split=str(_split_lab),
                     command=str(args.command),
                 )
+                try:
+                    no_ref_evidence_policy = json.loads(str(final_cfg.step5_no_ref_evidence_config_json or "{}"))
+                except Exception:
+                    no_ref_evidence_policy = {}
+                _eval_generation_policy = str(
+                    content_evidence_contract.get("generation_input_policy") or STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+                )
+                _eval_content_policy = str(
+                    content_evidence_contract.get("content_evidence_policy") or STEP5_CONTENT_EVIDENCE_POLICY_NEUTRAL_CONSTANT
+                )
+                _eval_content_source = str(
+                    content_evidence_contract.get("content_evidence_source") or "neutral_constant_paper_compatible"
+                )
+                _eval_input_protocol = (
+                    "not_applicable_paper_compatible"
+                    if _eval_generation_policy == STEP5_GENERATION_INPUT_POLICY_D4C_COMPAT
+                    else str(no_ref_evidence_policy.get("input_protocol") or TEXT_CLEAN_ITEM_ONLY_NO_REF)
+                )
                 encoder_input_audit = final.get("encoder_input_token_audit") or _summarize_step5_encoder_input_rows(merged)
+                no_ref_input_protocol = _eval_input_protocol
+                generation_input_samples = _build_step5_generation_input_samples(
+                    merged,
+                    eval_frame=pd.DataFrame(
+                        list(getattr(args, "_odcr_generation_input_frame_records", []) or [])
+                    ),
+                    split_label=str(_split_lab),
+                    split_csv=str(getattr(args, "_odcr_eval_data_path", "") or ""),
+                    no_ref_input_protocol=no_ref_input_protocol,
+                    max_samples=100,
+                    encoder_content_token_budget=int(
+                        (content_evidence_contract or {}).get(
+                            "encoder_content_token_budget",
+                            STEP5_ENCODER_CONTENT_TOKEN_BUDGET,
+                        )
+                    ),
+                )
+                generation_input_audit = {
+                    "schema_version": "odcr_step5_generation_input_audit/1",
+                    "split": str(_split_lab),
+                    "sample_count": int(len(merged)),
+                    "generation_input_policy": _eval_generation_policy,
+                    "content_evidence_policy": _eval_content_policy,
+                    "no_ref_input_protocol": no_ref_input_protocol,
+                    "no_ref_evidence_policy": no_ref_evidence_policy,
+                    "content_evidence_source": _eval_content_source,
+                    "current_eval_row_reference_used_in_generation": False,
+                    "current_eval_row_review_used_in_generation": False,
+                    "current_eval_row_content_evidence_used_in_generation": False,
+                    "reference_before_generation": False,
+                    "reference_after_generation_metric_only": True,
+                    "encoder_input_token_audit": encoder_input_audit,
+                    "checkpoint_replay_policy": checkpoint_replay_policy,
+                    "input_sample_schema_version": "odcr_step5_generation_input_samples/1",
+                    "input_sample_count": int(len(generation_input_samples)),
+                    "input_samples": generation_input_samples,
+                }
+                no_reference_evidence_guard = {
+                    "schema_version": "odcr_step5_no_leak_generation_input_guard/3_odcr_native_no_ref",
+                    "status": "pass",
+                    "old_oracle_eval_removed": True,
+                    "generation_input_policy": _eval_generation_policy,
+                    "content_evidence_policy": _eval_content_policy,
+                    "no_ref_input_protocol": no_ref_input_protocol,
+                    "no_ref_evidence_policy": no_ref_evidence_policy,
+                    "reference_usage": STEP5_REFERENCE_USAGE_METRIC_ONLY,
+                    "reference_before_generation": False,
+                    "current_eval_row_reference_used_in_generation": False,
+                    "current_eval_row_review_used_in_generation": False,
+                    "current_eval_row_content_evidence_used_in_generation": False,
+                    "reference_after_generation_metric_only": True,
+                    "forbidden_current_eval_fields": list(_STEP5_NO_REF_FORBIDDEN_EVAL_FIELDS),
+                    "paper_table_allowed": _paper_table_allowed,
+                    "checkpoint_replay_policy": checkpoint_replay_policy,
+                }
+                metric_source_ledger = {
+                    "schema_version": "odcr_step5_metric_source_ledger/1",
+                    "prediction_source": "generated_text_after_user_item_conditioned_generation",
+                    "reference_source": "raw_ref_text_metric_only_after_generation",
+                    "metric_builder": "base_utils.build_paper_metric_inputs",
+                    "metrics_implementation": "base_utils.official_paper_metrics",
+                    "rating_metrics_source": "step3_eval_handoff",
+                    "step5_rating_metrics_overwritten": False,
+                    "reference_before_generation": False,
+                    "reference_after_generation_metric_only": True,
+                    "checkpoint_replay_policy": checkpoint_replay_policy,
+                }
                 metrics_payload = {
                     "metrics_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
                     "eval_output_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
@@ -9348,6 +11143,29 @@ def _run_ddp(args):
                     "official_eval_profile": "paper_greedy_25",
                     "official_eval_policy": official_eval_policy,
                     "content_evidence_contract": content_evidence_contract,
+                    "generation_input_audit": generation_input_audit,
+                    "no_reference_evidence_guard": no_reference_evidence_guard,
+                    "metric_source_ledger": metric_source_ledger,
+                    "checkpoint_replay_policy": checkpoint_replay_policy,
+                    "candidate_paper_metrics_available": _paper_table_allowed,
+                    "requires_matching_step5_retrain": bool(checkpoint_train_eval_policy_mismatch),
+                    "requires_d4c_compatible_retrain": bool(checkpoint_train_eval_policy_mismatch),
+                    "paper_status": _paper_status,
+                    "paper_table_allowed": _paper_table_allowed,
+                    "bounded_diagnostic": _bounded_diagnostic,
+                    "bounded_max_rows": _bounded_max_rows or None,
+                    "generation_input_policy": _eval_generation_policy,
+                    "content_evidence_policy": _eval_content_policy,
+                    "no_ref_input_protocol": no_ref_input_protocol,
+                    "no_ref_evidence_policy": no_ref_evidence_policy,
+                    "content_evidence_source": _eval_content_source,
+                    "reference_usage": STEP5_REFERENCE_USAGE_METRIC_ONLY,
+                    "reference_before_generation": False,
+                    "current_eval_row_reference_used_in_generation": False,
+                    "current_eval_row_review_used_in_generation": False,
+                    "current_eval_row_content_evidence_used_in_generation": False,
+                    "reference_after_generation_metric_only": True,
+                    "old_oracle_eval_removed": True,
                     "encoder_input_token_audit": encoder_input_audit,
                     "encoder_truncated_count": int(encoder_input_audit.get("encoder_truncated_count", 0) or 0),
                     "encoder_truncated_rate": float(encoder_input_audit.get("encoder_truncated_rate", 0.0) or 0.0),
@@ -9385,7 +11203,13 @@ def _run_ddp(args):
                     "token_length_policy": {
                         "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
                         "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
-                        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+                        "encoder_content_token_budget": int(
+                            (content_evidence_contract or {}).get(
+                                "encoder_content_token_budget",
+                                STEP5_ENCODER_CONTENT_TOKEN_BUDGET,
+                            )
+                        ),
+                        "retired_legacy32_max_content_tokens": STEP5_RETIRED_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
                         "builder": "base_utils.build_paper_metric_inputs",
                     },
                     "collapse_stats": collapse_stats,
@@ -9576,6 +11400,12 @@ def _run_ddp(args):
                     "paper_metrics": final.get("paper_metrics") or {},
                     "collapse_stats": collapse_stats,
                 }
+                eval_handoff_path = os.path.join(eval_sub, "eval_handoff.json")
+                official_report_path = os.path.join(eval_sub, "official_eval_report.json")
+                paper_metrics_path = os.path.join(eval_sub, "paper_metrics.json")
+                generation_input_audit_path = os.path.join(eval_sub, "generation_input_audit.json")
+                no_ref_guard_path = os.path.join(eval_sub, "no_reference_evidence_guard.json")
+                metric_source_ledger_path = os.path.join(eval_sub, "metric_source_ledger.json")
                 handoff_payload = build_step5_explanation_handoff(
                     task=int(final_cfg.task_idx),
                     run_id=str(metrics_payload.get("step5_run_id") or ""),
@@ -9592,8 +11422,34 @@ def _run_ddp(args):
                         "eval_control_mode": STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT,
                     },
                 )
+                handoff_payload.update(
+                    {
+                        "split": str(_split_lab),
+                        "paper_status": _paper_status,
+                        "paper_table_allowed": _paper_table_allowed,
+                        "bounded_diagnostic": _bounded_diagnostic,
+                        "bounded_max_rows": _bounded_max_rows or None,
+                        "official_eval_profile": "paper_greedy_25",
+                        "official_eval_report": os.path.abspath(official_report_path),
+                        "metrics_path": os.path.abspath(metrics_output_path),
+                        "paper_metrics_path": os.path.abspath(paper_metrics_path),
+                        "generation_input_audit": os.path.abspath(generation_input_audit_path),
+                        "no_reference_evidence_guard": no_reference_evidence_guard,
+                        "no_reference_evidence_guard_path": os.path.abspath(no_ref_guard_path),
+                        "metric_source_ledger_path": os.path.abspath(metric_source_ledger_path),
+                        "generation_input_policy": _eval_generation_policy,
+                        "content_evidence_policy": _eval_content_policy,
+                        "content_evidence_contract": content_evidence_contract,
+                        "reference_before_generation": False,
+                        "reference_after_generation_metric_only": True,
+                        "current_eval_row_reference_used_in_generation": False,
+                        "current_eval_row_review_used_in_generation": False,
+                        "current_eval_row_content_evidence_used_in_generation": False,
+                        "test_used_for_selection": False if str(_split_lab) == "valid" else None,
+                    }
+                )
                 official_report = {
-                    "schema_version": "odcr_step5_official_eval_report/1",
+                    "schema_version": "odcr_step5_official_eval_report/4_odcr_native_no_ref",
                     "stage": "step5",
                     "task_id": int(final_cfg.task_idx),
                     "split": str(_split_lab),
@@ -9601,6 +11457,26 @@ def _run_ddp(args):
                     "metrics_path": os.path.abspath(metrics_output_path),
                     "rating_metrics_source": "step3_eval_handoff",
                     "step5_rating_metrics_overwritten": False,
+                    "generation_input_policy": _eval_generation_policy,
+                    "content_evidence_policy": _eval_content_policy,
+                    "no_ref_input_protocol": str(
+                        no_ref_evidence_policy.get("input_protocol") or TEXT_CLEAN_ITEM_ONLY_NO_REF
+                    ),
+                    "no_ref_evidence_policy": no_ref_evidence_policy,
+                    "content_evidence_source": _eval_content_source,
+                    "reference_before_generation": False,
+                    "current_eval_row_reference_used_in_generation": False,
+                    "current_eval_row_review_used_in_generation": False,
+                    "current_eval_row_content_evidence_used_in_generation": False,
+                    "reference_after_generation_metric_only": True,
+                    "paper_status": _paper_status,
+                    "paper_table_allowed": _paper_table_allowed,
+                    "bounded_diagnostic": _bounded_diagnostic,
+                    "bounded_max_rows": _bounded_max_rows or None,
+                    "old_oracle_eval_removed": True,
+                    "generation_input_audit": generation_input_audit,
+                    "no_reference_evidence_guard": no_reference_evidence_guard,
+                    "metric_source_ledger": metric_source_ledger,
                     "encoder_input_token_audit": encoder_input_audit,
                     "metrics": final,
                 }
@@ -9610,15 +11486,39 @@ def _run_ddp(args):
                 )
                 composed_paper["split"] = str(_split_lab)
                 composed_paper["explanation_paper_metrics"] = final.get("paper_metrics") or {}
-                atomic_write_json(os.path.join(eval_sub, "eval_handoff.json"), handoff_payload)
-                atomic_write_json(os.path.join(eval_sub, "official_eval_report.json"), official_report)
-                atomic_write_json(os.path.join(eval_sub, "paper_metrics.json"), composed_paper)
-                if str(_split_lab) == "valid":
+                atomic_write_json(eval_handoff_path, handoff_payload)
+                atomic_write_json(official_report_path, official_report)
+                atomic_write_json(paper_metrics_path, composed_paper)
+                atomic_write_json(generation_input_audit_path, generation_input_audit)
+                atomic_write_json(
+                    os.path.join(eval_sub, "generation_input_samples.json"),
+                    {
+                        "schema_version": "odcr_step5_generation_input_samples/1",
+                        "sample_count": int(len(generation_input_samples)),
+                        "samples": generation_input_samples,
+                    },
+                )
+                atomic_write_json(no_ref_guard_path, no_reference_evidence_guard)
+                atomic_write_json(metric_source_ledger_path, metric_source_ledger)
+                eval_meta_dir = os.path.join(eval_sub, "meta")
+                os.makedirs(eval_meta_dir, exist_ok=True)
+                atomic_write_json(os.path.join(eval_meta_dir, "generation_input_audit.json"), generation_input_audit)
+                atomic_write_json(
+                    os.path.join(eval_meta_dir, "generation_input_samples.json"),
+                    {
+                        "schema_version": "odcr_step5_generation_input_samples/1",
+                        "sample_count": int(len(generation_input_samples)),
+                        "samples": generation_input_samples,
+                    },
+                )
+                atomic_write_json(os.path.join(eval_meta_dir, "no_reference_evidence_guard.json"), no_reference_evidence_guard)
+                atomic_write_json(os.path.join(eval_meta_dir, "metric_source_ledger.json"), metric_source_ledger)
+                if str(_split_lab) == "valid" and _paper_table_allowed:
                     _sp_lock = _state_paths_from_save_file(str(final_cfg.save_file))
                     _valid_lock = {
                         "schema_version": "odcr_step5e_auto_selected_params/1",
                         "locked_split": "valid",
-                        "selection_basis": "valid official paper_greedy_25 metrics",
+                        "selection_basis": "valid official paper_greedy_25 metrics without current-reference generation input",
                         "test_used_for_selection": False,
                         "checkpoint": os.path.abspath(str(final_cfg.save_file)),
                         "checkpoint_hash": checkpoint_file_sha256(str(final_cfg.save_file)),
@@ -9640,10 +11540,17 @@ def _run_ddp(args):
                         "metrics_implementation": "base_utils.official_paper_metrics",
                         "content_evidence_used": True,
                         "content_evidence_contract": content_evidence_contract,
+                        "generation_input_policy": _eval_generation_policy,
+                        "content_evidence_policy": _eval_content_policy,
+                        "reference_before_generation": False,
+                        "reference_after_generation_metric_only": True,
+                        "current_eval_row_reference_used_in_generation": False,
+                        "current_eval_row_review_used_in_generation": False,
+                        "current_eval_row_content_evidence_used_in_generation": False,
                         "encoder_input_token_audit": encoder_input_audit,
                         "selected_params": {
                             "best_metric_policy": "official_paper_metrics_valid_only",
-                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
+                            "best_content_evidence_policy": _eval_content_policy,
                             "best_cache_policy": "token_cache_identity_content_affecting_only",
                         },
                         "candidates": [
@@ -9660,6 +11567,88 @@ def _run_ddp(args):
                     }
                     os.makedirs(_sp_lock["meta_dir"], exist_ok=True)
                     atomic_write_json(_sp_lock["auto_selected_params"], _valid_lock)
+                    if os.path.isfile(_sp_lock["best_event"]):
+                        _best_event = load_json_file(_sp_lock["best_event"])
+                        if isinstance(_best_event, dict):
+                            _best_event.update(
+                                {
+                                    "valid_official_metrics": final.get("paper_metrics") or {},
+                                    "checkpoint_acceptance": "accepted_by_valid_official_paper_metrics",
+                                    "checkpoint_selection_mode": "official_paper_metrics",
+                                    "checkpoint_save_reason": "valid_official_paper_metrics_locked_after_generation_eval",
+                                    "valid_eval_lock_path": os.path.abspath(_sp_lock["auto_selected_params"]),
+                                    "test_eligibility": "eligible_after_clean_valid_official_lock",
+                                    "test_used_for_selection": False,
+                                    "updated_after_valid_eval_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                }
+                            )
+                            atomic_write_json(_sp_lock["best_event"], _best_event)
+                    _repo_root_lock = get_odcr_root()
+
+                    def _rel_lock(_path: str) -> str:
+                        try:
+                            return os.path.relpath(os.path.abspath(_path), _repo_root_lock)
+                        except Exception:
+                            return os.path.abspath(_path)
+
+                    _parent_handoff = dict(handoff_payload)
+                    _parent_handoff.update(
+                        {
+                            "status": "accepted",
+                            "accepted_by": "valid_official_paper_metrics",
+                            "selection_basis": "valid official paper_greedy_25 metrics without current-reference generation input",
+                            "test_used_for_selection": False,
+                            "valid_eval_lock_path": os.path.abspath(_sp_lock["auto_selected_params"]),
+                            "valid_eval_run": os.path.abspath(eval_sub),
+                        }
+                    )
+                    _parent_explanation_handoff = os.path.join(_sp_lock["meta_dir"], "explanation_handoff.json")
+                    _parent_eval_handoff = os.path.join(_sp_lock["meta_dir"], "eval_handoff.json")
+                    atomic_write_json(_parent_explanation_handoff, _parent_handoff)
+                    atomic_write_json(_parent_eval_handoff, _parent_handoff)
+                    _parent_summary_path = os.path.join(_sp_lock["meta_dir"], "run_summary.json")
+                    if os.path.isfile(_parent_summary_path):
+                        _parent_summary = load_json_file(_parent_summary_path)
+                    else:
+                        _parent_summary = {}
+                    if isinstance(_parent_summary, dict):
+                        _parent_summary.update(
+                            {
+                                "status": "completed_with_explanation_handoff",
+                                "train_status": "completed",
+                                "eval_status": "completed",
+                                "needs_eval_handoff": False,
+                                "downstream_ready": True,
+                                "ready_for": ["eval", "rerank"],
+                                "selected_checkpoint": _rel_lock(str(final_cfg.save_file)),
+                                "selected_checkpoint_hash": checkpoint_file_sha256(str(final_cfg.save_file)),
+                                "explanation_handoff": _rel_lock(_parent_explanation_handoff),
+                                "eval_handoff": _rel_lock(_parent_eval_handoff),
+                                "latest_eval": _rel_lock(eval_sub),
+                                "latest_valid_eval": _rel_lock(eval_sub),
+                                "official_valid_eval_report": _rel_lock(official_report_path),
+                                "official_valid_metrics": final.get("paper_metrics") or {},
+                                "valid_eval_lock_path": _rel_lock(_sp_lock["auto_selected_params"]),
+                                "test_used_for_selection": False,
+                                "updated_after_valid_eval_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            }
+                        )
+                        atomic_write_json(_parent_summary_path, _parent_summary)
+                    _run_id_for_stage_status = str(metrics_payload.get("step5_run_id") or Path(_sp_lock["run_dir"]).name)
+                    _parent_stage_status = build_and_write_stage_status(
+                        repo_root=_repo_root_lock,
+                        stage="step5",
+                        task=int(final_cfg.task_idx),
+                        run_id=_run_id_for_stage_status,
+                    )
+                    _valid_lock["parent_explanation_handoff"] = os.path.abspath(_parent_explanation_handoff)
+                    _valid_lock["parent_eval_handoff"] = os.path.abspath(_parent_eval_handoff)
+                    _valid_lock["parent_stage_status"] = os.path.abspath(
+                        os.path.join(_sp_lock["meta_dir"], "stage_status.json")
+                    )
+                    _valid_lock["parent_stage_status_final_status"] = _parent_stage_status.get("final_status")
+                    _valid_lock["parent_downstream_ready"] = _parent_stage_status.get("downstream_ready")
+                    atomic_write_json(_sp_lock["auto_selected_params"], _valid_lock)
                     _auto_report_dir = os.path.join(get_odcr_root(), "AI_analysis", "05_final_reports")
                     os.makedirs(_auto_report_dir, exist_ok=True)
                     atomic_write_json(
@@ -9671,17 +11660,90 @@ def _run_ddp(args):
                             "auto_selected_params": _valid_lock,
                         },
                     )
+                elif str(_split_lab) == "valid":
+                    train_logger.info(
+                        "[valid_selection_lock] skipped paper_table_allowed=%s paper_status=%s bounded_diagnostic=%s",
+                        _paper_table_allowed,
+                        _paper_status,
+                        _bounded_diagnostic,
+                        extra=log_route_extra(train_logger, ROUTE_SUMMARY),
+                    )
                 samples_path = os.path.join(eval_sub, "samples.jsonl")
                 with open(samples_path, "w", encoding="utf-8") as sf:
                     for row in list(merged_for_pred)[:200]:
                         sf.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                eval_meta_dir = os.path.join(eval_sub, "meta")
+                os.makedirs(eval_meta_dir, exist_ok=True)
+                _complete_progress = {
+                    "schema_version": STEP5_EVAL_PROGRESS_SCHEMA_VERSION,
+                    "task": int(final_cfg.task_idx),
+                    "run_id": str(metrics_payload.get("step5_run_id") or ""),
+                    "split": str(_split_lab),
+                    "stage": "complete",
+                    "rank": 0,
+                    "pid": os.getpid(),
+                    "batch_idx": None,
+                    "total_batches": None,
+                    "rows_done": int(len(merged_for_pred)),
+                    "elapsed_sec": float((metrics_payload.get("eval_performance") or {}).get("summary", {}).get("total_eval_time", 0.0) or 0.0),
+                    "last_batch_decode_sec": None,
+                    "samples_per_sec": (
+                        float(len(merged_for_pred))
+                        / max(float((metrics_payload.get("eval_performance") or {}).get("summary", {}).get("total_eval_time", 0.0) or 0.0), 1.0e-9)
+                    ),
+                    "gpu_allocated_gb": _step5_gpu_memory_gb(local_rank)[0],
+                    "gpu_reserved_gb": _step5_gpu_memory_gb(local_rank)[1],
+                    "complete": True,
+                    "paper_table_allowed": _paper_table_allowed,
+                    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                atomic_write_json(os.path.join(eval_meta_dir, "eval_progress.json"), _complete_progress)
                 metrics_payload["official_eval_outputs"] = {
                     "eval_handoff": os.path.abspath(os.path.join(eval_sub, "eval_handoff.json")),
                     "official_eval_report": os.path.abspath(os.path.join(eval_sub, "official_eval_report.json")),
                     "paper_metrics": os.path.abspath(os.path.join(eval_sub, "paper_metrics.json")),
+                    "generation_input_audit": os.path.abspath(os.path.join(eval_sub, "generation_input_audit.json")),
+                    "no_reference_evidence_guard": os.path.abspath(os.path.join(eval_sub, "no_reference_evidence_guard.json")),
+                    "metric_source_ledger": os.path.abspath(os.path.join(eval_sub, "metric_source_ledger.json")),
                     "samples": os.path.abspath(samples_path),
                 }
-                if str(_split_lab) == "valid":
+                _eval_stage_status = {
+                    "schema_version": "odcr_step5_eval_stage_status/1",
+                    "stage": "step5_eval",
+                    "task": int(final_cfg.task_idx),
+                    "task_id": int(final_cfg.task_idx),
+                    "run_id": str(metrics_payload.get("step5_run_id") or ""),
+                    "eval_run_id": os.path.basename(os.path.abspath(eval_sub)),
+                    "split": str(_split_lab),
+                    "status": "completed",
+                    "final_status": "completed",
+                    "paper_status": _paper_status,
+                    "paper_table_allowed": _paper_table_allowed,
+                    "bounded_diagnostic": _bounded_diagnostic,
+                    "bounded_max_rows": _bounded_max_rows or None,
+                    "checkpoint": os.path.abspath(str(final_cfg.save_file)),
+                    "checkpoint_hash": checkpoint_file_sha256(str(final_cfg.save_file)),
+                    "generation_input_policy": _eval_generation_policy,
+                    "content_evidence_policy": _eval_content_policy,
+                    "reference_before_generation": False,
+                    "reference_after_generation_metric_only": True,
+                    "root_latest_updated": False,
+                    "artifacts": {
+                        "eval_metrics": os.path.abspath(metrics_output_path),
+                        "official_eval_report": os.path.abspath(os.path.join(eval_sub, "official_eval_report.json")),
+                        "predictions_csv": os.path.abspath(pred_csv),
+                        "samples_jsonl": os.path.abspath(samples_path),
+                        "generation_input_audit": os.path.abspath(os.path.join(eval_meta_dir, "generation_input_audit.json")),
+                        "no_reference_evidence_guard": os.path.abspath(os.path.join(eval_meta_dir, "no_reference_evidence_guard.json")),
+                        "eval_progress": os.path.abspath(os.path.join(eval_meta_dir, "eval_progress.json")),
+                    },
+                    "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                atomic_write_json(os.path.join(eval_meta_dir, "stage_status.json"), _eval_stage_status)
+                metrics_payload["official_eval_outputs"]["stage_status"] = os.path.abspath(
+                    os.path.join(eval_meta_dir, "stage_status.json")
+                )
+                if str(_split_lab) == "valid" and _paper_table_allowed:
                     metrics_payload["official_eval_outputs"]["auto_selected_params"] = os.path.abspath(
                         _state_paths_from_save_file(str(final_cfg.save_file))["auto_selected_params"]
                     )

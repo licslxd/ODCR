@@ -1,0 +1,21 @@
+name: odcr-cier-adapted
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - pandas
+  - numpy=1.26
+  - scikit-learn
+  - pyyaml
+  - pip:
+      - torch==2.2.2
+      - transformers==4.37.2
+      - peft==0.3.0
+      - accelerate==0.28.0
+      - sentencepiece==0.1.99
+      - pyarrow==14.0.2
+      - datasets==2.14.7
+      - evaluate==0.4.0

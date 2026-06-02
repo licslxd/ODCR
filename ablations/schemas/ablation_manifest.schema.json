@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "odcr_ablation_manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "is_ablation",
+    "task",
+    "variant",
+    "scenario",
+    "base_protocol",
+    "base_full_run",
+    "rating_source",
+    "forbidden_to_promote_latest",
+    "paper_table_allowed",
+    "requires_manual_review",
+    "status",
+    "notes"
+  ],
+  "properties": {
+    "is_ablation": {"const": true},
+    "task": {"enum": [7, 8]},
+    "variant": {"enum": ["wo_rcr", "wo_cf", "wo_ccv_fca"]},
+    "scenario": {"const": "weak_cross_platform"},
+    "base_protocol": {"const": "paper_greedy_25"},
+    "base_full_run": {"pattern": "^runs/step5/task[78]/1_19$"},
+    "rating_source": {"const": "task_local_step3_accepted_scorer"},
+    "forbidden_to_promote_latest": {"const": true},
+    "paper_table_allowed": {"const": false},
+    "requires_manual_review": {"const": true},
+    "status": {"const": "planned_skeleton_no_training"},
+    "notes": {"type": "string", "minLength": 1}
+  }
+}

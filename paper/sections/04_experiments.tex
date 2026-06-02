@@ -1,0 +1,37 @@
+\section{Experimental Setup}
+
+\subsection{Datasets and Directed Transfer Settings}
+
+ODCR is evaluated on four directed cross-domain explainable recommendation
+settings. The strong-related Amazon settings transfer between AM-Movies and
+AM-CDs in both directions. The weak cross-platform settings transfer between
+TripAdvisor and Yelp in both directions. In each setting, the dataset named in
+the result-table block is the evaluation dataset, and the auxiliary domain is
+the domain used for cross-domain transfer.
+
+\subsection{Metrics}
+
+We report automatic text-generation metrics and rating-error metrics in the
+same overall performance tables. The text metrics are ROUGE-1, ROUGE-L, BLEU-1,
+BLEU-2, BLEU-3, BLEU-4, METEOR, DIST-1, and DIST-2. Rating errors are reported
+by RMSE and MAE. Larger values are better for the automatic text metrics, while
+smaller values are better for RMSE and MAE.
+
+\subsection{Baselines and Comparison Scope}
+
+The comparison includes single-domain methods (DualPC, PETER, ReXPlug, and
+ERRA) and cross-domain methods (PEFT, PEPLER, AdaReX, D4C, and ODCR). D4C is
+the closest causal reference point for ODCR's dynamic textual-feedback view
+\cite{d4c}. Classical explainable recommendation systems are cited as
+task-family context where appropriate \cite{peter,pepler,adarex}. Modern
+external baselines such as CIER, MAPLE, ELIXIR, Prism, and XRec remain future
+comparison targets unless they are adapted to the same data and evaluation
+setting.
+
+\subsection{Evaluation Scope}
+
+We report single-run results on four directed transfer settings. Baseline
+values are adapted from the original D4C reporting and are shown without
+standard deviations for compactness. ODCR values are current single-run results,
+so the tables should be read as bounded evidence rather than as a multi-seed
+benchmark claim.

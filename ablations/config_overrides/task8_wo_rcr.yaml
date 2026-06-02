@@ -1,0 +1,33 @@
+task: 8
+variant: wo_rcr
+scenario: weak_cross_platform
+output_run: runs/step5/task8/ablation_wo_rcr_1
+source_full_run: runs/step5/task8/1_19
+expected_step3_rating_source: task_local_step3_accepted_scorer
+expected_step4_handoff_source: runs/step4/task8/latest.json
+base_protocol: paper_greedy_25
+step5:
+  head: explanation
+  lifecycle: train_only
+  explanation_only: true
+  official_eval_profile: paper_greedy_25
+safety:
+  no_promote_latest: true
+  forbidden_to_promote_latest: true
+  dry_run_safe: true
+variant_controls:
+  rcr:
+    route_pool_weighting: disabled
+    route_filter: disabled_for_ablation
+    pool_weight_source: uniform
+    sampling_policy: flat_uniform_eligible_pool
+  cf:
+    auxiliary_cross_domain_samples: preserve
+    cf_samples: preserve
+  ccv:
+    enabled: preserve
+  fca:
+    enabled: preserve
+migration_notes:
+  old_logic: none_migrated
+  active_training_support: future_formal_ablation_session_must_bind_these_controls_before_train

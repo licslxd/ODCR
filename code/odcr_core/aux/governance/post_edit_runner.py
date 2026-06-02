@@ -348,6 +348,7 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "code/tests/test_eval_report_composes_step3_rating_and_step5_explanation.py",
                 "code/tests/test_step5_eval_metrics_only_summary.py",
                 "code/tests/test_step5_explanation_quality_contract.py",
+                "code/tests/test_step5_no_ref_eval_runability.py",
                 "code/tests/test_step4_route_scorer_is_stability_signal.py",
             ),
             python_executable=python_executable,

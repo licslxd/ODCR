@@ -23,6 +23,7 @@ STEP5_RETIRED_SCORER_HEAD = "step5" + "A"
 STEP5_RETIRED_COMBINED_HEAD = "combined"
 _STEP5_HEAD_BY_LOWER = {"explanation": "explanation"}
 _RE_STEP5_HEAD_SLUG = re.compile(r"^(\d+(?:_\d+)*)_(explanation|step5_explanation)$", re.IGNORECASE)
+_RE_STEP5_ABLATION_RUN = re.compile(r"^ablation_(wo_rcr|wo_cf|wo_ccv_fca)_1$")
 _STEP5_RUN_ID_ERROR = (
     "Step5 run-id must include consumed Step4 run prefix, e.g. 1_1, or use --run-id auto."
 )
@@ -243,7 +244,12 @@ def step4_slug_from_step5_slug(step5_run: str) -> str:
 
 
 def parse_stage_run_id(stage: str, raw: str) -> str:
-    return parse_step5_run_id(raw) if str(stage or "").strip().lower() == "step5" else parse_run_id(raw)
+    if str(stage or "").strip().lower() != "step5":
+        return parse_run_id(raw)
+    s = str(raw or "").strip()
+    if _RE_STEP5_ABLATION_RUN.fullmatch(s):
+        return s
+    return parse_step5_run_id(raw)
 
 
 def inferred_step4_slug_from_step5_run(step5_run: str) -> str:

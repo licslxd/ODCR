@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "odcr_ablation_registry.schema.json",
+  "type": "object",
+  "required": [
+    "task8_full",
+    "task8_wo_rcr",
+    "task8_wo_cf",
+    "task8_wo_ccv_fca",
+    "task7_full",
+    "task7_wo_rcr",
+    "task7_wo_cf",
+    "task7_wo_ccv_fca"
+  ],
+  "additionalProperties": false,
+  "patternProperties": {
+    "^task[78]_(full|wo_rcr|wo_cf|wo_ccv_fca)$": {
+      "type": "object",
+      "required": [
+        "task",
+        "direction",
+        "scenario",
+        "variant",
+        "status",
+        "paper_role",
+        "allowed_for_paper_table",
+        "is_ablation"
+      ],
+      "properties": {
+        "task": {"enum": [7, 8]},
+        "direction": {"type": "string"},
+        "scenario": {"const": "weak_cross_platform"},
+        "variant": {"enum": ["full_odcr", "wo_rcr", "wo_cf", "wo_ccv_fca"]},
+        "status": {"enum": ["existing_official_single_run", "planned"]},
+        "source_run": {"pattern": "^runs/step5/task[78]/1_19$"},
+        "output_run": {"pattern": "^runs/step5/task[78]/ablation_[A-Za-z0-9_]+$"},
+        "paper_role": {"type": "string"},
+        "allowed_for_paper_table": {"type": "boolean"},
+        "is_ablation": {"type": "boolean"}
+      }
+    }
+  }
+}

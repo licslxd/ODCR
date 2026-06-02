@@ -1,0 +1,46 @@
+\begin{table*}[t]
+\centering
+\caption{Overall Performance on the Weak Cross-Platform Tasks}
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrrrrrr}
+\toprule
+Methods & ROUGE-1 & ROUGE-L & BLEU-1 & BLEU-2 & BLEU-3 & BLEU-4 & METEOR & DIST-1 & DIST-2 & RMSE & MAE \\
+\midrule
+\multicolumn{12}{c}{\textit{TripAdvisor Dataset, auxiliary domain: Yelp}} \\
+\midrule
+\multicolumn{12}{l}{\textbf{Single Domain}} \\
+DualPC & 16.41 & 12.59 & 14.80 & 5.62 & 2.10 & 0.85 & 10.35 & 0.04 & 0.09 & 0.8290 & 0.6260 \\
+PETER & 16.72 & 12.79 & 15.64 & 5.85 & 2.43 & 1.09 & 10.46 & 0.58 & 1.89 & 0.8193 & 0.6205 \\
+ReXPlug & 17.40 & 12.78 & 12.98 & 5.01 & 1.94 & 0.74 & 10.29 & 0.25 & 1.40 & 0.8571 & 0.6541 \\
+ERRA & 16.76 & 13.14 & 16.07 & 5.92 & 2.47 & 1.10 & 10.10 & 0.61 & 2.24 & 0.7896 & 0.6091 \\
+\midrule
+\multicolumn{12}{l}{\textbf{Cross-Domain}} \\
+PEFT & 15.93 & 12.16 & 14.21 & 5.34 & 2.25 & 1.00 & 9.20 & 0.22 & 0.81 & 0.8000 & 0.6180 \\
+PEPLER & 16.07 & 11.72 & 13.26 & 4.82 & 2.00 & 0.87 & 9.59 & 0.28 & 1.54 & 0.7910 & 0.6084 \\
+AdaReX & 16.77 & 13.18 & 16.27 & 6.20 & 2.48 & 1.13 & 10.31 & 0.60 & 1.82 & 0.7904 & 0.6058 \\
+D4C & 17.08 & 13.18 & 16.70 & 6.22 & 2.57 & 1.15 & 10.76 & 0.71 & 2.59 & 0.8014 & 0.6132 \\
+ODCR & 71.7019 & 52.5850 & 57.6942 & 40.3661 & 29.5623 & 22.3412 & 56.9855 & 3.7559 & 25.2687 & 0.7572 & 0.5748 \\
+\midrule
+\multicolumn{12}{c}{\textit{Yelp Dataset, auxiliary domain: TripAdvisor}} \\
+\midrule
+\multicolumn{12}{l}{\textbf{Single Domain}} \\
+DualPC & 10.48 & 8.11 & 10.33 & 2.71 & 0.95 & 0.41 & 6.31 & 0.05 & 0.04 & 1.0699 & 0.8264 \\
+PETER & 12.34 & 9.55 & 12.30 & 3.76 & 1.47 & 0.62 & 7.87 & 0.79 & 2.65 & 1.0459 & 0.8095 \\
+ReXPlug & 9.45 & 7.51 & 9.45 & 2.32 & 0.72 & 0.30 & 6.22 & 0.37 & 1.73 & 1.0414 & 0.8141 \\
+ERRA & 11.56 & 9.02 & 10.66 & 3.24 & 1.29 & 0.58 & 7.00 & 0.47 & 2.49 & 1.0519 & 0.8106 \\
+\midrule
+\multicolumn{12}{l}{\textbf{Cross-Domain}} \\
+PEFT & 11.32 & 8.79 & 11.54 & 3.39 & 1.30 & 0.56 & 7.37 & 1.20 & 3.90 & 1.0393 & 0.8085 \\
+PEPLER & 12.13 & 9.19 & 10.67 & 3.38 & 1.39 & 0.60 & 8.07 & 0.51 & 3.84 & 1.0358 & 0.7984 \\
+AdaReX & 12.36 & 9.61 & 12.31 & 3.78 & 1.49 & 0.64 & 7.98 & 0.60 & 3.05 & 1.0561 & 0.8050 \\
+D4C & 13.22 & 10.29 & 12.75 & 4.03 & 1.62 & 0.72 & 8.23 & 1.22 & 3.95 & 1.0472 & 0.8075 \\
+ODCR & 70.8476 & 53.2973 & 57.6096 & 40.8406 & 30.4034 & 23.3925 & 56.8649 & 2.8513 & 25.0243 & 0.9575 & 0.7301 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{2pt}
+\parbox{\textwidth}{\scriptsize \textit{Note:} For each dataset block, cross-domain methods use the auxiliary domain indicated in the block heading. Baseline values are reported without standard deviations. ODCR values are current single-run results.}
+\label{tab:overall_performance_cross_platform}
+\end{table*}

@@ -521,7 +521,7 @@ def format_eval_summary_lines(
 ) -> List[str]:
     """[Eval Summary] 紧凑一行式关键指标（decode + 主分数 + 塌缩摘要）。
 
-    Official text metrics come from paper_greedy_25 metric_pred/metric_ref.
+    Official text metrics come from the active Step5 final_eval profile metric_pred/metric_ref.
     ext_* 为 extended_text_metrics_bundle，诊断用，非论文主表 DIST。
     """
     ex = final.get("explanation") or {}

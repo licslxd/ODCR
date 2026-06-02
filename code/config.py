@@ -1426,6 +1426,12 @@ class FinalTrainingConfig:
     valid_loss_label_max_length: int = 128
     final_eval_prediction_max_length: int = 25
     final_eval_reference_max_length: int = 25
+    step5_final_eval_config_json: str = "{}"
+    step5_no_ref_evidence_config_json: str = "{}"
+    step5_no_ref_encoder_content_token_budget: int = 96
+    step5_train_generation_input_policy: str = ""
+    step5_train_content_evidence_policy: str = ""
+    step5_train_reference_usage: str = ""
     train_dynamic_padding: bool = True
     train_padding_strategy: str = "dynamic_batch"
     decode_strategy: str = "greedy"
@@ -2155,6 +2161,12 @@ def build_resolved_training_config(
     step5_sampler_config_json_v = "{}"
     step5_batch_candidates_config_json_v = "{}"
     step5_tuning_config_json_v = "{}"
+    step5_final_eval_config_json_v = "{}"
+    step5_no_ref_evidence_config_json_v = "{}"
+    step5_no_ref_encoder_content_token_budget_v = 96
+    step5_train_generation_input_policy_v = ""
+    step5_train_content_evidence_policy_v = ""
+    step5_train_reference_usage_v = ""
     step5_lifecycle_config_json_v = "{}"
     step5_lifecycle_phase_v = "train_only"
     step5_allow_embedded_final_eval_v = False
@@ -2184,6 +2196,11 @@ def build_resolved_training_config(
     src["step5_sampler"] = "inactive"
     src["step5_batch_candidates"] = "inactive"
     src["step5_tuning"] = "inactive"
+    src["step5_final_eval"] = "inactive"
+    src["step5_no_ref_evidence"] = "inactive"
+    src["step5_train_generation_input_policy"] = "inactive"
+    src["step5_train_content_evidence_policy"] = "inactive"
+    src["step5_train_reference_usage"] = "inactive"
     src["step5_lifecycle"] = "inactive"
     src["step5_lifecycle_phase"] = "inactive"
     src["step5_allow_embedded_final_eval"] = "inactive"
@@ -2274,12 +2291,77 @@ def build_resolved_training_config(
                 "effective payload missing step5_memory_truth; "
                 "Step5 memory admission controls must come from configs/odcr.yaml."
             )
+        st5_final_eval = _payload.get("step5_final_eval")
+        if not isinstance(st5_final_eval, dict):
+            raise RuntimeError(
+                "effective payload missing step5_final_eval; "
+                "Step5 no-reference final eval controls must come from configs/odcr.yaml."
+            )
+        st5_no_ref_evidence = _payload.get("step5_no_ref_evidence")
+        if not isinstance(st5_no_ref_evidence, dict):
+            raise RuntimeError(
+                "effective payload missing step5_no_ref_evidence; "
+                "Step5 no-reference input evidence controls must come from configs/odcr.yaml."
+            )
+        step5_train_generation_input_policy_v = str(
+            row.get("step5_train_generation_input_policy")
+            or row.get("generation_input_policy")
+            or "user_item_conditioned_counterfactual_training"
+        )
+        step5_train_content_evidence_policy_v = str(
+            row.get("step5_train_content_evidence_policy")
+            or row.get("content_evidence_policy")
+            or "neutral_constant"
+        )
+        step5_train_reference_usage_v = str(
+            row.get("step5_train_reference_usage")
+            or row.get("reference_usage")
+            or "label_only"
+        )
+        if step5_train_generation_input_policy_v not in {
+            "user_item_conditioned_counterfactual_training",
+            "odcr_native_controlled_verbalizer",
+            "history_conditioned_no_reference_evidence",
+        }:
+            raise RuntimeError(
+                "Step5 formal train generation_input_policy must be "
+                "user_item_conditioned_counterfactual_training, "
+                "odcr_native_controlled_verbalizer, or "
+                "history_conditioned_no_reference_evidence."
+            )
+        if step5_train_content_evidence_policy_v not in {"neutral_constant", "easd_content_plan", "train_only_history"}:
+            raise RuntimeError(
+                "Step5 formal train content_evidence_policy must be neutral_constant, "
+                "easd_content_plan, or train_only_history."
+            )
+        if (
+            step5_train_generation_input_policy_v == "user_item_conditioned_counterfactual_training"
+            and step5_train_content_evidence_policy_v != "neutral_constant"
+        ):
+            raise RuntimeError("D4C-compatible Step5 train requires content_evidence_policy=neutral_constant")
+        if (
+            step5_train_generation_input_policy_v == "odcr_native_controlled_verbalizer"
+            and step5_train_content_evidence_policy_v != "easd_content_plan"
+        ):
+            raise RuntimeError("ODCR-native Step5 train requires content_evidence_policy=easd_content_plan")
+        if (
+            step5_train_generation_input_policy_v == "history_conditioned_no_reference_evidence"
+            and step5_train_content_evidence_policy_v != "train_only_history"
+        ):
+            raise RuntimeError("no-reference Step5 train requires content_evidence_policy=train_only_history")
+        if step5_train_reference_usage_v != "label_only":
+            raise RuntimeError("Step5 train reference_usage must be label_only")
         step5_innovation_config_json_v = json.dumps(st5_innov, ensure_ascii=False, sort_keys=True)
         step5_task_decoupled_policy_config_json_v = json.dumps(st5_policy, ensure_ascii=False, sort_keys=True)
         step5_export_loader_config_json_v = json.dumps(st5_loader, ensure_ascii=False, sort_keys=True)
         step5_sampler_config_json_v = json.dumps(st5_sampler, ensure_ascii=False, sort_keys=True)
         step5_batch_candidates_config_json_v = json.dumps(st5_batch_candidates, ensure_ascii=False, sort_keys=True)
         step5_tuning_config_json_v = json.dumps(st5_tuning, ensure_ascii=False, sort_keys=True)
+        step5_final_eval_config_json_v = json.dumps(st5_final_eval, ensure_ascii=False, sort_keys=True)
+        step5_no_ref_evidence_config_json_v = json.dumps(st5_no_ref_evidence, ensure_ascii=False, sort_keys=True)
+        step5_no_ref_encoder_content_token_budget_v = int(
+            st5_no_ref_evidence.get("encoder_content_token_budget", 96)
+        )
         step5_lifecycle_config_json_v = json.dumps(st5_lifecycle, ensure_ascii=False, sort_keys=True)
         step5_lifecycle_phase_v = str(row.get("step5_lifecycle_phase") or st5_lifecycle.get("formal_default_phase") or "train_only")
         step5_allow_embedded_final_eval_v = bool(row.get("step5_allow_embedded_final_eval", False))
@@ -2300,6 +2382,11 @@ def build_resolved_training_config(
         src["step5_batch_candidates"] = "step5.batch_candidates"
         src["step5_tuning"] = "step5.tuning"
         src["step5_lifecycle"] = "step5.lifecycle"
+        src["step5_final_eval"] = "step5.final_eval"
+        src["step5_no_ref_evidence"] = "step5.no_ref_evidence"
+        src["step5_train_generation_input_policy"] = "step5.train.generation_input_policy"
+        src["step5_train_content_evidence_policy"] = "step5.train.content_evidence_policy"
+        src["step5_train_reference_usage"] = "step5.train.reference_usage"
         src["step5_lifecycle_phase"] = "step5.lifecycle.formal_default_phase"
         src["step5_allow_embedded_final_eval"] = "step5.lifecycle embedded-final-eval diagnostic gates"
         src["step5_memory_truth"] = "step5.memory_truth"
@@ -2763,6 +2850,12 @@ def build_resolved_training_config(
         valid_loss_label_max_length=int(row.get("valid_loss_label_max_length", row.get("train_label_max_length", 64))),
         final_eval_prediction_max_length=int(row.get("final_eval_prediction_max_length", 25)),
         final_eval_reference_max_length=int(row.get("final_eval_reference_max_length", 25)),
+        step5_final_eval_config_json=str(step5_final_eval_config_json_v),
+        step5_no_ref_evidence_config_json=str(step5_no_ref_evidence_config_json_v),
+        step5_no_ref_encoder_content_token_budget=int(step5_no_ref_encoder_content_token_budget_v),
+        step5_train_generation_input_policy=str(step5_train_generation_input_policy_v),
+        step5_train_content_evidence_policy=str(step5_train_content_evidence_policy_v),
+        step5_train_reference_usage=str(step5_train_reference_usage_v),
         train_batch_size=G,
         global_batch_size=G,
         batch_size_global=G,

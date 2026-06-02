@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "odcr_ablation_result_snapshot.schema.json",
+  "type": "object",
+  "required": [
+    "source_run",
+    "metric_file",
+    "official_eval_report",
+    "rating_source_task",
+    "paper_greedy_25",
+    "task_local_rating_source",
+    "valid_complete",
+    "test_complete",
+    "paper_table_allowed"
+  ],
+  "properties": {
+    "source_run": {"pattern": "^runs/step5/task[78]/ablation_[A-Za-z0-9_]+$"},
+    "metric_file": {"type": "object"},
+    "official_eval_report": {"type": "object"},
+    "rating_source_task": {"enum": [7, 8]},
+    "paper_greedy_25": {"type": "boolean"},
+    "task_local_rating_source": {"type": "boolean"},
+    "valid_complete": {"type": "boolean"},
+    "test_complete": {"type": "boolean"},
+    "paper_table_allowed": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,46 @@
+\begin{table*}[t]
+\centering
+\caption{Overall Performance on the Strong-Related Amazon Tasks}
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrrrrrr}
+\toprule
+Methods & ROUGE-1 & ROUGE-L & BLEU-1 & BLEU-2 & BLEU-3 & BLEU-4 & METEOR & DIST-1 & DIST-2 & RMSE & MAE \\
+\midrule
+\multicolumn{12}{c}{\textit{AM-CDs Dataset, auxiliary domain: AM-Movies}} \\
+\midrule
+\multicolumn{12}{l}{\textbf{Single Domain}} \\
+DualPC & 12.50 & 9.67 & 9.32 & 3.69 & 1.60 & 0.88 & 7.98 & 0.01 & 0.02 & 0.9563 & 0.6736 \\
+PETER & 11.62 & 9.07 & 10.42 & 3.86 & 1.77 & 0.99 & 8.41 & 0.78 & 2.64 & 0.9191 & 0.6577 \\
+ReXPlug & 13.16 & 10.18 & 9.85 & 3.86 & 1.64 & 0.88 & 8.13 & 0.59 & 2.53 & 0.9580 & 0.6751 \\
+ERRA & 12.72 & 9.92 & 11.53 & 4.32 & 1.99 & 1.12 & 8.88 & 0.42 & 1.46 & 0.9128 & 0.6592 \\
+\midrule
+\multicolumn{12}{l}{\textbf{Cross-Domain}} \\
+PEFT & 12.41 & 9.69 & 11.67 & 4.29 & 1.95 & 1.10 & 8.98 & 0.53 & 1.75 & 0.9050 & 0.6767 \\
+PEPLER & 12.80 & 9.71 & 11.67 & 4.07 & 1.78 & 0.97 & 8.94 & 0.70 & 2.94 & 0.9003 & 0.6568 \\
+AdaReX & 13.38 & 10.40 & 12.60 & 4.67 & 2.09 & 1.15 & 9.52 & 0.89 & 3.13 & 0.9178 & 0.6582 \\
+D4C & 13.41 & 10.49 & 12.84 & 4.85 & 2.29 & 1.26 & 9.82 & 0.98 & 4.07 & 0.9179 & 0.6601 \\
+ODCR & 22.6185 & 15.4686 & 17.1937 & 8.6939 & 4.9249 & 3.0127 & 16.5699 & 1.8254 & 11.1427 & 0.8494 & 0.5764 \\
+\midrule
+\multicolumn{12}{c}{\textit{AM-Movies Dataset, auxiliary domain: AM-CDs}} \\
+\midrule
+\multicolumn{12}{l}{\textbf{Single Domain}} \\
+DualPC & 11.83 & 9.10 & 9.21 & 3.04 & 1.23 & 0.63 & 7.94 & 0.03 & 0.06 & 1.0504 & 0.7567 \\
+PETER & 14.35 & 10.92 & 13.24 & 4.82 & 2.18 & 1.21 & 9.75 & 0.48 & 1.85 & 0.9959 & 0.7411 \\
+ReXPlug & 10.86 & 8.30 & 6.83 & 2.10 & 0.72 & 0.30 & 6.55 & 0.39 & 1.37 & 1.0236 & 0.7479 \\
+ERRA & 13.71 & 10.47 & 12.14 & 4.41 & 1.99 & 1.14 & 9.42 & 0.33 & 1.26 & 1.0025 & 0.7413 \\
+\midrule
+\multicolumn{12}{l}{\textbf{Cross-Domain}} \\
+PEFT & 13.79 & 9.93 & 12.24 & 4.72 & 1.90 & 1.05 & 9.56 & 0.57 & 2.23 & 0.9944 & 0.7339 \\
+PEPLER & 13.66 & 11.20 & 12.80 & 5.25 & 2.20 & 1.29 & 10.21 & 0.59 & 2.98 & 0.9919 & 0.7598 \\
+AdaReX & 13.97 & 10.60 & 12.53 & 4.62 & 2.11 & 1.20 & 9.94 & 0.44 & 2.29 & 0.9987 & 0.7305 \\
+D4C & 14.45 & 11.08 & 13.41 & 4.95 & 2.26 & 1.31 & 10.19 & 1.09 & 4.30 & 1.0045 & 0.7352 \\
+ODCR & 26.0735 & 17.6785 & 20.1472 & 10.7957 & 6.3840 & 4.0431 & 19.3942 & 1.4477 & 9.5002 & 0.8715 & 0.5750 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{2pt}
+\parbox{\textwidth}{\scriptsize \textit{Note:} For each dataset block, cross-domain methods use the auxiliary domain indicated in the block heading. Baseline values are reported without standard deviations. ODCR values are current single-run results.}
+\label{tab:overall_performance_amazon}
+\end{table*}

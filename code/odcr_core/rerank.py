@@ -295,6 +295,8 @@ RERANK_V3_SCHEMA_VERSION = "odcr_rerank_v3/1.0"
 
 _RE_GENERIC_TEMPLATES = re.compile(
     r"(?i)\b(great|good|nice|awesome|amazing)\s+(movie|film|product|item|book)\b|"
+    r"\b(the\s+)?(food|service|place|restaurant|hotel)\s+(is|was|are|were)?\s*"
+    r"(great|good|nice|awesome|amazing)\b|"
     r"\bi\s+(really\s+)?(enjoyed|liked|loved)\s+it\b|"
     r"\bhighly\s+recommend\b|\bworth\s+(watching|buying|reading)\b|"
     r"\bnot\s+bad\b|\bpretty\s+good\b"

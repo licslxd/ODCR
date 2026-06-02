@@ -1,0 +1,19 @@
+\begin{table}[t]
+\centering
+\caption{Single-run weak cross-platform ablations. These are not 5-seed mean\(\pm\)std and not a full D4C paper-compatible main table. Results remain candidate paper values until manual review clears paper\_table\_allowed and requires\_manual\_review.}
+\label{tab:weak-cross-platform-ablation}
+\begin{tabular}{llllcccc}
+\toprule
+Task & Direction & Variant & Status & MAE & RMSE & BLEU-4 & ROUGE-L \\
+\midrule
+8 & TripAdvisor $\rightarrow$ Yelp & full\_odcr & existing\_official\_single\_run &  &  &  &  \\
+8 & TripAdvisor $\rightarrow$ Yelp & wo\_rcr & missing\_artifact &  &  &  &  \\
+8 & TripAdvisor $\rightarrow$ Yelp & wo\_cf & missing\_artifact &  &  &  &  \\
+8 & TripAdvisor $\rightarrow$ Yelp & wo\_ccv\_fca & missing\_artifact &  &  &  &  \\
+7 & Yelp $\rightarrow$ TripAdvisor & full\_odcr & existing\_official\_single\_run &  &  &  &  \\
+7 & Yelp $\rightarrow$ TripAdvisor & wo\_rcr & missing\_artifact &  &  &  &  \\
+7 & Yelp $\rightarrow$ TripAdvisor & wo\_cf & missing\_artifact &  &  &  &  \\
+7 & Yelp $\rightarrow$ TripAdvisor & wo\_ccv\_fca & missing\_artifact &  &  &  &  \\
+\bottomrule
+\end{tabular}
+\end{table}

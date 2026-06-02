@@ -115,6 +115,12 @@ def _odcr_layout_env(cfg: ResolvedConfig) -> dict[str, str]:
         out["ODCR_CONFIG_FIELD_SOURCES_JSON"] = _fs
     if cfg.eval_run_dir:
         out["ODCR_EVAL_RUN_DIR"] = str(Path(cfg.eval_run_dir).resolve())
+    if getattr(cfg, "eval_max_rows", None):
+        out["ODCR_EVAL_MAX_ROWS"] = str(int(cfg.eval_max_rows))
+        out["ODCR_EVAL_BOUNDED_DIAGNOSTIC"] = "1"
+    else:
+        out["ODCR_EVAL_MAX_ROWS"] = ""
+        out["ODCR_EVAL_BOUNDED_DIAGNOSTIC"] = "0"
     if cfg.command == "step4" and cfg.step3_checkpoint_dir:
         out["ODCR_STEP4_RUN_ID"] = str(cfg.step4_run or "")
         out["ODCR_STEP3_RUN_DIR"] = str(Path(cfg.step3_checkpoint_dir).resolve())
@@ -530,15 +536,16 @@ def run_step4(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
     _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP4_SCRIPT, py_args=py_args, console_level=console_level)
 
 
-def _step5_decode_cli_args(cfg: ResolvedConfig) -> list[str]:
+def _step5_decode_cli_args(cfg: ResolvedConfig, *, train: bool = False) -> list[str]:
     """与 One-Control decode 解析结果对齐，传给 step5_entry（train/eval）。"""
+    label_smoothing = cfg.train_label_smoothing if train else cfg.label_smoothing
     out: list[str] = [
         "--decode-strategy",
         str(cfg.decode_strategy),
         "--max-explanation-length",
         str(cfg.max_explanation_length),
         "--label-smoothing",
-        str(cfg.label_smoothing),
+        str(label_smoothing),
         "--repetition-penalty",
         str(cfg.repetition_penalty),
     ]
@@ -640,7 +647,7 @@ def run_step5(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
         log_file,
         "--save_file",
         model_path,
-        *_step5_decode_cli_args(cfg),
+        *_step5_decode_cli_args(cfg, train=True),
     ]
     if cfg.step5_train_only:
         py_args.append("--train-only")
@@ -690,6 +697,8 @@ def run_eval(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
 
 def _rerank_runner_cli_args(cfg: ResolvedConfig) -> list[str]:
     out = [
+        "--eval-split",
+        str(getattr(cfg, "eval_split", "valid") or "valid"),
         "--num-return-sequences",
         str(cfg.num_return_sequences),
         "--rerank-method",
@@ -755,6 +764,5 @@ def run_eval_rerank(cfg: ResolvedConfig, *, console_level: str = "summary") -> N
     ]
     _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
 
-
-    print(f"Step3 产物: {cfg3.checkpoint_dir}", flush=True)
-    print(f"Step5 产物: {cfg5.checkpoint_dir}", flush=True)
+    print(f"Step5 checkpoint: {mp}", flush=True)
+    print(f"Eval/rerank artifacts: {cfg.checkpoint_dir}", flush=True)

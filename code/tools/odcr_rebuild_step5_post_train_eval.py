@@ -723,6 +723,12 @@ def main() -> int:
     parser.add_argument("--finalize", action="store_true")
     parser.add_argument("--scan", action="store_true")
     args = parser.parse_args()
+    raise SystemExit(
+        "odcr_rebuild_step5_post_train_eval.py is retired. The old post_train_eval protocol used "
+        "reference-before-generation content evidence and must not be rebuilt or finalized. "
+        "Use ./odcr eval, which now writes post_train_eval_no_ref under "
+        "history_conditioned_no_reference_evidence."
+    )
     tasks = parse_tasks(args.tasks)
     splits = [part.strip() for part in str(args.splits).split(",") if part.strip()]
     outputs = {}

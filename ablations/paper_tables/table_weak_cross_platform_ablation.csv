@@ -1,0 +1,9 @@
+task,direction,variant,status,mae,rmse,bleu1,bleu2,bleu3,bleu4,rouge1,rougeL,meteor,dist1,dist2,manual_review_required
+8,TripAdvisor -> Yelp,full_odcr,existing_official_single_run,,,,,,,,,,,,True
+8,TripAdvisor -> Yelp,wo_rcr,missing_artifact,,,,,,,,,,,,True
+8,TripAdvisor -> Yelp,wo_cf,missing_artifact,,,,,,,,,,,,True
+8,TripAdvisor -> Yelp,wo_ccv_fca,missing_artifact,,,,,,,,,,,,True
+7,Yelp -> TripAdvisor,full_odcr,existing_official_single_run,,,,,,,,,,,,True
+7,Yelp -> TripAdvisor,wo_rcr,missing_artifact,,,,,,,,,,,,True
+7,Yelp -> TripAdvisor,wo_cf,missing_artifact,,,,,,,,,,,,True
+7,Yelp -> TripAdvisor,wo_ccv_fca,missing_artifact,,,,,,,,,,,,True

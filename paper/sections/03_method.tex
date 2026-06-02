@@ -1,0 +1,177 @@
+\section{Method}
+
+\subsection{Problem Formulation}
+
+Let \(\mathcal{D}_s\) and \(\mathcal{D}_t\) denote a source domain and a target
+domain. Each domain contains user--item interaction records
+\((u,i,r,e)\), where \(u\) is a user, \(i\) is an item, \(r\) is an observed
+rating, and \(e\) is a natural-language explanation or review-derived
+explanation target. Given source-domain evidence and target-domain evidence,
+the goal is to predict a target-domain rating \(\hat r_{ui}\) and generate a
+target-domain explanation \(\hat e_{ui}\) for a user--item pair.
+
+The target explanation should satisfy two constraints. First, it should be
+content-grounded: the explanation should describe evidence relevant to the
+user and item rather than generic domain text. Second, it should be
+domain-appropriate: the explanation should use target-domain expression style
+without allowing style to replace recommendation evidence. ODCR formalizes
+these constraints through content evidence \(C\), dynamic style \(S^{(t)}\),
+and counterfactual reliability \(R_{cf}\).
+
+\subsection{Dynamic Feedback View of Explanation Degeneration}
+
+D4C diagnoses explanation degeneration as a causal shortcut involving hidden
+textual attributes \(W\) \cite{d4c}. In the static reading, \(W\) captures
+domain-level textual factors that can affect users, items, and explanations.
+The higher-value reading for ODCR is dynamic: textual attributes and generated
+explanations can reinforce one another over time,
+\[
+  W^{(t)} \rightarrow E^{(t)} \rightarrow W^{(t+1)} .
+\]
+When this loop is left uncontrolled, a generator can learn the shortcut
+\(W^{(t)} \rightarrow E^{(t)}\) instead of the intended interaction path
+\((U,I) \rightarrow E^{(t)}\). The resulting explanation may fit the target
+domain's surface language while failing to explain the specific user--item
+preference.
+
+This feedback view motivates a control problem. The model should preserve the
+part of textual evidence that supports the recommendation, allow style to adapt
+across domains, and prevent unreliable counterfactual shifts from being treated
+as trustworthy training evidence. ODCR keeps D4C's causal diagnosis but
+replaces the coarse textual shortcut with explicit control variables.
+
+\subsection{From Coarse Textual Attributes to ODCR Control Variables}
+
+ODCR refines the D4C textual attribute at time \(t\) as
+\[
+  W^{(t)} \Rightarrow (C, S^{(t)}, R_{cf}) .
+\]
+Here \(C\) is stable content evidence: it captures what should be explained and
+what can support rating prediction. \(S^{(t)}\) is a dynamic style state: it
+captures how content is expressed in a domain at time \(t\). \(R_{cf}\) is
+counterfactual reliability: it controls whether and how strongly
+counterfactual evidence should influence learning.
+
+\begin{figure}[t]
+  \centering
+  \resizebox{\textwidth}{!}{\input{figures/figure2_odcr_architecture}}
+  \caption{ODCR overall architecture. The method maps input interactions and reviews into evidence extraction, EASD content/style decomposition, HSS hierarchical style state modeling, RCR/UCI reliability-gated counterfactual routing, CCV controlled explanation generation, and FCA faithfulness consistency. The content-grounded rating branch is separated from explanation generation while sharing content evidence.}
+  \label{fig:overall_architecture}
+\end{figure}
+
+Figure~\ref{fig:overall_architecture} shows the resulting architecture. ODCR
+does not ask one representation to absorb every textual factor. Instead, it
+uses \(C\), \(S^{(t)}\), and \(R_{cf}\) as method-level controls for content,
+expression, and counterfactual trust.
+
+\subsection{Evidence-Anchored Content/Style Decomposition}
+
+Evidence-Anchored Content/Style Decomposition (EASD) is the first ODCR module.
+It separates stable content evidence from expression style while keeping both
+anchored to observable user--item evidence. Content evidence \(C\) is tied to
+rating-relevant aspects and interaction evidence. Style evidence captures
+domain phrasing, emphasis, and lexical conventions that affect how content is
+verbalized.
+
+The key distinction is that ODCR does not leave shared and specific
+representations to infer this split without guidance. The decomposition is
+anchored: content is constrained by preference evidence, while style is
+constrained by domain-specific expression signals. This turns the coarse
+attribute \(W^{(t)}\) into a controllable pair: \(C\) determines what should be
+explained, and \(S^{(t)}\) determines how that evidence is expressed. Rating
+prediction and explanation generation can therefore share content evidence
+without collapsing explanation style into the rating branch.
+
+\subsection{Hierarchical Style State}
+
+Hierarchical Style State (HSS) models style as more than a domain identifier.
+ODCR writes the style state as
+\[
+  S^{(t)} = \bigl(S_{\mathrm{domain}}^{(t)}, \Delta S_{\mathrm{local}}^{(t)}\bigr),
+\]
+where \(S_{\mathrm{domain}}^{(t)}\) captures domain-global textual conventions
+and \(\Delta S_{\mathrm{local}}^{(t)}\) captures instance-local residual style.
+The domain component models broad conventions such as review tone and
+domain-common phrasing. The local residual captures user--item-specific
+stylistic variation that should not be forced into a single domain template.
+
+HSS makes the D4C feedback channel more precise. If explanations feed back
+into the future textual environment, ODCR localizes that feedback mainly to
+\(S^{(t+1)}\). Content evidence \(C\) should remain a stable anchor for what is
+being recommended and explained. This prevents dynamic feedback from
+corrupting content while still allowing expression style to evolve with the
+target domain.
+
+\subsection{Reliability-Gated Counterfactual Control}
+
+Reliability-Gated Counterfactual Control combines RCR and uncertainty-aware
+counterfactual invariance (UCI). D4C shows that counterfactual domain evidence
+can reduce shortcut dependence, but ODCR further recognizes that
+counterfactual examples are not equally trustworthy. Some preserve content and
+shift only style; others alter the recommendation evidence or introduce noisy
+signals.
+
+ODCR uses two control layers. The first layer is eligibility filtering: a
+counterfactual example is usable only if it preserves the content needed for
+the target explanation and does not violate the intended transfer setting. The
+second layer is reliability weighting and sampling priority: usable
+counterfactual examples receive different influence according to \(R_{cf}\)
+and uncertainty. A compact module-level objective is
+\[
+  \mathcal{L}_{\mathrm{ODCR}}
+  =
+  \mathcal{L}_{\mathrm{fact}}
+  +
+  \lambda \sum_j R_{cf,j}\,\mathcal{L}_{\mathrm{cf},j},
+\]
+where \(\mathcal{L}_{\mathrm{fact}}\) is factual learning, \(\mathcal{L}_{\mathrm{cf},j}\)
+is the counterfactual learning signal for candidate \(j\), and \(R_{cf,j}\)
+controls its influence. UCI reduces trust in unstable or uncertain
+counterfactual signals rather than treating every counterfactual example as
+equally informative.
+
+\begin{figure}[t]
+  \centering
+  \resizebox{\textwidth}{!}{\input{figures/figure3_reliability_routing}}
+  \caption{RCR/UCI routing mechanism. Counterfactual candidates first pass eligibility filtering, then receive reliability and uncertainty-aware weights that determine sampling priority and training influence. Low-reliability evidence is down-weighted or filtered rather than treated as equal counterfactual supervision.}
+  \label{fig:rcr_routing}
+\end{figure}
+
+Figure~\ref{fig:rcr_routing} illustrates this two-layer routing mechanism. The
+figure is intended as a method diagram and as an insertion point for later
+module ablations; it does not claim that a complete ablation suite is already
+integrated into the current result tables.
+
+\subsection{Controlled Causal Verbalizer and Faithfulness Alignment}
+
+The Controlled Causal Verbalizer (CCV) is the output-side module. Instead of
+learning the shortcut \(P(E\mid W)\), ODCR conditions explanation generation on
+the refined variables:
+\[
+  P(E \mid U, I, C, S, R_{cf}) .
+\]
+Content evidence \(C\) controls what should be said, style state \(S\) controls
+how it should be expressed, and \(R_{cf}\) controls which counterfactual
+training signals are trusted. This design makes explanation generation a
+controlled causal verbalization problem rather than an unconstrained
+domain-language imitation problem.
+
+Faithfulness Consistency Alignment (FCA) keeps the generated explanation tied
+to content-grounded recommendation evidence. Style transfer should not
+substitute for preference evidence, and a fluent target-domain explanation
+should not drift away from the aspects that support the rating branch. FCA is
+therefore the consistency principle linking CCV back to \(C\): the output may
+adapt its expression style, but its content should remain aligned with
+rating-relevant evidence.
+
+\subsection{Implementation Mapping}
+
+The implementation maps these method modules to the current ODCR workflow
+without making workflow stages the paper's primary contribution. Preprocessing
+and Step3 support EASD/HSS by preparing evidence and learning content/style
+representations. Step4 supports RCR/UCI through reliability estimation,
+routing, confidence buckets, uncertainty signals, and sample-weight hints.
+Step5\_e supports CCV/FCA as explanation-only controlled generation. Rating
+evidence remains content-grounded and separate from explanation generation,
+while explanation learning consumes reliability-gated evidence for target-domain
+verbalization.

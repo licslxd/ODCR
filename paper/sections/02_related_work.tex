@@ -1,0 +1,47 @@
+\section{Related Work}
+
+\subsection{Generative Explainable Recommendation and Degeneration}
+
+Explainable recommendation studies models that pair recommendation decisions
+with textual or structured rationales \cite{explainable_rec_survey}. Neural
+and language-model-based systems such as PETER, PEPLER, ReXPlug, ERRA, and
+AdaReX demonstrate that explanations can be generated jointly with
+recommendation signals \cite{peter,pepler,rexplug,erra,adarex}. These models
+also highlight the central risk for this paper: fluent explanations are not
+automatically faithful explanations. When a generator overuses common review
+phrases or domain templates, explanation quality degenerates even if the text
+looks plausible.
+
+\subsection{Cross-Domain Explainable Recommendation}
+
+Cross-domain recommendation transfers evidence from a source domain to a
+target domain \cite{crossdomain_survey}. Cross-domain explainable
+recommendation adds a second transfer problem: the explanation must preserve
+recommendation content while adapting to target-domain language. This makes
+content and style inseparable if the model treats text as one coarse signal.
+ODCR addresses this by representing content evidence and style state as
+separate control variables rather than relying on a single domain-level
+textual attribute.
+
+\subsection{Causal and Counterfactual Recommendation}
+
+D4C is the closest causal foundation for ODCR \cite{d4c}. It diagnoses
+cross-domain explanation degeneration through hidden textual attributes \(W\)
+and uses domain counterfactual reasoning to reduce shortcut dependence. ODCR
+inherits this causal view but emphasizes the dynamic feedback part of the
+diagnosis: \(W^{(t)}\) influences explanations, and explanations can feed back
+into future textual attributes. ODCR refines this process into stable content
+evidence \(C\), dynamic style \(S^{(t)}\), and reliability-gated
+counterfactual influence \(R_{cf}\).
+
+\subsection{Controlled Generation, Faithfulness, and Consistency}
+
+Controlled explanation generation requires more than producing text in the
+right domain style. The generated explanation should remain tied to the
+content evidence that supports the recommendation. ODCR therefore positions
+controlled generation and faithfulness alignment as output-side parts of the
+method: \(C\) controls what is said, \(S^{(t)}\) controls how it is expressed,
+and \(R_{cf}\) controls which counterfactual signals are trusted during
+learning. Modern external systems such as CIER, MAPLE, ELIXIR, Prism, and XRec
+remain comparison targets once adapted to the same data and evaluation setting;
+the current manuscript does not claim results against them.

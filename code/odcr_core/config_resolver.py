@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -124,14 +125,20 @@ def apply_cli_sets(cfg: dict[str, Any], raw_sets: Iterable[str]) -> tuple[dict[s
         parts = key.split(".")
         cur: Any = out
         for part in parts[:-1]:
+            lookup_part: Any = part
+            if part not in cur and part.isdigit() and int(part) in cur:
+                lookup_part = int(part)
             if not isinstance(cur, dict):
                 raise OneControlConfigError(f"--set cannot descend through non-object key {part!r} in {key!r}")
-            if part not in cur or cur[part] is None:
-                cur[part] = {}
-            cur = cur[part]
+            if lookup_part not in cur or cur[lookup_part] is None:
+                cur[lookup_part] = {}
+            cur = cur[lookup_part]
         if not isinstance(cur, dict):
             raise OneControlConfigError(f"--set target parent is not an object for {key!r}")
-        cur[parts[-1]] = parse_set_value(value_raw)
+        final_part: Any = parts[-1]
+        if final_part not in cur and final_part.isdigit() and int(final_part) in cur:
+            final_part = int(final_part)
+        cur[final_part] = parse_set_value(value_raw)
         sources[key] = "cli --set"
     return out, sources
 
@@ -184,7 +191,10 @@ _RETIRED_ACCUM_ENV = frozenset(
 
 _STEP5_RETIRED_TRAIN_FIELDS = frozenset({"adv", "eta", "train_label_max_length"})
 _STEP5_FORMAL_RATIO_ID = "STEP5_RATIO_0"
+_STEP5_TARGET_GOLD_ONLY_RATIO_ID = "STEP5_RATIO_TARGET_GOLD_ONLY"
+_STEP5_TASK_ADAPTIVE_RATIO_IDS = {"STEP5_RATIO_T8_GOLD_DOM_CF_CAP", "STEP5_RATIO_T8_ODCR_NATIVE_CF_CAP"}
 _STEP5_FORMAL_CF_MIX_ID = "STEP5_CF_MIX_FORMAL_HIGH_MEDIUM"
+_STEP5_TASK_ADAPTIVE_CF_MIX_IDS = {"STEP5_CF_MIX_T8_ROUTE_CAP"}
 _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID = "WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1"
 _STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID = "TG_MIX_WEAK_MEDIUM_ONLY"
 _STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID = "AG_MIX_WEAK_MEDIUM_ONLY"
@@ -1209,13 +1219,6 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any], *, task_id: int | None
         cf = _rcr_float(obj.get("cf_ratio"), f"step5.sampler.{name}.cf_ratio", min_value=0.0, max_value=1.0)
         if abs((tg + ag + cf) - 1.0) > 1e-6:
             raise OneControlConfigError(f"step5.sampler.{name} ratios must sum to 1.0")
-        for value, (lo, hi), key in zip(
-            (tg, ag, cf),
-            ((0.30, 0.45), (0.10, 0.25), (0.34, 0.50)),
-            ("target_gold_ratio", "aux_gold_ratio", "cf_ratio"),
-        ):
-            if not (lo <= value <= hi):
-                raise OneControlConfigError(f"step5.sampler.{name}.{key} must be in [{lo}, {hi}]")
         def _gold_mix(mix_name: str) -> dict[str, float]:
             mix_raw = _mapping(obj.get(mix_name), f"step5.sampler.{name}.{mix_name}")
             _reject_unknown_keys(mix_raw, {"high", "medium"}, f"step5.sampler.{name}.{mix_name}")
@@ -1704,6 +1707,11 @@ def _resolve_step5_innovation_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
             "min_reliability": _rcr_float(fca.get("min_reliability"), "step5.fca.min_reliability", min_value=0.0, max_value=1.0),
             "max_uncertainty": _rcr_float(fca.get("max_uncertainty"), "step5.fca.max_uncertainty", min_value=0.0, max_value=1.0),
             "evidence_alignment_mode": mode,
+            "anchor_coverage_weight": _rcr_float(
+                fca.get("anchor_coverage_weight", 0.0),
+                "step5.fca.anchor_coverage_weight",
+                min_value=0.0,
+            ),
         },
     }
 
@@ -2943,6 +2951,40 @@ def _training_row(stage: str, train: Mapping[str, Any], task: Mapping[str, Any],
     if stage == "step5":
         if "label_max_length" not in train:
             raise OneControlConfigError("step5.train.label_max_length must be configured; train_label_max_length is retired for Step5.")
+        generation_policy = str(train.get("generation_input_policy") or "").strip()
+        content_policy = str(train.get("content_evidence_policy") or "").strip()
+        if generation_policy not in {
+            "user_item_conditioned_counterfactual_training",
+            "odcr_native_controlled_verbalizer",
+            "history_conditioned_no_reference_evidence",
+        }:
+            raise OneControlConfigError(
+                "step5.train.generation_input_policy must be "
+                "user_item_conditioned_counterfactual_training, "
+                "odcr_native_controlled_verbalizer, or "
+                "history_conditioned_no_reference_evidence."
+            )
+        if content_policy not in {"neutral_constant", "easd_content_plan", "train_only_history"}:
+            raise OneControlConfigError(
+                "step5.train.content_evidence_policy must be neutral_constant, "
+                "easd_content_plan, or train_only_history."
+            )
+        if generation_policy == "user_item_conditioned_counterfactual_training" and content_policy != "neutral_constant":
+            raise OneControlConfigError(
+                "paper-compatible Step5 requires step5.train.content_evidence_policy=neutral_constant"
+            )
+        if generation_policy == "odcr_native_controlled_verbalizer" and content_policy != "easd_content_plan":
+            raise OneControlConfigError(
+                "ODCR-native Step5 requires step5.train.content_evidence_policy=easd_content_plan"
+            )
+        if generation_policy == "history_conditioned_no_reference_evidence":
+            if content_policy != "train_only_history":
+                raise OneControlConfigError(
+                    "history-conditioned no-reference Step5 requires "
+                    "step5.train.content_evidence_policy=train_only_history"
+                )
+        if str(train.get("reference_usage") or "").strip() != "label_only":
+            raise OneControlConfigError("step5.train.reference_usage must be label_only")
         train_label_length = int(train["label_max_length"])
     else:
         train_label_length = int(train.get("train_label_max_length", 64))
@@ -3372,6 +3414,11 @@ def _resolve_step5_final_eval_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
             "prediction_max_length",
             "reference_max_length",
             "official_profile",
+            "generation_input_policy",
+            "content_evidence_policy",
+            "reference_usage",
+            "neutral_content_evidence",
+            "forbid_current_eval_fields_in_generation",
             "metric_input_builder",
             "metrics_implementation",
             "test_once",
@@ -3383,20 +3430,253 @@ def _resolve_step5_final_eval_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     if pred_max != 25 or ref_max != 25:
         raise OneControlConfigError("Step5 official final eval requires prediction/reference max length 25")
     profile = str(raw.get("official_profile") or "").strip()
-    if profile != "paper_greedy_25":
-        raise OneControlConfigError("step5.final_eval.official_profile must be paper_greedy_25")
+    if profile not in {"paper_greedy_25", "odcr_no_ref_k5_25"}:
+        raise OneControlConfigError(
+            "step5.final_eval.official_profile must be paper_greedy_25 or odcr_no_ref_k5_25"
+        )
     if str(raw.get("metric_input_builder") or "") != "build_paper_metric_inputs":
         raise OneControlConfigError("step5.final_eval.metric_input_builder must be build_paper_metric_inputs")
     if str(raw.get("metrics_implementation") or "") != "official_paper_metrics":
         raise OneControlConfigError("step5.final_eval.metrics_implementation must be official_paper_metrics")
+    generation_input_policy = str(raw.get("generation_input_policy") or "").strip()
+    if generation_input_policy not in {
+        "user_item_conditioned_counterfactual_training",
+        "history_conditioned_no_reference_evidence",
+    }:
+        raise OneControlConfigError(
+            "step5.final_eval.generation_input_policy must be "
+            "user_item_conditioned_counterfactual_training or "
+            "history_conditioned_no_reference_evidence."
+        )
+    content_evidence_policy = str(raw.get("content_evidence_policy") or "").strip()
+    if content_evidence_policy not in {"neutral_constant", "train_only_history"}:
+        raise OneControlConfigError(
+            "step5.final_eval.content_evidence_policy must be neutral_constant or train_only_history"
+        )
+    if generation_input_policy == "user_item_conditioned_counterfactual_training" and content_evidence_policy != "neutral_constant":
+        raise OneControlConfigError(
+            "D4C-compatible Step5 final eval requires content_evidence_policy=neutral_constant"
+        )
+    if generation_input_policy == "history_conditioned_no_reference_evidence" and content_evidence_policy != "train_only_history":
+        raise OneControlConfigError(
+            "ODCR-native no-reference Step5 final eval requires content_evidence_policy=train_only_history"
+        )
+    if profile == "odcr_no_ref_k5_25" and generation_input_policy != "history_conditioned_no_reference_evidence":
+        raise OneControlConfigError(
+            "ODCR-native K5 final eval requires generation_input_policy=history_conditioned_no_reference_evidence"
+        )
+    reference_usage = str(raw.get("reference_usage") or "").strip()
+    if reference_usage != "metric_only_after_generation":
+        raise OneControlConfigError("step5.final_eval.reference_usage must be metric_only_after_generation")
+    neutral = str(raw.get("neutral_content_evidence") or "").strip()
+    if not neutral:
+        raise OneControlConfigError("step5.final_eval.neutral_content_evidence must be non-empty")
+    forbidden = raw.get("forbid_current_eval_fields_in_generation")
+    if not isinstance(forbidden, list) or not all(isinstance(x, str) and x.strip() for x in forbidden):
+        raise OneControlConfigError("step5.final_eval.forbid_current_eval_fields_in_generation must be a non-empty string list")
+    required_forbidden = {
+        "explanation",
+        "review",
+        "clean_text",
+        "raw_ref_text",
+        "ref_text",
+        "metric_ref_text",
+        "content_evidence",
+        "style_evidence",
+    }
+    missing = sorted(required_forbidden - {str(x).strip() for x in forbidden})
+    if missing:
+        raise OneControlConfigError(
+            "step5.final_eval.forbid_current_eval_fields_in_generation missing required fields: "
+            + ", ".join(missing)
+        )
+    if generation_input_policy == "user_item_conditioned_counterfactual_training":
+        schema_version = "odcr_step5_final_eval_config/3_d4c_paper_compatible"
+    elif profile == "paper_greedy_25":
+        schema_version = "odcr_step5_final_eval_config/4_odcr_native_no_ref"
+    else:
+        schema_version = "odcr_step5_final_eval_config/5_odcr_native_no_ref_k5"
     return {
-        "schema_version": "odcr_step5_final_eval_config/1",
+        "schema_version": schema_version,
         "prediction_max_length": int(pred_max),
         "reference_max_length": int(ref_max),
         "official_profile": profile,
+        "generation_input_policy": generation_input_policy,
+        "content_evidence_policy": content_evidence_policy,
+        "reference_usage": reference_usage,
+        "neutral_content_evidence": neutral,
+        "forbid_current_eval_fields_in_generation": [str(x).strip() for x in forbidden],
         "metric_input_builder": "build_paper_metric_inputs",
         "metrics_implementation": "official_paper_metrics",
         "test_once": _bool(raw.get("test_once", True)),
+    }
+
+
+def _resolve_step5_no_ref_evidence_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    raw = _mapping(_get(cfg, "step5.no_ref_evidence"), "step5.no_ref_evidence")
+    final_eval_raw = _mapping(_get(cfg, "step5.final_eval"), "step5.final_eval")
+    final_eval_no_ref = (
+        str(final_eval_raw.get("generation_input_policy") or "").strip()
+        == "history_conditioned_no_reference_evidence"
+        and str(final_eval_raw.get("content_evidence_policy") or "").strip()
+        == "train_only_history"
+    )
+    _reject_unknown_keys(
+        raw,
+        {
+            "schema_version",
+            "diagnostic_only",
+            "formal_allowed",
+            "paper_table_allowed",
+            "input_protocol",
+            "allowed_input_protocols",
+            "cache_namespace",
+            "train_scope",
+            "selected_effective_epochs",
+            "context_label",
+            "concise_prompt",
+            "phrase_prompt",
+            "encoder_content_token_budget",
+            "fallback_encoder_content_token_budget",
+            "evidence_top_k",
+            "user_history_top_k",
+            "item_history_top_k",
+            "domain_prior_top_n",
+            "domain_prior_display_top_k",
+            "min_df",
+            "stopword_policy",
+            "term_token_limit",
+            "neutral_content_evidence",
+            "smoke_cache_identity_includes_max_rows",
+        },
+        "step5.no_ref_evidence",
+    )
+    default_allowed = [
+        "neutral_core_no_ref",
+        "text_clean_item_only_no_ref",
+        "text_clean_item_user_no_ref",
+        "route_weighted_item_phrase_v2_no_ref",
+        "soft_prefix_light_no_ref",
+    ]
+    diagnostic_only = _bool(raw.get("diagnostic_only", True))
+    formal_allowed = _bool(raw.get("formal_allowed", False))
+    paper_table_allowed = _bool(raw.get("paper_table_allowed", False))
+    if final_eval_no_ref:
+        if diagnostic_only or not formal_allowed or not paper_table_allowed:
+            raise OneControlConfigError(
+                "formal Step5 no-reference final eval requires "
+                "step5.no_ref_evidence.diagnostic_only=false, formal_allowed=true, "
+                "paper_table_allowed=true"
+            )
+    elif not diagnostic_only or formal_allowed or paper_table_allowed:
+        raise OneControlConfigError(
+            "step5.no_ref_evidence is diagnostic-only: set diagnostic_only=true, "
+            "formal_allowed=false, paper_table_allowed=false"
+        )
+    allowed = raw.get("allowed_input_protocols") or default_allowed
+    if not isinstance(allowed, list) or not all(isinstance(x, str) and x.strip() for x in allowed):
+        raise OneControlConfigError("step5.no_ref_evidence.allowed_input_protocols must be a string list")
+    allowed_norm = [str(x).strip() for x in allowed]
+    required = set(default_allowed)
+    missing = sorted(required - set(allowed_norm))
+    if missing:
+        raise OneControlConfigError(
+            "step5.no_ref_evidence.allowed_input_protocols missing required protocols: " + ", ".join(missing)
+        )
+    protocol = str(raw.get("input_protocol") or "text_clean_item_only_no_ref").strip()
+    retired_protocols = {
+        "selected_history_lite_no_ref",
+        "target_domain_phrase_no_ref",
+        "contrastive_evidence_no_ref",
+    }
+    if protocol in retired_protocols:
+        raise OneControlConfigError(
+            f"step5.no_ref_evidence.input_protocol {protocol!r} is retired; "
+            "use text_clean_item_only_no_ref, text_clean_item_user_no_ref, "
+            "or route_weighted_item_phrase_v2_no_ref"
+        )
+    if protocol not in allowed_norm:
+        raise OneControlConfigError(
+            f"step5.no_ref_evidence.input_protocol {protocol!r} is not in allowed_input_protocols"
+        )
+    cache_namespace = str(raw.get("cache_namespace") or "step5_no_ref_history").strip()
+    if not cache_namespace or "/" in cache_namespace or "\\" in cache_namespace:
+        raise OneControlConfigError("step5.no_ref_evidence.cache_namespace must be a simple cache directory name")
+    train_scope = str(raw.get("train_scope") or "selected_effective_epoch").strip()
+    if train_scope != "selected_effective_epoch":
+        raise OneControlConfigError("step5.no_ref_evidence.train_scope must be selected_effective_epoch")
+    selected_epochs = _rcr_int(
+        raw.get("selected_effective_epochs", 1),
+        "step5.no_ref_evidence.selected_effective_epochs",
+        min_value=1,
+    )
+    encoder_budget = _rcr_int(
+        raw.get("encoder_content_token_budget", 96),
+        "step5.no_ref_evidence.encoder_content_token_budget",
+        min_value=4,
+    )
+    fallback_budget = _rcr_int(
+        raw.get("fallback_encoder_content_token_budget", 96),
+        "step5.no_ref_evidence.fallback_encoder_content_token_budget",
+        min_value=4,
+    )
+    if fallback_budget > encoder_budget:
+        raise OneControlConfigError(
+            "step5.no_ref_evidence.fallback_encoder_content_token_budget must not exceed encoder_content_token_budget"
+        )
+    if encoder_budget < 96:
+        raise OneControlConfigError(
+            "step5.no_ref_evidence.encoder_content_token_budget must be at least 96; legacy32 is retired as active default"
+        )
+    min_df = _rcr_int(raw.get("min_df", 3), "step5.no_ref_evidence.min_df", min_value=1)
+    top_n = _rcr_int(raw.get("domain_prior_top_n", 128), "step5.no_ref_evidence.domain_prior_top_n", min_value=1)
+    try:
+        display_k = int(raw.get("domain_prior_display_top_k", 0))
+    except Exception as exc:
+        raise OneControlConfigError(
+            "step5.no_ref_evidence.domain_prior_display_top_k must be an integer"
+        ) from exc
+    if display_k < 0:
+        raise OneControlConfigError("step5.no_ref_evidence.domain_prior_display_top_k must be >= 0")
+    user_k = _rcr_int(raw.get("user_history_top_k", 6), "step5.no_ref_evidence.user_history_top_k", min_value=0)
+    item_k = _rcr_int(raw.get("item_history_top_k", 6), "step5.no_ref_evidence.item_history_top_k", min_value=0)
+    evidence_k = _rcr_int(raw.get("evidence_top_k", 6), "step5.no_ref_evidence.evidence_top_k", min_value=1)
+    term_limit = _rcr_int(raw.get("term_token_limit", 64), "step5.no_ref_evidence.term_token_limit", min_value=8)
+    context_label = str(raw.get("context_label", "") or "").strip()
+    concise_prompt = str(raw.get("concise_prompt") or "Write one concise review reason using the evidence.").strip()
+    if not concise_prompt:
+        raise OneControlConfigError("step5.no_ref_evidence.concise_prompt must be non-empty")
+    phrase_prompt = str(raw.get("phrase_prompt") or "Write one concise review reason using the evidence.").strip()
+    if not phrase_prompt:
+        raise OneControlConfigError("step5.no_ref_evidence.phrase_prompt must be non-empty")
+    neutral = str(raw.get("neutral_content_evidence") or "keywords none ; aspects none ; entities none").strip()
+    if not neutral:
+        raise OneControlConfigError("step5.no_ref_evidence.neutral_content_evidence must be non-empty")
+    return {
+        "schema_version": str(raw.get("schema_version") or "odcr_step5_no_ref_evidence_config/4_evidence_v3_phrase"),
+        "diagnostic_only": bool(diagnostic_only),
+        "formal_allowed": bool(formal_allowed),
+        "paper_table_allowed": bool(paper_table_allowed),
+        "input_protocol": protocol,
+        "allowed_input_protocols": allowed_norm,
+        "cache_namespace": cache_namespace,
+        "train_scope": train_scope,
+        "selected_effective_epochs": int(selected_epochs),
+        "context_label": context_label,
+        "concise_prompt": concise_prompt,
+        "phrase_prompt": phrase_prompt,
+        "encoder_content_token_budget": int(encoder_budget),
+        "fallback_encoder_content_token_budget": int(fallback_budget),
+        "evidence_top_k": int(evidence_k),
+        "user_history_top_k": int(user_k),
+        "item_history_top_k": int(item_k),
+        "domain_prior_top_n": int(top_n),
+        "domain_prior_display_top_k": int(display_k),
+        "min_df": int(min_df),
+        "stopword_policy": str(raw.get("stopword_policy") or "english_core_v1"),
+        "term_token_limit": int(term_limit),
+        "neutral_content_evidence": neutral,
+        "smoke_cache_identity_includes_max_rows": _bool(raw.get("smoke_cache_identity_includes_max_rows", True)),
     }
 
 
@@ -3609,9 +3889,9 @@ def _resolve_step5_tuning_config(
             if not isinstance(item, Mapping):
                 raise OneControlConfigError(f"step5.tuning.ratio_candidates.explanation.{cid} must be a mapping")
             _reject_unknown_keys(item, {"target_gold", "aux_gold", "cf"}, f"step5.tuning.ratio_candidates.explanation.{cid}")
-            tg = _rcr_float(item.get("target_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.target_gold", min_value=0.30, max_value=0.45)
-            ag = _rcr_float(item.get("aux_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.aux_gold", min_value=0.10, max_value=0.25)
-            cf = _rcr_float(item.get("cf"), f"step5.tuning.ratio_candidates.explanation.{cid}.cf", min_value=0.34, max_value=0.50)
+            tg = _rcr_float(item.get("target_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.target_gold", min_value=0.0, max_value=1.0)
+            ag = _rcr_float(item.get("aux_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.aux_gold", min_value=0.0, max_value=1.0)
+            cf = _rcr_float(item.get("cf"), f"step5.tuning.ratio_candidates.explanation.{cid}.cf", min_value=0.0, max_value=1.0)
             if abs((tg + ag + cf) - 1.0) > 1e-6:
                 raise OneControlConfigError(f"step5.tuning.ratio_candidates.explanation.{cid} ratios must sum to 1.0")
             out.append({"id": str(cid), "target_gold": tg, "aux_gold": ag, "cf": cf})
@@ -3755,9 +4035,24 @@ def _assert_step5_selected_candidate_consistency(
     innovation_config: Mapping[str, Any],
 ) -> None:
     tokens = _step5_candidate_tokens(str(tuning_config.get("selected_tuning_candidate") or ""))
-    if tokens.get("ratio") != _STEP5_FORMAL_RATIO_ID:
-        raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_RATIO_ID}")
     weak_task_allowed = str(scenario) == "weak_cross_platform" and int(task_id) in {7, 8}
+    allowed_ratio_ids = {_STEP5_FORMAL_RATIO_ID, _STEP5_TARGET_GOLD_ONLY_RATIO_ID}
+    if weak_task_allowed:
+        allowed_ratio_ids.update(_STEP5_TASK_ADAPTIVE_RATIO_IDS)
+    if tokens.get("ratio") not in allowed_ratio_ids:
+        raise OneControlConfigError(
+            f"Step5 explanation mainline requires {_STEP5_FORMAL_RATIO_ID}; "
+            f"bounded no-ref pilot may use {_STEP5_TARGET_GOLD_ONLY_RATIO_ID}; "
+            "task-adaptive weak-cross-platform candidates must be explicitly allowlisted"
+        )
+    if tokens.get("ratio") == _STEP5_TARGET_GOLD_ONLY_RATIO_ID and not weak_task_allowed:
+        raise OneControlConfigError(
+            f"{_STEP5_TARGET_GOLD_ONLY_RATIO_ID} is only allowed for task7/task8 weak_cross_platform Step5 no-ref pilots."
+        )
+    if tokens.get("ratio") in _STEP5_TASK_ADAPTIVE_RATIO_IDS and not weak_task_allowed:
+        raise OneControlConfigError(
+            f"{tokens.get('ratio')} is only allowed for task7/task8 weak_cross_platform Step5."
+        )
     if tokens.get("cf_mix") == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID:
         if not weak_task_allowed:
             raise OneControlConfigError(
@@ -3771,7 +4066,14 @@ def _assert_step5_selected_candidate_consistency(
             raise OneControlConfigError(
                 f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} requires {_STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID}."
             )
-    elif tokens.get("cf_mix") != _STEP5_FORMAL_CF_MIX_ID:
+    elif tokens.get("cf_mix") == _STEP5_FORMAL_CF_MIX_ID:
+        pass
+    elif tokens.get("cf_mix") in _STEP5_TASK_ADAPTIVE_CF_MIX_IDS:
+        if not weak_task_allowed:
+            raise OneControlConfigError(
+                f"{tokens.get('cf_mix')} is only allowed for task7/task8 weak_cross_platform Step5."
+            )
+    else:
         raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_CF_MIX_ID}")
     explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
     ratio = _candidate_row_by_id(
@@ -3848,11 +4150,12 @@ def _step5_formal_active_candidate_payload(
     explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
     explanation_mix = dict(_mapping(explanation_cfg.get("cf_tier_mix"), "step5.sampler.explanation.cf_tier_mix"))
     low_weighted_disabled = float(explanation_mix.get("low_weighted") or 0.0) == 0.0
-    sampler_protocol = (
-        _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
-        if tokens["cf_mix"] == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
-        else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
-    )
+    if tokens["cf_mix"] == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID:
+        sampler_protocol = _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
+    elif tokens["cf_mix"] in _STEP5_TASK_ADAPTIVE_CF_MIX_IDS:
+        sampler_protocol = "STEP5_TASK_ADAPTIVE_ROUTE_CAP_MAINLINE"
+    else:
+        sampler_protocol = "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
     return {
         "schema_version": "odcr_step5_formal_active_candidate/2",
         "mode": "explanation_only",
@@ -4089,6 +4392,9 @@ def resolve_config(
     eval_split = str((eval_cfg_top.get("split") if isinstance(eval_cfg_top, Mapping) else None) or "valid").strip().lower()
     if eval_split not in {"valid", "test"}:
         raise OneControlConfigError("eval.split must be either valid or test")
+    eval_max_rows = _optional_int(eval_cfg_top.get("max_rows") if isinstance(eval_cfg_top, Mapping) else None)
+    if eval_max_rows is not None and eval_max_rows <= 0:
+        raise OneControlConfigError("eval.max_rows must be null or a positive integer")
     hw_name_from_profile = eval_profile_obj.get("hardware") if eval_profile_obj else None
     hw_name, hw = _active_hardware(cfg, str(hw_name_from_profile) if hw_name_from_profile else None)
     ddp_world_size = _positive_int(hw.get("ddp_world_size", 1), "hardware.ddp_world_size")
@@ -4194,23 +4500,53 @@ def resolve_config(
     rerank_name = str(eval_profile_obj.get("rerank")) if eval_profile_obj.get("rerank") else None
     rerank_id, rerank = _resolve_rerank(cfg, rerank_name, need_rerank=need_rerank)
     if stage_for_train == "step5" and command == "eval":
-        if eval_profile_name != "paper_greedy_25":
+        if eval_profile_name not in {"paper_greedy_25", "odcr_no_ref_k5_25"}:
             raise OneControlConfigError(
-                "Step5 official eval requires eval profile paper_greedy_25; "
+                "Step5 official eval requires eval profile paper_greedy_25 or odcr_no_ref_k5_25; "
                 f"{eval_profile_name!r} is diagnostic_only and cannot write official paper metrics."
             )
         if not bool(eval_profile_obj.get("official", False)):
-            raise OneControlConfigError("eval.profiles.paper_greedy_25 must declare official: true")
-        if str(decode_id) != "paper_greedy_25":
-            raise OneControlConfigError("Step5 official eval requires eval.decode.paper_greedy_25")
-        if bool(eval_profile_obj.get("rerank")):
-            raise OneControlConfigError("Step5 official paper_greedy_25 eval forbids rerank")
-        if str(decode.get("decode_strategy", "")).strip().lower() != "greedy":
-            raise OneControlConfigError("Step5 official paper_greedy_25 decode_strategy must be greedy")
-        if int(decode.get("max_explanation_length", 0)) != 25 or int(decode.get("hard_max_len", 0)) != 25:
-            raise OneControlConfigError("Step5 official paper_greedy_25 max/hard length must be 25")
-        if abs(float(decode.get("repetition_penalty", 1.0)) - 1.0) > 1e-12:
-            raise OneControlConfigError("Step5 official paper_greedy_25 repetition_penalty must be 1.0")
+            raise OneControlConfigError(f"eval.profiles.{eval_profile_name} must declare official: true")
+        if eval_profile_name == "paper_greedy_25":
+            if str(decode_id) != "paper_greedy_25":
+                raise OneControlConfigError("Step5 official paper_greedy_25 eval requires eval.decode.paper_greedy_25")
+            if bool(eval_profile_obj.get("rerank")):
+                raise OneControlConfigError("Step5 official paper_greedy_25 eval forbids rerank")
+            if str(decode.get("decode_strategy", "")).strip().lower() != "greedy":
+                raise OneControlConfigError("Step5 official paper_greedy_25 decode_strategy must be greedy")
+            if int(decode.get("max_explanation_length", 0)) != 25 or int(decode.get("hard_max_len", 0)) != 25:
+                raise OneControlConfigError("Step5 official paper_greedy_25 max/hard length must be 25")
+            if abs(float(decode.get("repetition_penalty", 1.0)) - 1.0) > 1e-12:
+                raise OneControlConfigError("Step5 official paper_greedy_25 repetition_penalty must be 1.0")
+        else:
+            final_eval_generation_policy = str(
+                _get(cfg, "step5.final_eval.generation_input_policy", "")
+            ).strip()
+            final_eval_content_policy = str(
+                _get(cfg, "step5.final_eval.content_evidence_policy", "")
+            ).strip()
+            if final_eval_generation_policy != "history_conditioned_no_reference_evidence":
+                raise OneControlConfigError(
+                    "Step5 official odcr_no_ref_k5_25 eval requires no-reference generation_input_policy"
+                )
+            if final_eval_content_policy != "train_only_history":
+                raise OneControlConfigError(
+                    "Step5 official odcr_no_ref_k5_25 eval requires content_evidence_policy=train_only_history"
+                )
+            if str(decode_id) != "odcr_no_ref_k5_25":
+                raise OneControlConfigError("Step5 official odcr_no_ref_k5_25 eval requires eval.decode.odcr_no_ref_k5_25")
+            if str(rerank_id) != "odcr_no_ref_fca_anchor":
+                raise OneControlConfigError(
+                    "Step5 official odcr_no_ref_k5_25 eval requires eval.rerank.odcr_no_ref_fca_anchor"
+                )
+            if not bool(eval_profile_obj.get("rerank")):
+                raise OneControlConfigError("Step5 official odcr_no_ref_k5_25 eval requires reference-free rerank")
+            if int(eval_profile_obj.get("num_return_sequences", 0) or 0) != 5:
+                raise OneControlConfigError("Step5 official odcr_no_ref_k5_25 eval requires num_return_sequences=5")
+            if str(decode.get("decode_strategy", "")).strip().lower() not in {"nucleus", "uncertainty_low_temp_top_k"}:
+                raise OneControlConfigError("Step5 official odcr_no_ref_k5_25 decode must produce stochastic candidates")
+            if int(decode.get("max_explanation_length", 0)) != 25 or int(decode.get("hard_max_len", 0)) != 25:
+                raise OneControlConfigError("Step5 official odcr_no_ref_k5_25 max/hard length must be 25")
 
     iteration_id = "v1"
     run_name: str | None = None
@@ -4284,22 +4620,51 @@ def resolve_config(
             from_run = run_naming.parse_run_id(str(upstream_from_step3)) if upstream_from_step3 else _lineage_for_step5(step4_run)
             step5_parent = path_layout.get_stage_task_root(repo_root, "step5", tid)
             if run_id and run_id not in ("", "auto"):
-                try:
-                    step5_run = run_naming.normalize_step5_run_id_for_step4(
-                        str(run_id),
-                        step4_run=step4_run,
-                        head=step5_head_norm,
-                    )
-                except ValueError as exc:
-                    raise OneControlConfigError(str(exc)) from exc
-                if (step5_parent / step5_run).exists():
-                    raise FileExistsError(f"已存在目录（禁止覆盖）: {step5_parent / step5_run}")
+                from odcr_core.ablation.binding import is_ablation_run_id, load_ablation_binding, variant_from_ablation_run_id
+
+                if is_ablation_run_id(str(run_id)):
+                    try:
+                        variant = variant_from_ablation_run_id(str(run_id))
+                        binding = load_ablation_binding(repo_root, task=tid, variant=variant)
+                    except Exception as exc:
+                        raise OneControlConfigError(f"invalid formal ablation run binding: {exc}") from exc
+                    step5_run = str(run_id)
+                    if binding.run_id != step5_run:
+                        raise OneControlConfigError(
+                            f"ablation run-id {step5_run!r} does not match registry namespace {binding.run_id!r}"
+                        )
+                    existing = step5_parent / step5_run
+                    manifest = existing / "meta" / "ablation_manifest.json"
+                    if existing.exists() and not manifest.is_file():
+                        raise FileExistsError(f"ablation namespace exists without manifest（禁止覆盖）: {existing}")
+                    if existing.exists() and (existing / "model" / "best_observed.pth").exists():
+                        raise FileExistsError(f"formal ablation run already has checkpoint artifacts（禁止覆盖）: {existing}")
+                    status_path = existing / "meta" / "stage_status.json"
+                    if existing.exists() and status_path.is_file():
+                        try:
+                            status_payload = json.loads(status_path.read_text(encoding="utf-8"))
+                        except json.JSONDecodeError as exc:
+                            raise FileExistsError(f"formal ablation stage_status is invalid（禁止覆盖）: {status_path}") from exc
+                        final_status = str(status_payload.get("final_status") or "").strip().lower()
+                        if final_status in {"completed_with_explanation_handoff", "train_completed_no_explanation_handoff"}:
+                            raise FileExistsError(f"formal ablation run already completed training（禁止覆盖）: {existing}")
+                else:
+                    try:
+                        step5_run = run_naming.normalize_step5_run_id_for_step4(
+                            str(run_id),
+                            step4_run=step4_run,
+                            head=step5_head_norm,
+                        )
+                    except ValueError as exc:
+                        raise OneControlConfigError(str(exc)) from exc
+                    if (step5_parent / step5_run).exists():
+                        raise FileExistsError(f"已存在目录（禁止覆盖）: {step5_parent / step5_run}")
             else:
                 if not dry_run:
                     step5_parent.mkdir(parents=True, exist_ok=True)
                 step5_run = run_naming.allocate_step5_run_id(step5_parent, step4_run, head=step5_head_norm)
             run_root = _stage_root(repo_root, tid, "step5", step5_run)
-            eval_run_dir = str((run_root / "post_train_eval").resolve())
+            eval_run_dir = str((run_root / "post_train_eval_no_ref").resolve())
     elif command == "eval":
         src = from_step5 or "latest"
         try:
@@ -4352,16 +4717,29 @@ def resolve_config(
         else:
             upstream_from_step3 = ""
             upstream_from_step4 = ""
-        inferred_from_run, inferred_step4 = _lineage_for_eval(step5_run)
+        if run_naming.parse_stage_run_id("step5", step5_run).startswith("ablation_"):
+            inferred_from_run, inferred_step4 = "", ""
+        else:
+            inferred_from_run, inferred_step4 = _lineage_for_eval(step5_run)
         from_run = run_naming.parse_run_id(upstream_from_step3) if upstream_from_step3 else inferred_from_run
         step4_run = run_naming.parse_run_id(upstream_from_step4) if upstream_from_step4 else inferred_step4
+        if not from_run or not step4_run:
+            raise OneControlConfigError(
+                f"Step5 eval reclosure cannot infer Step3/Step4 lineage for run {step5_run}; "
+                "expected upstream.from_step3 and upstream.from_step4 in stage_status."
+            )
         run_root = _stage_root(repo_root, tid, "step5", step5_run)
         if need_rerank:
             eval_stage = "rerank"
             eval_run_id = _alloc_run(repo_root, tid, eval_stage, run_id or "auto", dry_run=dry_run)
             eval_run_dir = str(_stage_root(repo_root, tid, eval_stage, eval_run_id))
         else:
-            eval_run_dir = str((run_root / "post_train_eval" / eval_split).resolve())
+            eval_dir_name = eval_split
+            if run_id and str(run_id).strip() not in {"", "auto"}:
+                eval_dir_name = str(run_id).strip()
+                if any(ch in eval_dir_name for ch in ("/", "\\", ":", "\x00")) or eval_dir_name in {".", ".."}:
+                    raise OneControlConfigError(f"invalid Step5 eval output run-id: {eval_dir_name!r}")
+            eval_run_dir = str((run_root / "post_train_eval_no_ref" / eval_dir_name).resolve())
     else:
         raise OneControlConfigError(f"unsupported command for resolver: {command}")
 
@@ -4451,6 +4829,7 @@ def resolve_config(
     )
     step5_valid_loss_config = _resolve_step5_valid_loss_config(cfg) if stage_for_train == "step5" else {}
     step5_final_eval_config = _resolve_step5_final_eval_config(cfg) if stage_for_train == "step5" else {}
+    step5_no_ref_evidence_config = _resolve_step5_no_ref_evidence_config(cfg) if stage_for_train == "step5" else {}
     if (
         stage_for_train == "step5"
         and command == "eval"
@@ -4577,6 +4956,15 @@ def resolve_config(
         row["final_eval_prediction_max_length"] = int(step5_final_eval_config["prediction_max_length"])
         row["final_eval_reference_max_length"] = int(step5_final_eval_config["reference_max_length"])
         row["step5_final_eval"] = dict(step5_final_eval_config)
+        row["step5_final_eval_config_json"] = json_dumps(step5_final_eval_config)
+        row["step5_no_ref_evidence"] = dict(step5_no_ref_evidence_config)
+        row["step5_no_ref_evidence_config_json"] = json_dumps(step5_no_ref_evidence_config)
+        row["step5_no_ref_encoder_content_token_budget"] = int(
+            step5_no_ref_evidence_config.get("encoder_content_token_budget", 96)
+        )
+        row["step5_train_generation_input_policy"] = str(row.get("generation_input_policy") or "")
+        row["step5_train_content_evidence_policy"] = str(row.get("content_evidence_policy") or "")
+        row["step5_train_reference_usage"] = str(row.get("reference_usage") or "")
         row["step5_valid_loss"] = dict(step5_valid_loss_config)
         row.update(step5_model_config)
         row.update(step5_ddp_config)
@@ -4721,12 +5109,25 @@ def resolve_config(
         payload["step5_eval"] = step5_eval_config
         payload["step5_valid_loss"] = step5_valid_loss_config
         payload["step5_final_eval"] = step5_final_eval_config
+        payload["step5_no_ref_evidence"] = step5_no_ref_evidence_config
+        payload["step5_train_generation_input_policy"] = str(row.get("generation_input_policy") or "")
+        payload["step5_train_content_evidence_policy"] = str(row.get("content_evidence_policy") or "")
+        payload["step5_train_reference_usage"] = str(row.get("reference_usage") or "")
 
     decode_strategy = str(decode.get("decode_strategy", "greedy")).strip().lower()
     decode_seed = _optional_int(decode.get("decode_seed"))
     no_repeat = _optional_int(decode.get("no_repeat_ngram_size"))
     min_len = _optional_int(decode.get("min_len"))
     domain_fusion_mode = str(decode.get("domain_fusion_mode", "gate_cross_attn"))
+    train_label_smoothing = float(row.get("label_smoothing", SAFE_DECODE_PLACEHOLDER["label_smoothing"]))
+    if not math.isfinite(train_label_smoothing) or not (0.0 <= train_label_smoothing < 1.0):
+        raise OneControlConfigError("training_row.label_smoothing must be a finite value in [0,1)")
+    train_warmup_steps = _optional_int(row.get("warmup_steps"))
+    train_warmup_ratio = None
+    if "warmup_ratio" in row:
+        train_warmup_ratio = float(row["warmup_ratio"])
+        if not math.isfinite(train_warmup_ratio) or not (0.0 < train_warmup_ratio < 1.0):
+            raise OneControlConfigError("training_row.warmup_ratio must be a finite value in (0,1)")
     if decode_strategy not in ("greedy", "nucleus", "uncertainty_low_temp_top_k"):
         raise OneControlConfigError(f"unsupported decode_strategy: {decode_strategy!r}")
     step5_eval_source = (
@@ -4759,6 +5160,7 @@ def resolve_config(
         "train": f"{stage_for_train}.train",
         "eval_profile": f"eval.profiles.{eval_profile_name}" if eval_profile_name else None,
         "eval_split": "eval.split",
+        "eval_max_rows": "eval.max_rows",
         "decode": f"eval.decode.{decode_id}" if decode_id else None,
         "rerank": f"eval.rerank.{rerank_id}" if rerank_id else None,
         "step4_rcr": "step4.rcr",
@@ -4909,6 +5311,7 @@ def resolve_config(
         "step5_eval": step5_eval_source if stage_for_train == "step5" else None,
         "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
+        "step5_no_ref_evidence": "step5.no_ref_evidence" if stage_for_train == "step5" else None,
         "train_per_gpu_batch_size": "step5.train.per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_per_gpu_batch_size": f"{step5_eval_source}.valid_per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_global_batch_size": f"{step5_eval_source}.valid_batch_size" if stage_for_train == "step5" else None,
@@ -5141,6 +5544,41 @@ def resolve_config(
     ):
         field_sources[f"step5_eval.{key}"] = f"{step5_eval_source}.{key}"
     for key in (
+        "schema_version",
+        "official_profile",
+        "prediction_max_length",
+        "reference_max_length",
+        "generation_input_policy",
+        "content_evidence_policy",
+        "reference_usage",
+        "neutral_content_evidence",
+        "forbid_current_eval_fields_in_generation",
+        "metric_input_builder",
+        "metrics_implementation",
+        "test_once",
+    ):
+        field_sources[f"step5_final_eval.{key}"] = f"step5.final_eval.{key}"
+    for key in (
+        "schema_version",
+        "input_protocol",
+        "allowed_input_protocols",
+        "cache_namespace",
+        "train_scope",
+        "selected_effective_epochs",
+        "concise_prompt",
+        "evidence_top_k",
+        "user_history_top_k",
+        "item_history_top_k",
+        "domain_prior_top_n",
+        "domain_prior_display_top_k",
+        "min_df",
+        "stopword_policy",
+        "term_token_limit",
+        "neutral_content_evidence",
+        "smoke_cache_identity_includes_max_rows",
+    ):
+        field_sources[f"step5_no_ref_evidence.{key}"] = f"step5.no_ref_evidence.{key}"
+    for key in (
         "enabled",
         "evidence_level",
         "namespace_root",
@@ -5329,6 +5767,7 @@ def resolve_config(
         "step5_memory_truth": "step5.memory_truth" if stage_for_train == "step5" else None,
         "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
+        "step5_no_ref_evidence": "step5.no_ref_evidence" if stage_for_train == "step5" else None,
     }
     train_fp = fingerprint({"payload": payload, "hardware": hw_semantic, "ddp_world_size": ddp_world_size})
     gen_fp = fingerprint({"decode": decode, "eval_batch_size": eval_batch_size, "rerank": rerank}) if need_decode else ""
@@ -5387,6 +5826,9 @@ def resolve_config(
             "max_epochs": int(row.get("max_epochs", row["epochs"])),
             "epochs": int(row["epochs"]),
             "lr": row["lr"],
+            "label_smoothing": train_label_smoothing,
+            "warmup_steps": train_warmup_steps,
+            "warmup_ratio": train_warmup_ratio,
             **(
                 {
                     "min_epochs": int(row["min_epochs"]),
@@ -5441,6 +5883,7 @@ def resolve_config(
         "eval": {
             "profile": eval_profile_name or None,
             "split": eval_split,
+            "max_rows": eval_max_rows,
             "eval_batch_size": eval_batch_size,
             "eval_per_gpu_batch_size": eval_per_gpu,
             **(
@@ -5551,6 +5994,10 @@ def resolve_config(
         "step5_eval": step5_eval_config if stage_for_train == "step5" else None,
         "step5_valid_loss": step5_valid_loss_config if stage_for_train == "step5" else None,
         "step5_final_eval": step5_final_eval_config if stage_for_train == "step5" else None,
+        "step5_no_ref_evidence": step5_no_ref_evidence_config if stage_for_train == "step5" else None,
+        "step5_train_generation_input_policy": str(row.get("generation_input_policy") or "") if stage_for_train == "step5" else None,
+        "step5_train_content_evidence_policy": str(row.get("content_evidence_policy") or "") if stage_for_train == "step5" else None,
+        "step5_train_reference_usage": str(row.get("reference_usage") or "") if stage_for_train == "step5" else None,
         "step5_formal_active_candidate": (
             step5_formal_active_candidate_config if stage_for_train == "step5" else None
         ),
@@ -5710,6 +6157,12 @@ def resolve_config(
         valid_loss_label_max_length=int(row.get("valid_loss_label_max_length", row.get("train_label_max_length", 64))),
         final_eval_prediction_max_length=int(row.get("final_eval_prediction_max_length", 25)),
         final_eval_reference_max_length=int(row.get("final_eval_reference_max_length", 25)),
+        step5_final_eval_config_json=json_dumps(row.get("step5_final_eval", {})),
+        step5_no_ref_evidence_config_json=json_dumps(row.get("step5_no_ref_evidence", {})),
+        step5_no_ref_encoder_content_token_budget=int(row.get("step5_no_ref_encoder_content_token_budget", 96)),
+        step5_train_generation_input_policy=str(row.get("step5_train_generation_input_policy") or row.get("generation_input_policy") or ""),
+        step5_train_content_evidence_policy=str(row.get("step5_train_content_evidence_policy") or row.get("content_evidence_policy") or ""),
+        step5_train_reference_usage=str(row.get("step5_train_reference_usage") or row.get("reference_usage") or ""),
         num_proc=num_proc,
         ddp_world_size=ddp_world_size,
         seed=int(project.get("seed", 3407)),
@@ -5720,6 +6173,9 @@ def resolve_config(
         manifest_dir=manifest_dir,
         eval_run_dir=eval_run_dir,
         label_smoothing=float(decode["label_smoothing"]),
+        train_label_smoothing=train_label_smoothing,
+        train_warmup_steps=train_warmup_steps,
+        train_warmup_ratio=train_warmup_ratio,
         repetition_penalty=float(decode["repetition_penalty"]),
         generate_temperature=float(decode["generate_temperature"]),
         generate_top_p=float(decode["generate_top_p"]),
@@ -5793,6 +6249,7 @@ def resolve_config(
         eval_per_gpu_batch_size=eval_per_gpu,
         eval_profile_id=eval_profile_name,
         eval_split=eval_split,
+        eval_max_rows=eval_max_rows,
         consumed_presets_json=json_dumps(consumed),
         config_before_cli_json=json_dumps({"config_path": str(config_path)}),
         matrix_session_id=None,

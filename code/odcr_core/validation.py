@@ -340,7 +340,10 @@ def validate_resolved_config(cfg: ResolvedConfig) -> None:
                 + _hint_tail()
             )
         assert cfg.step5_run is not None
-        s4_slug = run_naming.step4_slug_from_step5_slug(cfg.step5_run)
+        if str(cfg.step5_run).startswith("ablation_") and cfg.step4_run:
+            s4_slug = run_naming.parse_run_id(cfg.step4_run)
+        else:
+            s4_slug = run_naming.step4_slug_from_step5_slug(cfg.step5_run)
         step4_dir = path_layout.get_train_step4_run_root(
             cfg.repo_root, cfg.task_id, cfg.iteration_id, s4_slug
         )

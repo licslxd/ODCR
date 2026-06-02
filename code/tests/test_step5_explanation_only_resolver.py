@@ -31,4 +31,4 @@ def test_step5_resolves_as_explanation_only() -> None:
     assert cfg.valid_loss_label_max_length == 128
     assert cfg.final_eval_prediction_max_length == 25
     assert cfg.final_eval_reference_max_length == 25
-    assert snapshot["step5_final_eval"]["official_profile"] == "paper_greedy_25"
+    assert snapshot["step5_final_eval"]["official_profile"] == "odcr_no_ref_k5_25"

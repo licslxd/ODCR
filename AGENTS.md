@@ -11,6 +11,7 @@ prompt:
 - `docs/skills/ODCR_GPU_SKILL.md`
 - `docs/skills/ODCR_AUDIT_DELIVERY_SKILL.md`
 - `docs/skills/ODCR_CACHE_SKILL.md`
+- `docs/skills/ODCR_TASK_ADAPTIVE_SAMPLER_CACHE_SKILL.md`
 
 ## Non-Negotiable One-Control Rules
 
@@ -395,3 +396,25 @@ gates, and explicit manual deep validation.
 
 Do not change Step3/Step4/Step5 model, loss, routing, training logic, data
 contracts, or generated data while performing architecture-only guardrail work.
+
+## ODCR paper collaboration mode
+
+- Chat is responsible for paper narrative, innovation story, causal framing,
+  and academic wording decisions.
+- Codex is responsible for implementing Chat decisions in LaTeX, extracting
+  evidence, verifying citations, building PDF, and producing handoff.
+- For every paper task, first read:
+  - `AI_analysis/00_paper/writing_decision_from_chat.md`
+- Every paper task must update:
+  - `AI_analysis/00_paper/paper_chat_handoff.md`
+- Codex must not invent the paper story.
+- Codex must not promote implementation stages such as Step3/Step4/Step5 into
+  paper contributions unless the Chat decision file explicitly asks for it.
+- Codex must not add unsupported claims, fake citations, fake BibTeX entries,
+  or fabricated results.
+- Paper tasks must not run training, eval, rerank, 5-seed, longest-reference
+  rebuild, or baseline adaptation unless the user starts a separate experiment
+  session.
+- Paper tasks may modify `paper/`, `.agents/skills/`, `AGENTS.md`,
+  `AI_analysis/00_paper/`, and paper workflow tools.
+- Paper tasks must not modify `runs/` formal artifacts.

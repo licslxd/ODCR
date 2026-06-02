@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from odcr_core import path_layout, run_naming
+from odcr_core.ablation.guards import AblationGuardError, assert_not_ablation_promotion_target
 from odcr_core.file_atomic import atomic_write_json
 from odcr_core.upstream_resolver import resolve_latest, resolve_run, validate_upstream_eligibility
 
@@ -49,6 +50,15 @@ def promote_upstream(
 ) -> dict[str, Any]:
     root = Path(repo_root).expanduser().resolve()
     stage_name = str(stage or "").strip().lower()
+    try:
+        assert_not_ablation_promotion_target(
+            repo_root=root,
+            stage=stage_name,
+            task=int(task),
+            run_id=str(run_id),
+        )
+    except AblationGuardError as exc:
+        raise StagePromotionError(str(exc)) from exc
     rid = run_naming.parse_stage_run_id(stage_name, str(run_id))
     target = resolve_run(repo_root=root, stage=stage_name, task=int(task), run_id=rid, repair=True)
     consumer = {

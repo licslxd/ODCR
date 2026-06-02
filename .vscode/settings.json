@@ -1,32 +1,47 @@
 {
-  "explorer.excludeGitIgnore": false,
-  "files.exclude": {
-    "**/audit.log": false
-  },
-  "files.watcherExclude": {
-    "**/*.log": false,
-    "**/audit.log": false,
-    "**/.git/**": true,
-    "**/.mypy_cache/**": true,
-    "**/.pytest_cache/**": true,
-    "**/.ruff_cache/**": true,
-    "**/.venv/**": true,
-    "**/__pycache__/**": true,
-    "**/venv/**": true
-  },
-  "search.exclude": {
-    "**/.codex": true,
-    "**/.cursor": true,
-    "**/AI_analysis": true,
-    "**/_archive": true,
-    "**/artifacts": true,
-    "**/cache": true,
-    "**/code1": true,
-    "**/data": true,
-    "**/merged": true,
-    "**/runs": true
-  },
-  "workbench.editorAssociations": {
-    "*.md": "vscode.markdown.preview.editor"
-  }
+  "latex-workshop.latex.tools": [
+    {
+      "name": "tectonic",
+      "command": "/public/home/zhangliml/miniconda3/envs/tex/bin/tectonic",
+      "args": [
+        "-X",
+        "compile",
+        "--synctex",
+        "--outdir",
+        "%OUTDIR%",
+        "%DOC%"
+      ],
+      "env": {}
+    },
+    {
+      "name": "pdflatex",
+      "command": "/usr/bin/pdflatex",
+      "args": [
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "%DOC%"
+      ],
+      "env": {}
+    },
+    {
+      "name": "bibtex",
+      "command": "/usr/bin/bibtex",
+      "args": ["%DOCFILE%"],
+      "env": {}
+    }
+  ],
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "tectonic (TeX 2023)",
+      "tools": ["tectonic"]
+    },
+    {
+      "name": "pdflatex -> bibtex -> pdflatex*2",
+      "tools": ["pdflatex", "bibtex", "pdflatex", "pdflatex"]
+    }
+  ],
+  "latex-workshop.latex.recipe.default": "first",
+  "latex-workshop.latex.outDir": "%DIR%",
+  "latex-workshop.latex.autoBuild.run": "onSave"
 }

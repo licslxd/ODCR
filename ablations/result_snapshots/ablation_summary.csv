@@ -1,0 +1,7 @@
+task,variant,status,source_run,valid_complete,test_complete,paper_greedy_25,task_local_rating_source,paper_table_allowed,paper_table_eligible,candidate_paper_metrics_available,manual_review_required,valid_mae,valid_rmse,valid_bleu4,valid_rougeL,test_mae,test_rmse,test_bleu4,test_rougeL
+8,wo_rcr,missing_artifact,runs/step5/task8/ablation_wo_rcr_1,False,False,False,False,False,False,False,True,,,,,,,,
+8,wo_cf,missing_artifact,runs/step5/task8/ablation_wo_cf_1,False,False,False,False,False,False,False,True,,,,,,,,
+8,wo_ccv_fca,missing_artifact,runs/step5/task8/ablation_wo_ccv_fca_1,False,False,False,False,False,False,False,True,,,,,,,,
+7,wo_rcr,missing_artifact,runs/step5/task7/ablation_wo_rcr_1,False,False,False,False,False,False,False,True,,,,,,,,
+7,wo_cf,missing_artifact,runs/step5/task7/ablation_wo_cf_1,False,False,False,False,False,False,False,True,,,,,,,,
+7,wo_ccv_fca,missing_artifact,runs/step5/task7/ablation_wo_ccv_fca_1,False,False,False,False,False,False,False,True,,,,,,,,

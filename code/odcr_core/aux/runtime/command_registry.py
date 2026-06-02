@@ -134,8 +134,8 @@ def _build_registry() -> RuntimeCommandRegistry:
     registry = RuntimeCommandRegistry()
     for spec in (
         RuntimeCommandSpec("bridge.discover", None, "bridge", "discover", False, False, False, timeout_s=20),
-        RuntimeCommandSpec("bridge.validate_only", None, "bridge", "validate-only", False, True, False, timeout_s=60),
-        RuntimeCommandSpec("bridge.marker_probe", None, "bridge", "marker-probe", False, True, False, timeout_s=30),
+        RuntimeCommandSpec("bridge.validate_only", None, "bridge", "validate-only", True, True, False, timeout_s=60),
+        RuntimeCommandSpec("bridge.marker_probe", None, "bridge", "marker-probe", True, True, False, timeout_s=30),
         RuntimeCommandSpec("bridge.cuda_probe", None, "bridge", "cuda-probe", True, True, False, timeout_s=120),
         RuntimeCommandSpec("probe.step3.bounded", "step3", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded"), timeout_s=180),
         RuntimeCommandSpec("probe.step4.bounded", "step4", "bounded", "probe", True, True, False, allowed_args=("--stage", "--task", "--bounded"), timeout_s=240),

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shlex
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +77,8 @@ TARGET_SOURCE_STATE = "state_hint"
 TARGET_SOURCE_LIVE_DISCOVERY = "live_discovery_cuda_probe"
 STEP5_FRESH_HANDOFF_REQUIRED_STAGES = {"step5", "rating_stability_control", "step5_explanation"}
 NO_LIVE_CUDA_AFTER_STALE = "no_live_cuda_pane_after_stale_handoff"
+BRIDGE_SEND_LOCK_NAME = "tmux_gpu_bridge_send.lock"
+BRIDGE_STALE_ARCHIVE_DIR = "runtime_bridge_stale_archive"
 
 
 class BridgeError(RuntimeError):
@@ -140,6 +144,71 @@ def _exec_dir() -> Path:
     path = RAW_LOG_DIR / BRIDGE_EXEC_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _bridge_send_lock_path() -> Path:
+    RAW_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return RAW_LOG_DIR / BRIDGE_SEND_LOCK_NAME
+
+
+def _archive_bridge_file_before_unlink(path: Path, *, reason: str) -> dict[str, Any] | None:
+    """Archive stale bridge-generated files before replacing them."""
+    if not path.exists() or not path.is_file():
+        return None
+    archive_dir = RAW_LOG_DIR / BRIDGE_STALE_ARCHIVE_DIR
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    archive_path = archive_dir / f"{stamp}.{path.name}"
+    try:
+        archive_path.write_bytes(path.read_bytes())
+        path.unlink()
+    except FileNotFoundError:
+        return None
+    return {
+        "schema_version": "odcr_runtime_bridge_stale_file_archive/1",
+        "source_path": str(path),
+        "archive_path": str(archive_path),
+        "reason": reason,
+        "archived_at_utc": _utc_now(),
+    }
+
+
+@contextmanager
+def _bridge_send_lock(timeout_s: int):
+    path = _bridge_send_lock_path()
+    with path.open("a+", encoding="utf-8") as fh:
+        started = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() - started > max(1, int(timeout_s)):
+                    raise BridgeError(
+                        f"timed out waiting for tmux GPU bridge send lock: {path}",
+                        stop_reason="tmux_bridge_send_lock_timeout",
+                        details={"lock_path": str(path), "timeout_s": int(timeout_s)},
+                    ) from exc
+                time.sleep(0.5)
+        try:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(
+                json.dumps(
+                    {
+                        "schema_version": "odcr_tmux_gpu_bridge_send_lock/1",
+                        "pid": os.getpid(),
+                        "acquired_at_utc": _utc_now(),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            fh.flush()
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _json_default(value: Any) -> str:
@@ -1493,10 +1562,9 @@ exit "$rc"
                 payload["stop_reason"] = "cuda_preflight_failed"
                 payload["error"] = "bridge exec target did not pass CUDA preflight"
                 return payload
-        try:
-            status_path.unlink()
-        except FileNotFoundError:
-            pass
+        archived_status = _archive_bridge_file_before_unlink(status_path, reason="bridge_exec_status_refresh")
+        if archived_status is not None:
+            payload.setdefault("stale_file_archives", []).append(archived_status)
         if options.background:
             try:
                 pid_path.unlink()
@@ -1504,41 +1572,46 @@ exit "$rc"
                 pass
         script_path = self._write_exec_script(command_id=command_id, argv=argv, status_path=status_path)
         payload["paths"]["driver_script"] = str(script_path)
-        if options.background:
-            line = (
-                f"nohup bash {shlex.quote(str(script_path))} "
-                f"> {shlex.quote(str(stdout_path))} "
-                f"2> {shlex.quote(str(stderr_path))} "
-                f"& echo $! > {shlex.quote(str(pid_path))}"
-            )
-            if stdout_path == stderr_path or bool(options.stderr_to_stdout):
+        timeout_s = int(options.timeout or 3600)
+        with _bridge_send_lock(timeout_s):
+            if options.background:
                 line = (
                     f"nohup bash {shlex.quote(str(script_path))} "
-                    f"> {shlex.quote(str(stdout_path))} 2>&1 "
+                    f"> {shlex.quote(str(stdout_path))} "
+                    f"2> {shlex.quote(str(stderr_path))} "
                     f"& echo $! > {shlex.quote(str(pid_path))}"
+                )
+                if stdout_path == stderr_path or bool(options.stderr_to_stdout):
+                    line = (
+                        f"nohup bash {shlex.quote(str(script_path))} "
+                        f"> {shlex.quote(str(stdout_path))} 2>&1 "
+                        f"& echo $! > {shlex.quote(str(pid_path))}"
+                    )
+                self._send_bridge_line(target, line)
+                payload["sent"] = True
+                payload["pid"] = self._wait_optional_pid_file(pid_path)
+                payload["pid_file_written"] = bool(payload.get("pid"))
+                payload["success"] = True
+                return payload
+            if stdout_path == stderr_path or bool(options.stderr_to_stdout):
+                line = f"bash {shlex.quote(str(script_path))} > {shlex.quote(str(stdout_path))} 2>&1"
+            else:
+                line = (
+                    f"bash {shlex.quote(str(script_path))} "
+                    f"> {shlex.quote(str(stdout_path))} "
+                    f"2> {shlex.quote(str(stderr_path))}"
                 )
             self._send_bridge_line(target, line)
             payload["sent"] = True
-            payload["pid"] = self._wait_optional_pid_file(pid_path)
-            payload["pid_file_written"] = bool(payload.get("pid"))
-            payload["success"] = True
-            return payload
-        if stdout_path == stderr_path or bool(options.stderr_to_stdout):
-            line = f"bash {shlex.quote(str(script_path))} > {shlex.quote(str(stdout_path))} 2>&1"
-        else:
-            line = (
-                f"bash {shlex.quote(str(script_path))} "
-                f"> {shlex.quote(str(stdout_path))} "
-                f"2> {shlex.quote(str(stderr_path))}"
+            payload["timeout_s"] = timeout_s
+            status = self._wait_status(
+                GeneratedPaths(status=status_path, log=stdout_path, report=status_path),
+                timeout_s,
+                terminal_statuses={"completed", "failed"},
             )
-        self._send_bridge_line(target, line)
-        payload["sent"] = True
-        timeout_s = int(options.timeout or 3600)
-        payload["timeout_s"] = timeout_s
-        status = self._wait_status(GeneratedPaths(status=status_path, log=stdout_path, report=status_path), timeout_s)
-        payload["child_status"] = status
-        payload["success"] = bool(status.get("success"))
-        payload["returncode"] = status.get("returncode")
+            payload["child_status"] = status
+            payload["success"] = bool(status.get("success"))
+            payload["returncode"] = status.get("returncode")
         return payload
 
     def _step5_handoff_admission(self, *, stage: str, socket: str | None, target: str | None) -> dict[str, Any]:
@@ -1598,13 +1671,24 @@ exit "$rc"
             }
         return {"required": True, "ok": False, "stop_reason": "unreachable_handoff_admission_state"}
 
-    def _wait_status(self, paths: GeneratedPaths, timeout_s: int) -> dict[str, Any]:
+    def _wait_status(
+        self,
+        paths: GeneratedPaths,
+        timeout_s: int,
+        *,
+        terminal_statuses: set[str] | None = None,
+    ) -> dict[str, Any]:
         started = self.clock()
         while self.clock() - started <= timeout_s:
             if paths.status.is_file():
                 try:
                     payload = json.loads(paths.status.read_text(encoding="utf-8"))
                     if isinstance(payload, dict):
+                        if terminal_statuses is not None:
+                            status = str(payload.get("status") or "").strip().lower()
+                            if status not in terminal_statuses:
+                                self.sleep(1)
+                                continue
                         return payload
                 except json.JSONDecodeError:
                     pass
@@ -1648,16 +1732,19 @@ exit "$rc"
             payload["success"] = not require_cuda
             payload["no_send"] = bool(no_send)
             return payload
+        archives: list[dict[str, Any]] = []
         for path in (paths.status, paths.log, paths.report):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            archived = _archive_bridge_file_before_unlink(path, reason=f"{mode}_handshake_refresh")
+            if archived is not None:
+                archives.append(archived)
+        if archives:
+            payload["stale_file_archives"] = archives
         command = _command_for_child(mode, paths, stage=stage, task=task, require_cuda=require_cuda)
         try:
-            self._send_registered_command(target, command)
-            payload["sent"] = True
-            status = self._wait_status(paths, timeout_s)
+            with _bridge_send_lock(timeout_s):
+                self._send_registered_command(target, command)
+                payload["sent"] = True
+                status = self._wait_status(paths, timeout_s)
         except BridgeError as exc:
             payload.update(
                 {
@@ -1794,11 +1881,13 @@ exit "$rc"
         if options.dry_run or options.no_send:
             payload["success"] = not spec.requires_gpu
             return payload
+        archives: list[dict[str, Any]] = []
         for path in (paths.status, paths.log, paths.report):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            archived = _archive_bridge_file_before_unlink(path, reason=f"{options.mode}_handshake_refresh")
+            if archived is not None:
+                archives.append(archived)
+        if archives:
+            payload["stale_file_archives"] = archives
         command = _command_for_child(
             options.mode,
             paths,
@@ -1806,23 +1895,24 @@ exit "$rc"
             task=options.task_id,
             require_cuda=spec.requires_gpu,
         )
-        self._send_registered_command(target, command)
-        payload["sent"] = True
         timeout_s = int(options.timeout or spec.timeout_s)
         payload["timeout_s"] = timeout_s
-        try:
-            status = self._wait_status(paths, timeout_s)
-        except BridgeError as exc:
-            payload.update(
-                {
-                    "success": False,
-                    "stop_reason": exc.stop_reason,
-                    "error": str(exc),
-                    "timeout_s": timeout_s,
-                    "bridge_repair_required": True,
-                }
-            )
-            return payload
+        with _bridge_send_lock(timeout_s):
+            self._send_registered_command(target, command)
+            payload["sent"] = True
+            try:
+                status = self._wait_status(paths, timeout_s)
+            except BridgeError as exc:
+                payload.update(
+                    {
+                        "success": False,
+                        "stop_reason": exc.stop_reason,
+                        "error": str(exc),
+                        "timeout_s": timeout_s,
+                        "bridge_repair_required": True,
+                    }
+                )
+                return payload
         payload["child_status"] = status
         payload["success"] = bool(status.get("success"))
         payload["selected_cuda_pane"] = _candidate_key(target) if payload["success"] and spec.requires_gpu else None
@@ -2034,10 +2124,9 @@ exit "$rc"
                     if normalized_evidence_level == E5_STEP5_EXPLANATION_POST_TRAIN_EVAL_LIFECYCLE
                     else PROBE_STATUS_NAME
                 )
-                try:
-                    status_path.unlink()
-                except FileNotFoundError:
-                    pass
+                archived_status = _archive_bridge_file_before_unlink(status_path, reason="runtime_probe_status_refresh")
+                if archived_status is not None:
+                    probe_result = {"stale_status_archive": archived_status}
                 cid = (
                     str(candidate_id)
                     if candidate_id

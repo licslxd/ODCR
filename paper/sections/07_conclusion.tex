@@ -1,0 +1,20 @@
+\section{Conclusion}
+
+ODCR is presented as a reliability-gated dynamic causal refinement framework
+for cross-domain explainable recommendation. Starting from D4C's feedback view
+of explanation degeneration, ODCR refines coarse textual attributes
+\(W^{(t)}\) into stable content evidence \(C\), feedback-sensitive hierarchical
+style \(S^{(t)}\), and counterfactual reliability \(R_{cf}\). This reframing
+turns cross-domain explanation learning into a controlled generation problem:
+content determines what should be explained, style determines how it is
+expressed, and reliability determines which counterfactual signals should
+shape learning.
+
+The resulting method loop combines EASD, HSS, RCR/UCI, and CCV/FCA. It keeps
+rating evidence content-grounded while allowing the explanation generator to
+adapt target-domain language without collapsing into a coarse textual shortcut.
+The current tables provide bounded single-run evidence on strong-related
+Amazon transfer and weak cross-platform TripAdvisor--Yelp transfer. Future
+evidence additions can extend this draft with module ablations, multi-seed
+evaluation, broader baseline adaptation, and human or faithfulness-oriented
+assessment without changing the central ODCR story.

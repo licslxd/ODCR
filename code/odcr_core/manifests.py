@@ -1098,6 +1098,13 @@ def write_latest_pointer_json(
     return atomic_write_json(latest_pointer_path(stage_unit_dir), payload)
 
 
+def _is_ablation_namespace_path(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    parts = Path(path).parts
+    return "step5" in parts and any(part.startswith("ablation_") for part in parts)
+
+
 def write_run_summary_json(
     summary: Mapping[str, Any],
     *,
@@ -1120,6 +1127,9 @@ def write_run_summary_json(
     out = run_summary_path(meta)
     atomic_write_json(out, dict(summary))
     stage = canonical_stage_name(str(summary.get("stage") or ""))
+    run_id_value = str(summary.get("run_id") or (run_dir.name if run_dir is not None else "")).strip()
+    if (stage == "step5" and run_id_value.startswith("ablation_")) or _is_ablation_namespace_path(run_dir):
+        update_latest = False
     stage_status_payload = None
     if stage in {"step3", "step4", "step5"} and summary.get("task_id") is not None and run_dir is not None:
         from odcr_core.stage_status import build_and_write_stage_status
@@ -1128,7 +1138,7 @@ def write_run_summary_json(
             repo_root=root,
             stage=stage,
             task=int(summary.get("task_id")),
-            run_id=str(summary.get("run_id") or run_dir.name),
+            run_id=run_id_value,
         )
         if stage == "step4" and stage_status_payload.get("downstream_ready") is not True:
             update_latest = False
@@ -1138,7 +1148,7 @@ def write_run_summary_json(
         write_latest_pointer_json(
             repo_root=root,
             stage_unit_dir=run_dir.parent,
-            run_id=str(summary.get("run_id") or run_dir.name),
+            run_id=run_id_value,
             run_dir=run_dir,
             summary_path=out,
             status=str(summary.get("status") or "pending"),
@@ -1383,6 +1393,9 @@ def _training_row_slice_for_manifest(cfg: ResolvedConfig) -> dict[str, Any]:
         "lambda_ortho_step5",
         "step5_lci_weight",
         "step5_fca_weight",
+        "label_smoothing",
+        "warmup_steps",
+        "warmup_ratio",
     )
     return {k: row[k] for k in keys if k in row}
 
@@ -1711,7 +1724,10 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
             "num_proc": cfg.num_proc,
             "ddp_world_size": cfg.ddp_world_size,
             "seed": cfg.seed,
-            "label_smoothing": cfg.label_smoothing,
+            "label_smoothing": getattr(cfg, "train_label_smoothing", cfg.label_smoothing),
+            "decode_label_smoothing": cfg.label_smoothing,
+            "warmup_steps": getattr(cfg, "train_warmup_steps", None),
+            "warmup_ratio": getattr(cfg, "train_warmup_ratio", None),
             "train_label_max_length": getattr(cfg, "train_label_max_length", None),
             "train_dynamic_padding": getattr(cfg, "train_dynamic_padding", None),
             "train_padding_strategy": getattr(cfg, "train_padding_strategy", None),

@@ -57,6 +57,13 @@ def _add_common_run_odcr_args(p: argparse.ArgumentParser) -> None:
         help="生成最小长度约束；默认 null（记录于 metrics.decode / generation_semantic_resolved）",
     )
     p.add_argument("--eval-batch-size", type=int, default=None, help="覆盖 FinalTrainingConfig.eval_batch_size 解析链")
+    p.add_argument(
+        "--eval-split",
+        type=str,
+        choices=("valid", "test"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--task-head", choices=("explanation",), default="explanation")
     p.add_argument(
         "--rating-metric-protocol",

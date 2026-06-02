@@ -123,6 +123,32 @@ class TestStep5CCVFCA(unittest.TestCase):
         self.assertEqual(tuple(bundle.scorer_evidence_basis.shape), (2, 4))
         self.assertEqual(tuple(bundle.explainer_evidence_basis.shape), (2, 4))
 
+    def test_disabled_fca_zero_loss_keeps_explainer_hidden_in_graph(self) -> None:
+        cfg = parse_step5_innovation_config_json(
+            {"fca": {"enabled": False, "weight": 0.0}},
+            allow_test_defaults=True,
+        )
+        batch = _batch()
+        packet = build_ccv_control_packet(batch, cfg)
+        gate = build_step5_explanation_gate(batch, cfg)
+        scorer_h = torch.randn(2, 4, requires_grad=True)
+        explainer_h = torch.randn(2, 4, requires_grad=True)
+        bundle = evidence_basis_fca_loss(
+            scorer_hidden=scorer_h,
+            explainer_hidden=explainer_h,
+            shared_latent=torch.randn(2, 4),
+            content_profile=torch.randn(2, 4),
+            content_evidence_latent=torch.randn(2, 4),
+            packet=packet,
+            gate=gate,
+            cfg=cfg,
+        )
+        bundle.fca_weighted_loss.backward()
+        self.assertIsNotNone(scorer_h.grad)
+        self.assertIsNotNone(explainer_h.grad)
+        self.assertTrue(torch.equal(scorer_h.grad, torch.zeros_like(scorer_h.grad)))
+        self.assertTrue(torch.equal(explainer_h.grad, torch.zeros_like(explainer_h.grad)))
+
 
 if __name__ == "__main__":
     unittest.main()

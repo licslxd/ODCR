@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from odcr_core import path_layout, run_naming
+from odcr_core.ablation.guards import AblationGuardError, assert_not_ablation_latest_pointer
 from odcr_core.stage_status import (
     BAD_FINAL_STATUSES,
     STAGE_STATUS_SCHEMA_VERSION,
@@ -158,6 +159,15 @@ def resolve_latest(*, repo_root: str | Path, stage: str, task: int, repair: bool
             f"latest.json pointer is incomplete for {stage_name} task {int(task)}: {latest_path}; "
             "expected latest_run_id and latest_summary_path"
         )
+    try:
+        assert_not_ablation_latest_pointer(
+            repo_root=root,
+            stage=stage_name,
+            task=int(task),
+            run_id=latest_run_id,
+        )
+    except AblationGuardError as exc:
+        raise UpstreamResolutionError(str(exc)) from exc
     run_id = run_naming.parse_stage_run_id(stage_name, latest_run_id)
     summary = _repo_path(root, latest_summary_path)
     expected_summary = parent / run_id / "meta" / "run_summary.json"

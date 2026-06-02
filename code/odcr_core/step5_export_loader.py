@@ -47,6 +47,7 @@ STEP5_EXPORT_LOADER_SCHEMA_VERSION = "odcr_step5_export_loader/1"
 STEP5_TRAIN_TABLE_CACHE_SCHEMA_VERSION = "odcr_step5_train_table_cache/1"
 STEP5_TRAIN_TABLE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_train_table_semantic/1"
 STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION = "odcr_step5_pool_train_table_cache/1"
+STEP5_POOL_TRAIN_TABLE_PRODUCER_VERSION = "odcr_step5_pool_train_table_producer/2_cf_single_gate"
 
 STEP5_RUNTIME_DIAGNOSTIC_KEYS: frozenset[str] = frozenset(
     {
@@ -616,6 +617,8 @@ def _pool_sample_cache_identity(
 ) -> dict[str, Any]:
     return {
         "schema_version": STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION,
+        "producer_version": STEP5_POOL_TRAIN_TABLE_PRODUCER_VERSION,
+        "sampler_schema_version": STEP5_POOL_SAMPLER_SCHEMA_VERSION,
         "source": _source_table_semantic_payload(pool_source),
         "sampler_config": dict(sampler_config or {}),
         "batch_candidates_config": dict(batch_candidates_config or {}),
@@ -635,6 +638,8 @@ def _pool_sample_cache_lineage(
 ) -> dict[str, Any]:
     return {
         "schema_version": "odcr_step5_pool_train_table_cache_lineage/1",
+        "producer_version": STEP5_POOL_TRAIN_TABLE_PRODUCER_VERSION,
+        "sampler_schema_version": STEP5_POOL_SAMPLER_SCHEMA_VERSION,
         "sampler_config": dict(sampler_config or {}),
         "batch_candidates_config": dict(batch_candidates_config or {}),
         "tuning_config": dict(tuning_config or {}),

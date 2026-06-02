@@ -1,0 +1,64 @@
+schema_version: odcr_cier_adapted_config_v1
+baseline: cier_adapted
+task_id: 2
+task_name: AM_Movies_to_AM_CDs
+source_domain: AM_Movies
+target_domain: AM_CDs
+mode_default: source_to_target
+upstream:
+  path: baselines/cier_adapted/upstream/CIER-main
+  original_entrypoint: main.py
+  original_supported_datasets:
+    - Yelp
+    - Amazon/MoviesAndTV
+    - TripAdvisor
+data:
+  odcr_data_dir: data
+  odcr_merged_dir: merged
+  required_fields: [user, item, rating, review, explanation]
+  forbidden_input_fields:
+    - confidence_bucket
+    - sample_weight_hint
+    - route_explainer
+    - route_scorer
+    - evidence_quality_prior
+    - preprocess_route_scorer_prior
+    - preprocess_route_explainer_prior
+  keyword_strategy: derived_from_explanation_or_review_first_words
+training:
+  model_name: openlm-research/open_llama_7b_v2
+  batch_size: 32
+  eval_batch_size: 32
+  source_epochs: 1
+  target_epochs: 3
+  learning_rate: 0.001
+  accumulation_steps: 1
+  num_workers: 0
+  eval_num_workers: 0
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
+  precision: fp16
+  tf32: true
+  device_index: 0
+  show_train_loss_steps: 500
+  rating_weight: 0.1
+  generate_weight: 1.0
+  delta: 0.2
+  id_hidden: 1024
+  lora_r: 4
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj]
+decode:
+  profile: paper_greedy_25
+  max_length: 25
+  do_sample: false
+  temperature:
+  top_p:
+  repetition_penalty: 1.0
+evaluation:
+  valid_selects_checkpoint: true
+  test_reports_only: true
+  official_metric_adapter: code/base_utils.official_paper_metrics
+  prediction_schema: odcr_baseline_prediction_v1

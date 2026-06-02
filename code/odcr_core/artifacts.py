@@ -28,6 +28,12 @@ def train_csv_path(cfg: ResolvedConfig) -> Path:
         return Path(cfg.train_csv).expanduser().resolve()
     if cfg.command == "step4":
         return Path(cfg.checkpoint_dir) / ODCR_ROUTING_TRAIN_CSV
+    if cfg.step5_run and str(cfg.step5_run).startswith("ablation_") and cfg.step4_run:
+        rid4 = run_naming.parse_run_id(cfg.step4_run)
+        return (
+            path_layout.get_train_step4_run_root(cfg.repo_root, cfg.task_id, cfg.iteration_id, rid4)
+            / ODCR_ROUTING_TRAIN_CSV
+        )
     if cfg.step5_run:
         rid4 = run_naming.step4_slug_from_step5_slug(cfg.step5_run)
         return (

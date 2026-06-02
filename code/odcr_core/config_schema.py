@@ -185,6 +185,12 @@ class ResolvedConfig:
     valid_loss_label_max_length: int
     final_eval_prediction_max_length: int
     final_eval_reference_max_length: int
+    step5_final_eval_config_json: str
+    step5_no_ref_evidence_config_json: str
+    step5_no_ref_encoder_content_token_budget: int
+    step5_train_generation_input_policy: str
+    step5_train_content_evidence_policy: str
+    step5_train_reference_usage: str
     num_proc: int
     ddp_world_size: int
     seed: int
@@ -197,6 +203,9 @@ class ResolvedConfig:
     eval_run_dir: Optional[str]
 
     label_smoothing: float
+    train_label_smoothing: float
+    train_warmup_steps: Optional[int]
+    train_warmup_ratio: Optional[float]
     repetition_penalty: float
     generate_temperature: float
     generate_top_p: float
@@ -276,6 +285,7 @@ class ResolvedConfig:
     eval_per_gpu_batch_size: Optional[int]
     eval_profile_id: str
     eval_split: str
+    eval_max_rows: Optional[int]
 
     consumed_presets_json: str
     config_before_cli_json: str

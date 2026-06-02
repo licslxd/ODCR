@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sys
 import time
 
@@ -116,6 +117,8 @@ def test_step5_pool_train_cache_ignores_optimizer_decode_lineage(monkeypatch, tm
     assert calls["sample"] == 1
     assert second.cache_dir == first.cache_dir
     assert len(second.train_df) == 2
+    manifest = json.loads(Path(first.cache_manifest_path).read_text(encoding="utf-8"))
+    assert manifest["cache_identity"]["producer_version"].endswith("cf_single_gate")
 
 
 def test_step5_pool_train_cache_rebuilds_when_sample_identity_changes(monkeypatch, tmp_path: Path) -> None:

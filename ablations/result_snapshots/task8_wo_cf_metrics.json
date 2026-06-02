@@ -1,0 +1,88 @@
+{
+  "candidate_paper_metrics_available": false,
+  "manual_review_required": true,
+  "metric_file": {
+    "test": "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/test/eval_metrics.json",
+    "valid": "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/valid/eval_metrics.json"
+  },
+  "metrics": {
+    "test": {
+      "bleu1": null,
+      "bleu2": null,
+      "bleu3": null,
+      "bleu4": null,
+      "dist1": null,
+      "dist2": null,
+      "mae": null,
+      "meteor": null,
+      "n_samples": null,
+      "rating_metrics_source": null,
+      "rmse": null,
+      "rouge1": null,
+      "rouge2": null,
+      "rougeL": null,
+      "step5_rating_metrics_written": false
+    },
+    "valid": {
+      "bleu1": null,
+      "bleu2": null,
+      "bleu3": null,
+      "bleu4": null,
+      "dist1": null,
+      "dist2": null,
+      "mae": null,
+      "meteor": null,
+      "n_samples": null,
+      "rating_metrics_source": null,
+      "rmse": null,
+      "rouge1": null,
+      "rouge2": null,
+      "rougeL": null,
+      "step5_rating_metrics_written": false
+    }
+  },
+  "missing_artifacts": [
+    "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/valid/eval_metrics.json",
+    "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/test/eval_metrics.json",
+    "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/valid/official_eval_report.json",
+    "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/test/official_eval_report.json"
+  ],
+  "official_eval_report": {
+    "test": "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/test/official_eval_report.json",
+    "valid": "runs/step5/task8/ablation_wo_cf_1/post_train_eval_no_ref/valid/official_eval_report.json"
+  },
+  "paper_greedy_25": false,
+  "paper_table_allowed": false,
+  "paper_table_gate": {
+    "eligible": false,
+    "missing_requirements": [
+      "valid_complete",
+      "test_complete",
+      "paper_greedy_25",
+      "task_local_rating_source",
+      "paper_table_allowed",
+      "requires_manual_review_false"
+    ],
+    "policy": "valid/test complete + paper_greedy_25 + task-local rating source + paper_table_allowed + manual review cleared",
+    "schema_version": "odcr_ablation_paper_table_gate/1"
+  },
+  "rating_source_task": 8,
+  "rating_source_task_observed": {
+    "test": null,
+    "valid": null
+  },
+  "requires_manual_review": true,
+  "run_dir_exists": true,
+  "schema_version": "odcr_ablation_result_snapshot/1",
+  "source_run": "runs/step5/task8/ablation_wo_cf_1",
+  "status": "missing_artifact",
+  "step5_rating_metrics_written": {
+    "test": false,
+    "valid": false
+  },
+  "task": 8,
+  "task_local_rating_source": false,
+  "test_complete": false,
+  "valid_complete": false,
+  "variant": "wo_cf"
+}

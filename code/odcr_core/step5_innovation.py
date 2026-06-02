@@ -84,6 +84,7 @@ class Step5FCAConfig:
     min_reliability: float
     max_uncertainty: float
     evidence_alignment_mode: str
+    anchor_coverage_weight: float
 
 
 @dataclass(frozen=True)
@@ -341,6 +342,7 @@ def _step5_test_default_mapping() -> dict[str, Any]:
             "min_reliability": 0.50,
             "max_uncertainty": 0.62,
             "evidence_alignment_mode": "evidence_basis",
+            "anchor_coverage_weight": 0.0,
         },
     }
 
@@ -516,6 +518,7 @@ def parse_step5_innovation_config_json(
             min_reliability=max(0.0, min(1.0, _float(_required_value(fca, "min_reliability", "step5.fca", 0.50, allow_test_defaults=allow_test_defaults), 0.50))),
             max_uncertainty=max(0.0, min(1.0, _float(_required_value(fca, "max_uncertainty", "step5.fca", 0.62, allow_test_defaults=allow_test_defaults), 0.62))),
             evidence_alignment_mode=str(_required_value(fca, "evidence_alignment_mode", "step5.fca", "evidence_basis", allow_test_defaults=allow_test_defaults)).strip().lower(),
+            anchor_coverage_weight=max(0.0, _float(_required_value(fca, "anchor_coverage_weight", "step5.fca", 0.0, allow_test_defaults=allow_test_defaults), 0.0)),
         ),
     )
 
@@ -635,8 +638,6 @@ def build_ccv_control_packet(
     producer: str = "build_ccv_control_packet",
     head: str = "unknown",
 ) -> CCVControlPacket:
-    if not cfg.ccv.enabled:
-        raise RuntimeError("CCV control packet requested while step5.ccv.enabled=false.")
     if cfg.ccv.control_packet_field_policy != "strict_required":
         raise RuntimeError(
             "Unsupported Step5 explanation CCV control packet policy "
@@ -719,7 +720,10 @@ def evidence_basis_fca_loss(
     cfg: Step5InnovationConfig,
 ) -> Step5ExplanationFCALoss:
     if not cfg.fca.enabled or cfg.fca.weight <= 0.0:
-        z = scorer_hidden.sum() * 0.0
+        # Keep the disabled-FCA path graph-safe for DDP find_unused=false.
+        # The explainer alignment projection is still part of the forward pass,
+        # so its trainable LoRA parameters must receive explicit zero grads.
+        z = (scorer_hidden.sum() + explainer_hidden.sum()) * 0.0
         return Step5ExplanationFCALoss(z, z, z, scorer_hidden, explainer_hidden)
     eps = 1e-8
     c_ret = packet.content_retention_score.to(dtype=scorer_hidden.dtype).view(-1, 1).clamp(0.0, 1.0)

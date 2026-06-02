@@ -58,7 +58,7 @@ def _command_line() -> str:
 def _common_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--config", default=DEFAULT_CONFIG)
-    p.add_argument("--set", dest="sets", action="append", default=[])
+    p.add_argument("--set", dest="sets", action="append", default=argparse.SUPPRESS)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true", help="display-only: expand console detail")
@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="ODCR one-control entry: CLI --set > configs/odcr.yaml > resolver schema defaults.",
     )
     p.add_argument("--config", default=DEFAULT_CONFIG)
-    p.add_argument("--set", dest="sets", action="append", default=[])
+    p.add_argument("--set", dest="sets", action="append", default=argparse.SUPPRESS)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--daemon", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true", help="display-only: expand console detail")
@@ -174,6 +174,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", parents=[common])
 
+    ab = sub.add_parser("ablation", parents=[common], help="controlled task7/task8 ablation registry and dry-run tools")
+    ab_sub = ab.add_subparsers(dest="ablation_action", required=True)
+    for action in ("show", "dry-run"):
+        item = ab_sub.add_parser(action)
+        item.add_argument("--task", type=int, required=True, choices=(7, 8))
+        item.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
+    ab_validate = ab_sub.add_parser("validate")
+    ab_validate.add_argument("--task", type=int, choices=(7, 8), default=None)
+    ab_validate.add_argument("--variant", choices=("wo_rcr", "wo_cf", "wo_ccv_fca"), default=None)
+    ab_snapshot = ab_sub.add_parser("snapshot")
+    ab_snapshot.add_argument("--task", type=int, required=True, choices=(7, 8))
+    ab_snapshot.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
+    ab_snapshot.add_argument("--write", action="store_true")
+    ab_probe = ab_sub.add_parser("probe")
+    ab_probe.add_argument("--task", type=int, required=True, choices=(7, 8))
+    ab_probe.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
+    ab_probe.add_argument("--max-steps", type=int, default=2)
+    ab_train = ab_sub.add_parser("train")
+    ab_train.add_argument("--task", type=int, required=True, choices=(7, 8))
+    ab_train.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
+    ab_train.add_argument("--dry-run", action="store_true")
+    ab_eval = ab_sub.add_parser("eval")
+    ab_eval.add_argument("--task", type=int, required=True, choices=(7, 8))
+    ab_eval.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
+    ab_eval.add_argument("--split", required=True, choices=("valid", "test"))
+    ab_eval.add_argument("--dry-run", action="store_true")
+    ab_run = ab_sub.add_parser("run")
+    ab_run.add_argument("--task", type=int, required=True, choices=(7, 8))
+    ab_run.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
+    ab_run.add_argument("--eval", default="valid,test")
+    ab_run.add_argument("--dry-run", action="store_true")
+
     rt = sub.add_parser("runtime", help="aux runtime/tmux/GPU validation and dispatch")
     rt_sub = rt.add_subparsers(dest="runtime_command", required=True)
     rt_bridge = rt_sub.add_parser("bridge", help="discover, validate, or dispatch to current tmux GPU pane")
@@ -269,10 +301,14 @@ _STEP5_REPLAY_EXACT_KEYS = {
     "step5.eval.test_per_gpu_batch_size",
     "step5.eval.test_forward_micro_batch_size",
     "eval.profiles.paper_greedy_25.eval_batch_size",
+    "step5.sampler.explanation.target_gold_ratio",
+    "step5.sampler.explanation.aux_gold_ratio",
+    "step5.sampler.explanation.cf_ratio",
 }
 _STEP5_REPLAY_PREFIXES = (
     "step5.tuning.effective_samples.",
     "step5.tuning.optimizer_steps.",
+    "step5.no_ref_evidence.",
     "step5.sampler.explanation.target_gold_tier_mix.",
     "step5.sampler.explanation.aux_gold_tier_mix.",
     "step5.sampler.explanation.cf_tier_mix.",
@@ -304,6 +340,8 @@ def _parse_step5_replay_sets_from_command(command: str, *, task: int) -> list[st
     out: list[str] = []
     idx = 0
     task_lr_key = f"step5.tasks.{int(task)}.lr"
+    task_selected_key = f"step5.tasks.{int(task)}.tuning.selected_tuning_candidate"
+    task_fallback_key = f"step5.tasks.{int(task)}.tuning.fallback_tuning_candidate"
     while idx < len(tokens):
         token = tokens[idx]
         value = ""
@@ -320,7 +358,7 @@ def _parse_step5_replay_sets_from_command(command: str, *, task: int) -> list[st
         key = value.split("=", 1)[0].strip()
         if (
             key in _STEP5_REPLAY_EXACT_KEYS
-            or key == task_lr_key
+            or key in {task_lr_key, task_selected_key, task_fallback_key}
             or any(key.startswith(prefix) for prefix in _STEP5_REPLAY_PREFIXES)
         ):
             out.append(value)
@@ -353,15 +391,59 @@ def _step5_run_summary_replay_sets(args: argparse.Namespace) -> tuple[list[str],
 
     add_if_missing("step5.tuning.selected_tuning_candidate", summary.get("selected_tuning_candidate"))
     add_if_missing("step5.tuning.fallback_tuning_candidate", summary.get("fallback_tuning_candidate"))
+    add_if_missing(
+        f"step5.tasks.{task}.tuning.selected_tuning_candidate",
+        summary.get("selected_tuning_candidate"),
+    )
+    add_if_missing(
+        f"step5.tasks.{task}.tuning.fallback_tuning_candidate",
+        summary.get("fallback_tuning_candidate"),
+    )
     effective = summary.get("step5_effective_samples") if isinstance(summary.get("step5_effective_samples"), dict) else {}
     optimizer = summary.get("step5_optimizer_steps") if isinstance(summary.get("step5_optimizer_steps"), dict) else {}
     for name, value in effective.items():
         add_if_missing(f"step5.tuning.effective_samples.{name}", value)
     for name, value in optimizer.items():
         add_if_missing(f"step5.tuning.optimizer_steps.{name}", value)
+    resolved_path_raw = str(summary.get("resolved_config_path") or "").strip()
+    if resolved_path_raw:
+        resolved_path = Path(resolved_path_raw)
+        if not resolved_path.is_absolute():
+            resolved_path = REPO_ROOT / resolved_path
+        try:
+            resolved_payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        except Exception:
+            resolved_payload = {}
+        no_ref_raw = resolved_payload.get("step5_no_ref_evidence_config_json") if isinstance(resolved_payload, dict) else None
+        try:
+            no_ref_cfg = json.loads(str(no_ref_raw or "{}")) if no_ref_raw else {}
+        except json.JSONDecodeError:
+            no_ref_cfg = {}
+        if isinstance(no_ref_cfg, dict):
+            for key, value in sorted(no_ref_cfg.items()):
+                add_if_missing(f"step5.no_ref_evidence.{key}", value)
+        sampler_raw = resolved_payload.get("step5_sampler_config_json") if isinstance(resolved_payload, dict) else None
+        try:
+            sampler_cfg = json.loads(str(sampler_raw or "{}")) if sampler_raw else {}
+        except json.JSONDecodeError:
+            sampler_cfg = {}
+        explanation_sampler = sampler_cfg.get("explanation") if isinstance(sampler_cfg, dict) else {}
+        if isinstance(explanation_sampler, dict):
+            for key in ("target_gold_ratio", "aux_gold_ratio", "cf_ratio"):
+                add_if_missing(f"step5.sampler.explanation.{key}", explanation_sampler.get(key))
+            for mix_name in ("target_gold_tier_mix", "aux_gold_tier_mix", "cf_tier_mix"):
+                mix = explanation_sampler.get(mix_name)
+                if isinstance(mix, dict):
+                    for tier, value in sorted(mix.items()):
+                        add_if_missing(f"step5.sampler.explanation.{mix_name}.{tier}", value)
+        if isinstance(resolved_payload, dict):
+            add_if_missing(
+                f"step5.tasks.{task}.tuning.selected_tuning_candidate",
+                resolved_payload.get("step5_selected_tuning_candidate"),
+            )
 
     manifest = {
-        "schema_version": "odcr_step5_run_config_replay/1",
+        "schema_version": "odcr_step5_run_config_replay/2_no_ref_evidence",
         "enabled": True,
         "task": task,
         "step5_run": run_id,
@@ -369,7 +451,7 @@ def _step5_run_summary_replay_sets(args: argparse.Namespace) -> tuple[list[str],
         "replayed_override_count": len(replay_sets),
         "replayed_override_keys": [item.split("=", 1)[0] for item in replay_sets],
         "rating_source_policy": "current_task_local_resolver_not_replayed_from_step5_snapshot",
-        "source": "run_summary.command plus strict run_summary field inference",
+        "source": "run_summary.command plus strict run_summary/resolved_config field inference",
     }
     if not replay_sets:
         raise OneControlConfigError(
@@ -495,6 +577,16 @@ def _resolve_for_args(args: argparse.Namespace, command: str):
     if isinstance(replay, dict) and replay:
         snapshot = dict(snapshot)
         snapshot["step5_run_config_replay"] = replay
+    if getattr(cfg, "command", "") in {"step5", "eval"} and str(getattr(cfg, "step5_run", "") or "").startswith("ablation_"):
+        from odcr_core.ablation.binding import (
+            apply_binding_to_resolved_step5_config,
+            load_ablation_binding,
+            variant_from_ablation_run_id,
+        )
+
+        variant = variant_from_ablation_run_id(str(cfg.step5_run))
+        binding = load_ablation_binding(REPO_ROOT, task=int(cfg.task_id), variant=variant)
+        cfg, snapshot = apply_binding_to_resolved_step5_config(binding, cfg, snapshot)
     return cfg, sources, snapshot
 
 
@@ -1065,8 +1157,10 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         step5_batch_candidates = doctor_snapshot.get("step5_batch_candidates") or {}
         step5_tuning = doctor_snapshot.get("step5_tuning") or {}
         step5_eval = doctor_snapshot.get("step5_eval") or {}
+        eval_top = doctor_snapshot.get("eval") or {}
         step5_valid_loss = doctor_snapshot.get("step5_valid_loss") or {}
         step5_final_eval = doctor_snapshot.get("step5_final_eval") or {}
+        step5_no_ref_evidence = doctor_snapshot.get("step5_no_ref_evidence") or {}
         step5_formal_active_candidate = doctor_snapshot.get("step5_formal_active_candidate") or {}
         step5_sample_plan_preflight = doctor_snapshot.get("step5_sample_plan_preflight") or {}
         step5_e4 = doctor_snapshot.get("step5_e4_bounded") or {}
@@ -1117,7 +1211,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             print("Step5 official eval policy:")
             print(
                 "  profile=%s prediction_max_length=%s reference_max_length=%s "
-                "builder=%s metrics=%s test_once=%s eval_batch=%s per_gpu=%s source=%s"
+                "builder=%s metrics=%s test_once=%s eval_batch=%s per_gpu=%s max_rows=%s source=%s"
                 % (
                     step5_final_eval.get("official_profile"),
                     step5_final_eval.get("prediction_max_length"),
@@ -1127,14 +1221,51 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                     step5_final_eval.get("test_once"),
                     step5_eval.get("valid_global_batch_size"),
                     step5_eval.get("valid_per_gpu_batch_size"),
+                    eval_top.get("max_rows"),
                     sources.get("step5_eval"),
+                )
+            )
+            print(
+                "  generation_input_policy=%s content_evidence_policy=%s reference_usage=%s "
+                "neutral_evidence=%s"
+                % (
+                    step5_final_eval.get("generation_input_policy"),
+                    step5_final_eval.get("content_evidence_policy"),
+                    step5_final_eval.get("reference_usage"),
+                    step5_final_eval.get("neutral_content_evidence"),
                 )
             )
             print(
                 "  valid_loss_label_max_length=%s (source: step5.valid_loss.label_max_length)"
                 % step5_valid_loss.get("label_max_length")
             )
-            checks.append("step5 official paper_greedy_25 final eval policy resolves from configs/odcr.yaml")
+            checks.append(
+                "step5 official final eval policy resolves from configs/odcr.yaml"
+            )
+            checks.append("eval.max_rows bounded diagnostic control resolves from configs/odcr.yaml")
+        if step5_no_ref_evidence:
+            print("Step5 no-ref evidence policy:")
+            print(
+                "  input_protocol=%s cache_namespace=%s train_scope=%s selected_effective_epochs=%s "
+                "encoder_budget=%s fallback_budget=%s min_df=%s domain_prior_top_n=%s "
+                "smoke_identity_max_rows=%s source=%s"
+                % (
+                    step5_no_ref_evidence.get("input_protocol"),
+                    step5_no_ref_evidence.get("cache_namespace"),
+                    step5_no_ref_evidence.get("train_scope"),
+                    step5_no_ref_evidence.get("selected_effective_epochs"),
+                    step5_no_ref_evidence.get("encoder_content_token_budget"),
+                    step5_no_ref_evidence.get("fallback_encoder_content_token_budget"),
+                    step5_no_ref_evidence.get("min_df"),
+                    step5_no_ref_evidence.get("domain_prior_top_n"),
+                    step5_no_ref_evidence.get("smoke_cache_identity_includes_max_rows"),
+                    sources.get("step5_no_ref_evidence"),
+                )
+            )
+            if bool(step5_no_ref_evidence.get("formal_allowed")):
+                checks.append("step5 no-reference evidence policy resolves as formal no-reference eval from configs/odcr.yaml")
+            else:
+                checks.append("step5 no-reference evidence policy resolves as diagnostic-only from configs/odcr.yaml")
         if rating_source:
             print("Step5 rating source:")
             print(
@@ -1370,6 +1501,20 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     if offenders:
         raise OneControlConfigError(f"main control files still mention legacy preset paths: {offenders}")
     checks.append("main control files do not read legacy preset paths")
+    try:
+        from odcr_core.ablation.cli import validate_ablation_infra
+
+        ablation_validation = validate_ablation_infra(REPO_ROOT)
+    except Exception as exc:
+        raise OneControlConfigError(f"ablation infrastructure validation failed: {exc}") from exc
+    registry_entries = (
+        (ablation_validation.get("registry_and_overrides") or {})
+        .get("registry", {})
+        .get("entry_count")
+    )
+    print("Ablation controls:")
+    print(f"  task7/task8 weak_cross_platform registry_entries={registry_entries} status={ablation_validation.get('status')}")
+    checks.append("task7/task8 ablation registry, schemas, manifests, and no-paper planned gates validate")
     from tools.check_one_control_guardrails import format_report, run_checks
 
     guardrail_report = run_checks(repo_root=REPO_ROOT, strict=True)
@@ -1559,6 +1704,14 @@ def main(argv: list[str] | None = None) -> int:
                 _print_source_table_payload(build_formal_source_table_snapshot(snapshot))
         elif args.command == "doctor":
             cmd_doctor(args)
+        elif args.command == "ablation":
+            from odcr_core.ablation.cli import cmd_ablation
+            from odcr_core.ablation.registry import AblationValidationError
+
+            try:
+                cmd_ablation(args, repo_root=REPO_ROOT)
+            except (AblationValidationError, ValueError) as exc:
+                raise OneControlConfigError(str(exc)) from exc
         elif args.command == "runtime":
             from odcr_core.aux.control.cli_runtime import cmd_runtime
 

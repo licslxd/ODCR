@@ -1,0 +1,9 @@
+task,direction,variant,status,valid_complete,test_complete,paper_greedy_25,task_local_rating_source,paper_table_allowed,metric_placeholder
+8,TripAdvisor -> Yelp,full_odcr,existing_official_single_run,true,true,true,true,true,
+8,TripAdvisor -> Yelp,wo_rcr,planned_skeleton_no_training,false,false,false,false,false,
+8,TripAdvisor -> Yelp,wo_cf,planned_skeleton_no_training,false,false,false,false,false,
+8,TripAdvisor -> Yelp,wo_ccv_fca,planned_skeleton_no_training,false,false,false,false,false,
+7,Yelp -> TripAdvisor,full_odcr,existing_official_single_run,true,true,true,true,true,
+7,Yelp -> TripAdvisor,wo_rcr,planned_skeleton_no_training,false,false,false,false,false,
+7,Yelp -> TripAdvisor,wo_cf,planned_skeleton_no_training,false,false,false,false,false,
+7,Yelp -> TripAdvisor,wo_ccv_fca,planned_skeleton_no_training,false,false,false,false,false,

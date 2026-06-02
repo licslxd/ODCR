@@ -1,0 +1,87 @@
+task8_full:
+  task: 8
+  direction: "TripAdvisor -> Yelp"
+  scenario: "weak_cross_platform"
+  variant: "full_odcr"
+  status: "existing_official_single_run"
+  source_run: "runs/step5/task8/1_19"
+  paper_role: "full baseline for weak-platform ablation"
+  allowed_for_paper_table: true
+  is_ablation: false
+
+task8_wo_rcr:
+  task: 8
+  direction: "TripAdvisor -> Yelp"
+  scenario: "weak_cross_platform"
+  variant: "wo_rcr"
+  status: "planned"
+  output_run: "runs/step5/task8/ablation_wo_rcr_1"
+  paper_role: "test RCR routing contribution"
+  allowed_for_paper_table: false
+  is_ablation: true
+
+task8_wo_cf:
+  task: 8
+  direction: "TripAdvisor -> Yelp"
+  scenario: "weak_cross_platform"
+  variant: "wo_cf"
+  status: "planned"
+  output_run: "runs/step5/task8/ablation_wo_cf_1"
+  paper_role: "test cross-domain CF contribution"
+  allowed_for_paper_table: false
+  is_ablation: true
+
+task8_wo_ccv_fca:
+  task: 8
+  direction: "TripAdvisor -> Yelp"
+  scenario: "weak_cross_platform"
+  variant: "wo_ccv_fca"
+  status: "planned"
+  output_run: "runs/step5/task8/ablation_wo_ccv_fca_1"
+  paper_role: "test explanation consistency constraints"
+  allowed_for_paper_table: false
+  is_ablation: true
+
+task7_full:
+  task: 7
+  direction: "Yelp -> TripAdvisor"
+  scenario: "weak_cross_platform"
+  variant: "full_odcr"
+  status: "existing_official_single_run"
+  source_run: "runs/step5/task7/1_19"
+  paper_role: "full baseline for reverse weak-platform ablation"
+  allowed_for_paper_table: true
+  is_ablation: false
+
+task7_wo_rcr:
+  task: 7
+  direction: "Yelp -> TripAdvisor"
+  scenario: "weak_cross_platform"
+  variant: "wo_rcr"
+  status: "planned"
+  output_run: "runs/step5/task7/ablation_wo_rcr_1"
+  paper_role: "test RCR routing contribution"
+  allowed_for_paper_table: false
+  is_ablation: true
+
+task7_wo_cf:
+  task: 7
+  direction: "Yelp -> TripAdvisor"
+  scenario: "weak_cross_platform"
+  variant: "wo_cf"
+  status: "planned"
+  output_run: "runs/step5/task7/ablation_wo_cf_1"
+  paper_role: "test cross-domain CF contribution"
+  allowed_for_paper_table: false
+  is_ablation: true
+
+task7_wo_ccv_fca:
+  task: 7
+  direction: "Yelp -> TripAdvisor"
+  scenario: "weak_cross_platform"
+  variant: "wo_ccv_fca"
+  status: "planned"
+  output_run: "runs/step5/task7/ablation_wo_ccv_fca_1"
+  paper_role: "test explanation consistency constraints"
+  allowed_for_paper_table: false
+  is_ablation: true

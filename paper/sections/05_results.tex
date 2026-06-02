@@ -1,0 +1,41 @@
+\section{Results}
+
+\subsection{Overall Performance on Strong-Related Amazon Tasks}
+
+\input{tables/overall_performance_amazon}
+
+The strong-related Amazon setting evaluates transfer between two related
+product domains. The AM-CDs block uses AM-Movies as the auxiliary domain, and
+the AM-Movies block uses AM-CDs as the auxiliary domain. This setting is the
+natural case for ODCR's content/style separation: related domains can share
+some content evidence while still requiring domain-specific expression style.
+The table therefore should be read jointly across rating and explanation
+metrics. RMSE and MAE summarize rating behavior, while ROUGE, BLEU, METEOR, and
+diversity metrics summarize automatic explanation behavior. ODCR's current
+single-run values show stronger automatic text metrics in this setting while
+retaining explicit rating-error reporting in the same table.
+
+\subsection{Overall Performance on Weak Cross-Platform Tasks}
+
+\input{tables/overall_performance_cross_platform}
+
+The TripAdvisor--Yelp setting is a weaker cross-platform transfer case. Here
+the style shift is larger, and counterfactual evidence is more likely to vary
+in reliability. This makes the setting a stress test for the ODCR control
+loop: EASD must preserve content evidence, HSS must represent a larger style
+shift, RCR/UCI must avoid over-trusting unstable counterfactual signals, and
+CCV/FCA must generate explanations that remain content-grounded. The table
+again reports rating errors and automatic explanation metrics together rather
+than reducing the comparison to a single score.
+
+\subsection{Discussion of the Results}
+
+Across the two tables, the main result presentation is organized by dataset
+block and method comparison rather than by implementation stages. This aligns
+the evidence with the paper's dynamic causal story. The Amazon blocks are best
+interpreted as related-domain content/style transfer, while the
+TripAdvisor--Yelp blocks emphasize larger style mismatch and reliability
+control. The current ODCR rows provide bounded single-run evidence for the
+proposed method framing. They should not be read as state-of-the-art claims,
+statistical-significance claims, full D4C reproduction, or multi-seed benchmark
+dominance.

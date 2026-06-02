@@ -28,6 +28,7 @@ STEP5_SAMPLING_CONTRACT = "step5_sampling_contract.json"
 STEP5_POOL_DISTRIBUTION_REPORT = "step5_pool_distribution_report.json"
 STEP5_POOL_EXPORTS_STATUS = "step5_pool_exports_status.json"
 WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL = "WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1"
+TASK8_ROUTE_CAP_CF_PROTOCOL = "STEP5_CF_MIX_T8_ROUTE_CAP"
 
 _EXPLANATION_POOL_PREFIX = "step5_explanation"
 _LEGACY_EXPLAINER_POOL_PREFIX = "step5" + "B"
@@ -55,6 +56,12 @@ def _weak_low_weighted_cf_protocol(tuning_config: Mapping[str, Any] | None) -> b
     return WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL in tokens
 
 
+def _task8_route_cap_cf_protocol(tuning_config: Mapping[str, Any] | None) -> bool:
+    candidate = str((tuning_config or {}).get("selected_tuning_candidate") or "")
+    tokens = {part.strip() for part in candidate.split("+") if part.strip()}
+    return TASK8_ROUTE_CAP_CF_PROTOCOL in tokens
+
+
 def _allow_weak_low_weighted_cf_route_bypass(
     *,
     weak_low_weighted_cf_protocol: bool,
@@ -68,6 +75,17 @@ def _allow_weak_low_weighted_cf_route_bypass(
         and str(component) == "cf"
         and str(tier) == "low_weighted"
     )
+
+
+def _cf_budget_single_gate_protocol(
+    *,
+    task8_route_cap_cf_protocol: bool,
+    head: str,
+    component: str,
+) -> bool:
+    return bool(task8_route_cap_cf_protocol) and str(head) == "explanation" and str(component) == "cf"
+
+
 LEGACY_COLUMN_ALIASES: dict[str, str] = {
     "cf_tier_step5_explanation": f"cf_tier_{_LEGACY_EXPLAINER_POOL_PREFIX}",
     "cf_tier_reason_step5_explanation": f"cf_tier_reason_{_LEGACY_EXPLAINER_POOL_PREFIX}",
@@ -398,6 +416,60 @@ def _mix_counts(total: int, mix: Mapping[str, Any], keys: Sequence[str]) -> dict
     return {str(key): int(out.get(str(key), 0)) for key in keys}
 
 
+def _route_cap_cf_tier_counts(
+    total: int,
+    *,
+    requested_counts: Mapping[str, Any],
+    component_mix: Mapping[str, Any],
+    available: Mapping[str, Any],
+    enabled: bool,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    """Allocate task-adaptive CF rows by total cap, then high/medium/low fallback."""
+
+    tiers = ("high", "medium", "low_weighted")
+    requested = {tier: int(requested_counts.get(tier) or 0) for tier in tiers}
+    if not enabled:
+        return requested, {"enabled": False}
+    high_active = float(component_mix.get("high") or 0.0) > 0.0
+    medium_active = float(component_mix.get("medium") or 0.0) > 0.0
+    low_allowed = float(component_mix.get("low_weighted") or 0.0) > 0.0
+    if not (high_active or medium_active):
+        return {
+            "high": 0,
+            "medium": 0,
+            "low_weighted": requested.get("low_weighted", 0),
+        }, {
+            "enabled": False,
+            "reason": "cf_high_medium_not_active",
+        }
+    counts = {tier: 0 for tier in tiers}
+    remaining = max(0, int(total))
+    order = ["high", "medium"]
+    if low_allowed:
+        order.append("low_weighted")
+    moved_by_receiver: dict[str, int] = {}
+    for tier in order:
+        if remaining <= 0:
+            break
+        capacity = max(0, int(available.get(tier) or 0))
+        take = min(remaining, capacity)
+        counts[tier] = int(take)
+        moved_by_receiver[tier] = int(take)
+        remaining -= int(take)
+    report = {
+        "enabled": True,
+        "policy": "cf_total_cap_high_then_medium_then_low_weighted",
+        "component_total_cap": int(total),
+        "requested_tier_counts_before_route_cap": requested,
+        "available_by_tier": {tier: max(0, int(available.get(tier) or 0)) for tier in tiers},
+        "low_weighted_allowed": bool(low_allowed),
+        "low_weighted_fallback_rows": int(counts.get("low_weighted", 0)),
+        "moved_by_receiver": moved_by_receiver,
+        "unfilled_after_route_cap": int(remaining),
+    }
+    return counts, report
+
+
 def _budget_for(
     source: Step5PoolSource,
     *,
@@ -450,6 +522,30 @@ def _route_column_for_head(head: str) -> str:
     if head != "explanation":
         raise Step5PoolSamplerError(f"unsupported Step5 head for route-compatible sampling: {head}")
     return "route_explainer"
+
+
+def _ablation_runtime(sampler_config: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    raw = (sampler_config or {}).get("ablation_runtime") if isinstance(sampler_config, Mapping) else None
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _route_filter_enabled_for_sampler(sampler_config: Mapping[str, Any] | None) -> bool:
+    runtime = _ablation_runtime(sampler_config)
+    rcr = runtime.get("rcr") if isinstance(runtime.get("rcr"), Mapping) else {}
+    return str(rcr.get("route_filter") or "enabled").strip().lower() not in {
+        "disabled",
+        "disabled_for_ablation",
+    }
+
+
+def _pool_weight_source_for_sampler(sampler_config: Mapping[str, Any] | None) -> str:
+    runtime = _ablation_runtime(sampler_config)
+    rcr = runtime.get("rcr") if isinstance(runtime.get("rcr"), Mapping) else {}
+    value = str(rcr.get("pool_weight_source") or "posterior").strip().lower()
+    if value in {"uniform", "posterior"}:
+        return value
+    raise Step5PoolSamplerError(f"unsupported ablation pool_weight_source: {value}")
+
 
 def _route_compatible_pool_df(df: pd.DataFrame, *, head: str, pool_name: str) -> pd.DataFrame:
     route_col = _route_column_for_head(head)
@@ -577,11 +673,15 @@ def validate_step5_formal_sample_plan_for_source(
         )
         or 0.0
     )
+    route_filter_enabled = _route_filter_enabled_for_sampler(sampler_config)
+    pool_weight_source = _pool_weight_source_for_sampler(sampler_config)
+    ablation_runtime = dict(_ablation_runtime(sampler_config))
     for head in _head_list(task_head):
         head_cfg = sampler_config.get(head)
         if not isinstance(head_cfg, Mapping):
             raise Step5PoolSamplerError(f"step5.sampler.{head} missing")
         weak_low_weighted_cf_protocol = _weak_low_weighted_cf_protocol(tuning_config)
+        task8_route_cap_cf_protocol = _task8_route_cap_cf_protocol(tuning_config)
         head_bounded = bounded_max_rows
         if False and bounded_max_rows is not None:
             head_bounded = max(1, int(bounded_max_rows) // 2)
@@ -617,7 +717,13 @@ def validate_step5_formal_sample_plan_for_source(
             inactive_tiers: list[str] = []
             route_bypass_tiers: list[str] = []
             component_shortage = 0
+            tier_shortage_before_reallocation = 0
             route_col = _route_column_for_head(head) if component == "cf" else None
+            cf_single_gate = _cf_budget_single_gate_protocol(
+                task8_route_cap_cf_protocol=task8_route_cap_cf_protocol,
+                head=head,
+                component=component,
+            )
             for tier in tier_keys:
                 pool_name = _pool_names_for(head, component, tier)
                 requested = int(requested_counts.get(tier, 0))
@@ -631,45 +737,112 @@ def validate_step5_formal_sample_plan_for_source(
                         component=component,
                         tier=tier,
                     )
-                    if route_bypass:
+                    if route_bypass or not route_filter_enabled:
                         route_positive = int(available_raw[tier])
-                        route_bypass_tiers.append(str(tier))
+                        if route_bypass:
+                            route_bypass_tiers.append(str(tier))
                     else:
                         route_positive = _route_compatible_count(source, head=head, pool_name=pool_name, timings=timings)
                     available_route[tier] = int(route_positive)
-                    if requested > 0 and int(route_positive) <= 0:
+                    if route_filter_enabled and not cf_single_gate and requested > 0 and int(route_positive) <= 0:
                         message = (
                             f"Step5 sampler active tier has no route-compatible rows for {head}/{component}/{tier}. "
                             "Set the tier mix to zero in configs/odcr.yaml or rerun Step4 pool export with matching route semantics."
                         )
                         errors.append(message)
-                    sampling_capacity = int(route_positive) if head == "retired_scorer_path" else (available_raw[tier] if int(route_positive) > 0 else 0)
+                    sampling_capacity = (
+                        int(available_raw[tier])
+                        if cf_single_gate or not route_filter_enabled
+                        else (int(route_positive) if head == "retired_scorer_path" else (available_raw[tier] if int(route_positive) > 0 else 0))
+                    )
                     sampling_capacity_by_tier[tier] = int(sampling_capacity)
                     shortage = max(0, requested - int(sampling_capacity))
                 else:
                     sampling_capacity_by_tier[tier] = int(available_raw[tier])
                     shortage = max(0, requested - int(available_raw[tier]))
                 if requested > 0 and shortage > 0:
-                    pool_exhaustion = True
                     component_shortage += int(shortage)
+                    tier_shortage_before_reallocation += int(shortage)
+            actual_tier_counts = dict(requested_counts)
+            tier_cap_reallocation: dict[str, Any] = {}
+            if component == "cf" and task8_route_cap_cf_protocol:
+                actual_tier_counts, tier_cap_reallocation = _route_cap_cf_tier_counts(
+                    int(count),
+                    requested_counts=requested_counts,
+                    component_mix=component_mix,
+                    available=sampling_capacity_by_tier,
+                    enabled=True,
+                )
+                component_shortage = max(0, int(count) - int(sum(actual_tier_counts.values())))
+            elif component in {"target_gold", "aux_gold"} and int(component_shortage) > 0:
+                capped_counts: dict[str, int] = {}
+                overflow = 0
+                for tier in tier_keys:
+                    requested = int(requested_counts.get(tier, 0))
+                    capacity = int(sampling_capacity_by_tier.get(tier, 0))
+                    take = min(requested, capacity)
+                    capped_counts[tier] = int(take)
+                    overflow += max(0, requested - capacity)
+                moved_by_receiver: dict[str, int] = {}
+                for receiver in ("medium", "high"):
+                    if overflow <= 0:
+                        break
+                    capacity = int(sampling_capacity_by_tier.get(receiver, 0))
+                    room = max(0, capacity - int(capped_counts.get(receiver, 0)))
+                    moved = min(int(overflow), int(room))
+                    if moved <= 0:
+                        continue
+                    capped_counts[receiver] = int(capped_counts.get(receiver, 0)) + int(moved)
+                    moved_by_receiver[receiver] = int(moved_by_receiver.get(receiver, 0)) + int(moved)
+                    overflow -= int(moved)
+                actual_tier_counts = capped_counts
+                tier_cap_reallocation = {
+                    "enabled": True,
+                    "policy": "gold_high_medium_cap_then_reallocate_within_component",
+                    "shortage_before_reallocation": int(tier_shortage_before_reallocation),
+                    "moved_by_receiver": moved_by_receiver,
+                    "unfilled_after_reallocation": int(overflow),
+                }
+                component_shortage = int(overflow)
+            if int(component_shortage) > 0:
+                pool_exhaustion = True
             replacement_extra += int(component_shortage)
             component_reports[component] = {
                 "requested": int(count),
                 "requested_tier_counts": requested_counts,
-                "actual_tier_counts": dict(requested_counts),
+                "actual_tier_counts": actual_tier_counts,
                 "active_tiers": active_tiers,
                 "inactive_tiers": inactive_tiers,
                 "available_raw_by_tier": available_raw,
                 "available_route_compatible_by_tier": available_route if component == "cf" else None,
                 "sampling_capacity_by_tier": sampling_capacity_by_tier,
                 "route_filter": {
-                    "enabled": component == "cf",
+                    "enabled": bool(component == "cf" and route_filter_enabled),
                     "route_column": route_col,
                     "route_requirement": (
-                        "route_scorer == 1" if route_col == "route_scorer" else ("route_explainer == 1" if route_col else None)
+                        (
+                            "route_scorer == 1"
+                            if route_col == "route_scorer"
+                            else ("route_explainer == 1" if route_col else None)
+                        )
+                        if route_filter_enabled
+                        else None
+                    ),
+                    "policy": (
+                        "single_gate_cf_budget"
+                        if cf_single_gate
+                        else ("route_compatible" if route_filter_enabled else "disabled_for_ablation")
+                    ),
+                    "single_gate_cf_budget_protocol": bool(cf_single_gate),
+                    "sampling_capacity_source": (
+                        "raw_pool_after_cf_budget_gate"
+                        if cf_single_gate
+                        else ("route_compatible_pool" if route_filter_enabled else "raw_pool_ablation")
                     ),
                 },
                 "shortage": int(component_shortage),
+                "tier_shortage_before_reallocation": int(tier_shortage_before_reallocation),
+                "tier_cap_reallocation": tier_cap_reallocation,
                 "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol) if component == "cf" else False,
                 "route_bypass_tiers": route_bypass_tiers if component == "cf" else [],
                 "graph_safe_zero_tiers": [
@@ -700,7 +873,7 @@ def validate_step5_formal_sample_plan_for_source(
             "sampler_protocol": (
                 WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL
                 if weak_low_weighted_cf_protocol
-                else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
+                else ("STEP5_TASK_ADAPTIVE_ROUTE_CAP_MAINLINE" if task8_route_cap_cf_protocol else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE")
             ),
             "low_weighted_policy": (
                 "disabled_for_mainline"
@@ -729,6 +902,12 @@ def validate_step5_formal_sample_plan_for_source(
         "active_sampler_source": (
             f"{sampler_config.get('task_override_source') or 'configs/odcr.yaml:step5.sampler'} + "
             f"{tuning_config.get('selected_tuning_candidate_source') or 'configs/odcr.yaml:step5.tuning.selected_tuning_candidate'}"
+        ),
+        "ablation_runtime": ablation_runtime,
+        "pool_weight_source": pool_weight_source,
+        "sampling_policy": (
+            ((ablation_runtime.get("rcr") or {}).get("sampling_policy") if isinstance(ablation_runtime.get("rcr"), Mapping) else None)
+            or "route_weighted_posterior_pool"
         ),
         "full_audit_default_forbidden": True,
         "old_dedicated_default_forbidden": True,
@@ -783,6 +962,9 @@ def _apply_prompt_and_weights(
     weight: float,
     effective_epoch: int,
     weak_low_weighted_cf_protocol: bool = False,
+    cf_budget_single_gate_protocol: bool = False,
+    route_filter_enabled: bool = True,
+    pool_weight_source: str = "posterior",
     timings: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     if df.empty:
@@ -795,13 +977,21 @@ def _apply_prompt_and_weights(
     out["effective_epoch"] = int(effective_epoch)
     out["sampler_weight"] = float(weight)
     out["posterior_sample_weight_hint"] = pd.to_numeric(out["sample_weight_hint"], errors="coerce").fillna(0.0)
-    out["sample_weight_hint"] = out["posterior_sample_weight_hint"].astype(float) * float(weight)
-    if _allow_weak_low_weighted_cf_route_bypass(
+    if str(pool_weight_source) == "uniform":
+        out["sample_weight_hint"] = float(weight)
+        out["ablation_pool_weight_source"] = "uniform"
+    else:
+        out["sample_weight_hint"] = out["posterior_sample_weight_hint"].astype(float) * float(weight)
+        out["ablation_pool_weight_source"] = "posterior"
+    route_bypass = _allow_weak_low_weighted_cf_route_bypass(
         weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
         head=task_head,
         component=component,
         tier=tier,
-    ):
+    )
+    ablation_route_filter_disabled = bool(component == "cf" and not route_filter_enabled)
+    cf_single_gate = bool(component == "cf" and cf_budget_single_gate_protocol)
+    if route_bypass or ablation_route_filter_disabled or cf_single_gate:
         original_route = (
             pd.to_numeric(out["route_explainer"], errors="coerce").fillna(0).astype(int)
             if "route_explainer" in out.columns
@@ -814,8 +1004,11 @@ def _apply_prompt_and_weights(
         )
         out["posterior_route_explainer"] = original_route
         out["posterior_train_keep"] = original_train_keep
-        out["weak_low_weighted_cf_protocol"] = True
-        out["weak_low_weighted_cf_route_override"] = original_route.ne(1)
+        out["weak_low_weighted_cf_protocol"] = bool(route_bypass)
+        out["weak_low_weighted_cf_route_override"] = original_route.ne(1) if route_bypass else False
+        out["cf_budget_single_gate_protocol"] = bool(cf_single_gate)
+        out["cf_budget_route_override"] = original_route.ne(1)
+        out["ablation_route_filter_disabled"] = bool(ablation_route_filter_disabled)
         out["route_explainer"] = 1
         out["train_keep"] = 1
         out["sample_weight_hint"] = float(weight)
@@ -864,6 +1057,9 @@ def _sample_component(
     epoch: int,
     columns: Sequence[str] | None,
     weak_low_weighted_cf_protocol: bool = False,
+    task8_route_cap_cf_protocol: bool = False,
+    route_filter_enabled: bool = True,
+    pool_weight_source: str = "posterior",
     timings: dict[str, float] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     tier_keys = ("high", "medium") if component in {"target_gold", "aux_gold"} else ("high", "medium", "low_weighted")
@@ -873,6 +1069,12 @@ def _sample_component(
     pool_frames: dict[str, pd.DataFrame] = {}
     available_raw: dict[str, int] = {}
     available: dict[str, int] = {}
+    available_route: dict[str, int] = {}
+    cf_single_gate = _cf_budget_single_gate_protocol(
+        task8_route_cap_cf_protocol=task8_route_cap_cf_protocol,
+        head=head,
+        component=component,
+    )
     for tier in tier_keys:
         pool_name = _pool_names_for(head, component, tier)
         pool_df = _read_pool(source, pool_name, columns, timings=timings)
@@ -883,18 +1085,38 @@ def _sample_component(
             component=component,
             tier=tier,
         )
-        route_df = pool_df if route_bypass else (_route_compatible_pool_df(pool_df, head=head, pool_name=pool_name) if component == "cf" else pool_df)
+        route_only_df = _route_compatible_pool_df(pool_df, head=head, pool_name=pool_name) if component == "cf" else pool_df
+        available_route[tier] = int(len(route_only_df))
+        route_df = (
+            pool_df
+            if route_bypass or cf_single_gate or not route_filter_enabled
+            else route_only_df
+        )
         pool_frames[tier] = route_df
         available[tier] = int(len(route_df))
 
     for tier in tier_keys:
-        if component == "cf" and int(requested_counts.get(tier, 0)) > 0 and int(available.get(tier, 0)) <= 0:
+        if (
+            route_filter_enabled
+            and not cf_single_gate
+            and component == "cf"
+            and int(requested_counts.get(tier, 0)) > 0
+            and int(available.get(tier, 0)) <= 0
+        ):
             raise Step5PoolSamplerError(
                 f"Step5 sampler active tier has no route-compatible rows for {head}/{component}/{tier}. "
                 "Set the tier mix to zero in configs/odcr.yaml or rerun Step4 pool export with matching route semantics."
             )
 
-    if component == "cf":
+    if component == "cf" and task8_route_cap_cf_protocol:
+        counts, shortage_reallocated = _route_cap_cf_tier_counts(
+            int(count),
+            requested_counts=requested_counts,
+            component_mix=component_mix,
+            available=available,
+            enabled=True,
+        )
+    elif component == "cf":
         for tier in tier_keys:
             take = int(counts.get(tier, 0))
             missing = max(0, take - int(available.get(tier, 0)))
@@ -949,6 +1171,9 @@ def _sample_component(
             weight=weight,
             effective_epoch=int(epoch),
             weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
+            cf_budget_single_gate_protocol=cf_single_gate,
+            route_filter_enabled=route_filter_enabled,
+            pool_weight_source=pool_weight_source,
             timings=timings,
         )
         frames.append(sampled)
@@ -961,10 +1186,11 @@ def _sample_component(
         "tier_counts": counts,
         "route_filter": {
             "head": str(head),
-            "enabled": component == "cf",
+            "enabled": bool(component == "cf" and route_filter_enabled),
             "route_column": _route_column_for_head(head) if component == "cf" else None,
             "available_raw_by_tier": available_raw,
-            "available_route_compatible_by_tier": available,
+            "available_route_compatible_by_tier": available_route if component == "cf" else available,
+            "sampling_capacity_by_tier": available,
             "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol) if component == "cf" else False,
             "route_bypass_tiers": [
                 str(tier)
@@ -976,7 +1202,19 @@ def _sample_component(
                     tier=tier,
                 )
             ] if component == "cf" else [],
+            "policy": (
+                "single_gate_cf_budget"
+                if cf_single_gate
+                else ("route_compatible" if route_filter_enabled else "disabled_for_ablation")
+            ),
+            "single_gate_cf_budget_protocol": bool(cf_single_gate),
+            "sampling_capacity_source": (
+                "raw_pool_after_cf_budget_gate"
+                if cf_single_gate
+                else ("route_compatible_pool" if route_filter_enabled else "raw_pool_ablation")
+            ),
         },
+        "pool_weight_source": str(pool_weight_source),
         "replacement_rate_by_tier": replacement,
         "shortage_reallocated_by_tier": shortage_reallocated,
     }
@@ -1083,6 +1321,10 @@ def sample_effective_epochs_from_pools(
         "parquet_read_time_s": 0.0,
         "prompt_build_time_s": 0.0,
     }
+    route_filter_enabled = _route_filter_enabled_for_sampler(sampler_config)
+    pool_weight_source = _pool_weight_source_for_sampler(sampler_config)
+    ablation_runtime = dict(_ablation_runtime(sampler_config))
+    task8_route_cap_cf_protocol = _task8_route_cap_cf_protocol(tuning_config)
     frames: list[pd.DataFrame] = []
     epoch_reports: list[dict[str, Any]] = []
     per_epoch_budget = 0
@@ -1132,6 +1374,9 @@ def sample_effective_epochs_from_pools(
                     epoch=epoch,
                     columns=columns,
                     weak_low_weighted_cf_protocol=weak_low_weighted_cf_protocol,
+                    task8_route_cap_cf_protocol=task8_route_cap_cf_protocol,
+                    route_filter_enabled=route_filter_enabled,
+                    pool_weight_source=pool_weight_source,
                     timings=timings,
                 )
                 head_frames.append(comp_df)
@@ -1176,6 +1421,12 @@ def sample_effective_epochs_from_pools(
                 if not head_df.empty
                 else {},
                 "components": component_reports,
+                "route_filter_enabled": bool(route_filter_enabled),
+                "pool_weight_source": str(pool_weight_source),
+                "sampling_policy": (
+                    ((ablation_runtime.get("rcr") or {}).get("sampling_policy") if isinstance(ablation_runtime.get("rcr"), Mapping) else None)
+                    or "route_weighted_posterior_pool"
+                ),
                 "gold_tier_counts": {
                     str(k): int(v)
                     for k, v in head_df.loc[head_df["sampler_component"].isin(["target_gold", "aux_gold"]), "sampler_tier"].value_counts().items()
@@ -1225,9 +1476,20 @@ def sample_effective_epochs_from_pools(
         "sampler_protocol": (
             WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL
             if weak_low_weighted_cf_protocol
-            else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
+            else (
+                "STEP5_TASK_ADAPTIVE_ROUTE_CAP_MAINLINE"
+                if _task8_route_cap_cf_protocol(tuning_config)
+                else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
+            )
         ),
         "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol),
+        "ablation_runtime": ablation_runtime,
+        "route_filter_enabled": bool(route_filter_enabled),
+        "pool_weight_source": str(pool_weight_source),
+        "sampling_policy": (
+            ((ablation_runtime.get("rcr") or {}).get("sampling_policy") if isinstance(ablation_runtime.get("rcr"), Mapping) else None)
+            or "route_weighted_posterior_pool"
+        ),
         "prompt_registry": prompt_registry_manifest(),
         "full_audit_default_train_forbidden": True,
         "legacy_gold_heavy_exports_rejected_by_default": True,

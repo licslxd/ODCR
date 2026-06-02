@@ -21,6 +21,7 @@ BUCKETS: dict[str, str] = {
     "ledger": "03_evidence_ledgers",
     "phase_summary": "04_phase_summaries",
     "final_report": "05_final_reports",
+    "paper": "00_paper",
 }
 
 
@@ -213,6 +214,9 @@ class AIAnalysisWriter:
 
     def final_report(self, name: str, body: str, **kwargs: Any) -> AIAnalysisWriteResult:
         return self.write_text("final_report", name, body, **kwargs)
+
+    def paper(self, name: str, body: str, **kwargs: Any) -> AIAnalysisWriteResult:
+        return self.write_text("paper", name, body, include_header=False, **kwargs)
 
     def runtime_diagnostic(self, name: str, payload: Mapping[str, Any], **kwargs: Any) -> AIAnalysisWriteResult:
         meta = self.metadata(**kwargs)
