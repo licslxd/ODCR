@@ -187,6 +187,7 @@ class ResolvedConfig:
     final_eval_reference_max_length: int
     step5_final_eval_config_json: str
     step5_no_ref_evidence_config_json: str
+    step5_racer_c1_config_json: str
     step5_no_ref_encoder_content_token_budget: int
     step5_train_generation_input_policy: str
     step5_train_content_evidence_policy: str

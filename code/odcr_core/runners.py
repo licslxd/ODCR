@@ -12,7 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from odcr_core.artifacts import ensure_step5_csv_symlink
 from odcr_core.dispatch import TORCHRUN_STEP3_SCRIPT, TORCHRUN_STEP4_SCRIPT, TORCHRUN_STEP5_SCRIPT
 from odcr_core.logging_meta import (
     append_debug_log,
@@ -622,147 +621,18 @@ def _torchrun_hardware_env(cfg: ResolvedConfig) -> dict[str, str]:
 
 
 def run_step5(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
-    assert cfg.from_run is not None and cfg.step5_run is not None
-    if str(getattr(cfg, "step5_lifecycle_phase", "") or "") == "eval_only":
-        raise RuntimeError("Step5 eval-only rating handoff is retired; run eval after explanation handoff.")
-    ensure_step5_csv_symlink(cfg)
-    Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
-    _maybe_write_run_manifest(cfg)
-    log_file = _full_log_file(cfg)
-
-    env_extra = dict(_odcr_profile_env(cfg))
-    model_path = str(path_layout.best_model_path(Path(cfg.checkpoint_dir)))
-    Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-    py_args = [
-        "train",
-        "--auxiliary",
-        cfg.auxiliary,
-        "--target",
-        cfg.target,
-        "--num-proc",
-        str(cfg.num_proc),
-        "--seed",
-        str(cfg.seed),
-        "--log_file",
-        log_file,
-        "--save_file",
-        model_path,
-        *_step5_decode_cli_args(cfg, train=True),
-    ]
-    if cfg.step5_train_only:
-        py_args.append("--train-only")
-        stub = run_log_paths(cfg)["debug"]
-        stub.parent.mkdir(parents=True, exist_ok=True)
-        with stub.open("a", encoding="utf-8") as fh:
-            fh.write("step5 --train-only：本次跳过训练后 valid 评估；完整指标请运行: python code/odcr.py eval …\n")
-    _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
+    raise RuntimeError(
+        "Old Step5 FLAN/T5/LoRA generator training has been deleted. "
+        "Use `python code/odcr.py racer-c1 --task 2 --mode prepare|train_eval`."
+    )
 
 
 def run_eval(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
-    Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
-    _maybe_write_run_manifest(cfg)
-    log_file = _full_log_file(cfg)
-
-    mp = Path(cfg.model_path).expanduser().resolve() if cfg.model_path else None
-    if mp is None:
-        assert cfg.from_run is not None and cfg.step5_run is not None
-        ck = Path(cfg.checkpoint_dir)
-        mp = path_layout.best_model_path(ck)
-
-    if not mp.is_file():
-        raise FileNotFoundError(f"评测权重不存在: {mp}")
-
-    env_extra: dict[str, str] = dict(_odcr_profile_env(cfg))
-
-    py_args = [
-        "test" if str(getattr(cfg, "eval_split", "valid") or "valid").lower() == "test" else "eval",
-        "--auxiliary",
-        cfg.auxiliary,
-        "--target",
-        cfg.target,
-        "--eval-batch-size",
-        str(cfg.global_eval_batch_size),
-        "--num-proc",
-        str(cfg.num_proc),
-        "--seed",
-        str(cfg.seed),
-        "--log_file",
-        log_file,
-        "--save_file",
-        str(mp),
-        *_step5_decode_cli_args(cfg),
-    ]
-    _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
-
-
-def _rerank_runner_cli_args(cfg: ResolvedConfig) -> list[str]:
-    out = [
-        "--eval-split",
-        str(getattr(cfg, "eval_split", "valid") or "valid"),
-        "--num-return-sequences",
-        str(cfg.num_return_sequences),
-        "--rerank-method",
-        str(cfg.rerank_method),
-        "--rerank-top-k",
-        str(cfg.rerank_top_k),
-        "--rerank-weight-logprob",
-        str(cfg.rerank_weight_logprob),
-        "--rerank-weight-length",
-        str(cfg.rerank_weight_length),
-        "--rerank-weight-repeat",
-        str(cfg.rerank_weight_repeat),
-        "--rerank-weight-dirty",
-        str(cfg.rerank_weight_dirty),
-        "--rerank-target-len-ratio",
-        str(cfg.rerank_target_len_ratio),
-        "--export-examples-mode",
-        str(cfg.export_examples_mode),
-        "--rerank-malformed-tail-penalty",
-        str(cfg.rerank_malformed_tail_penalty),
-        "--rerank-malformed-token-penalty",
-        str(cfg.rerank_malformed_token_penalty),
-    ]
-    if cfg.export_full_rerank_examples:
-        out.append("--export-full-rerank-examples")
-    return out
+    raise RuntimeError(
+        "Old Step5 generator eval has been deleted. RACER-C1 will write top-1 retrieval "
+        "predictions and official metrics from its own train_eval path."
+    )
 
 
 def run_eval_rerank(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
-    Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
-    _maybe_write_run_manifest(cfg)
-    log_file = _full_log_file(cfg)
-
-    mp = Path(cfg.model_path).expanduser().resolve() if cfg.model_path else None
-    if mp is None:
-        assert cfg.from_run is not None and cfg.step5_run is not None
-        ck = Path(cfg.checkpoint_dir)
-        mp = path_layout.best_model_path(ck)
-
-    if not mp.is_file():
-        raise FileNotFoundError(f"评测权重不存在: {mp}")
-
-    env_extra: dict[str, str] = dict(_odcr_profile_env(cfg))
-
-    py_args = [
-        "eval-rerank",
-        "--auxiliary",
-        cfg.auxiliary,
-        "--target",
-        cfg.target,
-        "--eval-batch-size",
-        str(cfg.global_eval_batch_size),
-        "--num-proc",
-        str(cfg.num_proc),
-        "--seed",
-        str(cfg.seed),
-        "--log_file",
-        log_file,
-        "--save_file",
-        str(mp),
-        *_step5_decode_cli_args(cfg),
-        *_rerank_runner_cli_args(cfg),
-    ]
-    _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
-
-    print(f"Step5 checkpoint: {mp}", flush=True)
-    print(f"Eval/rerank artifacts: {cfg.checkpoint_dir}", flush=True)
+    raise RuntimeError("Old multi-candidate Step5 rerank has been deleted; RACER-C1 does not use rerank.")

@@ -49,8 +49,6 @@ from odcr_core.step5_pool_sampler import (
     STEP5_SAMPLING_CONTRACT_SCHEMA_VERSION,
     required_columns_with_legacy_aliases,
 )
-from odcr_core.step5_prompt_templates import prompt_registry_manifest
-
 
 STEP4_POOL_EXPORTS_SCHEMA_VERSION = STEP5_POOL_MANIFEST_SCHEMA_VERSION
 STEP4_POOL_EXPORTS_STATUS_SCHEMA_VERSION = "odcr_step4_step5_pool_exports_status/1"
@@ -574,7 +572,7 @@ def export_step4_pool_exports(
         "sampling_contract_sha256": _file_sha256(sampling_contract_path),
         "distribution_report": _repo_relative(root, report_path),
         "distribution_report_sha256": _file_sha256(report_path),
-        "prompt_registry": prompt_registry_manifest(),
+        "prompt_registry": {"status": "retired", "replacement": "RACER-C1 train-only evidence retrieval"},
         "gold_quality": {
             "schema_version": gold_cfg.get("schema_version"),
             "config_hash": gold_cfg_hash,

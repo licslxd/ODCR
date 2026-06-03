@@ -3680,6 +3680,406 @@ def _resolve_step5_no_ref_evidence_config(cfg: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _string_list(value: Any, key: str, *, non_empty: bool = True) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(x, str) and str(x).strip() for x in value):
+        raise OneControlConfigError(f"{key} must be a string list")
+    out = [str(x).strip() for x in value]
+    if non_empty and not out:
+        raise OneControlConfigError(f"{key} must be non-empty")
+    return out
+
+
+def _resolve_step5_racer_c1_config(cfg: Mapping[str, Any], *, ddp_world_size: int) -> dict[str, Any]:
+    raw = _mapping(_get(cfg, "step5.racer_c1"), "step5.racer_c1")
+    _reject_unknown_keys(
+        raw,
+        {
+            "schema_version",
+            "enabled",
+            "method_name",
+            "paper_method_name",
+            "output_stage",
+            "formal_primary",
+            "legacy_generator_policy",
+            "task_allowlist",
+            "modes",
+            "evidence_pool",
+            "contrastive",
+            "train",
+            "retrieval",
+            "composer",
+            "cache",
+            "logging",
+            "guardrails",
+        },
+        "step5.racer_c1",
+    )
+    modes = _mapping(raw.get("modes"), "step5.racer_c1.modes")
+    evidence = _mapping(raw.get("evidence_pool"), "step5.racer_c1.evidence_pool")
+    contrastive = _mapping(raw.get("contrastive"), "step5.racer_c1.contrastive")
+    train = _mapping(raw.get("train"), "step5.racer_c1.train")
+    retrieval = _mapping(raw.get("retrieval"), "step5.racer_c1.retrieval")
+    composer = _mapping(raw.get("composer"), "step5.racer_c1.composer")
+    cache = _mapping(raw.get("cache"), "step5.racer_c1.cache")
+    logging = _mapping(raw.get("logging"), "step5.racer_c1.logging")
+    guardrails = _mapping(raw.get("guardrails"), "step5.racer_c1.guardrails")
+    _reject_unknown_keys(
+        modes,
+        {
+            "prepare_allowed",
+            "train_eval_requires_cuda",
+            "official_eval_requires_valid_locked_best",
+            "test_once",
+        },
+        "step5.racer_c1.modes",
+    )
+    _reject_unknown_keys(
+        evidence,
+        {
+            "schema_version",
+            "source_split",
+            "valid_test_pool_policy",
+            "exclude_current_train_interaction",
+            "clean_explanation_max_tokens",
+            "include_factual_explanations",
+            "include_step4_route_explainer",
+            "include_cf_evidence",
+            "include_preprocess_profiles",
+            "leakage_check_required",
+        },
+        "step5.racer_c1.evidence_pool",
+    )
+    _reject_unknown_keys(
+        contrastive,
+        {
+            "schema_version",
+            "projection_dim",
+            "hidden_dim",
+            "num_layers",
+            "dropout",
+            "temperature",
+            "num_pos_per_query",
+            "num_hard_neg_per_query",
+            "metric_overlap_weights",
+            "positive_weight",
+            "hard_negative_types",
+        },
+        "step5.racer_c1.contrastive",
+    )
+    _reject_unknown_keys(
+        train,
+        {
+            "max_epochs",
+            "min_epochs",
+            "early_stopping_patience",
+            "validate_every_epochs",
+            "learning_rate",
+            "weight_decay",
+            "optimizer",
+            "precision",
+            "global_batch_size",
+            "per_gpu_batch_size",
+            "target_gpu_memory_gb",
+            "memory_target_policy",
+            "checkpoint_metric",
+            "checkpoint_tie_breakers",
+        },
+        "step5.racer_c1.train",
+    )
+    _reject_unknown_keys(
+        retrieval,
+        {
+            "top_k",
+            "diagnostic_prediction_policy",
+            "official_prediction_policy",
+            "prediction_policy",
+            "fallback_policy",
+            "rcr_score_weight",
+            "template_penalty_weight",
+            "provenance_required",
+        },
+        "step5.racer_c1.retrieval",
+    )
+    _reject_unknown_keys(
+        composer,
+        {
+            "schema_version",
+            "enabled",
+            "policy",
+            "official_prediction_source",
+            "input_evidence",
+            "max_input_evidence",
+            "max_output_tokens",
+            "preserve_causal_content",
+            "suppress_style_shortcut",
+            "use_rcr_reliability",
+            "forbid_exact_copy",
+            "max_lcs_ratio",
+            "min_anchor_coverage",
+            "fallback_if_invalid",
+            "write_copy_lcs_stats",
+        },
+        "step5.racer_c1.composer",
+    )
+    _reject_unknown_keys(
+        cache,
+        {
+            "evidence_embedding_cache_enabled",
+            "cache_namespace",
+            "pair_manifest_cache_enabled",
+            "cache_schema_version",
+            "identity_fields",
+            "lineage_only_fields",
+        },
+        "step5.racer_c1.cache",
+    )
+    _reject_unknown_keys(
+        logging,
+        {
+            "schema_version",
+            "console_level",
+            "log_interval_steps",
+            "write_epoch_metrics",
+            "write_resource_utilization",
+            "write_throughput",
+            "write_bottleneck_analysis",
+            "required_files",
+        },
+        "step5.racer_c1.logging",
+    )
+    _reject_unknown_keys(
+        guardrails,
+        {
+            "train_only_evidence",
+            "forbid_eval_reference_in_query",
+            "forbid_test_metric_selection",
+            "forbid_big_model_generator_call",
+            "prediction_provenance_required",
+        },
+        "step5.racer_c1.guardrails",
+    )
+    method_name = str(raw.get("method_name") or "RACER-C1").strip()
+    if method_name != "RACER-C1":
+        raise OneControlConfigError("step5.racer_c1.method_name must be RACER-C1")
+    paper_method_name = str(raw.get("paper_method_name") or "RACER").strip()
+    if paper_method_name != "RACER":
+        raise OneControlConfigError("step5.racer_c1.paper_method_name must be RACER")
+    output_stage = str(raw.get("output_stage") or "racer_c1").strip()
+    if output_stage != "racer_c1":
+        raise OneControlConfigError("step5.racer_c1.output_stage must be racer_c1")
+    task_allowlist_raw = raw.get("task_allowlist") or [2]
+    if not isinstance(task_allowlist_raw, list):
+        raise OneControlConfigError("step5.racer_c1.task_allowlist must be a list")
+    task_allowlist = [_positive_int(x, "step5.racer_c1.task_allowlist[]") for x in task_allowlist_raw]
+    if 2 not in task_allowlist:
+        raise OneControlConfigError("RACER-C1 preparation currently requires task 2 in task_allowlist")
+    if str(raw.get("legacy_generator_policy") or "").strip() != "deleted_not_available":
+        raise OneControlConfigError("step5.racer_c1.legacy_generator_policy must be deleted_not_available")
+    if str(evidence.get("source_split") or "").strip() != "train":
+        raise OneControlConfigError("step5.racer_c1.evidence_pool.source_split must be train")
+    if str(evidence.get("valid_test_pool_policy") or "").strip() != "train_only":
+        raise OneControlConfigError("step5.racer_c1.evidence_pool.valid_test_pool_policy must be train_only")
+    max_tokens = _rcr_int(
+        evidence.get("clean_explanation_max_tokens"),
+        "step5.racer_c1.evidence_pool.clean_explanation_max_tokens",
+        min_value=1,
+    )
+    if max_tokens != 25:
+        raise OneControlConfigError("RACER-C1 official retrieval prediction requires clean_explanation_max_tokens=25")
+    metric_weights = _mapping(contrastive.get("metric_overlap_weights"), "step5.racer_c1.contrastive.metric_overlap_weights")
+    _reject_unknown_keys(metric_weights, {"rouge1", "rougeL", "bleu1", "meteor"}, "step5.racer_c1.contrastive.metric_overlap_weights")
+    metric_weight_out = {
+        key: _rcr_float(metric_weights.get(key), f"step5.racer_c1.contrastive.metric_overlap_weights.{key}", min_value=0.0)
+        for key in ("rouge1", "rougeL", "bleu1", "meteor")
+    }
+    if abs(sum(metric_weight_out.values()) - 1.0) > 1e-6:
+        raise OneControlConfigError("step5.racer_c1.contrastive.metric_overlap_weights must sum to 1.0")
+    positive_weight = _mapping(contrastive.get("positive_weight"), "step5.racer_c1.contrastive.positive_weight")
+    _reject_unknown_keys(
+        positive_weight,
+        {
+            "metric_overlap",
+            "rcr",
+            "same_item",
+            "same_user",
+            "causal_content",
+            "high_reliability_bucket",
+            "style_shortcut",
+            "template",
+        },
+        "step5.racer_c1.contrastive.positive_weight",
+    )
+    positive_weight_out = {
+        key: _rcr_float(positive_weight.get(key), f"step5.racer_c1.contrastive.positive_weight.{key}")
+        for key in ("metric_overlap", "rcr", "same_item", "same_user", "causal_content", "high_reliability_bucket")
+    }
+    positive_weight_out["style_shortcut"] = float(positive_weight.get("style_shortcut"))
+    positive_weight_out["template"] = float(positive_weight.get("template"))
+    if positive_weight_out["style_shortcut"] > 0:
+        raise OneControlConfigError("step5.racer_c1.contrastive.positive_weight.style_shortcut must be <= 0")
+    if positive_weight_out["template"] > 0:
+        raise OneControlConfigError("step5.racer_c1.contrastive.positive_weight.template must be <= 0")
+    per_gpu_batch = _rcr_int(train.get("per_gpu_batch_size"), "step5.racer_c1.train.per_gpu_batch_size", min_value=1)
+    global_batch = _rcr_int(train.get("global_batch_size"), "step5.racer_c1.train.global_batch_size", min_value=1)
+    expected_global = per_gpu_batch * int(ddp_world_size)
+    if global_batch != expected_global:
+        raise OneControlConfigError(
+            "RACER-C1 uses ODCR no-accum batch semantics: "
+            f"global_batch_size={global_batch} but per_gpu_batch_size({per_gpu_batch}) * "
+            f"ddp_world_size({ddp_world_size}) = {expected_global}"
+        )
+    max_epochs = _rcr_int(train.get("max_epochs"), "step5.racer_c1.train.max_epochs", min_value=1)
+    min_epochs = _rcr_int(train.get("min_epochs"), "step5.racer_c1.train.min_epochs", min_value=1)
+    if min_epochs > max_epochs:
+        raise OneControlConfigError("step5.racer_c1.train.min_epochs must be <= max_epochs")
+    precision = str(train.get("precision") or "").strip()
+    if precision not in TRAIN_PRECISION_CHOICES:
+        raise OneControlConfigError(f"step5.racer_c1.train.precision must be one of {TRAIN_PRECISION_CHOICES}")
+    checkpoint_metric = str(train.get("checkpoint_metric") or "").strip().lower()
+    if checkpoint_metric != "bleu4":
+        raise OneControlConfigError("RACER-C1 valid checkpoint selection currently requires checkpoint_metric=bleu4")
+    tie_breakers = _string_list(train.get("checkpoint_tie_breakers"), "step5.racer_c1.train.checkpoint_tie_breakers")
+    required_tie = ["meteor", "rougeL"]
+    if tie_breakers != required_tie:
+        raise OneControlConfigError("step5.racer_c1.train.checkpoint_tie_breakers must be [meteor, rougeL]")
+    retrieval_top_k = _rcr_int(retrieval.get("top_k"), "step5.racer_c1.retrieval.top_k", min_value=1)
+    if retrieval_top_k < 3:
+        raise OneControlConfigError("RACER-C1 official composer requires step5.racer_c1.retrieval.top_k >= 3")
+    diagnostic_policy = str(retrieval.get("diagnostic_prediction_policy") or "").strip()
+    official_policy = str(retrieval.get("official_prediction_policy") or retrieval.get("prediction_policy") or "").strip()
+    if diagnostic_policy != "top1_clean_explanation_25":
+        raise OneControlConfigError("step5.racer_c1.retrieval.diagnostic_prediction_policy must be top1_clean_explanation_25")
+    if official_policy != "composer_minimal_rewrite":
+        raise OneControlConfigError("step5.racer_c1.retrieval.official_prediction_policy must be composer_minimal_rewrite")
+    if str(retrieval.get("fallback_policy") or "").strip() != "top1_if_composer_invalid_record_provenance":
+        raise OneControlConfigError(
+            "step5.racer_c1.retrieval.fallback_policy must be top1_if_composer_invalid_record_provenance"
+        )
+    if not _bool(composer.get("enabled", True)):
+        raise OneControlConfigError("RACER-C1 official prediction requires step5.racer_c1.composer.enabled=true")
+    if str(composer.get("policy") or "").strip() != "rule_based_minimal_rewrite":
+        raise OneControlConfigError("step5.racer_c1.composer.policy must be rule_based_minimal_rewrite")
+    if str(composer.get("official_prediction_source") or "").strip() != "composed":
+        raise OneControlConfigError("step5.racer_c1.composer.official_prediction_source must be composed")
+    if not _bool(composer.get("forbid_exact_copy", True)):
+        raise OneControlConfigError("step5.racer_c1.composer.forbid_exact_copy must be true")
+    if _rcr_int(composer.get("max_output_tokens"), "step5.racer_c1.composer.max_output_tokens", min_value=1) != 25:
+        raise OneControlConfigError("step5.racer_c1.composer.max_output_tokens must be 25")
+    cache_namespace = str(cache.get("cache_namespace") or "").strip()
+    if not cache_namespace or "/" in cache_namespace or "\\" in cache_namespace:
+        raise OneControlConfigError("step5.racer_c1.cache.cache_namespace must be a simple directory name")
+    required_logs = _string_list(logging.get("required_files"), "step5.racer_c1.logging.required_files")
+    for log_file in required_logs:
+        if log_file.startswith("/") or ".." in Path(log_file).parts:
+            raise OneControlConfigError(f"step5.racer_c1.logging.required_files contains unsafe path {log_file!r}")
+    if not all(_bool(guardrails.get(key)) for key in guardrails):
+        raise OneControlConfigError("all step5.racer_c1.guardrails must be true")
+    return {
+        "schema_version": str(raw.get("schema_version") or "odcr_racer_c1_config/1"),
+        "enabled": _bool(raw.get("enabled", True)),
+        "method_name": method_name,
+        "paper_method_name": paper_method_name,
+        "output_stage": output_stage,
+        "formal_primary": _bool(raw.get("formal_primary", True)),
+        "legacy_generator_policy": "deleted_not_available",
+        "task_allowlist": task_allowlist,
+        "modes": {
+            "prepare_allowed": _bool(modes.get("prepare_allowed", True)),
+            "train_eval_requires_cuda": _bool(modes.get("train_eval_requires_cuda", True)),
+            "official_eval_requires_valid_locked_best": _bool(modes.get("official_eval_requires_valid_locked_best", True)),
+            "test_once": _bool(modes.get("test_once", True)),
+        },
+        "evidence_pool": {
+            "schema_version": str(evidence.get("schema_version") or "odcr_racer_c1_evidence_pool/2"),
+            "source_split": "train",
+            "valid_test_pool_policy": "train_only",
+            "exclude_current_train_interaction": _bool(evidence.get("exclude_current_train_interaction", True)),
+            "clean_explanation_max_tokens": int(max_tokens),
+            "include_factual_explanations": _bool(evidence.get("include_factual_explanations", True)),
+            "include_step4_route_explainer": _bool(evidence.get("include_step4_route_explainer", True)),
+            "include_cf_evidence": _bool(evidence.get("include_cf_evidence", True)),
+            "include_preprocess_profiles": _bool(evidence.get("include_preprocess_profiles", True)),
+            "leakage_check_required": _bool(evidence.get("leakage_check_required", True)),
+        },
+        "contrastive": {
+            "schema_version": str(contrastive.get("schema_version") or "odcr_racer_c1_contrastive/1"),
+            "projection_dim": _rcr_int(contrastive.get("projection_dim"), "step5.racer_c1.contrastive.projection_dim", min_value=1),
+            "hidden_dim": _rcr_int(contrastive.get("hidden_dim"), "step5.racer_c1.contrastive.hidden_dim", min_value=1),
+            "num_layers": _rcr_int(contrastive.get("num_layers"), "step5.racer_c1.contrastive.num_layers", min_value=1),
+            "dropout": _rcr_float(contrastive.get("dropout"), "step5.racer_c1.contrastive.dropout", min_value=0.0, max_value=1.0),
+            "temperature": _rcr_float(contrastive.get("temperature"), "step5.racer_c1.contrastive.temperature", min_value=1e-6),
+            "num_pos_per_query": _rcr_int(contrastive.get("num_pos_per_query"), "step5.racer_c1.contrastive.num_pos_per_query", min_value=1),
+            "num_hard_neg_per_query": _rcr_int(contrastive.get("num_hard_neg_per_query"), "step5.racer_c1.contrastive.num_hard_neg_per_query", min_value=1),
+            "metric_overlap_weights": metric_weight_out,
+            "positive_weight": positive_weight_out,
+            "hard_negative_types": _string_list(contrastive.get("hard_negative_types"), "step5.racer_c1.contrastive.hard_negative_types"),
+        },
+        "train": {
+            "max_epochs": int(max_epochs),
+            "min_epochs": int(min_epochs),
+            "early_stopping_patience": _rcr_int(train.get("early_stopping_patience"), "step5.racer_c1.train.early_stopping_patience", min_value=1),
+            "validate_every_epochs": _rcr_int(train.get("validate_every_epochs"), "step5.racer_c1.train.validate_every_epochs", min_value=1),
+            "learning_rate": _rcr_float(train.get("learning_rate"), "step5.racer_c1.train.learning_rate", min_value=1e-12),
+            "weight_decay": _rcr_float(train.get("weight_decay"), "step5.racer_c1.train.weight_decay", min_value=0.0),
+            "optimizer": str(train.get("optimizer") or "AdamW"),
+            "precision": precision,
+            "global_batch_size": int(global_batch),
+            "per_gpu_batch_size": int(per_gpu_batch),
+            "target_gpu_memory_gb": _rcr_float(train.get("target_gpu_memory_gb"), "step5.racer_c1.train.target_gpu_memory_gb", min_value=1.0),
+            "memory_target_policy": str(train.get("memory_target_policy") or ""),
+            "checkpoint_metric": checkpoint_metric,
+            "checkpoint_tie_breakers": tie_breakers,
+            "batch_semantics": "global_batch_size = per_gpu_batch_size * ddp_world_size",
+        },
+        "retrieval": {
+            "top_k": retrieval_top_k,
+            "diagnostic_prediction_policy": diagnostic_policy,
+            "official_prediction_policy": official_policy,
+            "prediction_policy": official_policy,
+            "fallback_policy": str(retrieval.get("fallback_policy") or ""),
+            "rcr_score_weight": _rcr_float(retrieval.get("rcr_score_weight"), "step5.racer_c1.retrieval.rcr_score_weight", min_value=0.0),
+            "template_penalty_weight": _rcr_float(retrieval.get("template_penalty_weight"), "step5.racer_c1.retrieval.template_penalty_weight", min_value=0.0),
+            "provenance_required": _bool(retrieval.get("provenance_required", True)),
+        },
+        "composer": {
+            "schema_version": str(composer.get("schema_version") or "odcr_racer_c1_composer/1"),
+            "enabled": True,
+            "policy": "rule_based_minimal_rewrite",
+            "official_prediction_source": "composed",
+            "input_evidence": str(composer.get("input_evidence") or "top1_or_topk"),
+            "max_input_evidence": _rcr_int(composer.get("max_input_evidence"), "step5.racer_c1.composer.max_input_evidence", min_value=1),
+            "max_output_tokens": 25,
+            "preserve_causal_content": _bool(composer.get("preserve_causal_content", True)),
+            "suppress_style_shortcut": _bool(composer.get("suppress_style_shortcut", True)),
+            "use_rcr_reliability": _bool(composer.get("use_rcr_reliability", True)),
+            "forbid_exact_copy": True,
+            "max_lcs_ratio": _rcr_float(composer.get("max_lcs_ratio"), "step5.racer_c1.composer.max_lcs_ratio", min_value=0.0, max_value=1.0),
+            "min_anchor_coverage": _rcr_float(composer.get("min_anchor_coverage"), "step5.racer_c1.composer.min_anchor_coverage", min_value=0.0, max_value=1.0),
+            "fallback_if_invalid": _bool(composer.get("fallback_if_invalid", True)),
+            "write_copy_lcs_stats": _bool(composer.get("write_copy_lcs_stats", True)),
+        },
+        "cache": {
+            "evidence_embedding_cache_enabled": _bool(cache.get("evidence_embedding_cache_enabled", True)),
+            "cache_namespace": cache_namespace,
+            "pair_manifest_cache_enabled": _bool(cache.get("pair_manifest_cache_enabled", True)),
+            "cache_schema_version": str(cache.get("cache_schema_version") or "odcr_racer_c1_cache/1"),
+            "identity_fields": _string_list(cache.get("identity_fields"), "step5.racer_c1.cache.identity_fields"),
+            "lineage_only_fields": _string_list(cache.get("lineage_only_fields"), "step5.racer_c1.cache.lineage_only_fields"),
+        },
+        "logging": {
+            "schema_version": str(logging.get("schema_version") or "odcr_racer_c1_logging/1"),
+            "console_level": str(logging.get("console_level") or "summary"),
+            "log_interval_steps": _rcr_int(logging.get("log_interval_steps"), "step5.racer_c1.logging.log_interval_steps", min_value=1),
+            "write_epoch_metrics": _bool(logging.get("write_epoch_metrics", True)),
+            "write_resource_utilization": _bool(logging.get("write_resource_utilization", True)),
+            "write_throughput": _bool(logging.get("write_throughput", True)),
+            "write_bottleneck_analysis": _bool(logging.get("write_bottleneck_analysis", True)),
+            "required_files": required_logs,
+        },
+        "guardrails": {key: True for key in guardrails},
+    }
+
+
 def _step5_official_eval_batch_layout(
     step5_eval_config: Mapping[str, Any],
     *,
@@ -4830,6 +5230,11 @@ def resolve_config(
     step5_valid_loss_config = _resolve_step5_valid_loss_config(cfg) if stage_for_train == "step5" else {}
     step5_final_eval_config = _resolve_step5_final_eval_config(cfg) if stage_for_train == "step5" else {}
     step5_no_ref_evidence_config = _resolve_step5_no_ref_evidence_config(cfg) if stage_for_train == "step5" else {}
+    step5_racer_c1_config = (
+        _resolve_step5_racer_c1_config(cfg, ddp_world_size=ddp_world_size)
+        if stage_for_train == "step5"
+        else {}
+    )
     if (
         stage_for_train == "step5"
         and command == "eval"
@@ -4959,6 +5364,8 @@ def resolve_config(
         row["step5_final_eval_config_json"] = json_dumps(step5_final_eval_config)
         row["step5_no_ref_evidence"] = dict(step5_no_ref_evidence_config)
         row["step5_no_ref_evidence_config_json"] = json_dumps(step5_no_ref_evidence_config)
+        row["step5_racer_c1"] = dict(step5_racer_c1_config)
+        row["step5_racer_c1_config_json"] = json_dumps(step5_racer_c1_config)
         row["step5_no_ref_encoder_content_token_budget"] = int(
             step5_no_ref_evidence_config.get("encoder_content_token_budget", 96)
         )
@@ -5110,6 +5517,7 @@ def resolve_config(
         payload["step5_valid_loss"] = step5_valid_loss_config
         payload["step5_final_eval"] = step5_final_eval_config
         payload["step5_no_ref_evidence"] = step5_no_ref_evidence_config
+        payload["step5_racer_c1"] = step5_racer_c1_config
         payload["step5_train_generation_input_policy"] = str(row.get("generation_input_policy") or "")
         payload["step5_train_content_evidence_policy"] = str(row.get("content_evidence_policy") or "")
         payload["step5_train_reference_usage"] = str(row.get("reference_usage") or "")
@@ -5312,6 +5720,7 @@ def resolve_config(
         "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
         "step5_no_ref_evidence": "step5.no_ref_evidence" if stage_for_train == "step5" else None,
+        "step5_racer_c1": "step5.racer_c1" if stage_for_train == "step5" else None,
         "train_per_gpu_batch_size": "step5.train.per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_per_gpu_batch_size": f"{step5_eval_source}.valid_per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_global_batch_size": f"{step5_eval_source}.valid_batch_size" if stage_for_train == "step5" else None,
@@ -5579,6 +5988,24 @@ def resolve_config(
     ):
         field_sources[f"step5_no_ref_evidence.{key}"] = f"step5.no_ref_evidence.{key}"
     for key in (
+        "schema_version",
+        "enabled",
+        "method_name",
+        "output_stage",
+        "formal_primary",
+        "legacy_generator_policy",
+        "task_allowlist",
+        "modes",
+        "evidence_pool",
+        "contrastive",
+        "train",
+        "retrieval",
+        "cache",
+        "logging",
+        "guardrails",
+    ):
+        field_sources[f"step5_racer_c1.{key}"] = f"step5.racer_c1.{key}"
+    for key in (
         "enabled",
         "evidence_level",
         "namespace_root",
@@ -5768,6 +6195,7 @@ def resolve_config(
         "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
         "step5_no_ref_evidence": "step5.no_ref_evidence" if stage_for_train == "step5" else None,
+        "step5_racer_c1": "step5.racer_c1" if stage_for_train == "step5" else None,
     }
     train_fp = fingerprint({"payload": payload, "hardware": hw_semantic, "ddp_world_size": ddp_world_size})
     gen_fp = fingerprint({"decode": decode, "eval_batch_size": eval_batch_size, "rerank": rerank}) if need_decode else ""
@@ -5995,6 +6423,7 @@ def resolve_config(
         "step5_valid_loss": step5_valid_loss_config if stage_for_train == "step5" else None,
         "step5_final_eval": step5_final_eval_config if stage_for_train == "step5" else None,
         "step5_no_ref_evidence": step5_no_ref_evidence_config if stage_for_train == "step5" else None,
+        "step5_racer_c1": step5_racer_c1_config if stage_for_train == "step5" else None,
         "step5_train_generation_input_policy": str(row.get("generation_input_policy") or "") if stage_for_train == "step5" else None,
         "step5_train_content_evidence_policy": str(row.get("content_evidence_policy") or "") if stage_for_train == "step5" else None,
         "step5_train_reference_usage": str(row.get("reference_usage") or "") if stage_for_train == "step5" else None,
@@ -6159,6 +6588,7 @@ def resolve_config(
         final_eval_reference_max_length=int(row.get("final_eval_reference_max_length", 25)),
         step5_final_eval_config_json=json_dumps(row.get("step5_final_eval", {})),
         step5_no_ref_evidence_config_json=json_dumps(row.get("step5_no_ref_evidence", {})),
+        step5_racer_c1_config_json=json_dumps(row.get("step5_racer_c1", {})),
         step5_no_ref_encoder_content_token_budget=int(row.get("step5_no_ref_encoder_content_token_budget", 96)),
         step5_train_generation_input_policy=str(row.get("step5_train_generation_input_policy") or row.get("generation_input_policy") or ""),
         step5_train_content_evidence_policy=str(row.get("step5_train_content_evidence_policy") or row.get("content_evidence_policy") or ""),

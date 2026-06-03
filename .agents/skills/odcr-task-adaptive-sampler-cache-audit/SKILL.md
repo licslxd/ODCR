@@ -31,3 +31,9 @@ For cache identity details, also read `docs/skills/ODCR_CACHE_SKILL.md`.
 - If changing runtime behavior, follow One-Control and post-edit validation.
 - Do not run training, eval, rerank, or GPU formal work unless the user
   separately authorizes it.
+- For RACER-C1/retrieval-first Step5 resets, FLAN/T5/LoRA generation is deleted
+  rather than kept as a baseline. The active path must be train-only evidence
+  retrieval with RCR-aware contrastive alignment, provenance, cache identity,
+  throughput/resource logs, and no hidden generator fallback.
+- If old Step5 generator, multi-candidate rerank, or legacy alias code is found
+  on the new active path, stop feature work and clean that path first.

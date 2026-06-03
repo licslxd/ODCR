@@ -1316,6 +1316,145 @@ step5:
     term_token_limit: 64
     neutral_content_evidence: "keywords none ; aspects none ; entities none"
     smoke_cache_identity_includes_max_rows: true
+  racer_c1:
+    schema_version: odcr_racer_c1_config/1
+    enabled: true
+    method_name: RACER-C1
+    paper_method_name: RACER
+    output_stage: racer_c1
+    formal_primary: true
+    legacy_generator_policy: deleted_not_available
+    task_allowlist: [2]
+    modes:
+      prepare_allowed: true
+      train_eval_requires_cuda: true
+      official_eval_requires_valid_locked_best: true
+      test_once: true
+    evidence_pool:
+      schema_version: odcr_racer_c1_evidence_pool/2
+      source_split: train
+      valid_test_pool_policy: train_only
+      exclude_current_train_interaction: true
+      clean_explanation_max_tokens: 25
+      include_factual_explanations: true
+      include_step4_route_explainer: true
+      include_cf_evidence: true
+      include_preprocess_profiles: true
+      leakage_check_required: true
+    contrastive:
+      schema_version: odcr_racer_c1_contrastive/1
+      projection_dim: 384
+      hidden_dim: 1024
+      num_layers: 2
+      dropout: 0.10
+      temperature: 0.07
+      num_pos_per_query: 4
+      num_hard_neg_per_query: 8
+      metric_overlap_weights: {rouge1: 0.35, rougeL: 0.25, bleu1: 0.20, meteor: 0.20}
+      positive_weight:
+        metric_overlap: 0.45
+        rcr: 0.20
+        same_item: 0.12
+        same_user: 0.08
+        causal_content: 0.20
+        high_reliability_bucket: 0.08
+        style_shortcut: -0.15
+        template: -0.10
+      hard_negative_types:
+        - in_batch
+        - bm25_high_metric_low
+        - low_rcr
+        - high_template
+        - high_style_shortcut
+        - wrong_content_anchor
+    train:
+      max_epochs: 12
+      min_epochs: 4
+      early_stopping_patience: 3
+      validate_every_epochs: 1
+      learning_rate: 1.0e-4
+      weight_decay: 1.0e-4
+      optimizer: AdamW
+      precision: bf16
+      global_batch_size: 2048
+      per_gpu_batch_size: 1024
+      target_gpu_memory_gb: 35.0
+      memory_target_policy: prefer_large_batch_until_cpu_or_embedding_pipeline_bound
+      checkpoint_metric: bleu4
+      checkpoint_tie_breakers: [meteor, rougeL]
+    retrieval:
+      top_k: 3
+      diagnostic_prediction_policy: top1_clean_explanation_25
+      official_prediction_policy: composer_minimal_rewrite
+      prediction_policy: composer_minimal_rewrite
+      fallback_policy: top1_if_composer_invalid_record_provenance
+      rcr_score_weight: 0.15
+      template_penalty_weight: 0.15
+      provenance_required: true
+    composer:
+      schema_version: odcr_racer_c1_composer/1
+      enabled: true
+      policy: rule_based_minimal_rewrite
+      official_prediction_source: composed
+      input_evidence: top1_or_topk
+      max_input_evidence: 3
+      max_output_tokens: 25
+      preserve_causal_content: true
+      suppress_style_shortcut: true
+      use_rcr_reliability: true
+      forbid_exact_copy: true
+      max_lcs_ratio: 0.85
+      min_anchor_coverage: 0.30
+      fallback_if_invalid: true
+      write_copy_lcs_stats: true
+    cache:
+      evidence_embedding_cache_enabled: true
+      cache_namespace: racer_c1_evidence_embeddings
+      pair_manifest_cache_enabled: true
+      cache_schema_version: odcr_racer_c1_cache/1
+      identity_fields:
+        - task_id
+        - source_split
+        - evidence_pool_schema_version
+        - clean_explanation_max_tokens
+        - sentence_embed_model
+        - embed_dim
+      lineage_only_fields:
+        - max_epochs
+        - learning_rate
+        - global_batch_size
+        - target_gpu_memory_gb
+        - runtime_diagnostics
+    logging:
+      schema_version: odcr_racer_c1_logging/1
+      console_level: summary
+      log_interval_steps: 50
+      write_epoch_metrics: true
+      write_resource_utilization: true
+      write_throughput: true
+      write_bottleneck_analysis: true
+      required_files:
+        - meta/console.log
+        - meta/full.log
+        - meta/errors.log
+        - meta/epoch_metrics.jsonl
+        - meta/resource_utilization.jsonl
+        - meta/throughput.jsonl
+        - diagnostics/bottleneck_analysis.json
+        - diagnostics/token_length_stats.json
+        - diagnostics/leakage_check.json
+        - diagnostics/innovation_alignment.json
+        - diagnostics/content_style_split_stats.json
+        - diagnostics/cf_anchor_stats.json
+        - diagnostics/contrastive_role_distribution.json
+        - diagnostics/copy_lcs_stats.json
+        - diagnostics/cross_domain_evidence_distribution.json
+    guardrails:
+      train_only_evidence: true
+      forbid_eval_reference_in_query: true
+      forbid_test_metric_selection: true
+      forbid_big_model_generator_call: true
+      prediction_provenance_required: true
   train:
     generation_input_policy: history_conditioned_no_reference_evidence
     content_evidence_policy: train_only_history

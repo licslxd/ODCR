@@ -671,8 +671,9 @@ def _check_step5_rating_source_and_explanation_handoff(repo_root: Path) -> RuleR
         for needle in needles:
             if needle not in text:
                 findings.append(Finding(rel, 1, needle, "rating-source/explanation handoff contract missing"))
-    engine = _read(repo_root / "code" / "executors" / "step5_engine.py")
-    if "rating_mse" in engine and "if False" not in engine:
+    engine_path = repo_root / "code" / "executors" / "step5_engine.py"
+    engine = _read(engine_path)
+    if engine_path.exists() and "rating_mse" in engine and "if False" not in engine:
         findings.append(Finding("code/executors/step5_engine.py", _line_of(engine, "rating_mse"), "rating_mse", "Step5 formal must not train rating"))
     if findings:
         return _fail("R142", "Step5 rating-source/explanation contract missing", findings[:20])
@@ -721,9 +722,23 @@ def _retired_legacy_guard_dead_code() -> RuleResult:
 
 
 def _check_step5_legacy_module_deletion(repo_root: Path) -> RuleResult:
-    engine_rel = "code/executors/step5_engine.py"
-    engine = _read(repo_root / engine_rel)
     findings: list[Finding] = []
+    deleted_files = (
+        "code/executors/step5_engine.py",
+        "code/executors/step5_entry.py",
+        "code/odcr_core/step5_explanation_flan_bridge.py",
+        "code/odcr_core/step5_native_lora.py",
+        "code/odcr_core/step5_no_ref_history_cache.py",
+        "code/odcr_core/step5_prompt_templates.py",
+        "code/odcr_core/step5_runtime_probe.py",
+        "code/odcr_core/generation/decoder_kv.py",
+        "code/odcr_core/generation/cache_types.py",
+    )
+    for rel in deleted_files:
+        if (repo_root / rel).exists():
+            findings.append(Finding(rel, 1, rel, "retired Step5 generator file must be physically deleted"))
+    engine_rel = "code/executors/step5.py"
+    engine = _read(repo_root / engine_rel)
     for needle in (
         "self.recommender",
         "PETER_MLP",
@@ -739,81 +754,58 @@ def _check_step5_legacy_module_deletion(repo_root: Path) -> RuleResult:
                     "retired Step5 module must be deleted from the production model, not frozen or kept as fallback",
                 )
             )
+    if "step5_entry" in engine or "step5_engine" in engine:
+        findings.append(Finding(engine_rel, 1, "step5_entry/step5_engine", "Step5 fail-fast stub must not import old executor"))
     if findings:
-        return _fail("R137", "retired Step5 production modules still present", findings)
+        return _fail("R137", "retired Step5 production modules still present", findings[:20])
     return _pass("R137")
 
 
 def _check_step5_lora_allowlist_only(repo_root: Path) -> RuleResult:
     findings: list[Finding] = []
     config_rel = "configs/odcr.yaml"
-    lora_rel = "code/odcr_core/step5_native_lora.py"
-    resolver_rel = "code/odcr_core/config_resolver.py"
     config = _read(repo_root / config_rel)
-    lora = _read(repo_root / lora_rel)
-    resolver = _read(repo_root / resolver_rel)
+    lora_rel = "code/odcr_core/step5_native_lora.py"
     if "target_modules: []" in config:
         findings.append(Finding(config_rel, _line_of(config, "target_modules: []"), "target_modules: []", "empty target_modules auto-discovery is retired"))
-    required = (
-        "HEAD_AWARE_LORA_TARGET_SENTINEL",
-        "head_aware_step5_lora_targets",
-        "resolve_step5_lora_targets",
-        "target_modules=[] is retired",
-        "target is outside the head-aware allowlist",
-    )
-    for needle in required:
-        if needle not in lora and needle not in resolver:
-            findings.append(Finding(lora_rel, 1, needle, "head-aware allowlist-only LoRA policy missing"))
-    if "discover_step5_text_linear_targets(model)" in lora or "targets = list(discovered)" in lora:
-        findings.append(Finding(lora_rel, 1, "auto-discovery", "native LoRA must not auto-scan the full model"))
+    if (repo_root / lora_rel).exists():
+        findings.append(Finding(lora_rel, 1, lora_rel, "LoRA helper must be deleted under RACER-C1"))
     if findings:
-        return _fail("R138", "Step5 LoRA allowlist-only policy violation", findings[:20])
-    return _pass("R138")
+        return _fail("R138", "Step5 LoRA deletion policy violation", findings[:20])
+    return _pass("R138", "Step5 LoRA code deleted under RACER-C1")
 
 
 def _check_step5_mha_out_proj_lora_ban(repo_root: Path) -> RuleResult:
     findings: list[Finding] = []
     lora_rel = "code/odcr_core/step5_native_lora.py"
-    lora = _read(repo_root / lora_rel)
-    required = (
-        "nn.MultiheadAttention",
-        'child == "out_proj"',
-        "must not be LoRA-wrapped",
-    )
-    for needle in required:
-        if needle not in lora:
-            findings.append(Finding(lora_rel, 1, needle, "MHA out_proj LoRA ban missing"))
-    for rel in ("code/executors/step5_engine.py", "code/odcr_core/step5_runtime_probe.py"):
+    if (repo_root / lora_rel).exists():
+        findings.append(Finding(lora_rel, 1, lora_rel, "LoRA helper must be deleted, not patched"))
+    for rel in ("code/executors/step5.py", "code/odcr_core/racer_c1/runner.py"):
         text = _read(repo_root / rel)
         if "out_proj.lora_A" in text or "out_proj.lora_B" in text:
-            findings.append(Finding(rel, _line_of(text, "out_proj.lora_"), "out_proj.lora_*", "MHA out_proj LoRA must not be trainable"))
+            findings.append(Finding(rel, _line_of(text, "out_proj.lora_"), "out_proj.lora_*", "LoRA artifacts must not appear in RACER-C1"))
     if findings:
         return _fail("R139", "MHA out_proj LoRA ban missing or violated", findings[:20])
-    return _pass("R139")
+    return _pass("R139", "LoRA path deleted; no MHA out_proj LoRA possible")
 
 
 def _check_step5_all_trainable_grad_gate(repo_root: Path) -> RuleResult:
     findings: list[Finding] = []
-    for rel in ("code/executors/step5_engine.py", "code/odcr_core/step5_runtime_probe.py"):
+    for rel in ("code/odcr_core/racer_c1/contrastive_trainer.py", "code/odcr_core/racer_c1/logging.py"):
         text = _read(repo_root / rel)
-        if "validate_all_trainable_params_receive_grad" not in text:
-            findings.append(Finding(rel, 1, "validate_all_trainable_params_receive_grad", "formal/E4 must use the shared all-trainable-grad gate"))
-        if "trainable_param_count" not in text or "lora_grad_present_count" not in text:
-            findings.append(Finding(rel, 1, "trainable/lora grad counts", "all-grad evidence counts must be emitted"))
-    bounded_rel = "code/odcr_core/aux/runtime/bounded_probe.py"
-    bounded = _read(repo_root / bounded_rel)
-    for needle in (
-        'probe_result.get("all_trainable_grad_status") == "pass"',
-        'probe_result.get("trainable_param_count")',
-        'probe_result.get("grad_present_count")',
-        'probe_result.get("lora_trainable_count")',
-        'probe_result.get("lora_grad_present_count")',
+        if "cuda_ready" not in text and "cuda_snapshot" not in text:
+            findings.append(Finding(rel, 1, "cuda_ready/cuda_snapshot", "RACER-C1 must keep CUDA/resource logging gate"))
+    for needle, rel in (
+        ("pairs_per_sec", "code/odcr_core/racer_c1/contrastive_trainer.py"),
+        ("target_gpu_memory_gb", "code/odcr_core/racer_c1/contrastive_trainer.py"),
+        ("resource_utilization.jsonl", "code/odcr_core/racer_c1/contracts.py"),
     ):
-        if needle not in bounded:
-            findings.append(Finding(bounded_rel, 1, needle, "E4 admission must require all-grad PASS"))
+        text = _read(repo_root / rel)
+        if needle not in text:
+            findings.append(Finding(rel, 1, needle, "RACER-C1 runtime diagnostics contract missing"))
     if findings:
-        return _fail("R140", "Step5 all-trainable-grad gate is not unified", findings[:20])
-    return _pass("R140")
+        return _fail("R140", "RACER-C1 runtime diagnostics gate is not unified", findings[:20])
+    return _pass("R140", "RACER-C1 CUDA/resource diagnostics gate present")
 
 
 def _check_step5_combined_formal_ban(repo_root: Path) -> RuleResult:

@@ -145,6 +145,13 @@ def build_parser() -> argparse.ArgumentParser:
     lifecycle.add_argument("--allow-embedded-final-eval", action="store_true", help=argparse.SUPPRESS)
     s5.add_argument("--no-embedded-final-eval", action="store_true", help="keep Step5 on the train-only lifecycle")
 
+    rc1 = sub.add_parser("racer-c1", parents=[common], help="prepare or run RACER-C1 retrieval-first Task2 path")
+    rc1.add_argument("--task", type=int, required=True)
+    rc1.add_argument("--from-step4", dest="from_step4", default="latest")
+    rc1.add_argument("--from-step4-run", dest="from_step4_run", default=None)
+    rc1.add_argument("--run-id", default="auto")
+    rc1.add_argument("--mode", choices=("prepare", "train_eval"), default="prepare")
+
     ev = sub.add_parser("eval", parents=[common])
     ev.add_argument("--task", type=int, required=True)
     ev.add_argument("--from-step5", default="latest")
@@ -793,13 +800,42 @@ def cmd_step4_export_step5_pools(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
 
 
+def cmd_racer_c1(args: argparse.Namespace) -> None:
+    from odcr_core.racer_c1 import run_racer_c1
+
+    if getattr(args, "from_step4", None) and getattr(args, "from_step4_run", None):
+        raise OneControlConfigError("use only one of --from-step4 or --from-step4-run")
+    cfg, _sources, snapshot = resolve_config(
+        config_path=_config_path(args),
+        command="step5",
+        task_id=int(args.task),
+        set_overrides=_merged_sets(args),
+        dry_run=True,
+        run_id="auto",
+        from_step4=getattr(args, "from_step4_run", None) or getattr(args, "from_step4", None),
+        step5_head="explanation",
+        eval_profile=getattr(args, "eval_profile", None),
+        mode="train_only",
+    )
+    result = run_racer_c1(
+        cfg,
+        snapshot,
+        mode=str(args.mode),
+        run_id=getattr(args, "run_id", None),
+        dry_run=_dry_run(args),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+
+
 def cmd_stage(args: argparse.Namespace, command: str) -> None:
     if command == "step4" and getattr(args, "step4_action", None):
         raise OneControlConfigError(f"unsupported step4 action: {getattr(args, 'step4_action', None)}")
+    if command == "step5":
+        raise OneControlConfigError(
+            "Old Step5 generator command is deleted. Use `python code/odcr.py racer-c1 --task 2 --mode prepare|train_eval`."
+        )
     if command == "step4" and getattr(args, "task", None) is None:
         raise OneControlConfigError("step4 requires --task")
-    if command == "step5" and getattr(args, "task", None) is None:
-        raise OneControlConfigError("step5 requires --task")
     if command == "step4" and getattr(args, "from_step3", None) and getattr(args, "from_step3_run", None):
         raise OneControlConfigError("use only one of --from-step3 or --from-step3-run")
     if command == "step4" and bool(getattr(args, "prepare_cache", False)) and bool(getattr(args, "preflight", False)):
@@ -1152,7 +1188,6 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         step5_sampler = doctor_snapshot.get("step5_sampler") or {}
         step5_task_policy = doctor_snapshot.get("step5_task_decoupled_policy") or {}
         step5_model_factory_policy = doctor_snapshot.get("step5_model_factory_policy") or {}
-        step5_prompt_templates = doctor_snapshot.get("step5_prompt_templates") or {}
         step5_effective_epoch = doctor_snapshot.get("step5_effective_epoch") or {}
         step5_batch_candidates = doctor_snapshot.get("step5_batch_candidates") or {}
         step5_tuning = doctor_snapshot.get("step5_tuning") or {}
@@ -1161,6 +1196,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         step5_valid_loss = doctor_snapshot.get("step5_valid_loss") or {}
         step5_final_eval = doctor_snapshot.get("step5_final_eval") or {}
         step5_no_ref_evidence = doctor_snapshot.get("step5_no_ref_evidence") or {}
+        step5_racer_c1 = doctor_snapshot.get("step5_racer_c1") or {}
         step5_formal_active_candidate = doctor_snapshot.get("step5_formal_active_candidate") or {}
         step5_sample_plan_preflight = doctor_snapshot.get("step5_sample_plan_preflight") or {}
         step5_e4 = doctor_snapshot.get("step5_e4_bounded") or {}
@@ -1266,6 +1302,33 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 checks.append("step5 no-reference evidence policy resolves as formal no-reference eval from configs/odcr.yaml")
             else:
                 checks.append("step5 no-reference evidence policy resolves as diagnostic-only from configs/odcr.yaml")
+        if step5_racer_c1:
+            racer_train = step5_racer_c1.get("train") or {}
+            racer_cache = step5_racer_c1.get("cache") or {}
+            print("Step5 RACER-C1 retrieval-first policy:")
+            print(
+                "  enabled=%s paper_method=%s experiment_method=%s output_stage=%s formal_primary=%s legacy_generator=%s"
+                % (
+                    step5_racer_c1.get("enabled"),
+                    step5_racer_c1.get("paper_method_name"),
+                    step5_racer_c1.get("method_name"),
+                    step5_racer_c1.get("output_stage"),
+                    step5_racer_c1.get("formal_primary"),
+                    step5_racer_c1.get("legacy_generator_policy"),
+                )
+            )
+            print(
+                "  batch=%s per_gpu=%s target_gpu_gb=%s epochs=%s patience=%s cache=%s"
+                % (
+                    racer_train.get("global_batch_size"),
+                    racer_train.get("per_gpu_batch_size"),
+                    racer_train.get("target_gpu_memory_gb"),
+                    racer_train.get("max_epochs"),
+                    racer_train.get("early_stopping_patience"),
+                    racer_cache.get("cache_namespace"),
+                )
+            )
+            checks.append("step5 RACER-C1 retrieval-first policy resolves from configs/odcr.yaml")
         if rating_source:
             print("Step5 rating source:")
             print(
@@ -1384,15 +1447,7 @@ def cmd_doctor(args: argparse.Namespace) -> None:
                 )
             )
             checks.append("step5 model factory policy derives from One-Control task-decoupled policy")
-        print("Step5 prompt/effective epoch/batch controls:")
-        print(
-            "  prompt_templates=%s train_policy=%s valid_test_policy=%s"
-            % (
-                step5_prompt_templates.get("allowed_template_count"),
-                step5_prompt_templates.get("train_policy"),
-                step5_prompt_templates.get("valid_test_policy"),
-            )
-        )
+        print("Step5 effective epoch/batch controls:")
         print(
             "  effective_epoch: enabled=%s max=%s patience=%s retired_full_table_policy=%s"
             % (
@@ -1662,6 +1717,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd_step4_export_step5_pools(args)
         elif args.command in ("step3", "step4", "step5", "eval"):
             cmd_stage(args, args.command)
+        elif args.command == "racer-c1":
+            cmd_racer_c1(args)
         elif args.command == "step3-rating":
             cmd_step3_rating(args)
         elif args.command == "pipeline":

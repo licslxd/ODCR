@@ -319,7 +319,7 @@ def _step4_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
 def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCommand]:
     return [
         CheckCommand(
-            label="step5 resolver dry-run",
+            label="racer-c1 resolver dry-run",
             argv=(
                 python_executable,
                 "-c",
@@ -332,23 +332,17 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                     "eval_profile='paper_greedy_25', mode='train_only')\n"
                 ),
             ),
-            display_argv=("python", "-c", "step5 resolver dry-run"),
+            display_argv=("python", "-c", "racer-c1 resolver dry-run"),
             group="dry-run",
         ),
+        _odcr_command("racer-c1 prepare dry-run", "racer-c1", "--task", "2", "--mode", "prepare", "--from-step4", "1", "--dry-run"),
         *_existing_tests(
             repo_root,
             (
                 "code/tests/test_rating_source_step3_contract.py",
-                "code/tests/test_step5_explanation_only_cli.py",
-                "code/tests/test_step5_explanation_only_resolver.py",
-                "code/tests/test_step5_explanation_only_sampler.py",
-                "code/tests/test_step5_explanation_handoff_references_rating_source.py",
-                "code/tests/test_step5_cache_manifest.py",
-                "code/tests/test_no_step5" + "A_active_code.py",
-                "code/tests/test_eval_report_composes_step3_rating_and_step5_explanation.py",
-                "code/tests/test_step5_eval_metrics_only_summary.py",
-                "code/tests/test_step5_explanation_quality_contract.py",
-                "code/tests/test_step5_no_ref_eval_runability.py",
+                "code/tests/test_racer_c1_config_and_cli.py",
+                "code/tests/test_racer_c1_innovation_contract.py",
+                "code/tests/test_racer_c1_legacy_purge.py",
                 "code/tests/test_step4_route_scorer_is_stability_signal.py",
             ),
             python_executable=python_executable,

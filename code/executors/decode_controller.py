@@ -1,7 +1,8 @@
 """
-手写解码控制器：与 HF generate 解耦，统一 nucleus / greedy + 尾部退火 + 终端约束。
+Shared decode controller used by Step3 text validation utilities.
 
-由 ``step5_engine.Model`` 调用；有效参数字典见 ``build_generate_kwargs_effective_v2``。
+The old Step5 generator is deleted; this module is retained because active
+Step3 code imports the shared logits and sampling helpers.
 """
 from __future__ import annotations
 

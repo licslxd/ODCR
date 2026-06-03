@@ -111,6 +111,28 @@
 - broad resolved config hash、run id、epoch、loss weight、runtime diagnostics 不得作为
   token cache identity 的唯一依据。
 
+### RACER-C1 / Retrieval-first Step5 reset
+
+当任务明确转向 `RACER-C1` 这类 retrieval-first 方法时，必须物理删除旧大模型生成器
+正式代码；不得保留 FLAN/T5/LoRA baseline、历史兼容测试或隐藏 fallback。
+
+- 新主线语义：train-only evidence pool -> metric-aligned contrastive retriever ->
+  RCR-aware rerank -> top-1 evidence prediction / compact composer。
+- evidence pool、pair manifest、embedding cache、prediction provenance 都是内容产物；
+  task、source split、清洗版本、25-token 截断、embedding backbone、embed_dim、schema
+  version 必须进入 cache identity。
+- epoch、lr、batch、target GPU memory、runtime utilization、throughput 只进 lineage；
+  这些调度/优化字段不得让同一份 evidence embedding cache 无意义重建。
+- 训练日志必须默认写入 `runs/racer_c1/task*/<run>/meta`，至少包含 per-epoch loss、
+  elapsed time、pairs/sec、tokens/sec、GPU/CPU utilization、GPU memory、dataloader/CPU
+  bottleneck 判断；诊断文件写入 `diagnostics/`。
+- 如果 GPU 显存没有接近目标值（例如每卡 35GB），报告必须解释是 CPU/embedding
+  cache/dataloader 限制、batch 太小、序列太短、模型太小，还是负样本挖掘耗时导致，
+  不能简单说“没有吃满显存”。
+- 发现旧 Step5 大模型/多候选 rerank/LoRA 路径仍在 active code/tests/config 里被当成
+  可运行主线时，先停止当前实现并物理清理；不允许用包装、alias、baseline-only 或
+  silent fallback 掩盖旧逻辑。
+
 ## 6. 常见红旗
 
 - sampler 名称里出现 `MEDIUM_ONLY`，但 High pool 非空且没有污染证据；

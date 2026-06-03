@@ -258,14 +258,7 @@ def cmd_ablation(args: argparse.Namespace, *, repo_root: str | Path) -> None:
         else:
             payload = build_result_snapshot(root, task=int(args.task), variant=str(args.variant))
     elif action == "probe":
-        from odcr_core.ablation.probe import run_ablation_probe
-
-        payload = run_ablation_probe(
-            root,
-            task=int(args.task),
-            variant=str(args.variant),
-            max_steps=int(getattr(args, "max_steps", 2)),
-        )
+        raise RuntimeError("Old Step5 ablation probe code has been deleted with the generator-first path.")
     elif action == "train":
         payload = _cmd_train(
             root,
@@ -311,10 +304,6 @@ def build_standalone_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--task", type=int, required=True, choices=(7, 8))
     snapshot.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
     snapshot.add_argument("--write", action="store_true")
-    probe = sub.add_parser("probe")
-    probe.add_argument("--task", type=int, required=True, choices=(7, 8))
-    probe.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
-    probe.add_argument("--max-steps", type=int, default=2)
     train = sub.add_parser("train")
     train.add_argument("--task", type=int, required=True, choices=(7, 8))
     train.add_argument("--variant", required=True, choices=("wo_rcr", "wo_cf", "wo_ccv_fca"))
