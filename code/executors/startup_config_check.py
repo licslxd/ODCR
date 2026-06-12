@@ -95,21 +95,6 @@ def _classify_decode_profile(*, required: bool) -> str:
     return "loaded"
 
 
-def _classify_rerank_profile(*, active: bool) -> str:
-    if not active:
-        return "absent"
-    raw = (os.environ.get("ODCR_RERANK_PROFILE_JSON") or "").strip()
-    if not raw:
-        return "missing"
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return "missing"
-    if not isinstance(obj, dict):
-        return "missing"
-    return "loaded"
-
-
 def _read_full_bleu_eval_startup_line(*, required: bool) -> str:
     raw = (os.environ.get("ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON") or "").strip()
     if not raw:
@@ -136,13 +121,11 @@ def print_startup_config_check(*, stage: str, command: str) -> None:
         return
     need_tp = stage in ("step3", "step5")
     need_decode = stage == "step5"
-    rerank_active = stage == "step5" and command == "eval-rerank"
     tfp = _read_training_semantic_fingerprint()
     gfp = _read_generation_semantic_fingerprint()
     rdfp = _read_runtime_diagnostics_fingerprint()
     tp = _classify_training_payload(required=need_tp)
     dec = _classify_decode_profile(required=need_decode)
-    rr = _classify_rerank_profile(active=rerank_active)
     fbe = _read_full_bleu_eval_startup_line(required=need_tp)
     print(
         "[startup_config_check] "
@@ -152,7 +135,6 @@ def print_startup_config_check(*, stage: str, command: str) -> None:
         f"runtime_diagnostics_fingerprint={rdfp} "
         f"effective_training_payload_loaded={tp} "
         f"decode_profile_loaded={dec} "
-        f"rerank_profile_loaded={rr} "
         f"{fbe}",
         flush=True,
     )

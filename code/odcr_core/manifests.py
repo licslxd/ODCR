@@ -70,7 +70,6 @@ _STEP3_FORMAL_VIEW_KEYS = (
     "step3_evidence",
     "step3_scheduler",
     "step3_eval",
-    "step3_worker_profiles",
     "step3_prefetcher",
     "step3_cross_rank_structured_gather",
     "step3_memory",
@@ -91,7 +90,6 @@ _STEP3_FORMAL_SOURCE_EXCLUDE_PARTS = (
     "exploration",
     "step5",
     "decode",
-    "rerank",
 )
 
 
@@ -473,8 +471,6 @@ def _duration_seconds(started_at: str | None, finished_at: str | None) -> float 
 
 
 def canonical_stage_name(command: str) -> str:
-    if command == "eval-rerank":
-        return "rerank"
     return str(command)
 
 
@@ -1151,8 +1147,8 @@ def _run_id_for_config(cfg: ResolvedConfig) -> str:
         return str(cfg.run_name)
     if cfg.command == "step4" and cfg.step4_run is not None:
         return str(cfg.step4_run)
-    if cfg.command in ("step5", "eval", "eval-rerank") and cfg.step5_run is not None:
-        if cfg.command in ("eval", "eval-rerank") and cfg.eval_run_dir:
+    if cfg.command in ("step5", "eval") and cfg.step5_run is not None:
+        if cfg.command == "eval" and cfg.eval_run_dir:
             return Path(cfg.eval_run_dir).name
         return str(cfg.step5_run)
     if cfg.eval_run_dir:
@@ -1161,7 +1157,7 @@ def _run_id_for_config(cfg: ResolvedConfig) -> str:
 
 
 def _run_dir_for_config(cfg: ResolvedConfig) -> Path:
-    if cfg.command in ("eval", "eval-rerank") and cfg.eval_run_dir:
+    if cfg.command == "eval" and cfg.eval_run_dir:
         return Path(cfg.eval_run_dir).expanduser().resolve()
     return Path(cfg.checkpoint_dir).expanduser().resolve()
 
@@ -1188,8 +1184,8 @@ def build_run_summary_for_config(
     run_dir = _run_dir_for_config(cfg)
     meta = Path(cfg.manifest_dir).expanduser().resolve()
     stage = canonical_stage_name(cfg.command)
-    if stage in ("eval", "rerank"):
-        metrics_path = path_layout.eval_metrics_path(run_dir, rerank=(stage == "rerank"))
+    if stage == "eval":
+        metrics_path = path_layout.eval_metrics_path(run_dir)
     elif stage == "step4":
         metrics_path = None
     else:
@@ -1205,7 +1201,7 @@ def build_run_summary_for_config(
         "debug_log": meta / DEBUG_LOG_FILENAME,
         "samples_log": meta / SAMPLES_LOG_FILENAME,
     }
-    if cfg.command in ("step3", "step5", "eval", "eval-rerank"):
+    if cfg.command in ("step3", "step5", "eval"):
         key_artifacts["model"] = path_layout.best_model_path(Path(cfg.checkpoint_dir))
     if cfg.command == "step3":
         key_artifacts["source_table_verbose"] = source_table_verbose_path(meta)
@@ -1219,7 +1215,7 @@ def build_run_summary_for_config(
             key_artifacts["training_csv"] = train_csv_path(cfg)
         except Exception:
             pass
-    if stage in ("eval", "rerank"):
+    if stage == "eval":
         key_artifacts["metrics"] = metrics_path
     payload = build_run_summary(
         repo_root=cfg.repo_root,
@@ -1255,7 +1251,7 @@ def build_run_summary_for_config(
             latest_error=latest_error,
             key_artifacts=key_artifacts,
         )
-    if cfg.command in {"step4", "step5", "eval", "eval-rerank"}:
+    if cfg.command in {"step4", "step5", "eval"}:
         if cfg.from_run is not None:
             payload["from_step3"] = cfg.from_run
         if cfg.step4_run is not None:
@@ -1278,7 +1274,6 @@ def build_run_summary_for_config(
             payload["head"] = head
             payload["formal_namespace"] = "explanation"
             payload["selected_tuning_candidate"] = str(getattr(cfg, "step5_selected_tuning_candidate", "") or "")
-            payload["fallback_tuning_candidate"] = str(getattr(cfg, "step5_fallback_tuning_candidate", "") or "")
             payload["step5_effective_samples"] = _load_json_string(getattr(cfg, "step5_effective_samples_json", "{}") or "{}")
             payload["step5_optimizer_steps"] = _load_json_string(getattr(cfg, "step5_optimizer_steps_json", "{}") or "{}")
             payload["step5_lifecycle"] = _load_json_string(getattr(cfg, "step5_lifecycle_config_json", "{}") or "{}")
@@ -1298,7 +1293,7 @@ def build_run_summary_for_config(
             payload["downstream_ready"] = (
                 status_norm in {"ok", "completed", "success", "completed_with_eval_handoff", "eval_handoff_accepted"} and not needs_eval_handoff
             )
-            payload["ready_for"] = ["eval", "rerank"] if payload["downstream_ready"] else []
+            payload["ready_for"] = ["eval"] if payload["downstream_ready"] else []
         upstream_resolution = getattr(cfg, "upstream_resolution_json", "") or ""
         if upstream_resolution.strip():
             try:
@@ -1338,7 +1333,6 @@ def _stage_label(command: str) -> str:
         "step4": "step4_counterfactual_eval_inference",
         "step5": "step5_main_train",
         "eval": "eval_step5_valid",
-        "eval-rerank": "eval_step5_valid_rerank",
     }.get(command, command)
 
 
@@ -1349,7 +1343,7 @@ def _resolved_train_csv(cfg: ResolvedConfig) -> str | None:
         return str(train_csv_path(cfg).resolve())
     if cfg.command == "step5" and cfg.from_run and cfg.step5_run:
         return str(train_csv_path(cfg).resolve())
-    if cfg.command in ("eval", "eval-rerank") and cfg.step5_run:
+    if cfg.command == "eval" and cfg.step5_run:
         return str(train_csv_path(cfg).resolve())
     return None
 
@@ -1357,7 +1351,7 @@ def _resolved_train_csv(cfg: ResolvedConfig) -> str | None:
 def _resolved_model_weights(cfg: ResolvedConfig) -> str | None:
     if cfg.model_path:
         return str(Path(cfg.model_path).resolve())
-    if cfg.command in ("step5", "eval", "eval-rerank"):
+    if cfg.command in ("step5", "eval"):
         ck = Path(cfg.checkpoint_dir)
         return str(path_layout.best_model_path(ck))
     return None
@@ -1490,17 +1484,10 @@ def _run_lineage(cfg: ResolvedConfig) -> dict[str, Any]:
         er = Path(cfg.eval_run_dir)
         out["eval_run"] = er.name
         out["eval_run_dir"] = str(er.resolve())
-        out["metrics_path"] = str(
-            path_layout.eval_metrics_path(er, rerank=(cfg.command == "eval-rerank")).resolve()
-        )
-    if cfg.command == "eval-rerank" and cfg.eval_run_dir:
-        out["rerank_run"] = Path(cfg.eval_run_dir).name
-        out["rerank_run_dir"] = str(Path(cfg.eval_run_dir).resolve())
+        out["metrics_path"] = str(path_layout.eval_metrics_path(er).resolve())
     dr = getattr(cfg, "decode_preset_id", "") or ""
     if dr:
         out["decode_preset_id"] = dr
-    if cfg.command == "eval-rerank" and cfg.rerank_preset_id:
-        out["rerank_preset_id"] = cfg.rerank_preset_id
     return out
 
 
@@ -1565,7 +1552,6 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         "stage": _stage_label(cfg.command),
         "step5_head": str(getattr(cfg, "step5_head", "explanation") or "explanation") if cfg.command == "step5" else None,
         "step5_selected_tuning_candidate": str(getattr(cfg, "step5_selected_tuning_candidate", "") or "") if cfg.command == "step5" else None,
-        "step5_fallback_tuning_candidate": str(getattr(cfg, "step5_fallback_tuning_candidate", "") or "") if cfg.command == "step5" else None,
         "step5_effective_samples": _load_json_string(getattr(cfg, "step5_effective_samples_json", "{}") or "{}") if cfg.command == "step5" else None,
         "step5_optimizer_steps": _load_json_string(getattr(cfg, "step5_optimizer_steps_json", "{}") or "{}") if cfg.command == "step5" else None,
         "task_id": cfg.task_id,
@@ -1611,9 +1597,6 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
                 "decode_profile_sha1": hashlib.sha1(
                     (cfg.decode_profile_json or "").encode("utf-8")
                 ).hexdigest()[:16],
-                "rerank_profile_sha1": hashlib.sha1(
-                    (cfg.rerank_profile_json or "").encode("utf-8")
-                ).hexdigest()[:16],
                 "generation_semantic_family_tag": compute_generation_semantic_family_tag(
                     {
                         "strategy": cfg.decode_strategy,
@@ -1649,7 +1632,7 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
                 "checkpoint_selection_metric": "valid_loss",
                 "canonical_weight_file": "model/best.pth",
             }
-            if cfg.command in ("step3", "step5", "eval", "eval-rerank")
+            if cfg.command in ("step3", "step5", "eval")
             else None
         ),
         "paths": {
@@ -1755,7 +1738,7 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         ),
         "governance_layer": {
             "purpose": "repro_orchestration_audit",
-            "note": "manifest/fingerprint/matrix/analysis_pack 属工程治理层，不属于核心建模增强。",
+            "note": "manifest/fingerprint/matrix 属工程治理层，不属于核心建模增强。",
         },
     }
     m["effective_config"] = {
@@ -1764,11 +1747,10 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         "training_preset": cfg.preset_name,
         "decode_preset": cfg.decode_preset_id or None,
         "eval_profile_orchestrator": getattr(cfg, "eval_profile_id", "") or None,
-        "rerank_preset": (cfg.rerank_preset_id or None) if cfg.command == "eval-rerank" else None,
         "training_semantic_fingerprint": _train_fp or None,
         "generation_semantic_fingerprint": _gen_fp or None,
     }
-    if cfg.command in ("eval", "eval-rerank", "eval-matrix", "eval-rerank-matrix", "step4") and getattr(
+    if cfg.command in ("eval", "eval-matrix", "step4") and getattr(
         cfg, "eval_profile_id", ""
     ):
         _ej = getattr(cfg, "eval_profile_resolution_json", "") or "{}"
@@ -1780,9 +1762,6 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
             "eval_profile": cfg.eval_profile_id,
             "resolved_hardware_preset": cfg.hardware_preset_id,
             "resolved_decode_preset": cfg.decode_preset_id or None,
-            "resolved_rerank_preset": (cfg.rerank_preset_id or None)
-            if cfg.command in ("eval-rerank", "eval-rerank-matrix")
-            else None,
             "global_eval_batch_size": cfg.global_eval_batch_size,
             "eval_per_gpu_batch_size": cfg.eval_per_gpu_batch_size,
             "ddp_world_size": cfg.ddp_world_size,
@@ -1813,23 +1792,6 @@ def build_run_manifest(cfg: ResolvedConfig, *, cli_invocation: str | None = None
         ri["model_weights_resolved"] = model_res
     if ri:
         m["resolved_inputs"] = ri
-
-    if cfg.command == "eval-rerank":
-        m["rerank"] = {
-            "rerank_preset": cfg.rerank_preset_id,
-            "num_return_sequences": cfg.num_return_sequences,
-            "rerank_method": cfg.rerank_method,
-            "rerank_top_k": cfg.rerank_top_k,
-            "rerank_weight_logprob": cfg.rerank_weight_logprob,
-            "rerank_weight_length": cfg.rerank_weight_length,
-            "rerank_weight_repeat": cfg.rerank_weight_repeat,
-            "rerank_weight_dirty": cfg.rerank_weight_dirty,
-            "rerank_target_len_ratio": cfg.rerank_target_len_ratio,
-            "export_examples_mode": cfg.export_examples_mode,
-            "export_full_rerank_examples": cfg.export_full_rerank_examples,
-            "rerank_malformed_tail_penalty": cfg.rerank_malformed_tail_penalty,
-            "rerank_malformed_token_penalty": cfg.rerank_malformed_token_penalty,
-        }
 
     if cfg.command == "step5":
         m["backbones"] = _manifest_backbones_block(cfg)

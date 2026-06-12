@@ -187,6 +187,47 @@ step3:
       train:
         lr: 3.0e-4
   task_profiles:
+    task1_electronics_to_cds:
+      task_id: 1
+      source: AM_Electronics
+      target: AM_CDs
+      scenario: legacy_scenario
+      direction: legacy
+      active_profile: legacy_isolated_init
+      profile_id: task1_legacy_isolated_init
+      candidate: task1_legacy_isolated_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      note: legacy profile is isolated/profile-ready only; it is not task2 formal-ready
+      train:
+        batch_size: 1024
+        per_gpu_batch_size: 512
+        lr: 5.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1024
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
     task2_am_movies_to_cds:
       task_id: 2
       source: AM_Movies
@@ -220,6 +261,88 @@ step3:
         enabled: true
         mode: local_gradient_context
       effective_pool_expected: 1536
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+    task3_cds_to_electronics:
+      task_id: 3
+      source: AM_CDs
+      target: AM_Electronics
+      scenario: legacy_scenario
+      direction: legacy
+      active_profile: legacy_isolated_init
+      profile_id: task3_legacy_isolated_init
+      candidate: task3_legacy_isolated_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      note: legacy profile is isolated/profile-ready only; it is not task2 formal-ready
+      train:
+        batch_size: 1024
+        per_gpu_batch_size: 512
+        lr: 5.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1024
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+    task4_movies_to_electronics:
+      task_id: 4
+      source: AM_Movies
+      target: AM_Electronics
+      scenario: legacy_scenario
+      direction: legacy
+      active_profile: legacy_isolated_init
+      profile_id: task4_legacy_isolated_init
+      candidate: task4_legacy_isolated_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      note: legacy profile is isolated/profile-ready only; it is not task2 formal-ready
+      train:
+        batch_size: 1024
+        per_gpu_batch_size: 512
+        lr: 5.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1024
       memory:
         activation_checkpointing: false
         profile_buffer_policy: gpu_resident
@@ -260,6 +383,47 @@ step3:
         enabled: true
         mode: local_gradient_context
       effective_pool_expected: 1536
+      memory:
+        activation_checkpointing: false
+        profile_buffer_policy: gpu_resident
+      optimizer: AdamW
+      precision: bf16_tf32
+    task6_electronics_to_movies:
+      task_id: 6
+      source: AM_Electronics
+      target: AM_Movies
+      scenario: legacy_scenario
+      direction: legacy
+      active_profile: legacy_isolated_init
+      profile_id: task6_legacy_isolated_init
+      candidate: task6_legacy_isolated_init
+      formal_allowed: false
+      profile_ready: true
+      formal_ready: false
+      probe_only: false
+      note: legacy profile is isolated/profile-ready only; it is not task2 formal-ready
+      train:
+        batch_size: 1024
+        per_gpu_batch_size: 512
+        lr: 5.0e-4
+        max_grad_norm: 0.5
+        backend:
+          train_precision: bf16
+          allow_tf32: true
+          amp_autocast: true
+          grad_scaler: false
+      tokenizer:
+        max_length: 48
+      evidence:
+        max_evidence_length: 48
+      scheduler:
+        name: warmup_cosine
+        warmup_ratio: 0.06
+        min_lr_ratio: 0.05
+      cross_rank_structured_gather:
+        enabled: true
+        mode: local_gradient_context
+      effective_pool_expected: 1024
       memory:
         activation_checkpointing: false
         profile_buffer_policy: gpu_resident
@@ -364,29 +528,6 @@ step3:
     name: warmup_cosine
     warmup_ratio: 0.06
     min_lr_ratio: 0.05
-    validation_aware_lr_damping:
-      enabled: false
-      name: safe_damping_v2
-      base_scheduler: warmup_cosine
-      formal_allowed: false
-      probe_only: true
-      monitor_metric: valid_loss
-      direction: min
-      worsen_abs_threshold: 0.25
-      worsen_ratio_threshold: 0.10
-      worsen_patience: 3
-      lr_decay_factor: 0.5
-      min_lr_ratio: 0.05
-      cooldown_epochs: 3
-      max_damping_events: 2
-      start_epoch: 4
-      recent_trend_epochs: 2
-      recent_recovery_tolerance: 1.0e-3
-      effective_lr_floor_abs: 0.0
-      effective_lr_floor_ratio: 0.25
-      effective_min_lr_policy: safe_floor_no_halve_to_zero
-      action_on_max_events: stop_and_select_candidate
-      action_on_low_lr_no_progress: stop_and_select_candidate
   objective_drift:
     enabled: true
     valid_loss_abs_threshold: 0.25
@@ -437,61 +578,6 @@ step3:
           L_variance: 0.45
           L_domain_style_alignment: 0.45
           L_prototype_separation: 0.5
-  conflict_aware:
-    enabled: false
-    mode: "off"
-    allowed_modes: ["off", dynamic_weighting, pcgrad, gradnorm, uncertainty_weighting]
-    default_mode: "off"
-    formal_allowed: false
-    requires_gradient_probe: true
-    ddp_graph_safe_zero_required: true
-  loss_gradient_conflict_probe:
-    enabled: true
-    real_data_only: true
-    synthetic_benchmark_forbidden: true
-    bounded_max_batches: 4
-    output_dir: AI_analysis/01_raw_logs/step3_loss_gradient_conflict_probe
-    write_formal_checkpoint: false
-  adapter_gating:
-    enabled: false
-    formal_allowed: false
-    requires_gradient_probe: true
-    rating_adapter: off
-    shared_specific_gate: off
-    explainer_adapter: off
-    style_content_residual_gate: off
-    checkpoint_compatibility: disabled_no_state_change
-  paper_candidate_selection:
-    enabled: true
-    eval_protocol: paper_target_only_eval
-    bounded_eval_required: true
-    candidate_pool: [best_observed, best_after_min_epochs, top_k_valid_loss, milestone, recovery, ema, checkpoint_average]
-    no_paper_eval_no_selection: true
-    scorer_explainer_split: true
-    rating_guard:
-      max_mae: 0.65
-      max_rmse: 0.95
-      max_mae_worse_abs: 0.02
-      max_rmse_worse_abs: 0.03
-    diversity_guard:
-      dist1_floor: 0.05
-      dist2_floor: 0.20
-      collapse_penalty: 100.0
-    composite_weights:
-      rouge_l: 0.30
-      bleu4: 0.25
-      meteor: 0.25
-      dist1: 0.10
-      dist2: 0.10
-    outputs:
-      paper_candidate_selection: paper_candidate_selection.json
-      candidate_eval_registry: candidate_eval_registry.jsonl
-  checkpoint_averaging:
-    enabled: false
-    candidate_only: true
-    never_overwrite_best_observed: true
-    requires_lineage: true
-    requires_paper_eval_before_downstream: true
   eval:
     protocol: minimal_eval
     split: valid
@@ -524,7 +610,7 @@ step3:
       metrics: [MAE, RMSE, ROUGE-1, ROUGE-L, BLEU-1, BLEU-2, BLEU-3, BLEU-4, DIST-1, DIST-2, METEOR]
     full_pipeline_final_eval:
       interface_only: true
-      requires: Step4/Step5/eval/rerank
+      requires: Step4/Step5/eval
   cache:
     tokenizer_schema_version: odcr_step3_tokenizer_cache/2
     formal_cache_namespace: cache/step3/tokenizer
@@ -582,7 +668,7 @@ step3:
       full_pipeline_final:
         diagnostic_only: false
         not_final_paper_metric: false
-        requires: Step4/Step5/eval/rerank
+        requires: Step4/Step5/eval
   cross_rank_structured_gather:
     enabled: true
     mode: local_gradient_context
@@ -652,91 +738,6 @@ step3:
       - sync_time
       - logging_time
       - total_step_time
-  performance_candidates:
-    schema_version: odcr_step3_a100_candidate_matrix/1
-    selected_candidate: G1S
-    formal_default_profile: task2_strong_forward_g1s
-    formal_default_unchanged: false
-    adopt:
-      zero_grad_set_to_none: true
-      timing_closure_instrumentation: true
-      memory_phase_attribution: true
-      grad_finite_gate: true
-      checkpoint_global_best_policy: true
-      quality_gate: true
-      samples_collapse_stats: true
-    probe:
-      fused_adamw: true
-      foreach_adamw: true
-      ddp_gradient_as_bucket_view: true
-      ddp_bucket_cap_mb_tuning: true
-      ddp_static_graph_feasibility: true
-      torch_compile_forward: true
-      torch_compile_loss_submodule: true
-      cuda_graphs_steady_state: true
-      allocator_expandable_segments: true
-      chunked_structured_loss: true
-      compact_gather_memory_optimization: true
-      worker_prefetch_sweep: true
-    reject:
-      dali_without_data_bottleneck: true
-      flashattention_without_compatible_attention: true
-      two_to_four_sparsity_without_quality_plan: true
-      activation_checkpointing_as_speed_optimization: true
-      bare_torchrun: true
-      g2_direct_formal: true
-      retired_optimizer_delay_training: true
-    batch_ladder:
-      G1S:
-        batch_size: 1536
-        per_gpu_batch_size: 768
-        ddp_world_size: 2
-        lr_candidate: 3.0e-4
-        warmup_ratio_min: 0.03
-        warmup_ratio_max: 0.06
-        formal_allowed: true
-        probe_only: false
-      G1-M:
-        batch_size: 1792
-        per_gpu_batch_size: 896
-        ddp_world_size: 2
-        formal_allowed: false
-        probe_only: true
-      G2-C:
-        batch_size: 2048
-        per_gpu_batch_size: 1024
-        ddp_world_size: 2
-        memory_optimized_only: true
-        formal_allowed: false
-        probe_only: true
-      G3:
-        batch_size: 2304
-        per_gpu_batch_size: 1152
-        ddp_world_size: 2
-        requires_prior_pass: true
-        formal_allowed: false
-        probe_only: true
-  worker_profiles:
-    W0:
-      train_workers_per_rank: 4
-      prefetch_factor: 2
-      role: active_default
-    W1:
-      train_workers_per_rank: 4
-      prefetch_factor: 4
-      role: performance_candidate
-    W2:
-      train_workers_per_rank: 5
-      prefetch_factor: 2
-      role: performance_candidate
-    W3:
-      train_workers_per_rank: 5
-      prefetch_factor: 4
-      role: performance_candidate
-    W4:
-      train_workers_per_rank: 3
-      prefetch_factor: 4
-      role: performance_candidate
   train:
     batch_size: 1536
     per_gpu_batch_size: 768
@@ -772,30 +773,10 @@ step4:
     perf_log_interval: 20
     preflight_default_max_samples: 128
     partial_wait_timeout_seconds: 600
-  step5_dedicated_exports:
-    enabled: false
-    output_dir_name: step5_exports
-    full_audit_format: parquet
-    scorer_train_format: parquet
-    explainer_train_format: parquet
-    scorer_filter:
-      train_keep: true
-      route_scorer: true
-      min_sample_weight_hint: 0.0
-    explainer_filter:
-      train_keep: true
-      route_explainer: true
-      min_sample_weight_hint: 0.0
-    write_gold_cf_subsplits: true
-    full_audit_role: audit_only
-    atomic_write: true
-    validate_after_write: true
-    chunk_rows: 100000
   step5_pool_exports:
     enabled: true
     output_dir_name: step5_pools
     full_audit_role: audit_only
-    legacy_dedicated_exports_role: legacy_old_filter_exports
     chunk_rows: 100000
   gold_quality:
     schema_version: odcr_gold_quality_score/1
@@ -996,8 +977,6 @@ step5:
     effective_epoch_enabled: true
     seed: 3407
     rotate_across_epochs: true
-    full_audit_default_allowed: false
-    legacy_gold_heavy_exports_allowed: false
     auto_budget:
       enabled: true
       capacity_basis: balanced_capacity
@@ -1007,14 +986,14 @@ step5:
         full: 1.00
         large: 1.20
       min_steps_per_effective_epoch: 400
-      preferred_steps_per_effective_epoch: [400, 1100]
-      max_steps_per_effective_epoch: 1800
+      preferred_steps_per_effective_epoch: [400, 2000]
+      max_steps_per_effective_epoch: 2200
       max_replacement_rate: 0.20
     explanation:
       default_candidate: medium
-      target_gold_ratio: 0.43
-      aux_gold_ratio: 0.23
-      cf_ratio: 0.34
+      target_gold_ratio: 0.50
+      aux_gold_ratio: 0.15
+      cf_ratio: 0.35
       target_gold_tier_mix:
         high: 0.60
         medium: 0.40
@@ -1060,8 +1039,6 @@ step5:
     enabled: true
     max_effective_epochs: 3
     early_stopping_patience: 1
-    retired_full_table_epochs: 30
-    retired_full_table_policy: fail_fast
   batch_candidates:
     ddp_world_size: 2
     fsdp_zero_policy: not_introduced
@@ -1069,60 +1046,39 @@ step5:
     candidates:
       - {id: B32, per_gpu_batch_size: 32, global_batch_size: 64, role: selected_task5_1_19_safe_candidate_for_memory_limited_step5}
       - {id: B64, per_gpu_batch_size: 64, global_batch_size: 128, role: selected_task2_1_18_safe_candidate}
-      - {id: B96, per_gpu_batch_size: 96, global_batch_size: 192, role: rejected_oom_label128_run1_15}
-      - {id: B128, per_gpu_batch_size: 128, global_batch_size: 256, role: rejected_oom_label128_run1_14}
-      - {id: B160, per_gpu_batch_size: 160, global_batch_size: 320, role: rejected_oom_label128_run1_13}
-      - {id: B192, per_gpu_batch_size: 192, global_batch_size: 384, role: rejected_oom_label128_run1_12}
-      - {id: B224, per_gpu_batch_size: 224, global_batch_size: 448, role: retired_oom_ceiling_history_not_active}
   tuning:
     enabled: true
     selected_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_1e-3+W0
-    fallback_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
     effective_samples:
-      explanation: 426541
+      explanation: 250000
     optimizer_steps:
-      explanation: 953
+      explanation: 1954
     batch_candidate: B64
-    fallback_batch_candidate: B64
     selected_budget_candidate: medium
-    pilot_fraction_candidates: [0.1, 0.2, 0.5]
-    lr_candidates: [0.001, 0.0005, 0.0002, 0.0015]
-    warmup_fraction_candidates: [0.03, 0.05, 0.08]
+    pilot_fraction_candidates: [0.1]
+    lr_candidates: [0.001]
+    selected_warmup_fraction: 0.05
+    warmup_fraction_candidates: [0.05]
     search_strategy:
       stage_a_fraction: 0.1
       stage_b_fraction: 0.2
       extended_primary_fraction: 0.5
-      extended_backup_fraction: 0.2
     ratio_candidates:
       explanation:
-        STEP5_RATIO_0: {target_gold: 0.43, aux_gold: 0.23, cf: 0.34}
-        STEP5_RATIO_1: {target_gold: 0.40, aux_gold: 0.15, cf: 0.45}
-        STEP5_RATIO_2: {target_gold: 0.35, aux_gold: 0.15, cf: 0.50}
+        STEP5_RATIO_0: {target_gold: 0.50, aux_gold: 0.15, cf: 0.35}
     cf_tier_mix_candidates:
       explanation:
         STEP5_CF_MIX_FORMAL_HIGH_MEDIUM: {high: 0.588235, medium: 0.411765, low_weighted: 0.00}
         WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1: {high: 0.00, medium: 0.00, low_weighted: 1.00}
-        STEP5_CF_MIX_0: {high: 0.50, medium: 0.40, low_weighted: 0.10}
-        STEP5_CF_MIX_1: {high: 0.50, medium: 0.35, low_weighted: 0.15}
-        STEP5_CF_MIX_2: {high: 0.45, medium: 0.40, low_weighted: 0.15}
-        STEP5_CF_MIX_3: {high: 0.40, medium: 0.40, low_weighted: 0.20}
     gold_tier_mix_candidates:
       target_gold:
         TG_MIX_0: {high: 0.60, medium: 0.40}
-        TG_MIX_1: {high: 0.70, medium: 0.30}
-        TG_MIX_2: {high: 0.50, medium: 0.50}
         TG_MIX_WEAK_MEDIUM_ONLY: {high: 0.00, medium: 1.00}
       aux_gold:
         AG_MIX_0: {high: 0.70, medium: 0.30}
-        AG_MIX_1: {high: 0.80, medium: 0.20}
-        AG_MIX_2: {high: 0.60, medium: 0.40}
         AG_MIX_WEAK_MEDIUM_ONLY: {high: 0.00, medium: 1.00}
     innovation_weight_candidates:
       - {id: W0, fca: 0.08, explainer_loss_weight: 1.0, ccv_numeric_control_weight: 1.0}
-      - {id: W1, fca: 0.08, explainer_loss_weight: 1.0, ccv_numeric_control_weight: 1.0}
-      - {id: W2, fca: 0.10, explainer_loss_weight: 1.2, ccv_numeric_control_weight: 1.1}
-      - {id: W3, fca: 0.12, explainer_loss_weight: 1.5, ccv_numeric_control_weight: 1.15}
-      - {id: W4, fca: 0.05, explainer_loss_weight: 0.8, ccv_numeric_control_weight: 1.0}
   e4_bounded:
     enabled: true
     evidence_level: E4_gpu_shard_forward_bounded_formal_entry_with_validation
@@ -1133,26 +1089,12 @@ step5:
     formal_namespace_policy: forbid
     batch_candidates:
       - {id: B64, per_gpu_batch_size: 64, global_batch_size: 128, role: selected_task2_1_18_safe_candidate}
-      - {id: B96, per_gpu_batch_size: 96, global_batch_size: 192, role: rejected_oom_label128_run1_15}
-      - {id: B128, per_gpu_batch_size: 128, global_batch_size: 256, role: rejected_oom_label128_run1_14}
-      - {id: B160, per_gpu_batch_size: 160, global_batch_size: 320, role: rejected_oom_label128_run1_13}
-      - {id: B192, per_gpu_batch_size: 192, global_batch_size: 384, role: rejected_oom_label128_run1_12}
-      - {id: B224, per_gpu_batch_size: 224, global_batch_size: 448, role: retired_oom_ceiling_history_not_active}
     dataloader_candidates:
       - {id: C0, workers_per_rank: 4, prefetch_factor: 2}
-      - {id: C1, workers_per_rank: 5, prefetch_factor: 2}
-      - {id: C2, workers_per_rank: 4, prefetch_factor: 4}
-      - {id: C3, workers_per_rank: 5, prefetch_factor: 4}
-      - {id: C4, workers_per_rank: 4, prefetch_factor: 6}
-      - {id: C5, workers_per_rank: 5, prefetch_factor: 6}
-      - {id: C6, workers_per_rank: 4, prefetch_factor: 8}
     row_candidates:
       - {id: R0, bounded_rows: 1024, chunk_rows: 100000}
-      - {id: R1, bounded_rows: 4096, chunk_rows: 100000}
-      - {id: R2, bounded_rows: 16384, chunk_rows: 100000}
     long_window_candidates:
       - {id: LW1, bounded_rows: 4096, min_steps: 100}
-      - {id: LW2, bounded_rows: 16384, min_steps: 128}
   memory_truth:
     schema_version: odcr_step5_memory_truth/1
     reserved_diagnostic_only: true
@@ -1244,16 +1186,15 @@ step5:
     max_uncertainty: 0.62
     evidence_alignment_mode: evidence_basis
   eval:
-    valid_per_gpu_batch_size: 1024
-    valid_batch_size: 2048
-    valid_forward_micro_batch_size: 1024
-    test_per_gpu_batch_size: 1024
-    test_forward_micro_batch_size: 1024
+    valid_per_gpu_batch_size: 128
+    valid_batch_size: 256
+    valid_forward_micro_batch_size: 128
+    test_per_gpu_batch_size: 128
+    test_forward_micro_batch_size: 128
     metric_accumulation: true
     validation_memory_policy: microbatch_accumulate
     validation_mode: explanation_only
     formal_entry_E4_validation_required: true
-    old_eval_batch_2048_retired: true
     valid_loss_components:
       explanation:
         - explainer_ce
@@ -1272,6 +1213,7 @@ step5:
     batch_size: 128
     per_gpu_batch_size: 64
     epochs: 1
+    validate_every_epochs: 1
     label_max_length: 128
     lr: 1.0e-3
     coef: 0.5
@@ -1307,7 +1249,22 @@ step5:
       loss_weight_terminal_clean: 0.02
       terminal_clean_span: 8
   tasks:
-    1: {lr: 5.0e-4, coef: 1.0}
+    1:
+      batch_size: 64
+      per_gpu_batch_size: 32
+      epochs: 1
+      label_max_length: 128
+      lr: 1.0e-3
+      coef: 1.0
+      tuning:
+        batch_candidate: B32
+        optimizer_steps: {explanation: 3907}
+      eval:
+        valid_per_gpu_batch_size: 128
+        valid_batch_size: 256
+        valid_forward_micro_batch_size: 128
+        test_per_gpu_batch_size: 128
+        test_forward_micro_batch_size: 128
     2:
       batch_size: 128
       per_gpu_batch_size: 64
@@ -1316,17 +1273,17 @@ step5:
       lr: 1.0e-3
       coef: 0.1
       eval:
-        valid_per_gpu_batch_size: 1024
-        valid_batch_size: 2048
-        valid_forward_micro_batch_size: 1024
-        test_per_gpu_batch_size: 1024
-        test_forward_micro_batch_size: 1024
+        valid_per_gpu_batch_size: 128
+        valid_batch_size: 256
+        valid_forward_micro_batch_size: 128
+        test_per_gpu_batch_size: 128
+        test_forward_micro_batch_size: 128
       backend:
         loss_weight_batch_diversity: 0.01
         batch_diversity_warmup_epochs: 0
         batch_diversity_ramp_epochs: 1
         batch_diversity_ramp_target_scale: 0.5
-    3: {lr: 5.0e-4, coef: 0.5}
+    3: {lr: 1.0e-3, coef: 0.5}
     4:
       epochs: 3
       lr: 1.0e-3
@@ -1347,9 +1304,7 @@ step5:
       coef: 0.5
       tuning:
         selected_tuning_candidate: STEP5_RATIO_0+WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1+TG_MIX_WEAK_MEDIUM_ONLY+AG_MIX_WEAK_MEDIUM_ONLY+LR_1e-3+W0
-        fallback_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
         batch_candidate: B32
-        fallback_batch_candidate: B32
         effective_samples: {explanation: 426496}
         optimizer_steps: {explanation: 6664}
       sampler:
@@ -1372,9 +1327,7 @@ step5:
       coef: 1.0
       tuning:
         selected_tuning_candidate: STEP5_RATIO_0+WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1+TG_MIX_WEAK_MEDIUM_ONLY+AG_MIX_WEAK_MEDIUM_ONLY+LR_1e-3+W0
-        fallback_tuning_candidate: STEP5_RATIO_0+STEP5_CF_MIX_FORMAL_HIGH_MEDIUM+TG_MIX_0+AG_MIX_0+LR_5e-4+W1
         batch_candidate: B32
-        fallback_batch_candidate: B32
         effective_samples: {explanation: 426496}
         optimizer_steps: {explanation: 6664}
       sampler:
@@ -1396,7 +1349,7 @@ eval:
     paper_greedy_25:
       hardware: default
       decode: paper_greedy_25
-      eval_batch_size: 2048
+      eval_batch_size: 256
       role: official_paper_eval
       official: true
   decode:

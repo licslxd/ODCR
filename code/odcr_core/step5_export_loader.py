@@ -40,6 +40,12 @@ from odcr_core.step5_pool_sampler import (
     resolve_step5_pool_source,
     sample_effective_epochs_from_pools,
 )
+from odcr_core.step5_sample_plan_intent import (
+    Step5SamplePlanIntentError,
+    assert_sampled_plan_matches_intent,
+    build_step5_sample_plan_intent,
+    sample_plan_intent_cache_identity,
+)
 from odcr_core.training_checkpoint import file_fingerprint, stable_hash
 
 
@@ -585,30 +591,10 @@ def _cache_key(source: Step5ExportSource, *, explainer_only_multiplier: float) -
     )
 
 
-def _pool_sampler_tuning_identity(tuning_config: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Content-affecting Step5 pool sampler knobs only.
-
-    Optimizer, loss, decode, and runtime fields are lineage-only for the sampled
-    table cache.  They do not alter the selected rows or rendered prompt text.
-    """
-
-    tuning = dict(tuning_config or {})
-    return {
-        "selected_tuning_candidate": tuning.get("selected_tuning_candidate"),
-        "selected_budget_candidate": tuning.get("selected_budget_candidate"),
-        "batch_candidate": tuning.get("batch_candidate"),
-        "effective_samples": dict(tuning.get("effective_samples") or {})
-        if isinstance(tuning.get("effective_samples"), Mapping)
-        else {},
-    }
-
-
 def _pool_sample_cache_identity(
     *,
     pool_source: Any,
-    sampler_config: Mapping[str, Any] | None,
-    batch_candidates_config: Mapping[str, Any] | None,
-    tuning_config: Mapping[str, Any] | None,
+    sample_plan_intent: Mapping[str, Any],
     mode: str,
     task_head: str,
     bounded_max_rows: int | None,
@@ -617,9 +603,11 @@ def _pool_sample_cache_identity(
     return {
         "schema_version": STEP5_POOL_TRAIN_TABLE_CACHE_SCHEMA_VERSION,
         "source": _source_table_semantic_payload(pool_source),
-        "sampler_config": dict(sampler_config or {}),
-        "batch_candidates_config": dict(batch_candidates_config or {}),
-        "tuning_identity": _pool_sampler_tuning_identity(tuning_config),
+        "sample_plan_intent": sample_plan_intent_cache_identity(sample_plan_intent),
+        "sample_plan_intent_hash": str(
+            sample_plan_intent.get("sample_plan_intent_hash")
+            or stable_hash(sample_plan_intent_cache_identity(sample_plan_intent))
+        ),
         "mode": str(mode),
         "task_head": str(task_head),
         "bounded_max_rows": int(bounded_max_rows) if bounded_max_rows is not None else None,
@@ -632,12 +620,15 @@ def _pool_sample_cache_lineage(
     sampler_config: Mapping[str, Any] | None,
     batch_candidates_config: Mapping[str, Any] | None,
     tuning_config: Mapping[str, Any] | None,
+    sample_plan_intent: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "schema_version": "odcr_step5_pool_train_table_cache_lineage/1",
         "sampler_config": dict(sampler_config or {}),
         "batch_candidates_config": dict(batch_candidates_config or {}),
         "tuning_config": dict(tuning_config or {}),
+        "sample_plan_intent": dict(sample_plan_intent or {}),
+        "sample_plan_intent_hash": str((sample_plan_intent or {}).get("sample_plan_intent_hash") or ""),
     }
 
 
@@ -674,6 +665,7 @@ def _load_pool_sample_cache(
     *,
     expected_identity: Mapping[str, Any],
     expected_cache_key: str,
+    expected_sample_plan_intent: Mapping[str, Any],
     source: Step5ExportSource,
     pool_source: Any,
     stale_policy: str,
@@ -702,6 +694,15 @@ def _load_pool_sample_cache(
     if row_count != len(df):
         return _stale("Step5 pool train table cache row count mismatch.")
     stats = dict(manifest.get("stats") or {})
+    try:
+        assert_sampled_plan_matches_intent(
+            df,
+            stats=stats,
+            intent=expected_sample_plan_intent,
+            context=f"Step5 pool train table cache {cache_dir}",
+        )
+    except Step5SamplePlanIntentError as exc:
+        return _stale(str(exc))
     stats["cache_load_wall_time_s"] = float(stats.get("cache_load_wall_time_s") or 0.0)
     return Step5TrainTableLoadResult(
         train_df=df,
@@ -985,9 +986,8 @@ def load_step5_pool_train_table(
 ) -> Step5TrainTableLoadResult:
     """Load Step5 train rows from Step4 pools and the sampling contract.
 
-    Full audit and old gold-heavy dedicated exports are intentionally rejected
-    as default training inputs by requiring ``step5_pools`` next to the selected
-    Step4 export.
+    Step5 train rows are loaded only from the Step4 RCR pool manifest next to
+    the selected Step4 export.
     """
 
     mode_norm = str(mode).strip().lower()
@@ -1013,25 +1013,34 @@ def load_step5_pool_train_table(
         raise Step5ExportLoaderError(
             "Step5 default train input now requires Step4 RCR pools: "
             f"{source.export_path.parent / STEP5_POOLS_DIRNAME / STEP5_POOL_MANIFEST} and "
-            f"{source.export_path.parent / STEP5_POOLS_DIRNAME / STEP5_SAMPLING_CONTRACT}. "
-            "Full audit and legacy gold-heavy dedicated exports are audit/ablation only."
+            f"{source.export_path.parent / STEP5_POOLS_DIRNAME / STEP5_SAMPLING_CONTRACT}."
         ) from exc
     sampler = _parse_sampler_config(sampler_config)
     if not sampler:
         raise Step5ExportLoaderError("Step5 pool loader requires resolved step5.sampler config.")
     batch_candidates = _parse_sampler_config(batch_candidates_config)
     tuning = _parse_sampler_config(tuning_config)
+    try:
+        sample_plan_intent = build_step5_sample_plan_intent(
+            sampler_config=sampler,
+            tuning_config=tuning,
+            batch_candidates_config=batch_candidates,
+            task_head=str(task_head),
+        )
+    except Step5SamplePlanIntentError as exc:
+        raise Step5ExportLoaderError(str(exc)) from exc
     if mode_norm == "validate_only":
         sample = pd.DataFrame()
         stats = {
             "schema_version": STEP5_POOL_SAMPLER_SCHEMA_VERSION,
             "mode": "validate_only",
+            "sample_plan_intent_hash": str(sample_plan_intent.get("sample_plan_intent_hash") or ""),
+            "sample_plan_intent": dict(sample_plan_intent),
             "full_csv_parse": False,
             "pool_manifest_required": True,
             "pool_manifest_path": str(pool_source.manifest_path),
             "sampling_contract_path": str(pool_source.sampling_contract_path),
             "full_audit_default_train_forbidden": True,
-            "legacy_gold_heavy_exports_rejected_by_default": True,
         }
         return Step5TrainTableLoadResult(
             train_df=pd.DataFrame(columns=_available_read_columns(source.header_columns)),
@@ -1058,9 +1067,7 @@ def load_step5_pool_train_table(
         root = Path(cache_root).expanduser().resolve() if cache_root is not None else source.export_path.parent / ".step5_pool_cache"
         cache_identity = _pool_sample_cache_identity(
             pool_source=pool_source,
-            sampler_config=sampler,
-            batch_candidates_config=batch_candidates,
-            tuning_config=tuning,
+            sample_plan_intent=sample_plan_intent,
             mode=mode_norm,
             task_head=str(task_head),
             bounded_max_rows=bounded_max_rows,
@@ -1070,6 +1077,7 @@ def load_step5_pool_train_table(
             sampler_config=sampler,
             batch_candidates_config=batch_candidates,
             tuning_config=tuning,
+            sample_plan_intent=sample_plan_intent,
         )
         cache_key = _pool_sample_cache_key(cache_identity)
         cache_dir = root / str(cache_key)
@@ -1077,6 +1085,7 @@ def load_step5_pool_train_table(
             cache_dir,
             expected_identity=cache_identity,
             expected_cache_key=cache_key,
+            expected_sample_plan_intent=sample_plan_intent,
             source=source,
             pool_source=pool_source,
             stale_policy=stale_policy_norm,
@@ -1101,8 +1110,22 @@ def load_step5_pool_train_table(
     train_df = sampled.train_df.reset_index(drop=True)
     if train_df.empty:
         raise Step5ExportLoaderError("Step5 pool sampler produced zero rows; check pool distribution and sampling contract.")
+    if mode_norm == "formal_train":
+        try:
+            assert_sampled_plan_matches_intent(
+                train_df,
+                stats=sampled.stats,
+                intent=sample_plan_intent,
+                context="Step5 pool loader sampled train table",
+            )
+        except Step5SamplePlanIntentError as exc:
+            raise Step5ExportLoaderError(str(exc)) from exc
     validate_split_indices(train_df, source.index_contract, "train", ctx=dict(validation_ctx or {}))
-    stats = dict(sampled.stats)
+    stats = {
+        **dict(sampled.stats),
+        "sample_plan_intent_hash": str(sample_plan_intent.get("sample_plan_intent_hash") or ""),
+        "sample_plan_intent": dict(sample_plan_intent),
+    }
     if cache_dir is not None and cache_identity is not None and cache_lineage is not None and cache_key is not None:
         cache_dir.parent.mkdir(parents=True, exist_ok=True)
         lock_dir = cache_dir.with_name(f"{cache_dir.name}.lock")
@@ -1112,6 +1135,7 @@ def load_step5_pool_train_table(
                 cache_dir,
                 expected_identity=cache_identity,
                 expected_cache_key=cache_key,
+                expected_sample_plan_intent=sample_plan_intent,
                 source=source,
                 pool_source=pool_source,
                 stale_policy=stale_policy_norm,
@@ -1136,6 +1160,7 @@ def load_step5_pool_train_table(
                 cache_dir,
                 expected_identity=cache_identity,
                 expected_cache_key=cache_key,
+                expected_sample_plan_intent=sample_plan_intent,
                 source=source,
                 pool_source=pool_source,
                 stale_policy=stale_policy_norm,
@@ -1230,8 +1255,7 @@ def validate_step5_export_for_resolved_config(
         pool_source = resolve_step5_pool_source(step4_run_dir=export.parent)
     except Step5PoolSamplerError as exc:
         raise Step5ExportLoaderError(
-            "Step5 show/dry-run requires Step4 pool manifest and sampling contract; "
-            "legacy full audit or gold-heavy dedicated tables are no longer default train inputs."
+            "Step5 show/dry-run requires Step4 pool manifest and sampling contract."
         ) from exc
     return {
         **source.to_summary(),
@@ -1241,7 +1265,6 @@ def validate_step5_export_for_resolved_config(
         "full_csv_parse": False,
         "formal_namespace_write": False,
         "full_audit_default_train_forbidden": True,
-        "legacy_gold_heavy_exports_rejected_by_default": True,
     }
 
 

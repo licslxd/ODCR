@@ -1,0 +1,34 @@
+\section{Experimental Setup}
+
+\subsection{Datasets and Directed Transfer Settings}
+
+The reset table system evaluates three Amazon target-domain settings. For
+AM-CDs, AM-Electronics and AM-Movies are used as auxiliary domains. For
+AM-Electronics, AM-CDs and AM-Movies are used as auxiliary domains. For
+AM-Movies, AM-CDs and AM-Electronics are used as auxiliary domains. In each
+setting, the target dataset is the evaluation dataset, and the auxiliary domain
+is the source of cross-domain transfer signal.
+
+\subsection{Metrics}
+
+We report automatic text-generation metrics and rating-error metrics in the
+same overall performance tables. The text metrics are ROUGE-1, ROUGE-L, BLEU-1,
+BLEU-2, BLEU-3, BLEU-4, METEOR, DIST-1, and DIST-2. Rating errors are reported
+by RMSE and MAE. Larger values are better for the automatic text metrics, while
+smaller values are better for RMSE and MAE.
+
+\subsection{Baselines and Comparison Scope}
+
+The main tables follow the D4C-style comparison format. Single-domain
+baselines are DualPC, PETER, ReXPlug, and ERRA. Cross-domain baselines are
+PEFT, PEPLER, AdaReX, and D4C. Our method is reported as ReCEG in the result
+tables. D4C is the closest causal reference point for the dynamic
+textual-feedback view \cite{d4c}. Classical explainable recommendation systems
+are cited as task-family context where appropriate \cite{peter,pepler,adarex}.
+
+\subsection{Evaluation Scope}
+
+We report current results on three Amazon target-domain settings. The baseline
+rows follow D4C-style reporting, but standard deviations are omitted for
+compactness. The results should be read as bounded evidence rather than as a
+multi-seed benchmark claim.

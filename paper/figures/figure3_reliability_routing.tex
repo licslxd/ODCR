@@ -1,0 +1,37 @@
+\begin{tikzpicture}[
+  font=\scriptsize,
+  box/.style={draw, rounded corners=2pt, align=center, minimum width=2.0cm, minimum height=0.65cm, fill=white},
+  gate/.style={draw, rounded corners=2pt, align=center, minimum width=2.15cm, minimum height=0.7cm, fill=blue!7},
+  high/.style={draw, rounded corners=2pt, align=center, minimum width=1.75cm, minimum height=0.6cm, fill=green!10},
+  med/.style={draw, rounded corners=2pt, align=center, minimum width=1.75cm, minimum height=0.6cm, fill=yellow!18},
+  low/.style={draw, rounded corners=2pt, align=center, minimum width=1.75cm, minimum height=0.6cm, fill=red!8},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  dline/.style={-{Stealth[length=2mm]}, thick, dashed, draw=gray!70}
+]
+\node[box] (CF) at (0,0) {candidate\\counterfactuals};
+\node[gate] (Elig) at (2.8,0) {Layer 1\\eligibility\\filtering};
+\node[box] (Use) at (5.5,0.7) {usable CF\\evidence};
+\node[box] (Drop) at (5.5,-0.7) {discarded or\\held out};
+\node[gate] (Score) at (8.2,0.7) {Layer 2\\reliability and\\uncertainty scoring};
+\node[high] (High) at (10.8,1.45) {high\\priority};
+\node[med] (Med) at (10.8,0.5) {medium\\priority};
+\node[low] (Low) at (10.8,-0.45) {low\\priority};
+\node[box] (Train) at (13.3,0.95) {weighted CF\\training signal};
+\node[box] (Filter) at (13.3,-0.45) {down-weighted\\or filtered};
+\node[box] (Gen) at (15.8,0.95) {controlled\\generator};
+
+\draw[arrow] (CF) -- (Elig);
+\draw[arrow] (Elig) -- node[above, font=\tiny] {eligible} (Use);
+\draw[dline] (Elig) -- node[below, font=\tiny] {not eligible} (Drop);
+\draw[arrow] (Use) -- (Score);
+\draw[arrow] (Score) -- (High);
+\draw[arrow] (Score) -- (Med);
+\draw[arrow] (Score) -- (Low);
+\draw[arrow] (High) -- (Train);
+\draw[arrow] (Med) -- (Train);
+\draw[dline] (Low) -- (Filter);
+\draw[arrow] (Train) -- (Gen);
+\draw[dline] (Filter) -- (Gen);
+\node[font=\tiny, text=gray!75] at (8.2,1.65) {UCI penalizes unstable signals};
+\node[font=\tiny, text=gray!75] at (13.3,1.65) {$R_{cf}$ sets sample influence};
+\end{tikzpicture}

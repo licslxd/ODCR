@@ -311,11 +311,16 @@ and prompt-concat controls are fail-fast legacy names, not active Step5
 configuration.
 
 Step5 valid/test factual controls are separately labeled
-`mode=factual_eval_default` under
-`odcr_step5_factual_eval_control/1.0`. They only let factual target eval rows
-build a neutral control packet; they are not RCR posterior, not train routes,
-and not Step4 export posterior. Missing posterior controls on
+`mode=train_memory_controls` under
+`odcr_step5_clean_memory_eval_control/1.0`. They must be constructed from
+train-only user/item/domain memory; current-row review, explanation, and gold
+rating derived controls are forbidden. Missing posterior controls on
 `odcr_routing_train.csv` remain a fail-fast Step5 train error.
+
+Task2 ODCR-CleanMemory uses a 250,000-sample effective epoch target with
+target_gold/aux_gold/CF ratios 0.50/0.15/0.35. The active warmup ratio is the
+One-Control `step5.tuning.selected_warmup_fraction` value, default 0.05. Step5
+fails fast if warmup spans the full run or exceeds 15% of optimizer steps.
 
 ## Lineage And Cache Gates
 

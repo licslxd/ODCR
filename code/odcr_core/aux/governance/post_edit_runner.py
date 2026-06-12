@@ -2,7 +2,7 @@
 """Run ODCR post-edit validation before Codex handoff.
 
 This is a lightweight final-response gate for AI-assisted edits. It does not
-run real preprocess, training, Step4, Step5, eval, or rerank work.
+run real preprocess, training, Step4, Step5, or eval work.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from odcr_core.aux.governance.post_edit_registry import (
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 REAL_STAGE_SUBCOMMANDS = {"step3", "step4", "step5"}
-FORBIDDEN_REAL_SUBCOMMANDS = {"preprocess", "eval", "rerank"}
+FORBIDDEN_REAL_SUBCOMMANDS = {"preprocess", "eval"}
 
 
 @dataclass(frozen=True)
@@ -273,11 +273,8 @@ def _step3_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "code/tests/test_step3_eval_run2_checkpoint_eval_only.py",
                 "code/tests/test_step3_eval_handoff.py",
                 "code/tests/test_scheduler_pure_warmup_cosine_no_damping.py",
-                "code/tests/test_scheduler_explicit_damping_semantics.py",
-                "code/tests/test_scheduler_safe_damping_v2_semantics.py",
                 "code/tests/test_scheduler_current_lr_floor_explained.py",
                 "code/tests/test_training_effectiveness_gate_plateau.py",
-                "code/tests/test_step3_v3_recovery_conflict_paper_selection.py",
                 "code/tests/test_loss_component_dashboard_fields.py",
                 "code/tests/test_run_status_train_eval_split.py",
                 "code/tests/test_step3_quality_evidence_performance_rebuild.py",
@@ -328,7 +325,7 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                     "sys.path.insert(0, 'code'); "
                     "from odcr_core.config_resolver import resolve_config; "
                     "resolve_config(config_path='configs/odcr.yaml', command='step5', "
-                    "task_id=2, set_overrides=[], dry_run=True, from_step4='1', "
+                    "task_id=5, set_overrides=[], dry_run=True, from_step4='1', "
                     "eval_profile='paper_greedy_25', mode='train_only')\n"
                 ),
             ),
@@ -347,7 +344,9 @@ def _step5_commands(repo_root: Path, *, python_executable: str) -> list[CheckCom
                 "code/tests/test_no_step5" + "A_active_code.py",
                 "code/tests/test_eval_report_composes_step3_rating_and_step5_explanation.py",
                 "code/tests/test_step5_eval_metrics_only_summary.py",
+                "code/tests/test_step5_eval_default_control.py",
                 "code/tests/test_step5_explanation_quality_contract.py",
+                "code/tests/test_step5_clean_memory_gate.py",
                 "code/tests/test_step4_route_scorer_is_stability_signal.py",
             ),
             python_executable=python_executable,
@@ -709,7 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run lightweight ODCR post-edit validation. This final-response gate never "
-            "runs real preprocess, training, Step4, Step5, eval, or rerank work."
+            "runs real preprocess, training, Step4, Step5, or eval work."
         )
     )
     parser.add_argument(

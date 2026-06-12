@@ -1,0 +1,46 @@
+\section{Discussion}
+
+\subsection{Dynamic Feedback Control}
+
+ODCR treats explanation degeneration as a dynamic causal-control problem. D4C's
+feedback view explains why domain textual shortcuts can become
+self-reinforcing: \(W^{(t)}\) influences explanations, and explanations can
+feed back into \(W^{(t+1)}\). ODCR does not discard this diagnosis. It refines
+the feedback loop so that stable content evidence, dynamic style, and
+counterfactual reliability are controlled separately.
+
+\subsection{Role of EASD and HSS}
+
+EASD and HSS are the parts of ODCR that keep the paper from becoming centered
+on reliability routing alone. EASD anchors content/style decomposition in evidence, separating what
+should be explained from how it is expressed. HSS makes style feedback
+hierarchical, with domain-global style and instance-local residuals. Together,
+they define where dynamic feedback should operate: generated explanations may
+reshape style, but they should not overwrite content evidence.
+
+\subsection{Role of RCR/UCI and CCV/FCA}
+
+RCR/UCI controls counterfactual influence after decomposition. It filters
+counterfactual candidates, scores reliability, and uses uncertainty to reduce
+trust in unstable shifts. CCV/FCA then turns the controlled evidence into
+target-domain explanations. CCV conditions generation on \(U\), \(I\), \(C\),
+\(S\), and \(R_{cf}\); FCA keeps explanation content aligned with
+content-grounded rating evidence. This closes the ODCR loop from dynamic
+feedback diagnosis to controlled faithful generation.
+
+\subsection{Reading the Current Evidence}
+
+The current result tables provide a compact main-text comparison over three
+Amazon target-domain settings, each with two auxiliary domains. The AM-CDs
+table shows that auxiliary domains can favor different metric families. The
+AM-Electronics and AM-Movies tables likewise show that auxiliary domains are
+not interchangeable: one domain can strengthen lexical relevance while another
+strengthens diversity or rating-side behavior. The AM-CDs ablation connects
+this pattern back to the method story. Semantic Evidence modeling supports
+content/evidence quality and improves BLEU-3, BLEU-4, and METEOR among the
+ablated variants, while Reliability Guidance supports reliability-controlled
+counterfactual use and improves DIST-1 and DIST-2. The full ReCEG combines
+both effects. These results support the manuscript as bounded current evidence;
+additional target-domain ablations, human assessment, multi-seed evaluation,
+and broader baseline adaptation can be integrated as later evidence without
+changing the core method story.

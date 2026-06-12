@@ -42,7 +42,14 @@ def _metrics(split: str) -> dict[str, object]:
 
 
 class Step3EvalHandoffTest(unittest.TestCase):
-    def _write_fixture(self, repo: Path, *, integrity_status: str = "PASS", omit_test: bool = False) -> None:
+    def _write_fixture(
+        self,
+        repo: Path,
+        *,
+        integrity_status: str = "PASS",
+        omit_test: bool = False,
+        latest_matches_best: bool = False,
+    ) -> None:
         run = repo / "runs" / "step3" / "task2" / "2"
         meta = run / "meta"
         model = run / "model"
@@ -50,7 +57,11 @@ class Step3EvalHandoffTest(unittest.TestCase):
         meta.mkdir(parents=True)
         for name in ("best_observed.pth", "best.pth", "latest.pth"):
             ckpt = model / name
-            payload = b"synthetic-step3-latest-checkpoint" if name == "latest.pth" else b"synthetic-step3-checkpoint"
+            payload = (
+                b"synthetic-step3-latest-checkpoint"
+                if name == "latest.pth" and not latest_matches_best
+                else b"synthetic-step3-checkpoint"
+            )
             ckpt.write_bytes(payload)
             write_checkpoint_lineage(
                 ckpt,
@@ -61,7 +72,8 @@ class Step3EvalHandoffTest(unittest.TestCase):
                     "sidecar_schema_version": STEP3_CHECKPOINT_COMPAT_SCHEMA_VERSION,
                     "checkpoint_path": str(ckpt),
                     "checkpoint_file_hash": checkpoint_file_sha256(ckpt),
-                    "reason": "global_best_improved",
+                    "checkpoint_epoch": 5,
+                    "reason": "latest_epoch_snapshot" if name == "latest.pth" else "global_best_improved",
                     "replaced_previous": False,
                     "selection_scope": "best_observed" if name != "latest.pth" else "latest",
                 },
@@ -166,6 +178,20 @@ class Step3EvalHandoffTest(unittest.TestCase):
             self.assertNotIn("latest_status", latest)
             self.assertEqual(latest["latest_run_id"], "2")
             self.assertEqual(_latest_run(repo, 2, "step3", dry_run=False), "2")
+
+    def test_latest_alias_same_hash_allowed_when_lineage_marks_latest_nonselected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self._write_fixture(repo, latest_matches_best=True)
+            result = accept_step3_eval_handoff(repo_root=repo, task_id=2, run_id="2")
+            self.assertTrue(result["accepted"])
+            handoff = json.loads((repo / "runs" / "step3" / "task2" / "2" / "meta" / "eval_handoff.json").read_text())
+            self.assertTrue(handoff["latest_checkpoint_matches_best_observed"])
+            self.assertFalse(handoff["latest_checkpoint_selected_downstream"])
+            self.assertEqual(
+                handoff["latest_checkpoint_nonselected_reason"],
+                "latest_epoch_snapshot_equals_best_observed_epoch_explicitly_nonselected",
+            )
 
     def test_old_failed_without_handoff_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

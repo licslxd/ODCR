@@ -207,7 +207,6 @@ class TestLoggingConsoleFile(unittest.TestCase):
                     "lr_effective",
                     "base_min_lr",
                     "effective_min_lr",
-                    "damping_event",
                     "objective_drift_status",
                     "loss_phase",
                     "checkpoint_improved",

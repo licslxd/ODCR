@@ -1,0 +1,37 @@
+\begin{tikzpicture}[
+  font=\scriptsize,
+  module/.style={draw, rounded corners=2pt, align=center, minimum width=2.0cm, minimum height=0.7cm, fill=blue!6},
+  core/.style={draw, rounded corners=2pt, align=center, minimum width=2.0cm, minimum height=0.7cm, fill=green!8},
+  output/.style={draw, rounded corners=2pt, align=center, minimum width=2.0cm, minimum height=0.7cm, fill=orange!10},
+  branch/.style={draw, rounded corners=2pt, align=center, minimum width=2.0cm, minimum height=0.65cm, fill=purple!7},
+  arrow/.style={-{Stealth[length=2mm]}, thick},
+  soft/.style={-{Stealth[length=2mm]}, thick, dashed, draw=gray!70}
+]
+\node[module] (Input) at (0,0) {Input interactions\\and reviews};
+\node[module] (Evidence) at (2.6,0) {Evidence\\extraction};
+\node[core] (EASD) at (5.2,0) {EASD\\content/style\\decomposition};
+\node[core] (HSS) at (7.8,0) {HSS\\hierarchical\\style state};
+\node[core] (RCR) at (10.4,0) {RCR/UCI\\reliability-gated\\routing};
+\node[core] (CCV) at (13.0,0) {CCV\\controlled\\verbalizer};
+\node[output] (Exp) at (15.6,0) {Target-domain\\explanation};
+
+\node[branch] (Rating) at (7.8,-1.75) {Content-grounded\\rating branch};
+\node[branch] (FCA) at (13.0,-1.75) {FCA\\faithfulness\\consistency};
+\node[output] (RateOut) at (10.4,-3.0) {Target-domain\\rating};
+
+\draw[arrow] (Input) -- (Evidence);
+\draw[arrow] (Evidence) -- (EASD);
+\draw[arrow] (EASD) -- (HSS);
+\draw[arrow] (HSS) -- (RCR);
+\draw[arrow] (RCR) -- (CCV);
+\draw[arrow] (CCV) -- (Exp);
+\draw[arrow] (EASD) -- node[left, font=\tiny] {$C$} (Rating);
+\draw[arrow] (Rating) -- (RateOut);
+\draw[arrow] (EASD) |- node[pos=0.22, left, font=\tiny] {$C$} (FCA);
+\draw[arrow] (CCV) -- (FCA);
+\draw[soft] (FCA) -- node[below, font=\tiny] {content alignment} (Rating);
+\draw[soft] (RCR) |- node[pos=0.2, right, font=\tiny] {$R_{cf}$ controls trusted signals} (FCA);
+\node[font=\tiny, text=gray!75] at (5.2,0.82) {what to explain};
+\node[font=\tiny, text=gray!75] at (7.8,0.82) {how to express};
+\node[font=\tiny, text=gray!75] at (10.4,0.82) {whether to trust CF};
+\end{tikzpicture}

@@ -75,5 +75,5 @@ def validate_step5_explanation_handoff(
         "rating_source": validated_source,
         "rating_source_status": "ok",
         "downstream_ready": True,
-        "ready_for": ["eval", "rerank"],
+        "ready_for": ["eval"],
     }

@@ -201,7 +201,6 @@ def _npy_contract(
 def _validate_preprocess_unit(repo_root: Path, runs_dir: Path, unit: str) -> tuple[dict[str, Any], dict[str, Any]]:
     latest_path = (runs_dir / "preprocess" / unit / "latest.json").resolve()
     latest = _load_json(latest_path, context=f"preprocess_{unit} latest.json")
-    _require(str(latest.get("latest_status", "")).lower() == "ok", f"preprocess_{unit} latest_status must be ok.")
 
     run_id = str(latest.get("latest_run_id", "")).strip()
     _require(run_id, f"preprocess_{unit} latest_run_id is required.")
@@ -209,6 +208,18 @@ def _validate_preprocess_unit(repo_root: Path, runs_dir: Path, unit: str) -> tup
     _reject_forbidden_formal_path(run_dir, context=f"preprocess_{unit} latest_run_dir")
     expected_run_dir = (runs_dir / "preprocess" / unit / run_id).resolve()
     _require(_same_path(run_dir, expected_run_dir), f"preprocess_{unit} latest points outside its unique formal run: {run_dir}")
+
+    latest_status_path = _repo_path(
+        repo_root,
+        latest.get("latest_stage_status_path"),
+        context=f"preprocess_{unit} latest_stage_status_path",
+    )
+    _reject_forbidden_formal_path(latest_status_path, context=f"preprocess_{unit} latest_stage_status_path")
+    expected_status_path = (run_dir / "meta" / "stage_status.json").resolve()
+    _require(
+        _same_path(latest_status_path, expected_status_path),
+        f"preprocess_{unit} latest_stage_status_path must point to meta/stage_status.json.",
+    )
 
     summary_path = _repo_path(repo_root, latest.get("latest_summary_path"), context=f"preprocess_{unit} latest_summary_path")
     _reject_forbidden_formal_path(summary_path, context=f"preprocess_{unit} latest_summary_path")
@@ -229,6 +240,10 @@ def _validate_preprocess_unit(repo_root: Path, runs_dir: Path, unit: str) -> tup
     source_table_path = _repo_path(repo_root, summary.get("source_table_path"), context=f"preprocess_{unit} source_table_path")
     manifest_path = _repo_path(repo_root, summary.get("manifest_path"), context=f"preprocess_{unit} manifest_path")
     status_path = _repo_path(repo_root, summary.get("lineage_path") or summary.get("stage_status_path"), context=f"preprocess_{unit} stage_status_path")
+    _require(
+        _same_path(status_path, latest_status_path),
+        f"preprocess_{unit} run_summary stage_status path must match latest_stage_status_path.",
+    )
 
     resolved_config = _load_json(resolved_config_path, context=f"preprocess_{unit} resolved_config.json")
     source_table = _load_json(source_table_path, context=f"preprocess_{unit} source_table.json")
@@ -296,7 +311,8 @@ def _validate_preprocess_unit(repo_root: Path, runs_dir: Path, unit: str) -> tup
         "unit": unit,
         "run_id": run_id,
         "fingerprint_hash": fingerprint_hash,
-        "latest_status": latest.get("latest_status"),
+        "latest_pointer_schema_version": latest.get("schema_version"),
+        "stage_status": stage_status.get("status"),
         "validation_status": summary.get("validation_status"),
         "paths": {
             "latest": _rel(repo_root, latest_path),

@@ -3,7 +3,7 @@
 
 This bridge/tooling entry runs a validation-namespace Step3 hot-path window.  It
 does not start formal training, update formal latest pointers, write formal
-checkpoints, or run Step4/Step5/eval/rerank.
+checkpoints, or run Step4/Step5/eval.
 """
 from __future__ import annotations
 

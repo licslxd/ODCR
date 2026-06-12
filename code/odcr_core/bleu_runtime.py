@@ -108,7 +108,6 @@ def build_explanation_bleu_rows_for_indices(
     dataloader_prefetch_factor: Optional[int],
     collate_fn: Optional[Callable[[List[Any]], Any]] = None,
     cfg_override: Optional[Mapping[str, Any]] = None,
-    include_ratings_for_monitor: bool = False,
     uncertainty_acc: Optional[MutableMapping[str, Any]] = None,
     step5_innov_cfg: Any = None,
     non_blocking_h2d: Optional[bool] = None,
@@ -152,9 +151,6 @@ def build_explanation_bleu_rows_for_indices(
                 raise RuntimeError("official Step5 monitor generation requires resolved step5_innov_cfg.")
             ccv_packet = build_ccv_control_packet(g, step5_innov_cfg)
             with odcr_cuda_bf16_autocast():
-                pred_rating_t = None
-                if include_ratings_for_monitor:
-                    pred_rating_t = underlying_model.recommend(user_idx, item_idx, domain_idx)
                 gen_pack = underlying_model.generate(
                     user_idx,
                     item_idx,
@@ -171,7 +167,6 @@ def build_explanation_bleu_rows_for_indices(
             pred_texts = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
             raw_refs = list(g.raw_ref_text or [])
             ref_texts = raw_refs if len(raw_refs) == int(user_idx.size(0)) else tokenizer.batch_decode(tgt_output, skip_special_tokens=True)
-            gt_rating = g.rating
             bsz = int(user_idx.size(0))
             for i in range(bsz):
                 sid = int(sample_id[i].item())
@@ -191,9 +186,6 @@ def build_explanation_bleu_rows_for_indices(
                     "paper_metric_input_schema_version": metric_input["schema_version"],
                     "paper_metric_token_max_len": int(metric_input["max_len"]),
                 }
-                if include_ratings_for_monitor and pred_rating_t is not None:
-                    row["pred_rating"] = float(pred_rating_t[i].item())
-                    row["gt_rating"] = float(gt_rating[i].item())
                 out.append(row)
     return out
 
@@ -381,7 +373,6 @@ def mainline_monitor_full_valid_ddp(
             dataloader_prefetch_factor=dataloader_prefetch_factor,
             collate_fn=collate_fn,
             cfg_override=cfg_override,
-            include_ratings_for_monitor=True,
             uncertainty_acc=unc_acc,
             step5_innov_cfg=step5_innov_cfg,
             non_blocking_h2d=non_blocking_h2d,
@@ -417,7 +408,6 @@ def mainline_monitor_full_valid_ddp(
         dataloader_prefetch_factor=dataloader_prefetch_factor,
         collate_fn=collate_fn,
         cfg_override=cfg_override,
-        include_ratings_for_monitor=True,
         uncertainty_acc=unc_acc,
         step5_innov_cfg=step5_innov_cfg,
         non_blocking_h2d=non_blocking_h2d,

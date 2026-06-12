@@ -1,0 +1,123 @@
+\begin{tikzpicture}[
+  x=1cm,y=1cm,
+  every node/.style={font=\large},
+  v/.style={
+    circle,
+    draw=black,
+    line width=0.78pt,
+    minimum size=8.2mm,
+    inner sep=0pt,
+    fill=white
+  },
+  arr/.style={
+    -{Stealth[length=1.95mm,width=1.45mm]},
+    draw=black,
+    line width=0.86pt,
+    shorten >=1.2pt,
+    shorten <=1.2pt
+  },
+  feed/.style={
+    -{Stealth[length=1.65mm,width=1.20mm]},
+    draw=black!62,
+    line width=0.70pt,
+    dashed,
+    dash pattern=on 2.8pt off 1.8pt,
+    shorten >=1.1pt,
+    shorten <=1.1pt
+  },
+  sub/.style={
+    font=\Large,
+    anchor=north
+  }
+]
+
+% ==========================================================
+% (a) D4C: W--E paired inner feedback loop
+% ==========================================================
+\begin{scope}[xshift=0cm]
+  \node[v] (Ua) at (0.00,1.30) {$U$};
+  \node[v] (Wa) at (1.60,1.30) {$W$};
+  \node[v] (Ia) at (3.20,1.30) {$I$};
+  \node[v] (Ea) at (1.60,2.92) {$E$};
+  \node[v] (Da) at (1.60,0.00) {$D$};
+
+  \draw[arr] (Da) -- (Wa);
+  \draw[arr] (Wa) -- (Ua);
+  \draw[arr] (Wa) -- (Ia);
+  \draw[arr] (Wa) -- (Ea);
+  \draw[arr] (Ua) -- (Ea);
+  \draw[arr] (Ia) -- (Ea);
+
+  % paired short inner loop, matching the D4C-style E<->W feedback
+  \draw[feed]
+    (Ea.245) .. controls (1.25,2.44) and (1.25,1.82) .. (Wa.115);
+  \draw[feed]
+    (Wa.65) .. controls (1.95,1.82) and (1.95,2.44) .. (Ea.295);
+
+  \node[sub] at (1.60,-0.72) {(a)};
+\end{scope}
+
+% ==========================================================
+% (b) ODCR: C/S factorization with symmetric C split
+% ==========================================================
+\begin{scope}[xshift=5.20cm]
+  \node[v] (Cb) at (0.80,1.30) {$C$};
+  \node[v] (Sb) at (2.85,1.30) {$S$};
+  \node[v] (Eb) at (1.80,2.92) {$E$};
+  \node[v] (Ub) at (0.20,0.00) {$U$};
+  \node[v] (Ib) at (1.40,0.00) {$I$};
+  \node[v] (Db) at (2.85,0.00) {$D$};
+
+  \draw[arr] (Cb) -- (Eb);
+  \draw[arr] (Sb) -- (Eb);
+
+  % strictly symmetric C -> U/I split
+  \draw[arr] (Cb.235) -- (Ub.55);
+  \draw[arr] (Cb.305) -- (Ib.125);
+
+  \draw[arr] (Db) -- (Sb);
+
+  % paired short inner loop around S--E
+  \draw[feed]
+    (Eb.292) .. controls (2.02,2.45) and (2.36,1.86) .. (Sb.118);
+  \draw[feed]
+    (Sb.112) .. controls (2.48,1.95) and (2.18,2.55) .. (Eb.305);
+
+  \node[sub] at (1.80,-0.72) {(b)};
+\end{scope}
+
+% ==========================================================
+% (c) ODCR: reliability control with symmetric C split
+% ==========================================================
+\begin{scope}[xshift=10.50cm]
+  \node[v] (Cc) at (0.80,1.30) {$C$};
+  \node[v] (Rc) at (1.90,1.30) {$R_{cf}$};
+  \node[v] (Sc) at (3.00,1.30) {$S$};
+  \node[v] (Ec) at (1.90,2.92) {$E$};
+  \node[v] (Uc) at (0.20,0.00) {$U$};
+  \node[v] (Ic) at (1.40,0.00) {$I$};
+  \node[v] (Dc) at (3.00,0.00) {$D$};
+
+  \draw[arr] (Cc) -- (Ec);
+  \draw[arr] (Rc) -- (Ec);
+  \draw[arr] (Sc) -- (Ec);
+
+  \draw[arr] (Cc) -- (Rc);
+  \draw[arr] (Sc) -- (Rc);
+
+  % strictly symmetric C -> U/I split
+  \draw[arr] (Cc.235) -- (Uc.55);
+  \draw[arr] (Cc.305) -- (Ic.125);
+
+  \draw[arr] (Dc) -- (Sc);
+
+  % paired short inner loop around S--E
+  \draw[feed]
+    (Ec.292) .. controls (2.10,2.45) and (2.50,1.86) .. (Sc.118);
+  \draw[feed]
+    (Sc.112) .. controls (2.60,1.95) and (2.26,2.55) .. (Ec.305);
+
+  \node[sub] at (1.90,-0.72) {(c)};
+\end{scope}
+
+\end{tikzpicture}

@@ -11,6 +11,12 @@ import numpy as np
 import pandas as pd
 
 from odcr_core.file_atomic import atomic_write_json
+from odcr_core.step5_sample_plan_intent import (
+    Step5SamplePlanIntentError,
+    assert_sampled_plan_matches_intent,
+    build_step5_sample_plan_intent,
+    head_config_from_sample_plan_intent,
+)
 from odcr_core.step5_auto_budget import effective_samples_for_head
 from odcr_core.step5_prompt_templates import default_prompt_registry, prompt_registry_manifest
 from odcr_core.training_checkpoint import file_fingerprint, stable_hash
@@ -27,10 +33,8 @@ STEP5_POOL_MANIFEST = "step5_pool_manifest.json"
 STEP5_SAMPLING_CONTRACT = "step5_sampling_contract.json"
 STEP5_POOL_DISTRIBUTION_REPORT = "step5_pool_distribution_report.json"
 STEP5_POOL_EXPORTS_STATUS = "step5_pool_exports_status.json"
-WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL = "WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1"
 
 _EXPLANATION_POOL_PREFIX = "step5_explanation"
-_LEGACY_EXPLAINER_POOL_PREFIX = "step5" + "B"
 POOL_NAMES: tuple[str, ...] = (
     f"{_EXPLANATION_POOL_PREFIX}_target_gold_anchor_high",
     f"{_EXPLANATION_POOL_PREFIX}_target_gold_anchor_medium",
@@ -43,16 +47,6 @@ POOL_NAMES: tuple[str, ...] = (
 )
 
 POOL_PARQUET_NAMES: dict[str, str] = {name: f"{name}.parquet" for name in POOL_NAMES}
-LEGACY_POOL_ALIASES: dict[str, str] = {
-    name: name.replace(_EXPLANATION_POOL_PREFIX, _LEGACY_EXPLAINER_POOL_PREFIX, 1)
-    for name in POOL_NAMES
-}
-
-
-def _weak_low_weighted_cf_protocol(tuning_config: Mapping[str, Any] | None) -> bool:
-    candidate = str((tuning_config or {}).get("selected_tuning_candidate") or "")
-    tokens = {part.strip() for part in candidate.split("+") if part.strip()}
-    return WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL in tokens
 
 
 def _allow_weak_low_weighted_cf_route_bypass(
@@ -68,12 +62,6 @@ def _allow_weak_low_weighted_cf_route_bypass(
         and str(component) == "cf"
         and str(tier) == "low_weighted"
     )
-LEGACY_COLUMN_ALIASES: dict[str, str] = {
-    "cf_tier_step5_explanation": f"cf_tier_{_LEGACY_EXPLAINER_POOL_PREFIX}",
-    "cf_tier_reason_step5_explanation": f"cf_tier_reason_{_LEGACY_EXPLAINER_POOL_PREFIX}",
-    "cf_quality_score_step5_explanation": f"cf_quality_score_{_LEGACY_EXPLAINER_POOL_PREFIX}",
-    "recommended_sampling_weight_step5_explanation": f"recommended_sampling_weight_{_LEGACY_EXPLAINER_POOL_PREFIX}",
-}
 
 
 class Step5PoolSamplerError(RuntimeError):
@@ -167,16 +155,14 @@ def resolve_step5_pool_source(
         raise Step5PoolSamplerError("Step5 sampling contract schema_version mismatch")
     if manifest.get("full_audit_default_train_forbidden") is not True:
         raise Step5PoolSamplerError("Step5 pool manifest must forbid full audit as default train input")
-    if manifest.get("legacy_gold_heavy_exports_allowed_by_default") is not False:
-        raise Step5PoolSamplerError("Step5 pool manifest must disable legacy gold-heavy exports by default")
     pools = manifest.get("pools")
     if not isinstance(pools, Mapping):
         raise Step5PoolSamplerError("Step5 pool manifest missing pools object")
-    missing = [name for name in POOL_NAMES if name not in pools and LEGACY_POOL_ALIASES[name] not in pools]
+    missing = [name for name in POOL_NAMES if name not in pools]
     if missing:
         raise Step5PoolSamplerError("Step5 pool manifest missing pools: " + ", ".join(missing))
     for name in POOL_NAMES:
-        item = pools.get(name) or pools.get(LEGACY_POOL_ALIASES[name])
+        item = pools.get(name)
         if not isinstance(item, Mapping):
             raise Step5PoolSamplerError(f"Step5 pool manifest pool is not an object: {name}")
         path = _repo_path(root, item.get("path"))
@@ -211,15 +197,14 @@ def _read_pool(
         use_columns = []
         seen_columns: set[str] = set()
         for col in columns:
-            selected = str(col) if str(col) in available else LEGACY_COLUMN_ALIASES.get(str(col), "")
-            if selected and selected in available and selected not in seen_columns:
+            selected = str(col)
+            if selected in available and selected not in seen_columns:
                 use_columns.append(selected)
                 seen_columns.add(selected)
     t0 = time.perf_counter()
     df = pd.read_parquet(path, columns=use_columns)
     if timings is not None:
         timings["parquet_read_time_s"] = float(timings.get("parquet_read_time_s", 0.0) + (time.perf_counter() - t0))
-    df = _normalize_legacy_columns(df)
     df["step5_pool_name"] = name
     df["step5_pool_path"] = str(path)
     df["step5_pool_row_group"] = 0
@@ -247,31 +232,8 @@ def _pool_item(source: Step5PoolSource, name: str) -> Mapping[str, Any]:
         raise Step5PoolSamplerError("Step5 pool manifest missing pools object")
     item = pools.get(name)
     if not isinstance(item, Mapping):
-        item = pools.get(LEGACY_POOL_ALIASES.get(name, ""))
-    if not isinstance(item, Mapping):
         raise Step5PoolSamplerError(f"Step5 pool manifest missing pool: {name}")
     return item
-
-
-def required_columns_with_legacy_aliases(required: Sequence[str], available: Sequence[str]) -> list[str]:
-    available_set = {str(col) for col in available}
-    missing: list[str] = []
-    for col in required:
-        text = str(col)
-        if text in available_set:
-            continue
-        alias = LEGACY_COLUMN_ALIASES.get(text)
-        if alias and alias in available_set:
-            continue
-        missing.append(text)
-    return missing
-
-
-def _normalize_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for canonical, legacy in LEGACY_COLUMN_ALIASES.items():
-        if canonical not in df.columns and legacy in df.columns:
-            df[canonical] = df[legacy]
-    return df
 
 
 def _sample_df(
@@ -416,10 +378,11 @@ def _budget_for(
                 "Step5 auto budget requires resolved step5.batch_candidates; "
                 "fixed effective_samples_per_epoch_candidates are retired."
             )
+        sampler_for_budget = {**dict(sampler_config), str(head): dict(head_cfg)}
         try:
             return effective_samples_for_head(
                 source.manifest,
-                sampler_config=sampler_config,
+                sampler_config=sampler_for_budget,
                 batch_candidates_config=batch_candidates_config,
                 tuning_config=tuning_config or {},
                 head=head,
@@ -456,8 +419,6 @@ def _route_compatible_pool_df(df: pd.DataFrame, *, head: str, pool_name: str) ->
     if route_col not in df.columns:
         raise Step5PoolSamplerError(f"Step5 pool {pool_name} missing required route column {route_col}")
     route = pd.to_numeric(df[route_col], errors="coerce").fillna(0).astype(int)
-    if head == "legacy_explainer_alias":
-        return df.copy().reset_index(drop=True) if int((route == 1).sum()) > 0 else df.head(0).copy()
     return df.loc[route == 1].copy().reset_index(drop=True)
 
 
@@ -465,7 +426,7 @@ def _pool_row_count(source: Step5PoolSource, name: str) -> int:
     pools = source.manifest.get("pools")
     if not isinstance(pools, Mapping):
         raise Step5PoolSamplerError("Step5 pool manifest missing pools object")
-    item = pools.get(name) or pools.get(LEGACY_POOL_ALIASES.get(name, ""))
+    item = pools.get(name)
     if not isinstance(item, Mapping):
         raise Step5PoolSamplerError(f"Step5 pool manifest missing pool: {name}")
     try:
@@ -520,8 +481,6 @@ def _route_compatible_count(
                     break
             if not unknown:
                 return int(exact)
-            if head == "legacy_explainer_alias":
-                return 1
     except Exception:
         pass
     df = _read_pool(source, pool_name, [route_col], timings=timings)
@@ -534,20 +493,12 @@ def _validate_sampler_guardrails(sampler_config: Mapping[str, Any], source: Step
         raise Step5PoolSamplerError("step5.sampler.enabled must be true for Step5 sample-plan preflight")
     if sampler_config.get("contract_source") != "step4_pool_manifest":
         raise Step5PoolSamplerError("step5.sampler.contract_source must be step4_pool_manifest")
-    if sampler_config.get("full_audit_default_allowed") is not False:
-        raise Step5PoolSamplerError("step5.sampler.full_audit_default_allowed must be false")
-    if sampler_config.get("legacy_gold_heavy_exports_allowed") is not False:
-        raise Step5PoolSamplerError("step5.sampler.legacy_gold_heavy_exports_allowed must be false")
     if source.manifest.get("full_audit_default_train_forbidden") is not True:
         raise Step5PoolSamplerError("Step5 pool manifest must forbid full audit as default train input")
-    if source.manifest.get("legacy_gold_heavy_exports_allowed_by_default") is not False:
-        raise Step5PoolSamplerError("Step5 pool manifest must disable legacy gold-heavy exports by default")
 
 
 def _head_list(task_head: str) -> tuple[str, ...]:
     head = str(task_head or "explanation").strip()
-    if head.lower() == ("step5" + "b").lower():
-        head = "explanation"
     if head != "explanation":
         raise Step5PoolSamplerError("Step5 sampling is explanation-only")
     return ("explanation",)
@@ -567,6 +518,15 @@ def validate_step5_formal_sample_plan_for_source(
     """Validate a no-write Step5 sample plan against route-compatible pool rows."""
 
     _validate_sampler_guardrails(sampler_config, source)
+    try:
+        sample_plan_intent = build_step5_sample_plan_intent(
+            sampler_config=sampler_config,
+            tuning_config=tuning_config or {},
+            batch_candidates_config=batch_candidates_config,
+            task_head=task_head,
+        )
+    except Step5SamplePlanIntentError as exc:
+        raise Step5PoolSamplerError(str(exc)) from exc
     timings: dict[str, float] = {"parquet_read_time_s": 0.0}
     heads: dict[str, Any] = {}
     errors: list[str] = []
@@ -581,7 +541,11 @@ def validate_step5_formal_sample_plan_for_source(
         head_cfg = sampler_config.get(head)
         if not isinstance(head_cfg, Mapping):
             raise Step5PoolSamplerError(f"step5.sampler.{head} missing")
-        weak_low_weighted_cf_protocol = _weak_low_weighted_cf_protocol(tuning_config)
+        head_cfg = {
+            **dict(head_cfg),
+            **head_config_from_sample_plan_intent(sample_plan_intent),
+        }
+        weak_low_weighted_cf_protocol = bool(sample_plan_intent.get("weak_cross_platform_protocol"))
         head_bounded = bounded_max_rows
         if False and bounded_max_rows is not None:
             head_bounded = max(1, int(bounded_max_rows) // 2)
@@ -697,11 +661,7 @@ def validate_step5_formal_sample_plan_for_source(
             "max_replacement_rate": float(max_replacement_rate),
             "pool_exhaustion": bool(pool_exhaustion),
             "actual_tier_counts_match_active_mix": True,
-            "sampler_protocol": (
-                WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL
-                if weak_low_weighted_cf_protocol
-                else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
-            ),
+            "sampler_protocol": str(sample_plan_intent.get("sampler_protocol") or ""),
             "low_weighted_policy": (
                 "disabled_for_mainline"
                 if float((_component_mix(head_cfg, "cf")).get("low_weighted") or 0.0) == 0.0
@@ -727,11 +687,15 @@ def validate_step5_formal_sample_plan_for_source(
         "formal_namespace_write": False,
         "step4_sampling_contract_role": "pool_lineage_only",
         "active_sampler_source": (
-            f"{sampler_config.get('task_override_source') or 'configs/odcr.yaml:step5.sampler'} + "
-            f"{tuning_config.get('selected_tuning_candidate_source') or 'configs/odcr.yaml:step5.tuning.selected_tuning_candidate'}"
+            sample_plan_intent.get("active_sampler_source")
+            or (
+                f"{sampler_config.get('task_override_source') or 'configs/odcr.yaml:step5.sampler'} + "
+                f"{(tuning_config or {}).get('selected_tuning_candidate_source') or 'configs/odcr.yaml:step5.tuning.selected_tuning_candidate'}"
+            )
         ),
+        "sample_plan_intent_hash": str(sample_plan_intent.get("sample_plan_intent_hash") or ""),
+        "sample_plan_intent": dict(sample_plan_intent),
         "full_audit_default_forbidden": True,
-        "old_dedicated_default_forbidden": True,
     }
 
 
@@ -1067,17 +1031,21 @@ def sample_effective_epochs_from_pools(
         raise Step5PoolSamplerError("step5.sampler.enabled must be true for Step5 pool sampling")
     if sampler_config.get("contract_source") != "step4_pool_manifest":
         raise Step5PoolSamplerError("step5.sampler.contract_source must be step4_pool_manifest")
-    if sampler_config.get("full_audit_default_allowed") is not False:
-        raise Step5PoolSamplerError("step5.sampler.full_audit_default_allowed must be false")
-    if sampler_config.get("legacy_gold_heavy_exports_allowed") is not False:
-        raise Step5PoolSamplerError("step5.sampler.legacy_gold_heavy_exports_allowed must be false")
-    seed = int(sampler_config.get("seed", 3407))
-    epochs_cfg = sampler_config.get("epochs") if isinstance(sampler_config.get("epochs"), Mapping) else {}
-    max_epochs = max(1, int(epochs_cfg.get("max_effective_epochs", 1)))
+    try:
+        sample_plan_intent = build_step5_sample_plan_intent(
+            sampler_config=sampler_config,
+            tuning_config=tuning_config or {},
+            batch_candidates_config=batch_candidates_config,
+            task_head=task_head,
+        )
+    except Step5SamplePlanIntentError as exc:
+        raise Step5PoolSamplerError(str(exc)) from exc
+    seed = int(sample_plan_intent["seed"])
+    max_epochs = max(1, int(sample_plan_intent["max_effective_epochs"]))
     if str(mode).lower() == "bounded":
         max_epochs = 1
     heads = ("explanation",)
-    weak_low_weighted_cf_protocol = _weak_low_weighted_cf_protocol(tuning_config)
+    weak_low_weighted_cf_protocol = bool(sample_plan_intent.get("weak_cross_platform_protocol"))
     plan_t0 = time.perf_counter()
     timings: dict[str, float] = {
         "parquet_read_time_s": 0.0,
@@ -1093,6 +1061,10 @@ def sample_effective_epochs_from_pools(
             head_cfg = sampler_config.get(head)
             if not isinstance(head_cfg, Mapping):
                 raise Step5PoolSamplerError(f"step5.sampler.{head} missing")
+            head_cfg = {
+                **dict(head_cfg),
+                **head_config_from_sample_plan_intent(sample_plan_intent),
+            }
             head_bounded = bounded_max_rows
             if False and bounded_max_rows is not None:
                 head_bounded = max(1, int(bounded_max_rows) // len(heads))
@@ -1206,13 +1178,15 @@ def sample_effective_epochs_from_pools(
         "schema_version": STEP5_POOL_SAMPLER_SCHEMA_VERSION,
         "mode": str(mode),
         "task_head": str(task_head),
+        "sample_plan_intent_hash": str(sample_plan_intent.get("sample_plan_intent_hash") or ""),
+        "sample_plan_intent": dict(sample_plan_intent),
         "seed": int(seed),
         "sampler_plan_time_s": float(total_plan_time_s),
         "parquet_read_time_s": float(timings.get("parquet_read_time_s", 0.0)),
         "prompt_build_time_s": float(timings.get("prompt_build_time_s", 0.0)),
         "sampler_compute_time_s": float(sampler_compute_time_s),
-        "rotate_across_epochs": bool(sampler_config.get("rotate_across_epochs", True)),
-        "effective_epoch_enabled": bool(sampler_config.get("effective_epoch_enabled", True)),
+        "rotate_across_epochs": bool(sample_plan_intent.get("rotate_across_epochs")),
+        "effective_epoch_enabled": bool(sample_plan_intent.get("effective_epoch_enabled")),
         "effective_samples_per_epoch": int(per_epoch_budget),
         "auto_budget_enabled": bool(
             isinstance(sampler_config.get("auto_budget"), Mapping)
@@ -1222,16 +1196,21 @@ def sample_effective_epochs_from_pools(
         "max_effective_epochs": int(max_epochs),
         "planned_total_rows": int(len(train_df)),
         "epoch_reports": epoch_reports,
-        "sampler_protocol": (
-            WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_PROTOCOL
-            if weak_low_weighted_cf_protocol
-            else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
-        ),
+        "sampler_protocol": str(sample_plan_intent.get("sampler_protocol") or ""),
         "weak_low_weighted_cf_protocol": bool(weak_low_weighted_cf_protocol),
         "prompt_registry": prompt_registry_manifest(),
         "full_audit_default_train_forbidden": True,
-        "legacy_gold_heavy_exports_rejected_by_default": True,
     }
+    if str(mode).lower() == "formal_train":
+        try:
+            assert_sampled_plan_matches_intent(
+                train_df,
+                stats=stats,
+                intent=sample_plan_intent,
+                context="Step5 formal_train sampler",
+            )
+        except Step5SamplePlanIntentError as exc:
+            raise Step5PoolSamplerError(str(exc)) from exc
     audit_raw = train_df.head(min(len(train_df), 16)).copy()
     return Step5PoolSampleResult(
         train_df=train_df,

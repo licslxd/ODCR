@@ -14,9 +14,9 @@ sys.path.insert(0, _CODE_DIR)
 
 from executors.step5_engine import (  # noqa: E402
     Model,
+    STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
     STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-    STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
-    _encode_legacy32_content_evidence,
+    _encode_clean_memory_content_evidence,
     _drop_step5_runtime_aux_state_keys,
     _step5_batch_diversity_ema_buffer,
     _step5_explainer_ce_route_mask,
@@ -97,12 +97,18 @@ class TestStep5ExplanationQualityContract(unittest.TestCase):
         over_budget = type(
             "Packet",
             (),
-            {"content_evidence_ids": torch.ones(1, STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS + 1, dtype=torch.long)},
+            {
+                "content_evidence_ids": torch.ones(
+                    1,
+                    STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS + 1,
+                    dtype=torch.long,
+                )
+            },
         )()
         with self.assertRaises(RuntimeError):
             model._build_flan_encoder_inputs(torch.randn(1, 4, 3), over_budget)
 
-    def test_flan_encoder_legacy32_tokenizer_truncates_content_evidence(self) -> None:
+    def test_flan_encoder_clean_memory32_tokenizer_truncates_content_evidence(self) -> None:
         class Tok:
             pad_token_id = 0
             eos_token_id = 1
@@ -124,7 +130,7 @@ class TestStep5ExplanationQualityContract(unittest.TestCase):
 
         set_step5_tokenizer_override(Tok())
         try:
-            encoded = _encode_legacy32_content_evidence(
+            encoded = _encode_clean_memory_content_evidence(
                 {
                     "content_evidence": " ".join(f"c{i}" for i in range(20)),
                     "item": "item-id",
@@ -136,7 +142,7 @@ class TestStep5ExplanationQualityContract(unittest.TestCase):
             )
         finally:
             set_step5_tokenizer_override(None)
-        self.assertEqual(encoded["legacy_max_content_tokens"], 6)
+        self.assertEqual(encoded["clean_memory_max_content_tokens"], 6)
         self.assertEqual(encoded["content_evidence_token_len"], 6)
         self.assertEqual(encoded["input_token_len"], 8)
         self.assertTrue(encoded["truncated"])

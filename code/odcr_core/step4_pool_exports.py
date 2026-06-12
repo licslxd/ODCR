@@ -1,18 +1,16 @@
-"""Step4-owned RCR pool exports for Step5 sampling.
-
-This replaces the old gold-heavy dedicated train-table semantics as the
-default Step5 handoff.  The old files may remain for legacy/ablation only.
-"""
+"""Step4-owned RCR pool exports for Step5 sampling."""
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping, Sequence
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from odcr_core.file_atomic import atomic_write_json
@@ -23,21 +21,8 @@ from odcr_core.gold_quality import (
     default_gold_quality_config,
 )
 from odcr_core.index_contract import INDEX_CONTRACT_FILENAME, ODCR_ROUTING_TRAIN_CSV
-from odcr_core.step4_dedicated_exports import (
-    FULL_AUDIT_PARQUET,
-    STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS,
-    STEP5_DEDICATED_SOURCE_REQUIRED_COLUMNS,
-    _ParquetSink,
-    _file_sha256,
-    _fsync_parent,
-    _load_json,
-    _normalize_chunk,
-    _repo_relative,
-    _validate_required_columns,
-)
 from odcr_core.step4_export_validator import STEP4_EXPORT_MANIFEST, validate_step4_export_ready
 from odcr_core.step5_pool_sampler import (
-    LEGACY_POOL_ALIASES,
     POOL_NAMES,
     POOL_PARQUET_NAMES,
     STEP5_POOL_DISTRIBUTION_REPORT,
@@ -47,14 +32,148 @@ from odcr_core.step5_pool_sampler import (
     STEP5_POOLS_DIRNAME,
     STEP5_SAMPLING_CONTRACT,
     STEP5_SAMPLING_CONTRACT_SCHEMA_VERSION,
-    required_columns_with_legacy_aliases,
 )
 from odcr_core.step5_prompt_templates import prompt_registry_manifest
 
 
 STEP4_POOL_EXPORTS_SCHEMA_VERSION = STEP5_POOL_MANIFEST_SCHEMA_VERSION
 STEP4_POOL_EXPORTS_STATUS_SCHEMA_VERSION = "odcr_step4_step5_pool_exports_status/1"
-STEP4_LEGACY_DEDICATED_EXPORTS_STATUS = "legacy_old_filter_exports_status.json"
+FULL_AUDIT_PARQUET = "odcr_routing_full_audit.parquet"
+STEP5_DEDICATED_SOURCE_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "user",
+    "item",
+    "rating",
+    "review",
+    "explanation",
+    "clean_text",
+    "domain",
+    "sample_id",
+    "sample_origin",
+    "train_keep",
+    "route_scorer",
+    "route_explainer",
+    "sample_weight_hint",
+    "confidence_bucket",
+    "uncertainty_score",
+    "cf_reliability_score",
+    "content_retention_score",
+    "rating_stability_score",
+    "style_shift_score",
+    "text_quality_score",
+    "route_reason_scorer",
+    "route_reason_explainer",
+    "preprocess_route_scorer_prior",
+    "preprocess_route_explainer_prior",
+    "entropy_score",
+    "content_evidence",
+    "style_evidence",
+    "domain_style_anchor",
+    "local_style_residual_hint",
+    "polarity_anchor",
+    "content_anchor_score",
+    "style_anchor_score",
+    "evidence_quality_prior",
+    "user_idx_global",
+    "item_idx_global",
+)
+STEP5_EXPLANATION_EXPLAINER_TRAIN_COLUMNS: tuple[str, ...] = (
+    "user",
+    "item",
+    "rating",
+    "review",
+    "explanation",
+    "clean_text",
+    "domain",
+    "sample_id",
+    "user_idx_global",
+    "item_idx_global",
+    "sample_origin",
+    "train_keep",
+    "route_scorer",
+    "route_explainer",
+    "sample_weight_hint",
+    "confidence_bucket",
+    "uncertainty_score",
+    "cf_reliability_score",
+    "content_retention_score",
+    "rating_stability_score",
+    "style_shift_score",
+    "text_quality_score",
+    "route_reason_scorer",
+    "route_reason_explainer",
+    "preprocess_route_scorer_prior",
+    "preprocess_route_explainer_prior",
+    "entropy_score",
+    "content_evidence",
+    "content_anchor_score",
+    "style_evidence",
+    "style_anchor_score",
+    "domain_style_anchor",
+    "local_style_residual_hint",
+    "polarity_anchor",
+    "evidence_quality_prior",
+)
+
+STRING_COLUMNS = {
+    "user",
+    "item",
+    "review",
+    "explanation",
+    "content_evidence",
+    "polarity_anchor",
+    "domain_style_anchor",
+    "local_style_residual_hint",
+    "style_evidence",
+    "domain",
+    "route_reason_scorer",
+    "route_reason_explainer",
+    "sample_origin",
+    "clean_text",
+    "bad_tail_types",
+    "train_drop_reason",
+}
+INT_COLUMNS = {
+    "preprocess_route_scorer_prior",
+    "preprocess_route_explainer_prior",
+    "sample_id",
+    "confidence_bucket",
+    "route_scorer",
+    "route_explainer",
+    "train_keep",
+    "is_counterfactual",
+    "clean_changed",
+    "html_entity_hit",
+    "bad_tail_hit",
+    "template_hit",
+    "template_count",
+    "template_hard_drop_hit",
+    "template_downweighted",
+    "noisy_tail_downweighted",
+    "short_fragment_hit",
+    "repeat_tail_hit",
+    "user_idx_global",
+    "item_idx_global",
+}
+FLOAT_COLUMNS = {
+    "rating",
+    "content_anchor_score",
+    "style_anchor_score",
+    "evidence_quality_prior",
+    "entropy",
+    "rating_target",
+    "rating_counterfactual",
+    "rating_delta",
+    "rating_stability_score",
+    "shared_latent_similarity",
+    "specific_latent_shift",
+    "content_retention_score",
+    "style_shift_score",
+    "cf_reliability_score",
+    "uncertainty_score",
+    "entropy_score",
+    "text_quality_score",
+    "sample_weight_hint",
+}
 
 POOL_EXTRA_COLUMNS: tuple[str, ...] = (
     "gold_anchor_quality",
@@ -136,13 +255,131 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _file_sha256(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _fsync_parent(path: Path) -> None:
+    try:
+        fd = os.open(str(path.parent), os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _repo_relative(repo_root: Path, path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    p = Path(path).expanduser()
+    p = (repo_root / p).resolve() if not p.is_absolute() else p.resolve()
+    try:
+        return p.relative_to(repo_root).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
+def _load_json(path: Path, *, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise Step4PoolExportError(f"{label} missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise Step4PoolExportError(f"{label} invalid JSON: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise Step4PoolExportError(f"{label} JSON root must be an object: {path}")
+    return payload
+
+
+def _validate_required_columns(columns: Sequence[str], required: Sequence[str], *, context: str) -> None:
+    available = {str(c) for c in columns}
+    missing = [str(c) for c in required if str(c) not in available]
+    if missing:
+        raise Step4PoolExportError(f"{context} missing required columns: {', '.join(missing)}")
+
+
+def _normalize_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
+    out = chunk.copy()
+    for col in out.columns:
+        if col in STRING_COLUMNS:
+            out[col] = out[col].astype("string").fillna("")
+        elif col in INT_COLUMNS:
+            out[col] = pd.to_numeric(out[col], errors="raise").astype("Int64")
+        elif col in FLOAT_COLUMNS:
+            out[col] = pd.to_numeric(out[col], errors="raise").astype("float64")
+    return out
+
+
+class _ParquetSink:
+    def __init__(self, path: Path, columns: Sequence[str]) -> None:
+        self.path = path
+        self.tmp_path = Path(str(path) + f".tmp.{os.getpid()}")
+        self.columns = tuple(columns)
+        self.writer: pq.ParquetWriter | None = None
+        self.row_count = 0
+        self.column_count = len(self.columns)
+        if self.tmp_path.exists():
+            self.tmp_path.unlink()
+
+    def write(self, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        table = pa.Table.from_pandas(df.loc[:, self.columns], preserve_index=False)
+        if self.writer is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.writer = pq.ParquetWriter(str(self.tmp_path), table.schema, compression="snappy")
+        self.writer.write_table(table)
+        self.row_count += int(len(df))
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+        elif not self.tmp_path.exists():
+            empty = pa.Table.from_pandas(pd.DataFrame(columns=list(self.columns)), preserve_index=False)
+            self.writer = pq.ParquetWriter(str(self.tmp_path), empty.schema, compression="snappy")
+            self.writer.close()
+            self.writer = None
+
+    def commit(self, *, require_non_empty: bool) -> dict[str, Any]:
+        self.close()
+        if require_non_empty and self.row_count <= 0:
+            raise Step4PoolExportError(f"refusing to publish zero-row parquet: {self.path}")
+        meta = pq.ParquetFile(str(self.tmp_path)).metadata
+        if int(meta.num_rows) != int(self.row_count):
+            raise Step4PoolExportError(
+                f"parquet row_count mismatch for {self.path.name}: writer={self.row_count} metadata={meta.num_rows}"
+            )
+        os.replace(str(self.tmp_path), str(self.path))
+        _fsync_parent(self.path)
+        return {
+            "path": self.path,
+            "row_count": int(self.row_count),
+            "column_count": int(self.column_count),
+            "size_bytes": int(self.path.stat().st_size),
+            "sha256": _file_sha256(self.path),
+        }
+
+    def cleanup(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+        if self.tmp_path.exists():
+            self.tmp_path.unlink()
+
+
 def _default_pool_config(raw: Mapping[str, Any] | None = None) -> dict[str, Any]:
     cfg = dict(raw or {})
     cfg.setdefault("enabled", True)
     cfg.setdefault("output_dir_name", STEP5_POOLS_DIRNAME)
     cfg.setdefault("chunk_rows", 100_000)
     cfg.setdefault("full_audit_role", "audit_only")
-    cfg.setdefault("legacy_dedicated_exports_role", "legacy_old_filter_exports")
     return cfg
 
 
@@ -237,38 +474,6 @@ def _pool_record(repo_root: Path, path: Path, *, role: str, tier: str, row_count
     }
 
 
-def _legacy_status(root: Path, run_dir: Path, legacy_dir: Path) -> dict[str, Any]:
-    items: dict[str, Any] = {}
-    for name in (
-        "rating_stability_control_scorer_train.parquet",
-        "step5_explanation_explainer_train.parquet",
-        "odcr_routing_full_audit.parquet",
-    ):
-        path = legacy_dir / name
-        items[name] = {
-            "path": _repo_relative(root, path),
-            "exists": path.is_file(),
-            "role": "legacy_old_filter_exports" if name != "odcr_routing_full_audit.parquet" else "legacy_full_audit",
-            "not_default_step5_train": True,
-            "gold_heavy_warning": name != "odcr_routing_full_audit.parquet",
-            "sha256": _file_sha256(path) if path.is_file() else None,
-        }
-    payload = {
-        "schema_version": "odcr_step4_legacy_old_filter_exports/1",
-        "generated_at_utc": _now(),
-        "producer_stage": "step4",
-        "run_dir": _repo_relative(root, run_dir),
-        "legacy_export_policy": "ablation_or_history_only",
-        "not_default_step5_train": True,
-        "gold_heavy_warning": True,
-        "exports": items,
-    }
-    out = legacy_dir / STEP4_LEGACY_DEDICATED_EXPORTS_STATUS
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(out, payload)
-    return {**payload, "path": _repo_relative(root, out), "sha256": _file_sha256(out)}
-
-
 def export_step4_pool_exports(
     *,
     repo_root: str | Path,
@@ -311,7 +516,6 @@ def export_step4_pool_exports(
             "sampling_contract_schema_version": STEP5_SAMPLING_CONTRACT_SCHEMA_VERSION,
             "gold_quality_schema_version": gold_cfg.get("schema_version"),
             "cf_tier_schema_version": cf_cfg.get("schema_version"),
-            "legacy_old_filter_exports_marked": True,
         }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -493,7 +697,6 @@ def export_step4_pool_exports(
         role = "cf_pool" if "_cf_" in name else "gold_anchor_pool"
         pools[name] = _pool_record(root, Path(record["path"]), role=role, tier=tier, row_count=int(record["row_count"]), columns=POOL_COLUMNS)
 
-    legacy = _legacy_status(root, run_dir, run_dir / "step5_exports")
     gold_cfg_hash = hashlib.sha256(json.dumps(gold_cfg, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     cf_cfg_hash = hashlib.sha256(json.dumps(cf_cfg, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     sampling_contract = {
@@ -586,10 +789,7 @@ def export_step4_pool_exports(
             "config_hash": cf_cfg_hash,
             "counts": cf_tier_counts,
         },
-        "legacy_old_filter_exports": legacy,
         "full_audit_default_train_forbidden": True,
-        "legacy_gold_heavy_exports_allowed_by_default": False,
-        "gold_default_full_route_removed": True,
         "aux_cf_full_pool_preserved": int(origin_counts.get("aux_cf", 0)) == int(
             cf_tier_counts["step5_explanation"]["high"]
             + cf_tier_counts["step5_explanation"]["medium"]
@@ -667,8 +867,6 @@ def validate_step4_pool_exports(
             raise Step4PoolExportError("Step5 sampling contract schema_version mismatch")
         if manifest.get("full_audit_default_train_forbidden") is not True:
             raise Step4PoolExportError("full audit must be forbidden as default train")
-        if manifest.get("legacy_gold_heavy_exports_allowed_by_default") is not False:
-            raise Step4PoolExportError("legacy gold-heavy exports must be disabled by default")
         pools = manifest.get("pools")
         if not isinstance(pools, Mapping):
             raise Step4PoolExportError("manifest missing pools")
@@ -678,11 +876,6 @@ def validate_step4_pool_exports(
             item = pools.get(name)
             if isinstance(item, Mapping):
                 return name, item
-            legacy_name = LEGACY_POOL_ALIASES.get(name)
-            if legacy_name:
-                item = pools.get(legacy_name)
-                if isinstance(item, Mapping):
-                    return legacy_name, item
             raise Step4PoolExportError(f"manifest missing pool {name}")
 
         for name in POOL_NAMES:
@@ -701,7 +894,8 @@ def validate_step4_pool_exports(
                 expected_rows = -1
             if int(pf.metadata.num_rows) != int(expected_rows):
                 raise Step4PoolExportError(f"pool row_count mismatch: {name}")
-            missing_columns = required_columns_with_legacy_aliases(POOL_COLUMNS, tuple(pf.schema_arrow.names))
+            available_columns = {str(col) for col in pf.schema_arrow.names}
+            missing_columns = [str(col) for col in POOL_COLUMNS if str(col) not in available_columns]
             if missing_columns:
                 raise Step4PoolExportError(
                     f"{name} pool missing required columns: " + ", ".join(missing_columns)
@@ -735,7 +929,6 @@ def validate_step4_pool_exports(
             "gold_quality_counts": report.get("gold_quality_counts"),
             "cf_tier_counts": report.get("cf_tier_counts"),
             "full_audit_default_train_forbidden": True,
-            "legacy_gold_heavy_exports_allowed_by_default": False,
         }
     except Exception as exc:
         result.errors.append(str(exc))
@@ -758,7 +951,6 @@ def step4_pool_stage_status_fields(
         "step5_pool_exports_ready": bool(validation.ready),
         "step5_train_input_role": "pool_manifest_sampling_contract" if validation.ready else None,
         "full_audit_default_train_forbidden": True,
-        "legacy_gold_heavy_exports_allowed_by_default": False,
         "step5_pool_exports_status": _repo_relative(root, run / "meta" / STEP5_POOL_EXPORTS_STATUS),
         "step5_pool_manifest": _repo_relative(root, validation.manifest_path),
         "step5_sampling_contract": _repo_relative(root, validation.sampling_contract_path),
@@ -800,18 +992,11 @@ def write_step5_pool_exports_status(
     if update_stage_status and stage_status_path.is_file() and validation.ready:
         status = _load_json(stage_status_path, label="stage_status")
         for key in (
-            "step5_dedicated_exports_ready",
-            "step5_dedicated_exports_status",
-            "step5_train_manifest",
-            "route_intersection_report",
-            "dedicated_export_readiness",
             "selected_full_audit_export",
             "rating_stability_control_scorer_train_export",
             "step5_explanation_explainer_train_export",
         ):
             status.pop(key, None)
-        if status.get("step5_train_input_role") == "dedicated_split_exports":
-            status.pop("step5_train_input_role", None)
         status.update(fields)
         status["downstream_ready"] = True
         status["ready_for"] = ["step5"]
@@ -860,7 +1045,6 @@ def write_step5_pool_exports_status(
 
 __all__ = [
     "POOL_COLUMNS",
-    "STEP4_LEGACY_DEDICATED_EXPORTS_STATUS",
     "STEP4_POOL_EXPORTS_SCHEMA_VERSION",
     "STEP4_POOL_EXPORTS_STATUS_SCHEMA_VERSION",
     "Step4PoolExportError",

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -210,6 +211,40 @@ def _maybe_write_run_manifest(cfg: ResolvedConfig) -> None:
     data = build_run_manifest(cfg)
     p = write_run_manifest_json(cfg, data)
     print(f"[Manifest] wrote {p}", flush=True)
+
+
+def _step3_eval_only_artifact_log_dir(cfg: ResolvedConfig) -> Path | None:
+    protocol = str(getattr(cfg, "step3_eval_protocol", "") or "").strip()
+    split = str(getattr(cfg, "step3_eval_split", "") or "").strip().lower()
+    if str(getattr(cfg, "step3_mode", "") or "").strip().lower() != "eval_only":
+        return None
+    if protocol != "paper_target_only_eval" or split not in {"valid", "test"}:
+        return None
+    batch = int(getattr(cfg, "valid_batch_size", 0) or 0)
+    if batch <= 0:
+        raise RuntimeError("Step3 eval-only paper artifact label requires a positive valid_batch_size")
+    label = f"paper_{split}_b{batch}_full_detached"
+    return Path(cfg.manifest_dir).resolve() / "eval_only" / label
+
+
+def _step3_eval_runtime_cfg(cfg: ResolvedConfig) -> ResolvedConfig:
+    eval_log_dir = _step3_eval_only_artifact_log_dir(cfg)
+    if eval_log_dir is None:
+        return cfg
+    eval_log_dir.mkdir(parents=True, exist_ok=True)
+    return replace(cfg, log_dir=str(eval_log_dir), manifest_dir=str(eval_log_dir))
+
+
+def _copy_step3_eval_only_lineage_artifacts(parent_cfg: ResolvedConfig, eval_cfg: ResolvedConfig) -> None:
+    parent_meta = Path(parent_cfg.manifest_dir).resolve()
+    eval_meta = Path(eval_cfg.manifest_dir).resolve()
+    if parent_meta == eval_meta:
+        return
+    eval_meta.mkdir(parents=True, exist_ok=True)
+    for name in ("resolved_config.json", "source_table.json", "source_table_verbose.json"):
+        src = parent_meta / name
+        if src.is_file():
+            shutil.copy2(src, eval_meta / name)
 
 
 def _line_is_error_or_warning(line: str) -> bool:
@@ -451,12 +486,15 @@ def run_step3(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
     assert cfg.run_name is not None
     Path(cfg.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
-    _maybe_write_run_manifest(cfg)
 
     mode = cfg.step3_mode
     if mode == "eval_only":
-        _run_step3_eval(cfg, console_level=console_level)
+        eval_cfg = _step3_eval_runtime_cfg(cfg)
+        _copy_step3_eval_only_lineage_artifacts(cfg, eval_cfg)
+        _maybe_write_run_manifest(eval_cfg)
+        _run_step3_eval(eval_cfg, console_level=console_level)
         return
+    _maybe_write_run_manifest(cfg)
     _run_step3_train(cfg, console_level=console_level)
     if mode == "full":
         _run_step3_eval(cfg, console_level=console_level)
@@ -563,15 +601,11 @@ def _step5_decode_cli_args(cfg: ResolvedConfig) -> list[str]:
 def _odcr_profile_env(cfg: ResolvedConfig) -> dict[str, str]:
     out: dict[str, str] = {
         "ODCR_DECODE_PROFILE_JSON": cfg.decode_profile_json,
-        "ODCR_RERANK_PROFILE_JSON": cfg.rerank_profile_json,
         "ODCR_DECODE_PRESET_STEM": str(cfg.decode_preset_id),
-        "ODCR_RERANK_PRESET_STEM": str(cfg.rerank_preset_id or ""),
     }
     if getattr(cfg, "eval_profile_id", "") and cfg.command in (
         "eval",
-        "eval-rerank",
         "eval-matrix",
-        "eval-rerank-matrix",
         "step4",
     ):
         out["ODCR_EVAL_PROFILE_NAME"] = str(cfg.eval_profile_id)
@@ -686,75 +720,3 @@ def run_eval(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
         *_step5_decode_cli_args(cfg),
     ]
     _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
-
-
-def _rerank_runner_cli_args(cfg: ResolvedConfig) -> list[str]:
-    out = [
-        "--num-return-sequences",
-        str(cfg.num_return_sequences),
-        "--rerank-method",
-        str(cfg.rerank_method),
-        "--rerank-top-k",
-        str(cfg.rerank_top_k),
-        "--rerank-weight-logprob",
-        str(cfg.rerank_weight_logprob),
-        "--rerank-weight-length",
-        str(cfg.rerank_weight_length),
-        "--rerank-weight-repeat",
-        str(cfg.rerank_weight_repeat),
-        "--rerank-weight-dirty",
-        str(cfg.rerank_weight_dirty),
-        "--rerank-target-len-ratio",
-        str(cfg.rerank_target_len_ratio),
-        "--export-examples-mode",
-        str(cfg.export_examples_mode),
-        "--rerank-malformed-tail-penalty",
-        str(cfg.rerank_malformed_tail_penalty),
-        "--rerank-malformed-token-penalty",
-        str(cfg.rerank_malformed_token_penalty),
-    ]
-    if cfg.export_full_rerank_examples:
-        out.append("--export-full-rerank-examples")
-    return out
-
-
-def run_eval_rerank(cfg: ResolvedConfig, *, console_level: str = "summary") -> None:
-    Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
-    _maybe_write_run_manifest(cfg)
-    log_file = _full_log_file(cfg)
-
-    mp = Path(cfg.model_path).expanduser().resolve() if cfg.model_path else None
-    if mp is None:
-        assert cfg.from_run is not None and cfg.step5_run is not None
-        ck = Path(cfg.checkpoint_dir)
-        mp = path_layout.best_model_path(ck)
-
-    if not mp.is_file():
-        raise FileNotFoundError(f"评测权重不存在: {mp}")
-
-    env_extra: dict[str, str] = dict(_odcr_profile_env(cfg))
-
-    py_args = [
-        "eval-rerank",
-        "--auxiliary",
-        cfg.auxiliary,
-        "--target",
-        cfg.target,
-        "--eval-batch-size",
-        str(cfg.global_eval_batch_size),
-        "--num-proc",
-        str(cfg.num_proc),
-        "--seed",
-        str(cfg.seed),
-        "--log_file",
-        log_file,
-        "--save_file",
-        str(mp),
-        *_step5_decode_cli_args(cfg),
-        *_rerank_runner_cli_args(cfg),
-    ]
-    _run_torchrun(cfg, env_extra=env_extra, script=TORCHRUN_STEP5_SCRIPT, py_args=py_args, console_level=console_level)
-
-
-    print(f"Step3 产物: {cfg3.checkpoint_dir}", flush=True)
-    print(f"Step5 产物: {cfg5.checkpoint_dir}", flush=True)

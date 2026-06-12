@@ -78,6 +78,15 @@ def _patch_torch_load_default_weights_only() -> None:
 
 _patch_torch_load_default_weights_only()
 
+
+def _torch_load_map_location_for_device(device: Any) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device("cuda", int(device))
+    return torch.device(device)
+
+
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Subset
@@ -231,7 +240,6 @@ from train_diagnostics import (
     warn_empty_batch,
 )
 from train_logging import (
-    append_step3_damping_events_jsonl,
     append_step3_epoch_summary_csv,
     append_step3_gpu_profile_jsonl,
     append_step3_loss_breakdown_jsonl,
@@ -252,7 +260,6 @@ from odcr_core.step3_v3_policy import (
     build_recovery_plan,
     detect_objective_drift,
     resolve_phase_for_epoch,
-    safe_damping_v2_decision,
 )
 
 def _nonfinite_loss_abort_threshold() -> int:
@@ -1314,7 +1321,7 @@ def _step3_checkpoint_run_id(checkpoint_path: str) -> str:
 def _step3_checkpoint_compatibility_metadata() -> Dict[str, Any]:
     return {
         "minimum_accepted_schema_version": STEP3_CHECKPOINT_MIN_ACCEPTED_SCHEMA_VERSION,
-        "downstream_consumers": ["step4", "step5_indirect_via_step4_export", "eval_rerank_indirect_via_step5_checkpoint"],
+        "downstream_consumers": ["step4", "step5_indirect_via_step4_export", "eval_indirect_via_step5_checkpoint"],
         "downstream_compare_fields": [
             "sidecar_schema_version",
             "checkpoint_file_hash",
@@ -1513,7 +1520,6 @@ def _build_step3_checkpoint_lineage(
         "step3_task_profile": payload.get("step3_task_profile"),
         "step3_backup_profiles": payload.get("step3_backup_profiles"),
         "step3_exploration_profiles": payload.get("step3_exploration_profiles"),
-        "step3_worker_profiles": payload.get("step3_worker_profiles"),
         "step3_prefetcher": payload.get("step3_prefetcher"),
         "step3_cross_rank_structured_gather": payload.get("step3_cross_rank_structured_gather"),
         "step3_memory": payload.get("step3_memory"),
@@ -3124,7 +3130,6 @@ def _build_tokenize_cache_fingerprint(
         "step3_task_profile": effective_payload.get("step3_task_profile"),
         "step3_backup_profiles": effective_payload.get("step3_backup_profiles"),
         "step3_exploration_profiles": effective_payload.get("step3_exploration_profiles"),
-        "step3_worker_profiles": effective_payload.get("step3_worker_profiles"),
         "step3_prefetcher": effective_payload.get("step3_prefetcher"),
         "step3_cross_rank_structured_gather": effective_payload.get("step3_cross_rank_structured_gather"),
         "step3_memory": effective_payload.get("step3_memory"),
@@ -4793,18 +4798,8 @@ def trainModel_ddp(
     warmup_epochs = float(final_cfg.warmup_epochs)
     min_lr_ratio = float(final_cfg.min_lr_ratio)
     scheduler_cfg = json.loads(str(getattr(final_cfg, "scheduler_config_json", "") or "{}"))
-    damping_cfg_for_semantics = (
-        scheduler_cfg.get("validation_aware_lr_damping")
-        if isinstance(scheduler_cfg.get("validation_aware_lr_damping"), Mapping)
-        else {}
-    )
-    damping_enabled_for_semantics = bool(scheduler_cfg.get("damping_enabled", False))
-    if lr_scheduler_type == "warmup_cosine" and damping_enabled_for_semantics:
-        raise RuntimeError("hidden Step3 LR damping is forbidden for scheduler_type=warmup_cosine.")
-    if lr_scheduler_type == "warmup_cosine_with_damping":
-        raise RuntimeError("warmup_cosine_with_damping is retired from formal Step3; use pure warmup_cosine or probe-only safe_damping_v2.")
-    if lr_scheduler_type == "safe_damping_v2" and not damping_enabled_for_semantics:
-        raise RuntimeError("scheduler_type=safe_damping_v2 requires damping_enabled=true.")
+    if lr_scheduler_type != "warmup_cosine":
+        raise RuntimeError("Step3 clean path requires scheduler_type=warmup_cosine.")
     warmup_steps_env = final_cfg.odcr_warmup_steps
     warmup_ratio_env = final_cfg.odcr_warmup_ratio
     validate_every_epochs = max(1, int(final_cfg.validate_every_epochs))
@@ -4862,21 +4857,14 @@ def trainModel_ddp(
     ws_resolved = None
     warmup_ratio_logged = 0.0
     base_min_lr = initial_lr * min_lr_ratio
-    damping_factor_cumulative = 1.0
     effective_min_lr = base_min_lr
-    effective_min_lr_policy = str(
-        damping_cfg_for_semantics.get("effective_min_lr_policy")
-        or scheduler_cfg.get("effective_min_lr_policy")
-        or "base_floor"
-    )
+    effective_min_lr_policy = "base_floor"
     scheduler_state = scheduler_semantics(
         scheduler_type=lr_scheduler_type,
-        damping_enabled=damping_enabled_for_semantics,
         base_min_lr=base_min_lr,
-        damping_factor_cumulative=damping_factor_cumulative,
         effective_min_lr_policy=effective_min_lr_policy,
     )
-    if lr_scheduler_type in ("warmup_cosine", "safe_damping_v2"):
+    if lr_scheduler_type == "warmup_cosine":
         ws_resolved, warmup_ratio_logged = resolve_warmup_steps(
             total_steps_plan,
             n_steps,
@@ -4888,20 +4876,18 @@ def trainModel_ddp(
         sched = lr_sched.LambdaLR(optimizer, lr_lambda)
         if rank == 0 and _lg:
             _lg.info(
-                "LR schedule resolved: scheduler_type=%s base_scheduler=%s damping_enabled=%s "
+                "LR schedule resolved: scheduler_type=%s base_scheduler=%s "
                 "initial_lr=%s current_lr=%s (equals initial before first step) "
-                "base_min_lr=%s effective_min_lr=%s min_lr_ratio=%s damping_factor_cumulative=%s "
+                "base_min_lr=%s effective_min_lr=%s min_lr_ratio=%s "
                 "warmup_steps=%d total_steps=%d warmup_ratio=%s | "
                 "LambdaLR: one scheduler.step() immediately after each optimizer.step() (global_step aligned)",
                 scheduler_state["scheduler_type"],
                 scheduler_state["base_scheduler"],
-                str(scheduler_state["damping_enabled"]).lower(),
                 initial_lr,
                 initial_lr,
                 scheduler_state["base_min_lr"],
                 scheduler_state["effective_min_lr"],
                 min_lr_ratio,
-                scheduler_state["damping_factor_cumulative"],
                 ws_resolved,
                 total_steps_plan,
                 warmup_ratio_logged,
@@ -4912,8 +4898,6 @@ def trainModel_ddp(
     objective_drift_cfg = json.loads(str(getattr(final_cfg, "objective_drift_config_json", "") or "{}"))
     recovery_cfg = json.loads(str(getattr(final_cfg, "recovery_config_json", "") or "{}"))
     phase_schedule_cfg = json.loads(str(getattr(final_cfg, "phase_loss_schedule_config_json", "") or "{}"))
-    conflict_aware_cfg = json.loads(str(getattr(final_cfg, "conflict_aware_config_json", "") or "{}"))
-    adapter_gating_cfg = json.loads(str(getattr(final_cfg, "adapter_gating_config_json", "") or "{}"))
     orth_w_xcov = structured_weights.orthogonal_xcov_weight
     orth_w_cos = structured_weights.orthogonal_cosine_weight
     graph_preflight_enabled = bool(getattr(final_cfg, "ddp_graph_safety_preflight", True))
@@ -5001,13 +4985,11 @@ def trainModel_ddp(
     post_clip_zero_count = 0
     optimizer_step_attempts = 0
     scheduler_events: list[dict[str, Any]] = []
-    damping_events: list[dict[str, Any]] = []
     training_effectiveness_records: list[dict[str, Any]] = []
     objective_drift_records: list[dict[str, Any]] = []
     recovery_events: list[dict[str, Any]] = []
     phase_history: list[dict[str, Any]] = []
     loss_component_records: list[dict[str, Any]] = []
-    damping_state = {"worsen_count": 0, "cooldown_remaining": 0, "event_count": 0}
     recovery_state = {"active": False, "remaining_epochs": 0, "count": 0}
     latest_objective_drift_status = "none"
     _finite_mode, _finite_warn = parse_odcr_finite_check_mode()
@@ -5118,117 +5100,6 @@ def trainModel_ddp(
         )
         return event
 
-    def _apply_validation_aware_lr_damping(epoch: int, valid_loss_value: float, *, emit: bool) -> None:
-        nonlocal damping_factor_cumulative, effective_min_lr
-        if lr_scheduler_type != "safe_damping_v2":
-            return
-        damping_cfg = scheduler_cfg.get("validation_aware_lr_damping")
-        if not isinstance(damping_cfg, Mapping) or not bool(damping_cfg.get("enabled", False)):
-            return
-        if best_observed_metric is None:
-            return
-        decision = safe_damping_v2_decision(
-            epoch=epoch,
-            valid_loss=valid_loss_value,
-            best_valid_loss=float(best_observed_metric),
-            previous_valid_loss=None if not math.isfinite(prev_valid_loss) else prev_valid_loss,
-            current_lr=float(optimizer.param_groups[0].get("lr", 0.0) or 0.0),
-            base_min_lr=float(base_min_lr),
-            event_count=int(damping_state.get("event_count", 0) or 0),
-            cooldown_remaining=int(damping_state.get("cooldown_remaining", 0) or 0),
-            config=damping_cfg,
-        )
-        damping_state["cooldown_remaining"] = int(decision.get("cooldown_remaining", damping_state.get("cooldown_remaining", 0)) or 0)
-        if not bool(decision.get("apply", False)):
-            if decision.get("action_gate") and emit:
-                scheduler_events.append(
-                    {
-                        "event": "safe_damping_v2_action_gate",
-                        "scheduler_type": "safe_damping_v2",
-                        "epoch": int(epoch),
-                        "reason": str(decision.get("reason") or ""),
-                        "action_gate": str(decision.get("action_gate") or ""),
-                        "event_count": int(damping_state.get("event_count", 0) or 0),
-                        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    }
-                )
-            return
-        factor = float(decision.get("lr_decay_factor", damping_cfg.get("lr_decay_factor", 0.5)) or 0.5)
-        new_damping_factor_cumulative = float(damping_factor_cumulative) * factor
-        new_effective_min_lr = float(decision.get("effective_lr_floor", float(base_min_lr) * 0.25))
-        before_lrs = [float(group.get("lr", 0.0) or 0.0) for group in optimizer.param_groups]
-        before_base_lrs = [
-            float(x)
-            for x in (
-                getattr(sched, "base_lrs", None)
-                if sched is not None and hasattr(sched, "base_lrs")
-                else [group.get("initial_lr", initial_lr) for group in optimizer.param_groups]
-            )
-        ]
-        after_lrs: list[float] = []
-        for group in optimizer.param_groups:
-            old = float(group.get("lr", 0.0) or 0.0)
-            old_initial = float(group.get("initial_lr", initial_lr) or initial_lr)
-            new_initial = max(old_initial * factor, new_effective_min_lr)
-            new = max(old * factor, new_effective_min_lr)
-            group["lr"] = new
-            group["initial_lr"] = new_initial
-            after_lrs.append(float(new))
-        if sched is not None and hasattr(sched, "base_lrs"):
-            sched.base_lrs = [max(float(x) * factor, new_effective_min_lr) for x in getattr(sched, "base_lrs")]
-        damping_factor_cumulative = new_damping_factor_cumulative
-        effective_min_lr = new_effective_min_lr
-        damping_state["cooldown_remaining"] = int(decision.get("cooldown_remaining", damping_cfg.get("cooldown_epochs", 3)) or 3)
-        damping_state["event_count"] = int(damping_state.get("event_count", 0) or 0) + 1
-        damping_state["worsen_count"] = 0
-        if not emit:
-            return
-        event = {
-            "event": "validation_aware_lr_damping",
-            "scheduler_type": "safe_damping_v2",
-            "base_scheduler": "warmup_cosine",
-            "epoch": int(epoch),
-            "global_step": int(global_step),
-            "monitor_metric": "valid_loss",
-            "damping_reason": str(decision.get("reason") or "safe_damping_v2_recent_trend_worsened"),
-            "current_valid_loss": float(valid_loss_value),
-            "best_observed_metric": float(best_observed_metric),
-            "worsen_abs": float(decision.get("worsen_abs", float(valid_loss_value) - float(best_observed_metric))),
-            "worsen_ratio": float(decision.get("worsen_ratio", 0.0)),
-            "base_lr_before_damping": before_base_lrs,
-            "lr_before": before_lrs,
-            "lr_after": after_lrs,
-            "effective_lr_after_damping": after_lrs,
-            "damping_factor": factor,
-            "damping_factor_cumulative": float(damping_factor_cumulative),
-            "event_count": int(damping_state.get("event_count", 0) or 0),
-            "max_damping_events": int(damping_cfg.get("max_damping_events", 2) or 2),
-            "base_min_lr": float(base_min_lr),
-            "effective_min_lr": float(effective_min_lr),
-            "effective_min_lr_policy": effective_min_lr_policy,
-            "cooldown_epochs": int(damping_cfg.get("cooldown_epochs", 3) or 3),
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }
-        scheduler_events.append(event)
-        damping_events.append(event)
-        append_step3_scheduler_events_jsonl(log_file=getattr(final_cfg, "log_file", None), row=event)
-        append_step3_damping_events_jsonl(log_file=getattr(final_cfg, "log_file", None), row=event)
-        if _lg:
-            _lg.warning(
-                "[Step3][LRDamping] scheduler_type=safe_damping_v2 epoch=%d "
-                "valid_loss=%.6f best=%.6f base_min_lr=%.6g effective_min_lr=%.6g "
-                "damping_factor_cumulative=%.6g lr_before=%s lr_after=%s",
-                epoch,
-                valid_loss_value,
-                float(best_observed_metric),
-                float(base_min_lr),
-                float(effective_min_lr),
-                float(damping_factor_cumulative),
-                before_lrs,
-                after_lrs,
-                extra=log_route_extra(_lg, ROUTE_SUMMARY),
-            )
-
     def _component_weighted_means_for_epoch(epoch: int) -> dict[str, float]:
         values: dict[str, list[float]] = {}
         for row in loss_component_records:
@@ -5285,7 +5156,7 @@ def trainModel_ddp(
                 )
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
-        state = torch.load(best_observed_path, map_location=device)
+        state = torch.load(best_observed_path, map_location=_torch_load_map_location_for_device(device))
         get_underlying_model(model).load_state_dict(state, strict=False)
         optimizer = build_step3_optimizer(model, final_cfg)
         restart_lr = float(initial_lr) * float(recovery_cfg.get("restart_lr_ratio", 0.25) or 0.25)
@@ -5741,10 +5612,8 @@ def trainModel_ddp(
                 current_lr=lr_epoch,
                 base_min_lr=base_min_lr,
                 scheduler_type=lr_scheduler_type,
-                damping_enabled=damping_enabled_for_semantics,
                 effective_min_lr=effective_min_lr,
             )
-            latest_damping_event = damping_events[-1] if damping_events and int(damping_events[-1].get("epoch", -1)) == int(epoch_1) else None
             effectiveness_record = build_training_effectiveness_record(
                 epoch=epoch_1,
                 valid_loss=current_valid_loss,
@@ -5754,7 +5623,6 @@ def trainModel_ddp(
                 lr_effective=lr_epoch,
                 base_min_lr=base_min_lr,
                 effective_min_lr=effective_min_lr,
-                damping_event=latest_damping_event,
                 checkpoint_improved=bool(is_best_observed_epoch),
                 grad_finite=True,
             )
@@ -5791,18 +5659,15 @@ def trainModel_ddp(
                 if sched is not None and ws_resolved is not None:
                     scheduler_state = scheduler_semantics(
                         scheduler_type=lr_scheduler_type,
-                        damping_enabled=damping_enabled_for_semantics,
                         base_min_lr=base_min_lr,
-                        damping_factor_cumulative=damping_factor_cumulative,
                         effective_min_lr_policy=effective_min_lr_policy,
                     )
                     lr_sched_line = (
                         f"scheduler_type={scheduler_state['scheduler_type']} "
                         f"base_scheduler={scheduler_state['base_scheduler']} "
-                        f"damping_enabled={str(scheduler_state['damping_enabled']).lower()} "
                         f"initial_lr={initial_lr:.6g} current_lr={lr_epoch:.6g} "
                         f"base_min_lr={base_min_lr:.6g} effective_min_lr={effective_min_lr:.6g} "
-                        f"min_lr_ratio={min_lr_ratio:.6g} damping_factor_cumulative={damping_factor_cumulative:.6g} "
+                        f"min_lr_ratio={min_lr_ratio:.6g} "
                         f"warmup_steps={ws_resolved} total_steps={total_steps_plan} "
                         f"scheduler_steps_end_of_epoch={global_step} warmup_ratio={warmup_ratio_logged:.6g} "
                         f"lr_floor_explained={str(lr_floor_state['floor_explained']).lower()}"
@@ -5880,7 +5745,6 @@ def trainModel_ddp(
                         "lr_effective": float(lr_epoch),
                         "base_min_lr": float(base_min_lr),
                         "effective_min_lr": float(effective_min_lr),
-                        "damping_event": json.dumps(latest_damping_event or {}, ensure_ascii=False, sort_keys=True),
                         "objective_drift_status": latest_objective_drift_status,
                         "loss_phase": str(phase_record.get("phase") or ""),
                         "checkpoint_improved": bool(is_best_observed_epoch),
@@ -5899,10 +5763,6 @@ def trainModel_ddp(
 
             if current_valid_loss > prev_valid_loss:
                 enduration += 1
-                if lr_scheduler_type not in ("warmup_cosine", "safe_damping_v2"):
-                    learning_rate /= 2.0
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = learning_rate
             else:
                 enduration = 0
             best_observed_replaced_previous = best_observed_epoch is not None
@@ -6025,8 +5885,6 @@ def trainModel_ddp(
                 recovery_state["remaining_epochs"] = max(0, int(recovery_state.get("remaining_epochs", 0) or 0) - 1)
                 if int(recovery_state["remaining_epochs"]) <= 0:
                     recovery_state["active"] = False
-            if not recovery_requested:
-                _apply_validation_aware_lr_damping(epoch_1, current_valid_loss, emit=bool(rank == 0))
             prev_valid_loss = current_valid_loss
 
             if odcr_ddp_epoch_end_barrier():
@@ -6085,12 +5943,9 @@ def trainModel_ddp(
                     },
                     "scheduler": scheduler_semantics(
                         scheduler_type=lr_scheduler_type,
-                        damping_enabled=damping_enabled_for_semantics,
                         base_min_lr=base_min_lr,
-                        damping_factor_cumulative=damping_factor_cumulative,
                         effective_min_lr_policy=effective_min_lr_policy,
                     ),
-                    "damping_events_count": len(damping_events),
                     "objective_drift": {
                         "schema_version": "odcr_step3_objective_drift/1",
                         "records": objective_drift_records,
@@ -6108,8 +5963,6 @@ def trainModel_ddp(
                         "count": int(recovery_state.get("count", 0) or 0),
                     },
                     "phase_history": phase_history,
-                    "conflict_aware": conflict_aware_cfg,
-                    "adapter_gating": adapter_gating_cfg,
                 }
                 write_step3_training_effectiveness_summary_json(
                     log_file=getattr(final_cfg, "log_file", None),
@@ -6289,14 +6142,14 @@ def metrics_from_eval_lists(prediction_ratings, ground_truth_ratings, prediction
 
 
 def step3_target_only_diagnostic_protocol() -> dict[str, Any]:
-    """Declare the Step3 target-only diagnostic protocol without running Step4/5/eval/rerank."""
+    """Declare the Step3 target-only diagnostic protocol without running Step4/5/eval."""
     return {
         "evaluator_protocol": "code1_target_only_comparable",
         "diagnostic_only": True,
         "not_final_paper_metric": True,
         "target_only": True,
         "stage_boundary": "Step3 internal valid/test reader only",
-        "does_not_start": ["step4", "step5", "eval", "rerank"],
+        "does_not_start": ["step4", "step5", "eval"],
     }
 
 

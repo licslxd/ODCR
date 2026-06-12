@@ -1,0 +1,66 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{xurl}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{hyperref}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,shapes.geometric,backgrounds}
+\input{figures/figure_macros}
+
+\emergencystretch=2em
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\title{ODCR: Reliability-Gated Dynamic Causal Refinement for Cross-Domain Explainable Recommendation}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Cross-domain explainable recommendation must predict target-domain preferences
+and generate explanations that remain content-specific, domain-appropriate, and
+faithful to recommendation evidence. A central failure mode is explanation
+degeneration, where generators learn self-reinforcing textual shortcuts instead
+of user--item rationale. Building on D4C, which diagnoses degeneration as a
+dynamic feedback process \(W^{(t)} \rightarrow E^{(t)} \rightarrow
+W^{(t+1)}\), ODCR refines the coarse textual attribute \(W^{(t)}\) into stable
+content evidence \(C\), feedback-sensitive hierarchical style \(S^{(t)}\), and
+counterfactual reliability \(R_{cf}\). This refinement yields a complete
+control loop: evidence-anchored content/style decomposition, hierarchical style
+state modeling, reliability-gated counterfactual routing, and controlled
+faithful explanation generation. ODCR therefore learns explanations from
+\(P(E\mid U,I,C,S,R_{cf})\) rather than shortcut dependence on \(P(E\mid W)\).
+We report current results on three Amazon target-domain settings, treating
+them as bounded evidence for the proposed dynamic causal refinement rather
+than as a multi-seed benchmark-dominance claim.
+\end{abstract}
+
+\input{sections/01_intro}
+\input{sections/02_related_work}
+\input{sections/03_method}
+\input{sections/04_experiments}
+\input{sections/05_results}
+\input{sections/06_discussion}
+\input{sections/06_limitations}
+\input{sections/07_conclusion}
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

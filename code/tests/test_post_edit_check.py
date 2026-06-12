@@ -129,8 +129,6 @@ class TestPostEditCheck(unittest.TestCase):
             "./odcr preprocess b",
             "./odcr preprocess c",
             "./odcr eval ",
-            " eval-rerank",
-            " rerank ",
         )
         for forbidden in forbidden_substrings:
             with self.subTest(forbidden=forbidden):

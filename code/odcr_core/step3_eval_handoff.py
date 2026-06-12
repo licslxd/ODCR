@@ -220,12 +220,42 @@ def _registry_has(entries: Iterable[Mapping[str, Any]], *, split: str, eval_path
 
 
 def _lineage_hash(path: Path) -> str:
-    lineage_path = Path(str(path) + ".lineage.json")
-    lineage = _load_json(lineage_path, context=f"{path.name}.lineage.json")
+    lineage = _lineage_payload(path)
     expected_hash = str(lineage.get("checkpoint_file_hash") or "")
     actual_hash = checkpoint_file_sha256(path)
     _require(expected_hash == actual_hash, f"{path.name} lineage hash mismatch: {expected_hash!r} != {actual_hash!r}")
     return actual_hash
+
+
+def _lineage_payload(path: Path) -> dict[str, Any]:
+    lineage_path = Path(str(path) + ".lineage.json")
+    return _load_json(lineage_path, context=f"{path.name}.lineage.json")
+
+
+def _latest_matches_best_with_explicit_nonselected_lineage(
+    *,
+    latest_hash: str | None,
+    checkpoint_hash: str,
+    lineages: Mapping[str, Mapping[str, Any]],
+) -> tuple[bool, str | None]:
+    if latest_hash != checkpoint_hash:
+        return False, None
+    best = lineages.get("best_observed.pth") or {}
+    latest = lineages.get("latest.pth") or {}
+    best_scope = str(best.get("selection_scope") or "")
+    latest_scope = str(latest.get("selection_scope") or "")
+    best_epoch = best.get("checkpoint_epoch")
+    latest_epoch = latest.get("checkpoint_epoch")
+    latest_reason = str(latest.get("reason") or "")
+    if (
+        best_scope == "best_observed"
+        and latest_scope == "latest"
+        and best_epoch is not None
+        and str(best_epoch) == str(latest_epoch)
+        and latest_reason == "latest_epoch_snapshot"
+    ):
+        return True, "latest_epoch_snapshot_equals_best_observed_epoch_explicitly_nonselected"
+    return False, None
 
 
 def validate_step3_eval_handoff_evidence(
@@ -243,6 +273,11 @@ def validate_step3_eval_handoff_evidence(
     run_summary = _load_json(summary_path, context="run_summary.json")
     checkpoint = model / "best_observed.pth"
     _require(checkpoint.is_file(), f"best_observed checkpoint missing: {checkpoint}")
+    lineages = {
+        name: _lineage_payload(model / name)
+        for name in ("best_observed.pth", "best.pth", "latest.pth")
+        if (model / name).is_file()
+    }
     checkpoint_hash = _lineage_hash(checkpoint)
     sibling_hashes = {
         name: _lineage_hash(model / name)
@@ -259,8 +294,13 @@ def validate_step3_eval_handoff_evidence(
         f"best checkpoint alias hash mismatch: {best_alias_hashes}",
     )
     latest_hash = sibling_hashes.get("latest.pth")
+    latest_same_allowed, latest_nonselected_reason = _latest_matches_best_with_explicit_nonselected_lineage(
+        latest_hash=latest_hash,
+        checkpoint_hash=checkpoint_hash,
+        lineages=lineages,
+    )
     _require(
-        latest_hash != checkpoint_hash,
+        latest_hash != checkpoint_hash or latest_same_allowed,
         "latest.pth unexpectedly matches best_observed; handoff must explicitly preserve latest as non-selected unless it is reselected by paper-aware policy",
     )
     paths = default_eval_paths(run)
@@ -301,6 +341,8 @@ def validate_step3_eval_handoff_evidence(
         "checkpoint_hash": checkpoint_hash,
         "sibling_checkpoint_hashes": sibling_hashes,
         "latest_checkpoint_hash": latest_hash,
+        "latest_checkpoint_matches_best_observed": bool(latest_hash == checkpoint_hash),
+        "latest_checkpoint_nonselected_reason": latest_nonselected_reason,
         "paths": paths,
         "valid": valid,
         "test": test,
@@ -409,7 +451,9 @@ def build_eval_handoff_payload(
         },
         "checkpoint_sibling_hashes": evidence.get("sibling_checkpoint_hashes") or {},
         "latest_checkpoint_hash": evidence.get("latest_checkpoint_hash"),
+        "latest_checkpoint_matches_best_observed": bool(evidence.get("latest_checkpoint_matches_best_observed")),
         "latest_checkpoint_selected_downstream": False,
+        "latest_checkpoint_nonselected_reason": evidence.get("latest_checkpoint_nonselected_reason"),
         "eval_registry_path": _repo_relative(root, evidence["registry_path"]),
         "single_run_caveat_recorded": True,
     }

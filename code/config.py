@@ -795,7 +795,6 @@ TRAINING_ORCHESTRATION_FORBIDDEN_KEYS: FrozenSet[str] = frozenset(
         "compile_mode",
         "eval_profile",
         "decode_preset",
-        "rerank_preset",
         "max_pending_jobs",
     }
 )
@@ -808,7 +807,6 @@ _FORBIDDEN_TRAINING_KEY_HINTS: Dict[str, str] = {
     "max_pending_jobs": "configs/odcr.yaml eval/daemon orchestration",
     "eval_profile": "configs/odcr.yaml eval.profiles",
     "decode_preset": "configs/odcr.yaml eval.decode",
-    "rerank_preset": "configs/odcr.yaml eval.rerank",
 }
 
 
@@ -1324,7 +1322,6 @@ class FinalTrainingConfig:
     validation_memory_policy: str
     step5_validation_mode: str
     formal_entry_E4_validation_required: bool
-    old_eval_batch_2048_retired: bool
     valid_loss_components_json: str
     train_batch_size: int
     global_batch_size: int
@@ -1365,7 +1362,6 @@ class FinalTrainingConfig:
     task_profile_config_json: str
     backup_profiles_config_json: str
     exploration_profiles_config_json: str
-    worker_profiles_config_json: str
     prefetcher_config_json: str
     checkpoint_policy_config_json: str
     quality_gate_config_json: str
@@ -1374,16 +1370,10 @@ class FinalTrainingConfig:
     cross_rank_structured_gather_config_json: str
     memory_config_json: str
     timing_config_json: str
-    performance_candidates_config_json: str
     cache_policy_config_json: str
     objective_drift_config_json: str
     recovery_config_json: str
     phase_loss_schedule_config_json: str
-    conflict_aware_config_json: str
-    loss_gradient_conflict_probe_config_json: str
-    adapter_gating_config_json: str
-    paper_candidate_selection_config_json: str
-    checkpoint_averaging_config_json: str
 
     eval_batch_size: int
     min_epochs: int
@@ -1484,7 +1474,6 @@ class FinalTrainingConfig:
     head_specific_trainable_policy: str = ""
     head_gated_loss_contract_json: str = "{}"
     step5_selected_tuning_candidate: str = ""
-    step5_fallback_tuning_candidate: str = ""
     step5_effective_samples_json: str = "{}"
     step5_optimizer_steps_json: str = "{}"
     step5_innovation_config_json: str = ""
@@ -2172,7 +2161,6 @@ def build_resolved_training_config(
     head_specific_trainable_policy_v = ""
     head_gated_loss_contract_json_v = "{}"
     step5_selected_tuning_candidate_v = ""
-    step5_fallback_tuning_candidate_v = ""
     step5_effective_samples_json_v = "{}"
     step5_optimizer_steps_json_v = "{}"
     step5_gradient_checkpointing_enabled_v = True
@@ -2284,7 +2272,6 @@ def build_resolved_training_config(
         step5_lifecycle_phase_v = str(row.get("step5_lifecycle_phase") or st5_lifecycle.get("formal_default_phase") or "train_only")
         step5_allow_embedded_final_eval_v = bool(row.get("step5_allow_embedded_final_eval", False))
         step5_selected_tuning_candidate_v = str(st5_tuning.get("selected_tuning_candidate") or "")
-        step5_fallback_tuning_candidate_v = str(st5_tuning.get("fallback_tuning_candidate") or "")
         step5_effective_samples_json_v = json.dumps(st5_tuning.get("effective_samples") or {}, ensure_ascii=False, sort_keys=True)
         step5_optimizer_steps_json_v = json.dumps(st5_tuning.get("optimizer_steps") or {}, ensure_ascii=False, sort_keys=True)
         step5_memory_truth_config_json_v = json.dumps(st5_memory_truth, ensure_ascii=False, sort_keys=True)
@@ -2635,7 +2622,6 @@ def build_resolved_training_config(
     task_profile_config_v = _payload_obj("step3_task_profile")
     backup_profiles_config_v = _payload_obj("step3_backup_profiles")
     exploration_profiles_config_v = _payload_obj("step3_exploration_profiles")
-    worker_profiles_config_v = _payload_obj("step3_worker_profiles")
     prefetcher_config_v = _payload_obj("step3_prefetcher")
     checkpoint_policy_config_v = _payload_obj("step3_checkpoint_policy")
     quality_gate_config_v = _payload_obj("step3_quality_gate")
@@ -2644,16 +2630,10 @@ def build_resolved_training_config(
     cross_rank_structured_gather_config_v = _payload_obj("step3_cross_rank_structured_gather")
     memory_config_v = _payload_obj("step3_memory")
     timing_config_v = _payload_obj("step3_timing")
-    performance_candidates_config_v = _payload_obj("step3_performance_candidates")
     cache_policy_config_v = _payload_obj("step3_cache_policy")
     objective_drift_config_v = _payload_obj("step3_objective_drift")
     recovery_config_v = _payload_obj("step3_recovery")
     phase_loss_schedule_config_v = _payload_obj("step3_phase_loss_schedule")
-    conflict_aware_config_v = _payload_obj("step3_conflict_aware")
-    loss_gradient_conflict_probe_config_v = _payload_obj("step3_loss_gradient_conflict_probe")
-    adapter_gating_config_v = _payload_obj("step3_adapter_gating")
-    paper_candidate_selection_config_v = _payload_obj("step3_paper_candidate_selection")
-    checkpoint_averaging_config_v = _payload_obj("step3_checkpoint_averaging")
     tokenizer_max_length_v = int(row.get("tokenizer_max_length", 0))
     evidence_max_length_v = int(row.get("evidence_max_length", 0))
     max_grad_norm_v = float(row.get("max_grad_norm", 0.0))
@@ -2671,7 +2651,6 @@ def build_resolved_training_config(
     validation_memory_policy_v = str(row.get("validation_memory_policy", ""))
     step5_validation_mode_v = str(row.get("step5_validation_mode", ""))
     formal_entry_e4_validation_required_v = bool(row.get("formal_entry_E4_validation_required", False))
-    old_eval_batch_2048_retired_v = bool(row.get("old_eval_batch_2048_retired", False))
     valid_loss_components_v = row.get("valid_loss_components", {})
     src["optimizer"] = "step3.optimizer" if preset_nm == "step3" else "inactive"
     src["tokenizer_max_length"] = "effective_payload" if "tokenizer_max_length" in row else "inactive"
@@ -2687,7 +2666,6 @@ def build_resolved_training_config(
     src["validation_memory_policy"] = "step5.eval" if preset_nm == "step5" and "validation_memory_policy" in row else "inactive"
     src["step5_validation_mode"] = "step5.eval" if preset_nm == "step5" and "step5_validation_mode" in row else "inactive"
     src["formal_entry_E4_validation_required"] = "step5.eval" if preset_nm == "step5" and "formal_entry_E4_validation_required" in row else "inactive"
-    src["old_eval_batch_2048_retired"] = "step5.eval" if preset_nm == "step5" and "old_eval_batch_2048_retired" in row else "inactive"
     src["valid_loss_components"] = "step5.eval" if preset_nm == "step5" and "valid_loss_components" in row else "inactive"
     if preset_nm == "step3":
         for key in (
@@ -2758,7 +2736,6 @@ def build_resolved_training_config(
         validation_memory_policy=str(validation_memory_policy_v),
         step5_validation_mode=str(step5_validation_mode_v),
         formal_entry_E4_validation_required=bool(formal_entry_e4_validation_required_v),
-        old_eval_batch_2048_retired=bool(old_eval_batch_2048_retired_v),
         valid_loss_components_json=json.dumps(valid_loss_components_v, ensure_ascii=False, sort_keys=True),
         valid_loss_label_max_length=int(row.get("valid_loss_label_max_length", row.get("train_label_max_length", 64))),
         final_eval_prediction_max_length=int(row.get("final_eval_prediction_max_length", 25)),
@@ -2800,7 +2777,6 @@ def build_resolved_training_config(
         task_profile_config_json=json.dumps(task_profile_config_v, ensure_ascii=False, sort_keys=True),
         backup_profiles_config_json=json.dumps(backup_profiles_config_v, ensure_ascii=False, sort_keys=True),
         exploration_profiles_config_json=json.dumps(exploration_profiles_config_v, ensure_ascii=False, sort_keys=True),
-        worker_profiles_config_json=json.dumps(worker_profiles_config_v, ensure_ascii=False, sort_keys=True),
         prefetcher_config_json=json.dumps(prefetcher_config_v, ensure_ascii=False, sort_keys=True),
         checkpoint_policy_config_json=json.dumps(checkpoint_policy_config_v, ensure_ascii=False, sort_keys=True),
         quality_gate_config_json=json.dumps(quality_gate_config_v, ensure_ascii=False, sort_keys=True),
@@ -2809,16 +2785,10 @@ def build_resolved_training_config(
         cross_rank_structured_gather_config_json=json.dumps(cross_rank_structured_gather_config_v, ensure_ascii=False, sort_keys=True),
         memory_config_json=json.dumps(memory_config_v, ensure_ascii=False, sort_keys=True),
         timing_config_json=json.dumps(timing_config_v, ensure_ascii=False, sort_keys=True),
-        performance_candidates_config_json=json.dumps(performance_candidates_config_v, ensure_ascii=False, sort_keys=True),
         cache_policy_config_json=json.dumps(cache_policy_config_v, ensure_ascii=False, sort_keys=True),
         objective_drift_config_json=json.dumps(objective_drift_config_v, ensure_ascii=False, sort_keys=True),
         recovery_config_json=json.dumps(recovery_config_v, ensure_ascii=False, sort_keys=True),
         phase_loss_schedule_config_json=json.dumps(phase_loss_schedule_config_v, ensure_ascii=False, sort_keys=True),
-        conflict_aware_config_json=json.dumps(conflict_aware_config_v, ensure_ascii=False, sort_keys=True),
-        loss_gradient_conflict_probe_config_json=json.dumps(loss_gradient_conflict_probe_config_v, ensure_ascii=False, sort_keys=True),
-        adapter_gating_config_json=json.dumps(adapter_gating_config_v, ensure_ascii=False, sort_keys=True),
-        paper_candidate_selection_config_json=json.dumps(paper_candidate_selection_config_v, ensure_ascii=False, sort_keys=True),
-        checkpoint_averaging_config_json=json.dumps(checkpoint_averaging_config_v, ensure_ascii=False, sort_keys=True),
         eval_batch_size=eval_bs,
         min_epochs=min_ep,
         train_min_epochs=min_ep,
@@ -2875,7 +2845,6 @@ def build_resolved_training_config(
         head_specific_trainable_policy=str(head_specific_trainable_policy_v),
         head_gated_loss_contract_json=str(head_gated_loss_contract_json_v),
         step5_selected_tuning_candidate=str(step5_selected_tuning_candidate_v),
-        step5_fallback_tuning_candidate=str(step5_fallback_tuning_candidate_v),
         step5_effective_samples_json=str(step5_effective_samples_json_v),
         step5_optimizer_steps_json=str(step5_optimizer_steps_json_v),
         step5_innovation_config_json=str(step5_innovation_config_json_v),

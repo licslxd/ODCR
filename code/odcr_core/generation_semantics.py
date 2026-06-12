@@ -1,4 +1,4 @@
-"""生成/评测语义快照与 SHA256 指纹（无 torch/nltk），供 manifest、metrics、phase1 共用。"""
+"""生成/评测语义快照与 SHA256 指纹（无 torch/nltk），供 manifest、metrics 共用。"""
 from __future__ import annotations
 
 import hashlib

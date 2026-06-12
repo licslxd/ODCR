@@ -1,0 +1,67 @@
+\section{Results}
+
+\subsection{Overall Performance on AM-CDs}
+
+\input{tables/overall_performance_am_cds}
+
+Table~\ref{tab:overall_performance_am_cds} reports AM-CDs as the target
+dataset with AM-Electronics and AM-Movies as auxiliary domains. The table uses
+the full D4C-style baseline set, separating single-domain methods from
+cross-domain methods. ReCEG improves over the corresponding D4C rows on all
+text-generation metrics for both auxiliary domains. The auxiliary domains show
+different strengths: ReCEG with AM-Electronics is stronger on ROUGE-1,
+ROUGE-L, and rating error among the ReCEG rows, while ReCEG with AM-Movies is
+stronger on BLEU, METEOR, and diversity.
+
+\subsection{Overall Performance on AM-Electronics}
+
+\input{tables/overall_performance_am_electronics}
+
+Table~\ref{tab:overall_performance_am_electronics} reports AM-Electronics as
+the target dataset. ReCEG is strongest on the explanation-oriented columns:
+ReCEG with AM-CDs leads ROUGE-1, ROUGE-L, BLEU-1, BLEU-2, and METEOR, while
+ReCEG with AM-Movies leads BLEU-3, BLEU-4, DIST-1, and DIST-2. The best
+rating-error values still come from earlier baselines in this table, which
+keeps the evidence focused on explanation generation rather than recommendation
+prediction. This split is consistent with the paper's content/style/reliability
+story: one auxiliary domain contributes closer textual relatedness, while the
+other contributes stronger diversity.
+
+\subsection{Overall Performance on AM-Movies}
+
+\input{tables/overall_performance_am_movies}
+
+Table~\ref{tab:overall_performance_am_movies} reports AM-Movies as the target
+dataset. ReCEG with AM-Electronics is strongest on ROUGE and BLEU-1 through
+BLEU-3, matching the stronger textual relatedness visible in the D4C rows.
+ReCEG with AM-CDs is strongest on BLEU-4, METEOR, DIST-1, DIST-2, and MAE,
+preserving the higher-diversity pattern associated with the AM-CDs auxiliary
+domain. As in the other target-domain tables, explanation metrics show clearer
+movement than rating-error metrics.
+
+\subsection{Ablation Study on AM-CDs}
+
+\input{tables/ablation_am_cds}
+
+Table~\ref{tab:ablation_am_cds} studies the effect of semantic evidence
+modeling and reliability guidance on the AM-CDs target setting. Removing both
+components yields the weakest ReCEG variant. Adding semantic evidence improves
+BLEU-3, BLEU-4, and METEOR, suggesting that evidence-aware content modeling
+mainly strengthens explanation quality. Adding reliability guidance improves
+DIST-1 and DIST-2, indicating that reliability-guided counterfactual use helps
+reduce repetitive generation and improves diversity. The full model achieves
+the best performance in both auxiliary-domain blocks, showing that semantic
+evidence and reliability guidance are complementary.
+
+\subsection{Discussion of the Results}
+
+Across the three tables, ReCEG consistently improves explanation metrics over
+D4C while retaining explicit RMSE and MAE reporting. The metric pattern is not
+homogeneous across auxiliary domains, and that difference is important. AM-CDs
+separates lexical/rating behavior from BLEU/diversity behavior across the two
+auxiliary domains. AM-Electronics separates lexical relevance from diversity.
+AM-Movies shows a parallel split, with AM-Electronics stronger on ROUGE/BLEU
+and AM-CDs stronger on diversity and MAE. Together with the AM-CDs ablation in
+Table~\ref{tab:ablation_am_cds}, these results support the manuscript as
+bounded current evidence for the content/style/reliability framing, not as a
+state-of-the-art or statistical significance claim.

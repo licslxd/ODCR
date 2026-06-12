@@ -20,11 +20,7 @@ from odcr_core.step4_export_validator import (
     STEP4_EXPORT_MANIFEST,
     validate_step4_export_ready,
 )
-from odcr_core.step4_dedicated_exports import (
-    STEP4_DEDICATED_EXPORTS_STATUS,
-)
 from odcr_core.step4_pool_exports import (
-    STEP4_LEGACY_DEDICATED_EXPORTS_STATUS,
     STEP5_POOL_EXPORTS_STATUS,
     step4_pool_stage_status_fields,
 )
@@ -38,7 +34,7 @@ QUALITY_AUDIT_SUPERSEDED_SCHEMA_VERSION = "odcr_quality_audit_superseded_by/1"
 READY_FOR_BY_STAGE: dict[str, tuple[str, ...]] = {
     "step3": ("step4",),
     "step4": ("step5",),
-    "step5": ("eval", "rerank"),
+    "step5": ("eval",),
 }
 
 BAD_FINAL_STATUSES = {
@@ -68,7 +64,6 @@ def _canonical_stage(stage: str) -> str:
         "train_step3": "step3",
         "train_step4": "step4",
         "train_step5": "step5",
-        "eval-rerank": "rerank",
     }.get(raw, raw)
 
 
@@ -333,16 +328,6 @@ def _step4_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
     }
     if pool_fields:
         payload.update(pool_fields)
-    dedicated_status = run_root / "meta" / STEP4_DEDICATED_EXPORTS_STATUS
-    if dedicated_status.is_file():
-        payload["legacy_step5_dedicated_exports"] = {
-            "role": "audit_or_history_only",
-            "not_default_step5_train": True,
-            "status": _repo_relative(repo_root, dedicated_status),
-        }
-    legacy_old_filter = run_root / "step5_exports" / STEP4_LEGACY_DEDICATED_EXPORTS_STATUS
-    if legacy_old_filter.is_file():
-        payload["legacy_old_filter_exports_status"] = _repo_relative(repo_root, legacy_old_filter)
     return payload
 
 
@@ -388,7 +373,7 @@ def _step5_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
         "stage": "step5",
         "mode": "explanation_only",
         "downstream_ready": downstream_ready,
-        "ready_for": ["eval", "rerank"] if downstream_ready else [],
+        "ready_for": ["eval"] if downstream_ready else [],
         "status_source": "run_summary",
         "rejection_reasons": reasons,
         "head": "explanation",
@@ -402,7 +387,6 @@ def _step5_status(*, repo_root: Path, run_root: Path, run_summary: Mapping[str, 
         "paper_explanation_ready": downstream_ready,
         "paper_comparable_mean_std": False,
         "selected_tuning_candidate": run_summary.get("selected_tuning_candidate"),
-        "fallback_tuning_candidate": run_summary.get("fallback_tuning_candidate"),
         "step5_effective_samples": run_summary.get("step5_effective_samples"),
         "step5_optimizer_steps": run_summary.get("step5_optimizer_steps"),
         "selected_checkpoint": selected_checkpoint,
@@ -528,11 +512,6 @@ def build_stage_status(
         "upstream": {},
     }
     for key in (
-        "selected_full_audit_export",
-        "rating_stability_control_scorer_train_export",
-        "legacy_explainer_alias_explainer_train_export",
-        "step5_train_manifest",
-        "route_intersection_report",
         "step5_pool_manifest",
         "step5_sampling_contract",
         "step5_pool_distribution_report",
@@ -542,22 +521,14 @@ def build_stage_status(
         "full_audit_table_role",
         "step5_train_input_role",
         "pool_export_readiness",
-        "legacy_step5_dedicated_exports",
-        "legacy_old_filter_exports_status",
     ):
         if key in stage_payload:
             payload[key] = stage_payload.get(key)
     for key in (
-        "selected_full_audit_export",
-        "rating_stability_control_scorer_train_export",
-        "legacy_explainer_alias_explainer_train_export",
-        "step5_train_manifest",
-        "route_intersection_report",
         "step5_pool_manifest",
         "step5_sampling_contract",
         "step5_pool_distribution_report",
         "step5_pool_exports_status",
-        "legacy_old_filter_exports_status",
     ):
         if payload.get(key):
             payload["artifacts"][key] = _artifact_status(root, payload.get(key))
@@ -579,13 +550,11 @@ def build_stage_status(
         "rating_source_ok",
         "paper_comparable_single_run",
         "paper_comparable_mean_std",
-        "rerank_touched",
         "generation_touched",
         "eval_handoff_status",
         "downstream_ready_for_merge",
         "merge_gate",
         "selected_tuning_candidate",
-        "fallback_tuning_candidate",
         "step5_effective_samples",
         "step5_optimizer_steps",
     ):

@@ -22,11 +22,10 @@ class TestTrainingEffectivenessGatePlateau(unittest.TestCase):
             lr_effective=2.6e-7,
             base_min_lr=5e-7,
             effective_min_lr=2.5e-7,
-            damping_event={},
             checkpoint_improved=False,
         )
         self.assertIn(row["effective_improvement_status"], {"low_lr_no_progress", "marginal_improvement"})
-        self.assertIn("need_protocol_eval", row["reasons"])
+        self.assertIn(row["recommended_action"], {"review_checkpoint_readiness", "continue_monitoring"})
 
 
 if __name__ == "__main__":

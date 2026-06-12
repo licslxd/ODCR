@@ -133,7 +133,7 @@ class Step5CacheManifestTest(unittest.TestCase):
             self.assertTrue(ok, reason)
             self.assertEqual(reason, "hit")
 
-    def test_eval_only_fingerprint_labels_factual_default_controls(self) -> None:
+    def test_eval_only_fingerprint_labels_clean_memory_controls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             train = repo / "step4_export" / "train.csv"
@@ -160,7 +160,8 @@ class Step5CacheManifestTest(unittest.TestCase):
                     step4_export_lineage={"lineage_hash": "abc"},
                 )
             contract = fp["eval_control_contract"]
-            self.assertEqual(contract["mode"], "factual_eval_default")
+            self.assertEqual(contract["mode"], "train_memory_eval_controls")
+            self.assertEqual(contract["control_source"], "train_only_memory_controls")
             self.assertFalse(contract["is_rcr_posterior"])
             self.assertFalse(contract["is_step4_export_posterior"])
             self.assertTrue(fp["eval_control_contract_hash"])

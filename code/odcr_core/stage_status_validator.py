@@ -160,7 +160,6 @@ def _canonical_stage(stage: str) -> str:
         "train_step3": "step3",
         "train_step4": "step4",
         "train_step5": "step5",
-        "eval-rerank": "rerank",
     }.get(raw, raw)
 
 

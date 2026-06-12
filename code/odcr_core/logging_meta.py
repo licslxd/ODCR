@@ -145,7 +145,7 @@ def _run_id(cfg: ResolvedConfig) -> str:
         return str(cfg.run_name)
     if cfg.command == "step4" and cfg.step4_run:
         return str(cfg.step4_run)
-    if cfg.command in ("eval", "eval-rerank") and cfg.eval_run_dir:
+    if cfg.command == "eval" and cfg.eval_run_dir:
         return Path(cfg.eval_run_dir).name
     if cfg.command == "step5" and cfg.step5_run:
         return str(cfg.step5_run)
@@ -312,9 +312,6 @@ def _stage_label(command: str) -> str:
         "step4": "step4（反事实推理，eval 语义 / eval_profile）",
         "step5": "step5（主模型训练）",
         "eval": "eval（Step5 评测）",
-        "eval-rerank": "eval-rerank（Step5 多候选 rerank 评测）",
-        "eval-rerank-matrix": "eval-rerank-matrix（多 decode preset × rerank）",
-        "rerank-summary": "rerank-summary（Phase2 汇总表）",
         "pipeline": "pipeline（step3→step4→step5）",
     }.get(command, command)
 
@@ -352,11 +349,10 @@ def print_pre_run_banner(
         f"decode_preset={cfg.decode_preset_id!r}",
         flush=True,
     )
-    if getattr(cfg, "eval_profile_id", "") and cfg.command in ("eval", "eval-rerank", "step4"):
-        _rp = cfg.rerank_preset_id if cfg.command == "eval-rerank" else ""
+    if getattr(cfg, "eval_profile_id", "") and cfg.command in ("eval", "step4"):
         print(
             f"[Eval profile orchestrator] name={cfg.eval_profile_id!r} hardware={cfg.hardware_preset_id!r} "
-            f"decode_preset={cfg.decode_preset_id!r} rerank_preset={_rp!r} "
+            f"decode_preset={cfg.decode_preset_id!r} "
             f"global_eval_batch_size={cfg.global_eval_batch_size} eval_per_gpu_batch_size={cfg.eval_per_gpu_batch_size} "
             f"ddp_world_size={cfg.ddp_world_size}",
             flush=True,
@@ -392,10 +388,8 @@ def print_pre_run_banner(
     if cfg.eval_run_dir:
         _er = Path(cfg.eval_run_dir)
         print(f"  eval_run_dir={cfg.eval_run_dir}", flush=True)
-        if cfg.command == "eval-rerank":
-            print(f"  rerank_run_dir={cfg.eval_run_dir}", flush=True)
         print(
-            f"  metrics_path={path_layout.eval_metrics_path(_er, rerank=(cfg.command == 'eval-rerank'))}",
+            f"  metrics_path={path_layout.eval_metrics_path(_er)}",
             flush=True,
         )
     if command == "step3":
@@ -426,7 +420,7 @@ def print_pre_run_banner(
             f"ddp_world_size={cfg.ddp_world_size} seed={cfg.seed}",
             flush=True,
         )
-    elif cfg.global_eval_batch_size is not None and cfg.command in ("eval", "eval-rerank", "step5"):
+    elif cfg.global_eval_batch_size is not None and cfg.command in ("eval", "step5"):
         _epg = cfg.eval_per_gpu_batch_size
         print(
             f"  eval_parallelism: global_eval_batch_size={cfg.global_eval_batch_size} "

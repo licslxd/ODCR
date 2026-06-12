@@ -193,22 +193,18 @@ def assemble_step4_training_table(
 
     combined = pd.concat([target_gold, aux_gold, aux_cf], ignore_index=True)
 
-    # 第一轮：清洗，准备模板统计
-    cleans: List[str] = []
-    clean_results = []
-    raws: List[str] = []
-    for _, row in combined.iterrows():
-        raw = row.get("explanation", "")
-        raws.append(str(raw) if raw is not None else "")
-        cr = clean_explanation_text(raw)
-        clean_results.append(cr)
-        cleans.append(cr.clean_text)
+    # 第一轮：清洗，准备模板统计。避免 iterrows 在百万级导出尾段上制造不必要的 Python 开销。
+    raw_values = combined["explanation"].tolist() if "explanation" in combined.columns else [""] * len(combined)
+    raws: List[str] = [str(raw) if raw is not None else "" for raw in raw_values]
+    clean_results = [clean_explanation_text(raw) for raw in raw_values]
+    cleans: List[str] = [cr.clean_text for cr in clean_results]
 
     tmpl_stats = build_template_stats(cleans)
 
     rows_out: List[Dict[str, Any]] = []
-    for i, (_, row) in enumerate(combined.iterrows()):
-        d = _preserve_preprocess_route_priors(row.to_dict())
+    combined_columns = list(combined.columns)
+    for i, row_values in enumerate(combined.itertuples(index=False, name=None)):
+        d = _preserve_preprocess_route_priors(dict(zip(combined_columns, row_values)))
         d = _fill_odcr_export_defaults(d)
         d["template_hard_drop_min_count"] = int(template_hard_drop_min_count)
         role = str(d.pop("_export_role", ""))

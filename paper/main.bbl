@@ -1,0 +1,57 @@
+\begin{thebibliography}{1}
+
+\bibitem{erra}
+Hao Cheng, Shuo Wang, Wensheng Lu, Wei Zhang, Mingyang Zhou, Kezhong Lu, and
+  Hao Liao.
+\newblock Explainable recommendation with personalized review retrieval and
+  aspect learning.
+\newblock In {\em Proceedings of the 61st Annual Meeting of the Association for
+  Computational Linguistics}, pages 51--64. Association for Computational
+  Linguistics, 2023.
+
+\bibitem{rexplug}
+Deepesh~V. Hada, Vijaikumar M, and Shirish~K. Shevade.
+\newblock {ReXPlug}: Explainable recommendation using plug-and-play language
+  model.
+\newblock In {\em Proceedings of the 44th International ACM SIGIR Conference on
+  Research and Development in Information Retrieval}, pages 81--91. ACM, 2021.
+
+\bibitem{peter}
+Lei Li, Yongfeng Zhang, and Li~Chen.
+\newblock Personalized transformer for explainable recommendation.
+\newblock In {\em Proceedings of the 59th Annual Meeting of the Association for
+  Computational Linguistics and the 11th International Joint Conference on
+  Natural Language Processing}, pages 4947--4957. Association for Computational
+  Linguistics, 2021.
+
+\bibitem{pepler}
+Lei Li, Yongfeng Zhang, and Li~Chen.
+\newblock Personalized prompt learning for explainable recommendation.
+\newblock {\em ACM Transactions on Information Systems}, 41(4), 2023.
+
+\bibitem{adarex}
+Yi~Yu, Kazunari Sugiyama, and Adam Jatowt.
+\newblock {AdaReX}: Cross-domain, adaptive, and explainable recommender system.
+\newblock In {\em Proceedings of the 2023 International ACM SIGIR Conference on
+  Information Retrieval in the Asia Pacific}, pages 272--281, 2023.
+
+\bibitem{d4c}
+Yi~Yu, Kazunari Sugiyama, and Adam Jatowt.
+\newblock Domain counterfactual data augmentation for explainable
+  recommendation.
+\newblock {\em ACM Transactions on Information Systems}, 43(3):58:1--58:30,
+  2025.
+
+\bibitem{explainable_rec_survey}
+Yongfeng Zhang and Xu~Chen.
+\newblock Explainable recommendation: A survey and new perspectives.
+\newblock {\em Foundations and Trends in Information Retrieval}, 14(1):1--101,
+  2020.
+
+\bibitem{crossdomain_survey}
+Feng Zhu, Yan Wang, Chaochao Chen, Jun Zhou, Longfei Li, and Guanfeng Liu.
+\newblock Cross-domain recommendation: Challenges, progress, and prospects.
+\newblock In {\em Proceedings of the Thirtieth International Joint Conference
+  on Artificial Intelligence}, pages 4721--4728, 2021.
+
+\end{thebibliography}

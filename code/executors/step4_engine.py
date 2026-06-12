@@ -697,7 +697,7 @@ def _decode_pred_token_rows(token_rows, chunk_size: int = 4096, progress_plog: S
         )
 
     num_chunks = (n + cs - 1) // cs if n else 0
-    log_every = 0
+    log_every = max(1, num_chunks // 20) if num_chunks > 1 else 1
     out = [""] * n
     t_prog0 = time.perf_counter()
     for chunk_i, s in enumerate(range(0, n, cs)):
@@ -1362,6 +1362,9 @@ def _run_one_task(
     rank0_read_partials_wall_s = 0.0
     rank0_sort_validate_wall_s = 0.0
     rank0_filter_wall_s = 0.0
+    table_assemble_wall_s = 0.0
+    manifest_build_wall_s = 0.0
+    artifact_write_wall_s = 0.0
     csv_write_wall_s = 0.0
 
     if rank == 0:
@@ -1416,7 +1419,16 @@ def _run_one_task(
         plog.line(f"rank0_filter_wall_s={rank0_filter_wall_s:.4f} (odcr reliability routing)")
 
         t_csv0 = time.perf_counter()
+        t_assemble0 = time.perf_counter()
+        plog.line(
+            f"step4_train_table_assemble_start train_rows={len(train_df)} cf_rows={len(routed_cf_df)}"
+        )
         final_df = assemble_step4_training_table(train_df, routed_cf_df, rcr_config=rcr_config)
+        table_assemble_wall_s = time.perf_counter() - t_assemble0
+        plog.line(f"step4_train_table_assemble_wall_s={table_assemble_wall_s:.4f} rows={len(final_df)}")
+
+        t_manifest0 = time.perf_counter()
+        plog.line("step4_manifest_build_start")
         os.makedirs(_task_ckpt_dir, exist_ok=True)
         _lineage = parse_training_run_lineage(_task_ckpt_dir)
         _tid = int(_lineage.get("task_id") or task_idx)
@@ -1479,9 +1491,16 @@ def _run_one_task(
             lineage=_step4_export_lineage,
         )
         manifest["partial_artifacts"] = partial_manifests
+        manifest_build_wall_s = time.perf_counter() - t_manifest0
+        plog.line(f"step4_manifest_build_wall_s={manifest_build_wall_s:.4f}")
+
+        t_write0 = time.perf_counter()
+        plog.line("step4_artifact_write_start")
         csv_out, man_out, ic_out = write_step4_training_artifacts(
             final_df, manifest, _task_ckpt_dir, index_contract=_ic
         )
+        artifact_write_wall_s = time.perf_counter() - t_write0
+        plog.line(f"step4_artifact_write_wall_s={artifact_write_wall_s:.4f}")
         csv_write_wall_s = time.perf_counter() - t_csv0
         print(f"Task {task_idx}: 已写入 {csv_out}", flush=True)
         print(f"Task {task_idx}: manifest {man_out}", flush=True)
@@ -1523,6 +1542,9 @@ def _run_one_task(
         f"step4_perf_summary "
         f"inference_loop_wall_s={inference_loop_wall_s:.4f} "
         f"decode_tail_wall_s={decode_tail_wall_s:.4f} "
+        f"step4_train_table_assemble_wall_s={table_assemble_wall_s:.4f} "
+        f"step4_manifest_build_wall_s={manifest_build_wall_s:.4f} "
+        f"step4_artifact_write_wall_s={artifact_write_wall_s:.4f} "
         f"csv_write_wall_s={csv_write_wall_s:.4f} "
         f"step4_end_to_end_wall_s={step4_end_to_end_wall_s:.4f} "
         f"total_wall_s__alias_of_step4_e2e={step4_end_to_end_wall_s:.4f} "

@@ -22,11 +22,6 @@ from odcr_core.step5_grad_contract import (
 
 HEAD_AWARE_LORA_TARGET_SENTINEL = "__HEAD_AWARE_STEP5_DEFAULT__"
 
-_RETIRED_SCORER_PREFIXES: tuple[str, ...] = (
-    "domain_gate",
-    "transformer_encoder",
-)
-
 _EXPLANATION_PREFIXES: tuple[str, ...] = (
     "domain_gate",
     "transformer_encoder",
@@ -36,8 +31,6 @@ _EXPLANATION_PREFIXES: tuple[str, ...] = (
     "fca_explain_align",
     "flan_explainer",
 )
-
-_EXPLANATION_PREFIXES: tuple[str, ...] = tuple(dict.fromkeys(_RETIRED_SCORER_PREFIXES + _EXPLANATION_PREFIXES))
 
 
 class LoRALinear(nn.Module):

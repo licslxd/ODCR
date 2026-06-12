@@ -161,13 +161,13 @@ DIAGNOSTIC_PROTOCOLS: dict[str, dict[str, Any]] = {
         "evaluator_protocol": "code1_target_only_comparable",
         "diagnostic_only": True,
         "not_final_paper_metric": True,
-        "split_policy": "target-only valid/test inside Step3; no Step4/5/eval/rerank",
+        "split_policy": "target-only valid/test inside Step3; no Step4/5/eval",
     },
     "full_pipeline_final": {
         "evaluator_protocol": "full_pipeline_final",
         "diagnostic_only": False,
         "not_final_paper_metric": False,
-        "split_policy": "available only after Step4/Step5/eval/rerank",
+        "split_policy": "available only after Step4/Step5/eval",
     },
 }
 

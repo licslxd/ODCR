@@ -243,6 +243,13 @@ def build_split_metrics_only(split_dir: str | Path) -> dict[str, Any]:
     return {
         "split": split,
         "status": run_summary.get("status"),
+        "model_name": eval_metrics.get("model_name"),
+        "clean_protocol": eval_metrics.get("clean_protocol"),
+        "control_source": eval_metrics.get("control_source"),
+        "evidence_source": eval_metrics.get("evidence_source"),
+        "step3_source": eval_metrics.get("step3_source"),
+        "step4_source": eval_metrics.get("step4_source"),
+        "leakage_audit_status": eval_metrics.get("leakage_audit_status"),
         "started_at": run_summary.get("started_at"),
         "finished_at": run_summary.get("finished_at"),
         "duration_sec": run_summary.get("duration_sec"),
@@ -283,6 +290,10 @@ def build_post_train_eval_metrics_only(path: str | Path) -> dict[str, Any]:
     rating_source_metrics: dict[str, Any] = {}
     step5_run_id = ""
     checkpoint = ""
+    model_name = ""
+    clean_protocol = ""
+    control_source = ""
+    leakage_audit_status = ""
     for split in SPLITS:
         split_dir = root / split
         if not split_dir.is_dir():
@@ -293,10 +304,19 @@ def build_post_train_eval_metrics_only(path: str | Path) -> dict[str, Any]:
         if not rating_source_metrics and isinstance(report.get("rating_metrics"), Mapping):
             rating_source_metrics = dict(report.get("rating_metrics") or {})
         handoff = _load_split_json(split_dir, "eval_handoff.json")
+        eval_metrics = _load_split_json(split_dir, "eval_metrics.json")
         if not step5_run_id:
             step5_run_id = str(handoff.get("run_id") or "")
         if not checkpoint:
             checkpoint = str(handoff.get("checkpoint") or "")
+        if not model_name:
+            model_name = str(eval_metrics.get("model_name") or "")
+        if not clean_protocol:
+            clean_protocol = str(eval_metrics.get("clean_protocol") or "")
+        if not control_source:
+            control_source = str(eval_metrics.get("control_source") or "")
+        if not leakage_audit_status:
+            leakage_audit_status = str(eval_metrics.get("leakage_audit_status") or "")
         paper = payload["explanation_paper_metrics"]
         collapse = payload["collapse"]
         rating = payload["rating_source_metrics"]
@@ -323,6 +343,10 @@ def build_post_train_eval_metrics_only(path: str | Path) -> dict[str, Any]:
         "post_train_eval_dir": str(root),
         "stage": "step5",
         "mode": "explanation_only",
+        "model_name": model_name,
+        "clean_protocol": clean_protocol,
+        "control_source": control_source,
+        "leakage_audit_status": leakage_audit_status,
         "step5_run_id": step5_run_id,
         "checkpoint": checkpoint,
         "rating_metrics_source": "step3_eval_handoff",
@@ -353,6 +377,10 @@ def render_post_train_eval_metrics_log(payload: Mapping[str, Any]) -> str:
             [
                 f"[{split}]",
                 f"  samples = {_fmt_int(detail.get('sample_count'))} | status = {_fmt(detail.get('status'))}",
+                (
+                    f"  model = {_fmt(detail.get('model_name'))} | clean_protocol = {_fmt(detail.get('clean_protocol'))} | "
+                    f"control_source = {_fmt(detail.get('control_source'))} | leakage_audit = {_fmt(detail.get('leakage_audit_status'))}"
+                ),
                 "[Recommendation]",
                 f"\tMAE = {_fmt(rating.get('mae'))} | RMSE = {_fmt(rating.get('rmse'))} ",
                 "[Explanation]",
@@ -375,6 +403,10 @@ def render_split_metrics_log(payload: Mapping[str, Any]) -> str:
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         f"[{split}]",
         f"\tsamples = {_fmt_int(payload.get('sample_count'))} | status = {_fmt(payload.get('status'))}",
+        (
+            f"\tmodel = {_fmt(payload.get('model_name'))} | clean_protocol = {_fmt(payload.get('clean_protocol'))} | "
+            f"control_source = {_fmt(payload.get('control_source'))} | leakage_audit = {_fmt(payload.get('leakage_audit_status'))}"
+        ),
         "[Recommendation]",
         f"\tMAE = {_fmt(rating.get('mae'))} | RMSE = {_fmt(rating.get('rmse'))} ",
         "[Explanation]",

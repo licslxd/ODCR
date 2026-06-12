@@ -341,29 +341,17 @@ def _flatten_numbers(obj: Mapping[str, Any], prefix: str = "") -> dict[str, floa
 def scheduler_semantics(
     *,
     scheduler_type: str,
-    damping_enabled: bool,
     base_min_lr: float,
-    damping_factor_cumulative: float = 1.0,
     effective_min_lr_policy: str = "base_floor",
 ) -> dict[str, Any]:
     stype = str(scheduler_type or "").strip().lower()
-    if stype == "warmup_cosine" and damping_enabled:
-        raise ValueError("hidden damping is forbidden: warmup_cosine requires damping_enabled=false")
-    if stype == "safe_damping_v2" and not damping_enabled:
-        raise ValueError("safe_damping_v2 requires damping_enabled=true")
-    if stype == "warmup_cosine_with_damping":
-        raise ValueError("warmup_cosine_with_damping is retired from formal Step3; use safe_damping_v2 probe-only.")
-    if stype not in {"warmup_cosine", "safe_damping_v2"}:
+    if stype != "warmup_cosine":
         raise ValueError(f"unsupported Step3 scheduler_type: {scheduler_type!r}")
-    factor = max(0.0, float(damping_factor_cumulative))
-    effective_min = float(base_min_lr) if not damping_enabled else float(base_min_lr) * factor
     return {
         "scheduler_type": stype,
         "base_scheduler": "warmup_cosine",
-        "damping_enabled": bool(damping_enabled),
         "base_min_lr": float(base_min_lr),
-        "damping_factor_cumulative": factor,
-        "effective_min_lr": effective_min,
+        "effective_min_lr": float(base_min_lr),
         "effective_min_lr_policy": str(effective_min_lr_policy),
     }
 
@@ -373,16 +361,10 @@ def explain_lr_floor(
     current_lr: float,
     base_min_lr: float,
     scheduler_type: str,
-    damping_enabled: bool,
     effective_min_lr: float | None = None,
 ) -> dict[str, Any]:
     below = float(current_lr) < float(base_min_lr) - 1.0e-15
-    explained = (not below) or (
-        str(scheduler_type) in {"safe_damping_v2", "warmup_cosine_with_damping"}
-        and bool(damping_enabled)
-        and effective_min_lr is not None
-        and float(current_lr) >= float(effective_min_lr) - 1.0e-15
-    )
+    explained = not below
     return {
         "current_lr": float(current_lr),
         "base_min_lr": float(base_min_lr),
@@ -402,10 +384,8 @@ def build_training_effectiveness_record(
     lr_effective: float,
     base_min_lr: float,
     effective_min_lr: float,
-    damping_event: Mapping[str, Any] | None,
     checkpoint_improved: bool,
     grad_finite: bool = True,
-    paper_eval_proxy: float | None = None,
     explanation_proxy: float | None = None,
 ) -> dict[str, Any]:
     delta_from_best = float(valid_loss) - float(best_valid_loss)
@@ -417,10 +397,10 @@ def build_training_effectiveness_record(
         action = "continue"
     elif low_lr and delta_recent >= -1.0e-3:
         status = "low_lr_no_progress"
-        action = "stop_and_select_candidate"
+        action = "review_checkpoint_readiness"
     elif rel_gap <= 0.005 or abs(delta_recent) <= 1.0e-3:
         status = "marginal_improvement"
-        action = "run_paper_target_only_eval"
+        action = "continue_monitoring"
     else:
         status = "no_meaningful_improvement"
         action = "review_loss_rebalance"
@@ -429,8 +409,6 @@ def build_training_effectiveness_record(
         reasons.append("lr_too_low")
     if delta_recent >= -1.0e-3:
         reasons.append("validation_plateau")
-    if paper_eval_proxy is None:
-        reasons.append("need_protocol_eval")
     if not grad_finite:
         reasons.append("grad_optimization_abnormal")
     return {
@@ -444,9 +422,7 @@ def build_training_effectiveness_record(
         "lr_effective": float(lr_effective),
         "base_min_lr": float(base_min_lr),
         "effective_min_lr": float(effective_min_lr),
-        "damping_event": dict(damping_event or {}),
         "checkpoint_improved": bool(checkpoint_improved),
-        "paper_eval_proxy": paper_eval_proxy,
         "explanation_proxy": explanation_proxy,
         "grad_finite": bool(grad_finite),
         "effective_improvement_status": status,

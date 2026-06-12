@@ -257,9 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _STEP5_REPLAY_EXACT_KEYS = {
     "step5.tuning.selected_tuning_candidate",
-    "step5.tuning.fallback_tuning_candidate",
     "step5.tuning.batch_candidate",
-    "step5.tuning.fallback_batch_candidate",
     "step5.train.batch_size",
     "step5.train.per_gpu_batch_size",
     "step5.train.epochs",
@@ -352,7 +350,6 @@ def _step5_run_summary_replay_sets(args: argparse.Namespace) -> tuple[list[str],
         seen_keys.add(key)
 
     add_if_missing("step5.tuning.selected_tuning_candidate", summary.get("selected_tuning_candidate"))
-    add_if_missing("step5.tuning.fallback_tuning_candidate", summary.get("fallback_tuning_candidate"))
     effective = summary.get("step5_effective_samples") if isinstance(summary.get("step5_effective_samples"), dict) else {}
     optimizer = summary.get("step5_optimizer_steps") if isinstance(summary.get("step5_optimizer_steps"), dict) else {}
     for name, value in effective.items():
@@ -571,7 +568,7 @@ def _run_resolved(cfg, snapshot: dict[str, Any], *, dry_run: bool, console_level
         console_summary_lines,
     )
     from odcr_core.manifests import write_run_summary_for_config
-    from odcr_core.runners import run_eval, run_eval_rerank, run_step3, run_step4, run_step5
+    from odcr_core.runners import run_eval, run_step3, run_step4, run_step5
     from odcr_core.validation import validate_resolved_config
 
     started_at = _utc_now()
@@ -600,8 +597,6 @@ def _run_resolved(cfg, snapshot: dict[str, Any], *, dry_run: bool, console_level
             run_step4(cfg, console_level=console_level)
         elif cfg.command == "step5":
             run_step5(cfg, console_level=console_level)
-        elif cfg.command == "eval-rerank":
-            run_eval_rerank(cfg, console_level=console_level)
         elif cfg.command == "eval":
             run_eval(cfg, console_level=console_level)
         else:
@@ -994,39 +989,16 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         )
         checks.append("step3 max_parallel_cpu, train_precision, and ddp policy resolve from configs/odcr.yaml")
     if step4_doctor_snapshot:
-        sources = step4_doctor_snapshot.get("field_sources") or {}
-        dedicated = step4_doctor_snapshot.get("step4_step5_dedicated_exports") or {}
         pools = step4_doctor_snapshot.get("step4_step5_pool_exports") or {}
         gold_quality = step4_doctor_snapshot.get("step4_gold_quality") or {}
         cf_tiers = step4_doctor_snapshot.get("step4_cf_tiers") or {}
-        print("Step4 legacy dedicated Step5 export controls (disabled; audit-only):")
-        print(
-            "  enabled=%s output_dir_name=%s full_audit_role=%s write_gold_cf_subsplits=%s chunk_rows=%s"
-            % (
-                dedicated.get("enabled"),
-                dedicated.get("output_dir_name"),
-                dedicated.get("full_audit_role"),
-                dedicated.get("write_gold_cf_subsplits"),
-                dedicated.get("chunk_rows"),
-            )
-        )
-        print(
-            "  filters: scorer=%s explainer=%s (source: %s)"
-            % (
-                dedicated.get("scorer_filter"),
-                dedicated.get("explainer_filter"),
-                sources.get("step4_step5_dedicated_exports"),
-            )
-        )
-        checks.append("step4 legacy dedicated export controls resolve disabled/audit-only from configs/odcr.yaml")
         print("Step4 Step5 pool export controls:")
         print(
-            "  enabled=%s output_dir_name=%s full_audit_role=%s legacy_role=%s chunk_rows=%s"
+            "  enabled=%s output_dir_name=%s full_audit_role=%s chunk_rows=%s"
             % (
                 pools.get("enabled"),
                 pools.get("output_dir_name"),
                 pools.get("full_audit_role"),
-                pools.get("legacy_dedicated_exports_role"),
                 pools.get("chunk_rows"),
             )
         )
@@ -1185,15 +1157,14 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         print("Step5 sampler controls:")
         print(
             "  enabled=%s contract_source=%s effective_epoch=%s rotate=%s seed=%s "
-            "full_audit_default_allowed=%s legacy_gold_heavy_exports_allowed=%s"
+            "full_audit_default_train_forbidden=%s"
             % (
                 step5_sampler.get("enabled"),
                 step5_sampler.get("contract_source"),
                 step5_sampler.get("effective_epoch_enabled"),
                 step5_sampler.get("rotate_across_epochs"),
                 step5_sampler.get("seed"),
-                step5_sampler.get("full_audit_default_allowed"),
-                step5_sampler.get("legacy_gold_heavy_exports_allowed"),
+                True,
             )
         )
         print(
@@ -1209,18 +1180,21 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             )
         )
         print(
-            "  formal_candidate: explanation_cf=%s %s source=%s"
+            "  formal_candidate: ratios=%s explanation_cf=%s %s intent_hash=%s source=%s"
             % (
+                step5_formal_active_candidate.get("component_ratios"),
                 step5_formal_active_candidate.get("explanation_cf_mix_id"),
                 step5_formal_active_candidate.get("explanation_cf_mix"),
+                step5_formal_active_candidate.get("sample_plan_intent_hash"),
                 step5_formal_active_candidate.get("active_sampler_source"),
             )
         )
         print(
-            "  sample_plan_preflight: status=%s task_head=%s step4_contract_role=%s"
+            "  sample_plan_preflight: status=%s task_head=%s intent_hash=%s step4_contract_role=%s"
             % (
                 step5_sample_plan_preflight.get("status"),
                 step5_sample_plan_preflight.get("task_head"),
+                step5_sample_plan_preflight.get("sample_plan_intent_hash"),
                 step5_sample_plan_preflight.get("step4_sampling_contract_role"),
             )
         )
@@ -1263,12 +1237,11 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             )
         )
         print(
-            "  effective_epoch: enabled=%s max=%s patience=%s retired_full_table_policy=%s"
+            "  effective_epoch: enabled=%s max=%s patience=%s"
             % (
                 step5_effective_epoch.get("enabled"),
                 step5_effective_epoch.get("max_effective_epochs"),
                 step5_effective_epoch.get("early_stopping_patience"),
-                step5_effective_epoch.get("retired_full_table_policy"),
             )
         )
         print(
@@ -1280,15 +1253,14 @@ def cmd_doctor(args: argparse.Namespace) -> None:
             )
         )
         print(
-            "  bounded_tuning: enabled=%s selected=%s fallback_candidate=%s batch=%s fallback=%s budget=%s lr=%s warmup=%s samples=%s steps=%s"
+            "  bounded_tuning: enabled=%s selected=%s batch=%s budget=%s lr=%s selected_warmup=%s warmup_candidates=%s samples=%s steps=%s"
             % (
                 step5_tuning.get("enabled"),
                 step5_tuning.get("selected_tuning_candidate"),
-                step5_tuning.get("fallback_tuning_candidate"),
                 step5_tuning.get("batch_candidate"),
-                step5_tuning.get("fallback_batch_candidate"),
                 step5_tuning.get("selected_budget_candidate"),
                 step5_tuning.get("lr_candidates"),
+                step5_tuning.get("selected_warmup_fraction"),
                 step5_tuning.get("warmup_fraction_candidates"),
                 step5_tuning.get("effective_samples"),
                 step5_tuning.get("optimizer_steps"),

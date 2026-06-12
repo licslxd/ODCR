@@ -41,7 +41,6 @@ def _canonical_stage(stage: str) -> str:
         "train_step3": "step3",
         "train_step4": "step4",
         "train_step5": "step5",
-        "eval-rerank": "rerank",
     }.get(raw, raw)
 
 
@@ -60,7 +59,6 @@ def _stage_label(stage: str) -> str:
         "step4": "Step4",
         "step5": "Step5",
         "eval": "Eval",
-        "rerank": "Rerank",
     }.get(_canonical_stage(stage), stage)
 
 

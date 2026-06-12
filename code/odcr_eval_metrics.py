@@ -386,7 +386,7 @@ def write_eval_digest_log(
     command: str,
     eval_timing_summary: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """写入当次 eval/rerank 产物目录下的 eval_digest.log；返回绝对路径。"""
+    """写入当次 eval 产物目录下的 eval_digest.log；返回绝对路径。"""
     sub = os.path.abspath(eval_subdir)
     os.makedirs(sub, exist_ok=True)
     out_path = os.path.join(sub, "eval_digest.log")

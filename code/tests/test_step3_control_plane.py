@@ -133,7 +133,6 @@ class TestStep3ControlPlane(unittest.TestCase):
         self.assertNotIn("step3_performance_ladder", snapshot)
         self.assertNotIn("step3_backup_profiles", snapshot)
         self.assertNotIn("step3_exploration_profiles", snapshot)
-        self.assertEqual(snapshot["step3_worker_profiles"]["W2"]["cpu_budget"], 12)
         self.assertTrue(snapshot["step3_prefetcher"]["enabled"])
         self.assertTrue(snapshot["step3_cross_rank_structured_gather"]["enabled"])
         self.assertEqual(snapshot["step3_cross_rank_structured_gather"]["mode"], "local_gradient_context")
@@ -219,6 +218,30 @@ class TestStep3ControlPlane(unittest.TestCase):
         self.assertEqual(snap5["train"]["batch_size"], 1536)
         self.assertEqual(snap5["step3_tokenizer"]["max_length"], 48)
         self.assertNotIn("task2_", snap5["train"]["step3_batch_candidate_role"])
+
+        legacy_profiles = (
+            (1, "AM_Electronics", "AM_CDs", "task1_legacy_isolated_init"),
+            (3, "AM_CDs", "AM_Electronics", "task3_legacy_isolated_init"),
+            (4, "AM_Movies", "AM_Electronics", "task4_legacy_isolated_init"),
+            (6, "AM_Electronics", "AM_Movies", "task6_legacy_isolated_init"),
+        )
+        for task_id, source, target, profile_id in legacy_profiles:
+            with self.subTest(task_id=task_id):
+                cfg, _, snap = _resolve_step3_task(task_id)
+                self.assertEqual(cfg.scenario, "legacy_scenario")
+                self.assertEqual(cfg.direction, "legacy")
+                self.assertEqual(snap["task"]["source"], source)
+                self.assertEqual(snap["task"]["target"], target)
+                self.assertEqual(cfg.task_profile_id, profile_id)
+                self.assertEqual(snap["step3_task_profile"]["profile_id"], profile_id)
+                self.assertEqual(snap["train"]["lr"], 5.0e-4)
+                self.assertEqual(snap["train"]["batch_size"], 1024)
+                self.assertEqual(snap["train"]["per_gpu_batch_size"], 512)
+                self.assertEqual(snap["step3_tokenizer"]["max_length"], 48)
+                self.assertEqual(snap["step3_evidence"]["max_evidence_length"], 48)
+                self.assertFalse(snap["step3_task_profile"]["formal_allowed"])
+                self.assertNotIn("task2_", snap["train"]["step3_batch_candidate_role"])
+                self.assertIn(profile_id, snap["train"]["step3_batch_candidate_role"])
 
         for task_id, direction, profile_id in ((8, "forward", "task8_weak_forward_init"), (7, "reverse", "task7_weak_reverse_init")):
             with self.subTest(task_id=task_id):
@@ -306,6 +329,35 @@ class TestStep3ControlPlane(unittest.TestCase):
         )
         self.assertFalse(snap["step3_cross_rank_structured_gather"]["enabled"])
         self.assertEqual(cfg.task_profile_id, "task2_strong_forward_g1s")
+
+    def test_step3_eval_only_explicit_run_id_binds_existing_run_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "configs"
+            config_dir.mkdir(parents=True)
+            cfg_path = config_dir / "odcr.yaml"
+            cfg_path.write_text((_REPO_ROOT / "configs" / "odcr.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+            run_root = root / "runs" / "step3" / "task1" / "4"
+            (run_root / "meta").mkdir(parents=True)
+            with patch("odcr_core.config_resolver._REPO_ROOT", root):
+                cfg, _sources, snapshot = resolve_config(
+                    config_path=cfg_path,
+                    command="step3",
+                    task_id=1,
+                    set_overrides=[
+                        "step3.eval.protocol=paper_target_only_eval",
+                        "step3.eval.split=valid",
+                        "step3.eval.derive_from_train=false",
+                        "step3.eval.valid_batch_size=6144",
+                        "step3.eval.valid_micro_batch_size=3072",
+                    ],
+                    dry_run=False,
+                    run_id="4",
+                    mode="eval_only",
+                )
+            self.assertEqual(Path(cfg.log_dir).resolve(), (run_root / "meta").resolve())
+            self.assertEqual(snapshot["run"]["stage_run_dir"], str(run_root.resolve()))
+            self.assertFalse((root / "runs" / "step3" / "task1" / "5").exists())
 
     def test_step3_hardware_profile_missing_max_parallel_cpu_fails_fast(self) -> None:
         raw = load_yaml_config(_REPO_ROOT / "configs" / "odcr.yaml")

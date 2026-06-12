@@ -117,6 +117,20 @@ lineage metadata mismatch：
 6. 运行 narrow post-edit validation。
 7. 说明哪些旧 cache 可继续复用，哪些必须重建。
 
+### 磁盘满 / partial cache 恢复顺序
+
+遇到 `[Errno 28] No space left on device` 时，先确认没有仍在运行的
+`torchrun` / `odcr.py pipeline` / stage worker，再按安全性从高到低清理：
+
+1. run-local 半写临时文件，例如 `runs/.../state/*.tmp`。
+2. 失败 cache 的 `.partial.<pid>.*` 目录和 `failed.marker` 对应目录。
+3. `/public/home/zhangliml/tmp/codex/tmp*` 下的 datasets/torch 临时拷贝目录。
+4. 失败 run 的重型 `model/`、`state/`，但尽量保留 `meta/` 作为诊断证据。
+
+不要把磁盘满当作 cache identity mismatch。完整且 manifest 合法的 tokenizer
+cache 可继续复用；只有半写 partial 或缺少 completed marker 的 cache 才删除重建。
+不要清理 `data/`、`merged/`、正式 completed cache 或已接受 handoff 的 run，除非用户明确授权。
+
 ## 8. 禁止事项
 
 - 不得把 broad resolved config hash 当作唯一 token cache key。

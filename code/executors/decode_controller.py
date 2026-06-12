@@ -27,7 +27,7 @@ _DIAG_DTYPE = torch.float32
 
 def decode_as_inference_enhancement(strategy: str) -> bool:
     """
-    Step5 ODCR 主线约束：decode/rerank 仅作为 inference enhancement，不参与 scorer 主训练图。
+    Step5 ODCR 主线约束：decode 仅作为 inference enhancement，不参与 scorer 主训练图。
     """
     return str(strategy or "").strip().lower() in {"greedy", "nucleus", "uncertainty_low_temp_top_k"}
 

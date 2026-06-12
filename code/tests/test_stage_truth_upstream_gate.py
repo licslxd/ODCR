@@ -127,7 +127,6 @@ def _write_step5_pool_fixture(repo: Path, run: Path, *, task: int, run_id: str) 
             "sampling_contract": (pool_dir / STEP5_SAMPLING_CONTRACT).relative_to(repo).as_posix(),
             "distribution_report": (pool_dir / STEP5_POOL_DISTRIBUTION_REPORT).relative_to(repo).as_posix(),
             "full_audit_default_train_forbidden": True,
-            "legacy_gold_heavy_exports_allowed_by_default": False,
         },
     )
     validation = validate_step4_pool_exports(run, repo_root=repo, raise_on_error=True)
@@ -327,22 +326,6 @@ class StageTruthUpstreamGateTest(unittest.TestCase):
             )
             self.assertIn("selected_export", latest["sha256s"])
             self.assertIn("stage_status", latest["sha256s"])
-
-    def test_step4_status_treats_dedicated_exports_as_legacy_only(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-            _write_step3_run(repo, task=2, run_id="2", active=True, eligible=True, quality_blocked=True)
-            run = _write_step4_run(repo, task=2, run_id="2_1", from_step3="2", active=False)
-            _write_json(
-                run / "meta" / "step5_dedicated_exports_status.json",
-                {"schema_version": "odcr_step4_step5_dedicated_exports_status/1", "ready": True},
-            )
-            status = build_and_write_stage_status(repo_root=repo, stage="step4", task=2, run_id="2_1")
-            self.assertEqual(status["step5_train_input_role"], "pool_manifest_sampling_contract")
-            self.assertTrue(status["step5_pool_exports_ready"])
-            self.assertNotIn("step5_dedicated_exports_ready", status)
-            self.assertNotIn("dedicated_export_readiness", status)
-            self.assertEqual(status["legacy_step5_dedicated_exports"]["role"], "audit_or_history_only")
 
     def test_step5_rejects_step4_run_summary_ok_when_stage_status_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -33,20 +33,14 @@ STAGE_DEFAULTS = {
     "step5": {
         "yaml": "step5.<new_key>",
         "producer": "code/executors/step5_engine.py or Step5 innovation helper",
-        "consumer": "Step5 checkpoint / eval / rerank consumer",
+        "consumer": "Step5 checkpoint / eval consumer",
         "dry_run": "./odcr step5 --task 4 --dry-run when allowed",
     },
     "eval": {
         "yaml": "eval.<new_key>",
-        "producer": "eval/rerank output writer",
+        "producer": "eval output writer",
         "consumer": "metrics/report consumer",
         "dry_run": "./odcr eval --task 4 --dry-run when allowed",
-    },
-    "rerank": {
-        "yaml": "eval.rerank.<new_key> or rerank owner path",
-        "producer": "rerank output writer",
-        "consumer": "rerank metrics/report consumer",
-        "dry_run": "./odcr eval --task 4 --mode rerank --dry-run when allowed",
     },
     "tooling": {
         "yaml": "N/A - tooling-only unless public config is added",
@@ -65,7 +59,7 @@ CHANGE_TYPES = (
     "new model/loss/router/verbalizer",
     "modify configuration control plane",
     "modify cache/checkpoint/export",
-    "modify eval/rerank",
+    "modify eval",
     "delete or migrate old logic",
 )
 
@@ -84,7 +78,7 @@ IMPACT_ROWS = (
     "fingerprint key",
     "mismatch policy",
     "DDP risk",
-    "eval/rerank risk",
+    "eval risk",
     "legacy cleanup",
     "guardrail rule",
     "unit test",

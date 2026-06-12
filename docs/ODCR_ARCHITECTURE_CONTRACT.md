@@ -158,13 +158,17 @@ controls are resolved from `step5.ccv` / `step5.ccv.native_lora`; retired
 `lambda_lci`, `lambda_fca`, prompt-concat controls, and backend LoRA keys must
 not form a parallel active path.
 
-Step5 eval/validation factual target rows may receive default control values
-only under the explicit eval contract
-`odcr_step5_factual_eval_control/1.0` with `mode=factual_eval_default`. Those
-values are not Step4 RCR posterior, not train routes, and not Step4 export
-posterior fields. Step5 train inputs that are expected to come from
-`odcr_routing_train.csv` must reject missing posterior route/control columns
-instead of substituting factual eval defaults.
+Step5 eval/validation factual target rows may receive controls only after the
+train-memory construction step under the explicit eval contract
+`odcr_step5_clean_memory_eval_control/1.0` with
+`mode=train_memory_controls`. These controls are not current-row review,
+current-row explanation, or gold-rating derived fields. Step5 train inputs that
+are expected to come from `odcr_routing_train.csv` must reject missing posterior
+route/control columns instead of substituting eval defaults.
+Task2 ODCR-CleanMemory uses the 250,000-sample effective epoch plan and
+target_gold/aux_gold/CF ratios 0.50/0.15/0.35; active warmup comes from
+`step5.tuning.selected_warmup_fraction` and Step5 training must reject
+all-warmup schedules and warmup ratios above 15%.
 
 ## Evolution Protocol
 

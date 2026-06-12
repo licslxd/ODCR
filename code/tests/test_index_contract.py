@@ -6,7 +6,6 @@ import os
 import sys
 import tempfile
 import unittest
-from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +31,7 @@ from odcr_core.index_contract import (  # noqa: E402
     write_index_contract,
 )
 from odcr_core.training_checkpoint import CheckpointLineageError  # noqa: E402
-from executors.step5_engine import _rerank_eval_cli_resolved, _step5_collate_dynamic  # noqa: E402
+from executors.step5_engine import _step5_collate_dynamic  # noqa: E402
 from functools import partial  # noqa: E402
 
 
@@ -167,36 +166,6 @@ class TestIndexContract(unittest.TestCase):
                 auxiliary_domain="AM_Movies",
                 target_domain="AM_Electronics",
             )
-
-    def test_rerank_cli_requires_resolver_transport(self) -> None:
-        args = SimpleNamespace(
-            num_return_sequences=4,
-            rerank_method="rule_v3",
-            rerank_top_k=1,
-            rerank_weight_logprob=0.45,
-            rerank_weight_length=0.12,
-            rerank_weight_repeat=0.18,
-            rerank_weight_dirty=0.25,
-            rerank_target_len_ratio=1.10,
-            export_examples_mode="head50",
-            rerank_malformed_tail_penalty=0.15,
-            rerank_malformed_token_penalty=0.18,
-        )
-        old = os.environ.get("ODCR_RERANK_PROFILE_JSON")
-        try:
-            os.environ.pop("ODCR_RERANK_PROFILE_JSON", None)
-            with self.assertRaises(RuntimeError):
-                _rerank_eval_cli_resolved(args)
-            os.environ["ODCR_RERANK_PROFILE_JSON"] = json.dumps({"method": "rule_v3"})
-            resolved = _rerank_eval_cli_resolved(args)
-            self.assertEqual(resolved["rerank_method"], "rule_v3")
-            self.assertIn("rerank_source_table", resolved)
-            self.assertIn("ODCR_RERANK_PROFILE_JSON", resolved["rerank_source_table"])
-        finally:
-            if old is None:
-                os.environ.pop("ODCR_RERANK_PROFILE_JSON", None)
-            else:
-                os.environ["ODCR_RERANK_PROFILE_JSON"] = old
 
     def test_remap_csv_columns(self) -> None:
         df = pd.DataFrame(

@@ -59,11 +59,10 @@ STEP5_TASK_EVAL_OVERRIDE_KEYS: tuple[str, ...] = (
 
 STEP5_TASK_TUNING_OVERRIDE_KEYS: tuple[str, ...] = (
     "selected_tuning_candidate",
-    "fallback_tuning_candidate",
     "effective_samples",
     "optimizer_steps",
     "batch_candidate",
-    "fallback_batch_candidate",
+    "selected_warmup_fraction",
 )
 """Task-local Step5 tuning overrides allowed under step5.tasks.<task>.tuning."""
 
@@ -180,7 +179,6 @@ class ResolvedConfig:
     validation_memory_policy: str
     step5_validation_mode: str
     formal_entry_E4_validation_required: bool
-    old_eval_batch_2048_retired: bool
     valid_loss_components_json: str
     valid_loss_label_max_length: int
     final_eval_prediction_max_length: int
@@ -217,22 +215,7 @@ class ResolvedConfig:
     hardware_preset_id: str
     decode_preset_id: str
 
-    num_return_sequences: int
-    rerank_method: str
-    rerank_top_k: int
-    rerank_weight_logprob: float
-    rerank_weight_length: float
-    rerank_weight_repeat: float
-    rerank_weight_dirty: float
-    rerank_target_len_ratio: float
-    export_examples_mode: str
-    export_full_rerank_examples: bool
-    rerank_malformed_tail_penalty: float
-    rerank_malformed_token_penalty: float
-
     decode_profile_json: str
-    rerank_profile_json: str
-    rerank_preset_id: str
 
     hardware_profile_json: str
     optimizer_config_json: str
@@ -245,7 +228,6 @@ class ResolvedConfig:
     task_profile_config_json: str
     backup_profiles_config_json: str
     exploration_profiles_config_json: str
-    worker_profiles_config_json: str
     prefetcher_config_json: str
     checkpoint_policy_config_json: str
     quality_gate_config_json: str
@@ -254,16 +236,10 @@ class ResolvedConfig:
     cross_rank_structured_gather_config_json: str
     memory_config_json: str
     timing_config_json: str
-    performance_candidates_config_json: str
     cache_policy_config_json: str
     objective_drift_config_json: str
     recovery_config_json: str
     phase_loss_schedule_config_json: str
-    conflict_aware_config_json: str
-    loss_gradient_conflict_probe_config_json: str
-    adapter_gating_config_json: str
-    paper_candidate_selection_config_json: str
-    checkpoint_averaging_config_json: str
     omp_num_threads: int
     mkl_num_threads: int
     tokenizers_parallelism: bool
@@ -294,7 +270,6 @@ class ResolvedConfig:
     upstream_resolution_json: str = ""
     step4_rcr_config_json: str = "{}"
     step4_runtime_config_json: str = "{}"
-    step4_step5_dedicated_exports_config_json: str = "{}"
     step4_step5_pool_exports_config_json: str = "{}"
     step4_gold_quality_config_json: str = "{}"
     step4_cf_tiers_config_json: str = "{}"
@@ -313,7 +288,6 @@ class ResolvedConfig:
     head_specific_trainable_policy: str = ""
     head_gated_loss_contract_json: str = "{}"
     step5_selected_tuning_candidate: str = ""
-    step5_fallback_tuning_candidate: str = ""
     step5_effective_samples_json: str = "{}"
     step5_optimizer_steps_json: str = "{}"
     step5_export_loader_config_json: str = "{}"

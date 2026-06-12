@@ -11,13 +11,12 @@ if str(CODE_DIR) not in sys.path:
 from odcr_core.step3_eval_protocol import scheduler_semantics  # noqa: E402
 
 
-class TestSchedulerPureWarmupCosineNoDamping(unittest.TestCase):
-    def test_pure_scheduler_rejects_hidden_damping(self) -> None:
-        state = scheduler_semantics(scheduler_type="warmup_cosine", damping_enabled=False, base_min_lr=1e-6)
-        self.assertFalse(state["damping_enabled"])
+class TestSchedulerPureWarmupCosine(unittest.TestCase):
+    def test_pure_scheduler_uses_base_floor(self) -> None:
+        state = scheduler_semantics(scheduler_type="warmup_cosine", base_min_lr=1e-6)
         self.assertEqual(state["effective_min_lr"], 1e-6)
         with self.assertRaises(ValueError):
-            scheduler_semantics(scheduler_type="warmup_cosine", damping_enabled=True, base_min_lr=1e-6)
+            scheduler_semantics(scheduler_type="unsupported", base_min_lr=1e-6)
 
 
 if __name__ == "__main__":

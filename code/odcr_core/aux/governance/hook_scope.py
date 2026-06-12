@@ -623,7 +623,7 @@ def _scope_for_path(rel_path: str) -> str | None:
         "step5_word_losses.py",
     } or _looks_like(rel, ("step5", "test_step5")):
         return "step5"
-    if _looks_like(rel, ("eval", "rerank", "bleu", "bert_score", "bertscore", "decode")):
+    if _looks_like(rel, ("eval", "bleu", "bert_score", "bertscore", "decode")):
         return "eval"
     return None
 

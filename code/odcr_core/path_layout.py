@@ -76,9 +76,9 @@ _ARTIFACT_ROLE_SPECS: dict[str, ArtifactRoleSpec] = {
     ),
     "metrics": ArtifactRoleSpec(
         role="metrics",
-        default_directory="runs/<stage>/<unit>/<run_id>/meta or eval/rerank run root",
-        filename_convention="metrics.jsonl, eval_metrics.json, rerank_summary.json, epoch_summary.csv, loss_breakdown.jsonl, timing_profile.jsonl, gpu_profile.jsonl, rcr_distribution.json",
-        producer="stage/eval/rerank metric writers",
+        default_directory="runs/<stage>/<unit>/<run_id>/meta or eval run root",
+        filename_convention="metrics.jsonl, eval_metrics.json, epoch_summary.csv, loss_breakdown.jsonl, timing_profile.jsonl, gpu_profile.jsonl, rcr_distribution.json",
+        producer="stage/eval metric writers",
         consumer="summaries, analysis packs, baselines, humans",
         retention_note="small structured metrics may be retained with the producing run",
         ai_analysis_may_copy=True,
@@ -146,7 +146,6 @@ _METRIC_FILENAMES: dict[str, str] = {
     "timing_profile": "timing_profile.jsonl",
     "gpu_profile": "gpu_profile.jsonl",
     "scheduler_events": "scheduler_events.jsonl",
-    "damping_events": "damping_events.jsonl",
     "objective_drift": "objective_drift.jsonl",
     "recovery_events": "recovery_events.jsonl",
     "training_effectiveness": "training_effectiveness.jsonl",
@@ -163,7 +162,6 @@ _METRIC_FILENAMES: dict[str, str] = {
     "quality_audit": "quality_audit.json",
     "rcr_distribution": "rcr_distribution.json",
     "eval_metrics": "eval_metrics.json",
-    "rerank_summary": "rerank_summary.json",
     "data_audit": "data_audit.json",
     "data_audit_summary": "data_audit_summary.csv",
 }
@@ -214,12 +212,12 @@ def metrics_filename(kind: str) -> str:
         raise KeyError(f"unknown metrics filename kind {kind!r}; register a role/filename before writing it") from exc
 
 
-def eval_metrics_filename(*, rerank: bool = False) -> str:
-    return metrics_filename("rerank_summary" if rerank else "eval_metrics")
+def eval_metrics_filename() -> str:
+    return metrics_filename("eval_metrics")
 
 
-def eval_metrics_path(run_dir: Path, *, rerank: bool = False) -> Path:
-    return Path(run_dir).expanduser().resolve() / eval_metrics_filename(rerank=rerank)
+def eval_metrics_path(run_dir: Path) -> Path:
+    return Path(run_dir).expanduser().resolve() / eval_metrics_filename()
 
 
 def runs_root(repo_root: Path) -> Path:
@@ -266,7 +264,6 @@ def get_stage_task_root(repo_root: Path, stage: str, task_id: int) -> Path:
         "train_step3": "step3",
         "train_step4": "step4",
         "train_step5": "step5",
-        "eval-rerank": "rerank",
     }.get(stage, stage)
     return runs_root(repo_root) / canonical / f"task{int(task_id)}"
 
@@ -313,10 +310,6 @@ def get_eval_run_root(repo_root: Path, task_id: int, iteration_id: str, run_id: 
     return get_stage_task_root(repo_root, "eval", task_id) / run_id
 
 
-def get_rerank_run_root(repo_root: Path, task_id: int, iteration_id: str, run_id: str) -> Path:
-    return get_stage_task_root(repo_root, "rerank", task_id) / run_id
-
-
 def get_matrix_run_root(repo_root: Path, task_id: int, iteration_id: str, run_id: str) -> Path:
     return get_stage_task_root(repo_root, "matrix", task_id) / run_id
 
@@ -324,16 +317,6 @@ def get_matrix_run_root(repo_root: Path, task_id: int, iteration_id: str, run_id
 def get_baselines_root(repo_root: Path, task_id: int, iteration_id: str) -> Path:
     """``runs/task{T}/vN/baselines/``：注册基线、默认基线索引与 metrics 快照（不修改原 eval 目录）。"""
     return get_iteration_root(repo_root, task_id, iteration_id) / "baselines"
-
-
-def get_analysis_root(repo_root: Path, task_id: int, iteration_id: str) -> Path:
-    return get_iteration_root(repo_root, task_id, iteration_id) / "analysis"
-
-
-def get_analysis_pack_root(
-    repo_root: Path, task_id: int, iteration_id: str, pack_id: str
-) -> Path:
-    return get_analysis_root(repo_root, task_id, iteration_id) / pack_id
 
 
 def get_stage_run_root(
@@ -344,7 +327,7 @@ def get_stage_run_root(
     run_id: str,
 ) -> Path:
     """
-    stage_name: step3 | step4 | step5 | train_step3 | train_step4 | train_step5 | eval | rerank | matrix
+    stage_name: step3 | step4 | step5 | train_step3 | train_step4 | train_step5 | eval | matrix
     """
     if stage_name in ("step3", "train_step3"):
         return get_train_step3_run_root(repo_root, task_id, iteration_id, run_id)
@@ -354,8 +337,6 @@ def get_stage_run_root(
         return get_train_step5_run_root(repo_root, task_id, iteration_id, run_id)
     if stage_name == "eval":
         return get_eval_run_root(repo_root, task_id, iteration_id, run_id)
-    if stage_name == "rerank":
-        return get_rerank_run_root(repo_root, task_id, iteration_id, run_id)
     if stage_name == "matrix":
         return get_matrix_run_root(repo_root, task_id, iteration_id, run_id)
     raise ValueError(f"未知 stage_name: {stage_name!r}")

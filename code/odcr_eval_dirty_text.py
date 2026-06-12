@@ -147,7 +147,7 @@ def compute_dirty_text_stats(
 
 
 def per_text_dirty_rule_hits(s: str, *, ref_mean_len_words: Optional[float] = None) -> Dict[str, bool]:
-    """与 compute_dirty_text_stats 规则一致的单条布尔命中（供 rerank / 诊断复用）。"""
+    """与 compute_dirty_text_stats 规则一致的单条布尔命中（供 eval 诊断复用）。"""
     t = str(s) if s is not None else ""
     return {
         "html_entity": bool(_HTML_ENTITY_RE.search(t)),

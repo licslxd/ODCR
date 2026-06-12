@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from odcr_core.aux.artifacts.path_policy import repo_relative_path
+from odcr_core.file_atomic import atomic_write_json
 from odcr_core.preprocess_metadata import (
     csv_header_metadata as _contract_csv_header_metadata,
     dataset_current_headers,
@@ -103,6 +106,228 @@ def _safe_run_git(repo_root: Path, *args: str) -> str | None:
 
 def _fingerprint_existing(path: Path, *, sample_only: bool = False) -> dict[str, Any]:
     return file_fingerprint(path, sample_only=sample_only)
+
+
+def _npy_verify_entry(
+    *,
+    path: str | Path,
+    dataset: str,
+    expected_rank: int,
+    expected_dtype: str,
+    expected_shape: list[int] | None,
+    expected_shape_label: str,
+    spec: str | None = None,
+    entity_kind: str | None = None,
+    domain: str | None = None,
+    domain_shape_contract_version: str | None = None,
+) -> dict[str, Any]:
+    artifact_path = Path(path).expanduser().resolve()
+    exists = artifact_path.is_file()
+    entry: dict[str, Any] = {
+        "path": str(artifact_path),
+        "exists": bool(exists),
+        "dataset": str(dataset),
+        "expected_dtype": expected_dtype,
+        "expected_shape": expected_shape,
+        "expected_shape_label": expected_shape_label,
+        "status": "fail",
+    }
+    if spec is not None:
+        entry["spec"] = spec
+    if entity_kind is not None:
+        entry["entity_kind"] = entity_kind
+    if domain is not None:
+        entry["domain"] = domain
+    if domain_shape_contract_version is not None:
+        entry["domain_shape_contract_version"] = domain_shape_contract_version
+    if not exists:
+        entry["error"] = "missing_artifact"
+        return entry
+
+    arr = np.load(artifact_path, mmap_mode="r", allow_pickle=False)
+    shape = [int(dim) for dim in arr.shape]
+    dtype = str(arr.dtype)
+    sample_count = min(int(arr.size), 4096)
+    sample = np.asarray(arr.reshape(-1)[:sample_count]) if sample_count > 0 else np.asarray([], dtype=arr.dtype)
+    finite_sample_count = int(np.isfinite(sample).sum()) if sample_count > 0 else 0
+    nonzero_sample_count = int(np.count_nonzero(sample)) if sample_count > 0 else 0
+    status = (
+        "pass"
+        if (
+            int(arr.ndim) == int(expected_rank)
+            and dtype == expected_dtype
+            and sample_count > 0
+            and finite_sample_count == sample_count
+            and nonzero_sample_count > 0
+            and (expected_shape is None or shape == [int(dim) for dim in expected_shape])
+        )
+        else "fail"
+    )
+    entry.update(
+        {
+            "shape": shape,
+            "rank": int(arr.ndim),
+            "dtype": dtype,
+            "finite_sample_count": finite_sample_count,
+            "nonzero_sample_count": nonzero_sample_count,
+            "verify_sample_count": sample_count,
+            "status": status,
+            "fingerprint": file_fingerprint(artifact_path, sample_only=True),
+        }
+    )
+    return entry
+
+
+def build_preprocess_gpu_metrics_verify_payloads(
+    *,
+    repo_root: str | Path,
+    meta_root: str | Path,
+    stage: str,
+    unit: str,
+    run_id: str,
+    stage_metadata: dict[str, Any],
+    dataset_statuses: dict[str, dict[str, Any]],
+    worker_results: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    status: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build B/C aggregate metrics and artifact verify reports from declared outputs."""
+
+    if stage not in {"preprocess_b", "preprocess_c"}:
+        raise ValueError(f"metrics/verify payloads are only defined for preprocess_b/c, got {stage!r}")
+    root = Path(repo_root).expanduser().resolve()
+    meta = Path(meta_root).expanduser().resolve()
+    stage_specific = stage_metadata.get("stage_specific")
+    if not isinstance(stage_specific, dict):
+        raise RuntimeError(f"{stage} stage_metadata.stage_specific must be an object.")
+    artifacts: list[dict[str, Any]] = []
+    embed_dim = int(stage_specific.get("embed_dim") or stage_metadata.get("resolved_payload", {}).get("embed_dim") or 0)
+    if embed_dim <= 0:
+        raise RuntimeError(f"{stage} embed_dim is required for artifact verification.")
+
+    if stage == "preprocess_b":
+        output_paths = stage_specific.get("profile_output_paths")
+        if not isinstance(output_paths, dict):
+            raise RuntimeError("preprocess_b stage_specific.profile_output_paths must be an object.")
+        for dataset, paths in sorted(output_paths.items()):
+            if not isinstance(paths, dict):
+                continue
+            for key, (spec, entity_kind) in (
+                ("item_content_profiles", ("item_content", "item")),
+                ("item_style_profiles", ("item_style", "item")),
+                ("user_content_profiles", ("user_content", "user")),
+                ("user_style_profiles", ("user_style", "user")),
+            ):
+                artifacts.append(
+                    _npy_verify_entry(
+                        path=paths.get(key, ""),
+                        dataset=str(dataset),
+                        expected_rank=2,
+                        expected_dtype="float32",
+                        expected_shape=None,
+                        expected_shape_label="[entity_count, env.embed_dim]",
+                        spec=spec,
+                        entity_kind=entity_kind,
+                    )
+                )
+    else:
+        output_paths = stage_specific.get("domain_output_paths")
+        if not isinstance(output_paths, dict):
+            raise RuntimeError("preprocess_c stage_specific.domain_output_paths must be an object.")
+        for dataset, paths in sorted(output_paths.items()):
+            if not isinstance(paths, dict):
+                continue
+            for key, domain in (("domain_content", "content"), ("domain_style", "style")):
+                artifacts.append(
+                    _npy_verify_entry(
+                        path=paths.get(key, ""),
+                        dataset=str(dataset),
+                        expected_rank=1,
+                        expected_dtype="float32",
+                        expected_shape=[embed_dim],
+                        expected_shape_label="[env.embed_dim]",
+                        domain=domain,
+                        domain_shape_contract_version=PREPROCESS_C_DOMAIN_CONTRACT_VERSION,
+                    )
+                )
+
+    failed = [item for item in artifacts if str(item.get("status", "")).lower() != "pass"]
+    if failed:
+        sample = [
+            {
+                "dataset": item.get("dataset"),
+                "path": item.get("path"),
+                "status": item.get("status"),
+                "shape": item.get("shape"),
+                "dtype": item.get("dtype"),
+                "error": item.get("error"),
+            }
+            for item in failed[:5]
+        ]
+        raise RuntimeError(f"{stage} artifact verification failed for {len(failed)} artifacts: {sample}")
+
+    status_counts: dict[str, int] = {}
+    for payload in dataset_statuses.values():
+        cur = str((payload or {}).get("status") or "unknown")
+        status_counts[cur] = status_counts.get(cur, 0) + 1
+    metrics = {
+        "schema_version": "odcr_preprocess_gpu_metrics/1",
+        "generated_at_utc": _utc_now(),
+        "stage": stage,
+        "unit": unit,
+        "run_id": str(run_id),
+        "run_meta_dir": str(meta),
+        "repo_root": str(root),
+        "status": status,
+        "dataset_count": len(dataset_statuses),
+        "dataset_status_counts": status_counts,
+        "artifact_count": len(artifacts),
+        "verified_artifact_count": len(artifacts),
+        "embed_dim": embed_dim,
+        "worker_results": list(worker_results),
+    }
+    verify = {
+        "schema_version": "odcr_preprocess_gpu_verify_report/1",
+        "generated_at_utc": metrics["generated_at_utc"],
+        "stage": stage,
+        "unit": unit,
+        "run_id": str(run_id),
+        "run_meta_dir": str(meta),
+        "repo_root": str(root),
+        "status": "pass",
+        "artifact_count": len(artifacts),
+        "artifacts": artifacts,
+    }
+    return metrics, verify
+
+
+def write_preprocess_gpu_metrics_verify_artifacts(
+    *,
+    repo_root: str | Path,
+    meta_root: str | Path,
+    stage: str,
+    unit: str,
+    run_id: str,
+    stage_metadata: dict[str, Any],
+    dataset_statuses: dict[str, dict[str, Any]],
+    worker_results: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    status: str,
+) -> tuple[Path, Path]:
+    metrics, verify = build_preprocess_gpu_metrics_verify_payloads(
+        repo_root=repo_root,
+        meta_root=meta_root,
+        stage=stage,
+        unit=unit,
+        run_id=run_id,
+        stage_metadata=stage_metadata,
+        dataset_statuses=dataset_statuses,
+        worker_results=worker_results,
+        status=status,
+    )
+    meta = Path(meta_root).expanduser().resolve()
+    return (
+        atomic_write_json(meta / "metrics.json", metrics),
+        atomic_write_json(meta / "verify_report.json", verify),
+    )
 
 
 def _csv_header_metadata(path: Path, *, contract_kind: str) -> dict[str, Any]:
@@ -253,6 +478,8 @@ class PreprocessRuntime:
                     started_at=self.started_at,
                     finished_at=finished_at,
                 )
+            if self.config.stage in {"preprocess_b", "preprocess_c"}:
+                self._write_gpu_metrics_verify(status="ok")
             self._write_stage_status(status="ok", finished_at=finished_at, error_message=None)
             self._write_run_summary(status="ok", finished_at=finished_at, error_message=None)
             self._log(f"Completed preprocess stage {self.config.stage}")
@@ -288,6 +515,19 @@ class PreprocessRuntime:
                 + "; ".join(issues)
             )
         self.stage_metadata = dict(refreshed["metadata"])
+
+    def _write_gpu_metrics_verify(self, *, status: str) -> None:
+        write_preprocess_gpu_metrics_verify_artifacts(
+            repo_root=self.repo_root,
+            meta_root=self.paths.meta_root,
+            stage=self.config.stage,
+            unit=self.config.stage[-1],
+            run_id=str(self.config.run_id),
+            stage_metadata=self.stage_metadata,
+            dataset_statuses=self._read_all_statuses("dataset"),
+            worker_results=tuple(item.to_dict() for item in self._worker_results),
+            status=status,
+        )
 
     def _log(self, message: str) -> None:
         with self._log_lock:

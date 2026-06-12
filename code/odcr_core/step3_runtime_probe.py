@@ -335,14 +335,12 @@ class Step3ValidationNamespaceGuard:
             "runs/step4/",
             "runs/step5/",
             "runs/eval/",
-            "runs/rerank/",
             "model/best.pth",
             "checkpoint_lineage.json",
             "./odcr step3",
             "./odcr step4",
             "./odcr step5",
             "./odcr eval",
-            "./odcr rerank",
         )
         bad = [token for token in formal_tokens if token and token in text]
         if bad:
@@ -1237,7 +1235,7 @@ def _resolve_validation_env(request: Step3ValidationWindowRequest, guard: Step3V
         "namespace": "validation",
         "formal_latest_updates_allowed": False,
         "formal_checkpoint_writes_allowed": False,
-        "step4_step5_eval_rerank_allowed": False,
+        "step4_step5_eval_allowed": False,
     }
     source_table = build_formal_source_table_snapshot(snapshot)
     source_table["validation"] = dict(formal["validation"])
@@ -1305,40 +1303,12 @@ def _apply_rank_skew(ddp_rows: list[dict[str, Any]], timing_rows: Sequence[Mappi
 def _stage2_candidate_set_overrides(config_path: Path, *, task_id: int, candidate_name: str | None) -> list[str]:
     if not candidate_name:
         return []
-    from odcr_core.config_resolver import load_yaml_config
-
-    cfg = load_yaml_config(config_path)
     raw_name = safe_component(str(candidate_name), label="candidate_name")
     if raw_name == "G1S":
         return []
-    profiles = ((cfg.get("step3") or {}).get("task_profiles") or {})
-    if not isinstance(profiles, Mapping):
-        raise Step3RuntimeProbeError("step3.task_profiles must be configured for candidate probes")
-    profile_key = ""
-    for key, value in profiles.items():
-        if isinstance(value, Mapping) and int(value.get("task_id") or -1) == int(task_id):
-            profile_key = str(key)
-            break
-    if not profile_key:
-        raise Step3RuntimeProbeError(f"no Step3 task profile found for task {task_id}")
-    ladder = (((cfg.get("step3") or {}).get("performance_candidates") or {}).get("batch_ladder") or {})
-    if not isinstance(ladder, Mapping) or raw_name not in ladder:
-        raise Step3RuntimeProbeError(f"unknown Stage2 candidate {raw_name!r}")
-    row = ladder[raw_name]
-    if not isinstance(row, Mapping):
-        raise Step3RuntimeProbeError(f"Stage2 candidate {raw_name!r} must be a mapping")
-    # Candidate probes are validation-only batch/micro/lr overrides.  They must
-    # not mutate the formal task2 candidate identity, which remains G1 by
-    # resolver contract.
-    overrides: list[str] = []
-    for source_key, dest_key in (
-        ("batch_size", "batch_size"),
-        ("micro_batch_size", "micro_batch_size"),
-        ("lr_candidate", "lr"),
-    ):
-        if source_key in row and row[source_key] is not None:
-            overrides.append(f"step3.task_profiles.{profile_key}.train.{dest_key}={row[source_key]}")
-    return overrides
+    raise Step3RuntimeProbeError(
+        f"Step3 clean runtime probe accepts only the configured profile; got candidate_name={raw_name!r}."
+    )
 
 
 def failure_report(
@@ -1513,7 +1483,7 @@ def run_step3_validation_window(
             "validation_run_root": str(guard.run_root),
             "formal_latest_updated": False,
             "formal_checkpoint_created": False,
-            "step4_step5_eval_rerank_started": False,
+            "step4_step5_eval_started": False,
         }
         paths = sink.write_outputs(report)
         report["paths"] = paths

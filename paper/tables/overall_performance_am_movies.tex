@@ -1,0 +1,34 @@
+\begin{table*}[t]
+\centering
+\caption{Overall Performance on the AM-Movies Dataset}
+\scriptsize
+\setlength{\tabcolsep}{2.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lrrrrrrrrrrr}
+\toprule
+Methods & ROUGE-1 & ROUGE-L & BLEU-1 & BLEU-2 & BLEU-3 & BLEU-4 & METEOR & DIST-1 & DIST-2 & RMSE & MAE \\
+\midrule
+\multicolumn{12}{l}{\textit{Single Domain}} \\
+DualPC & 11.83 & 9.10 & 9.21 & 3.04 & 1.23 & 0.63 & 7.94 & 0.03 & 0.06 & 1.0504 & 0.7567 \\
+PETER & 14.35 & 10.92 & 13.24 & 4.82 & 2.18 & 1.21 & 9.75 & 0.48 & 1.85 & 0.9959 & 0.7411 \\
+ReXPlug & 10.86 & 8.30 & 6.83 & 2.10 & 0.72 & 0.30 & 6.55 & 0.39 & 1.37 & 1.0236 & 0.7479 \\
+ERRA & 13.71 & 10.47 & 12.14 & 4.41 & 1.99 & 1.14 & 9.42 & 0.33 & 1.26 & 1.0025 & 0.7413 \\
+\midrule
+\multicolumn{12}{l}{\textit{Cross-Domain}} \\
+PEFT (C) & 13.79 & 9.93 & 12.24 & 4.72 & 1.90 & 1.05 & 9.56 & 0.57 & 2.23 & 0.9944 & 0.7339 \\
+PEFT (E) & 13.89 & 9.97 & 12.22 & 4.90 & 1.88 & 1.04 & 10.14 & 0.45 & 1.59 & 0.9921 & 0.7471 \\
+PEPLER (C) & 13.66 & 11.20 & 12.80 & 5.25 & 2.20 & 1.29 & 10.21 & 0.59 & 2.98 & \textbf{0.9919} & 0.7598 \\
+PEPLER (E) & 13.62 & 10.52 & 12.65 & 4.94 & 2.23 & 1.17 & 10.13 & 0.61 & 3.01 & 0.9920 & 0.7598 \\
+AdaReX (C) & 13.97 & 10.60 & 12.53 & 4.62 & 2.11 & 1.20 & 9.94 & 0.44 & 2.29 & 0.9987 & 0.7305 \\
+AdaReX (E) & 14.21 & 10.89 & 13.31 & 4.81 & 2.11 & 1.23 & 9.97 & 0.52 & 2.24 & 0.9988 & 0.7360 \\
+D4C (C) & 14.45 & 11.08 & 13.41 & 4.95 & 2.26 & 1.31 & 10.19 & 1.09 & 4.30 & 1.0045 & 0.7352 \\
+D4C (E) & 14.54 & 11.25 & 13.49 & 5.12 & 2.33 & 1.30 & 10.13 & 0.98 & 3.97 & 1.0071 & 0.7376 \\
+ReCEG (C) & 14.90 & 11.42 & 13.78 & 5.22 & 2.47 & \textbf{1.44} & \textbf{10.48} & \textbf{1.18} & \textbf{4.72} & 0.9960 & \textbf{0.7290} \\
+ReCEG (E) & \textbf{14.98} & \textbf{11.55} & \textbf{13.88} & \textbf{5.34} & \textbf{2.53} & 1.43 & 10.45 & 1.10 & 4.46 & 0.9980 & 0.7310 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{2pt}
+\parbox{\textwidth}{\scriptsize \textit{Note:} ``C'' and ``E'' refer to AM-CDs and AM-Electronics as the auxiliary domains, respectively. Bold values indicate the best performance.}
+\label{tab:overall_performance_am_movies}
+\end{table*}

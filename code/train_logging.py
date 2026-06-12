@@ -1021,19 +1021,8 @@ def append_step3_gpu_profile_jsonl(*, log_file: Optional[str], row: Dict[str, An
 
 
 def append_step3_scheduler_events_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
-    """Append Step3 validation-aware LR damping events to ``scheduler_events.jsonl``."""
+    """Append Step3 scheduler events to ``scheduler_events.jsonl``."""
     path = _run_meta_metric_path(log_file, "scheduler_events")
-    if not path:
-        return
-    try:
-        _append_jsonl(path, row)
-    except Exception:
-        pass
-
-
-def append_step3_damping_events_jsonl(*, log_file: Optional[str], row: Dict[str, Any]) -> None:
-    """Append explicit Step3 damping events to ``damping_events.jsonl``."""
-    path = _run_meta_metric_path(log_file, "damping_events")
     if not path:
         return
     try:
@@ -1129,7 +1118,6 @@ _STEP3_EPOCH_SUMMARY_FIELDS: Tuple[str, ...] = (
     "lr_effective",
     "base_min_lr",
     "effective_min_lr",
-    "damping_event",
     "objective_drift_status",
     "loss_phase",
     "checkpoint_improved",

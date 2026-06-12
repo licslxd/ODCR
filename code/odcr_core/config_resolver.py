@@ -34,10 +34,8 @@ from odcr_core.step3_quality import (
     PREFETCH_EVIDENCE_FIELDS,
     STEP3_CHECKPOINT_POLICY_VERSION,
     STEP3_DIAGNOSTIC_PROTOCOL_VERSION,
-    STEP3_PERFORMANCE_CANDIDATE_SCHEMA_VERSION,
     STEP3_QUALITY_GATE_VERSION,
     TIMING_REQUIRED_FIELDS,
-    default_a100_candidate_matrix,
 )
 from odcr_core.step3_eval_protocol import (
     MINIMAL_EVAL,
@@ -45,6 +43,13 @@ from odcr_core.step3_eval_protocol import (
     PAPER_TARGET_ONLY_EVAL,
     normalize_eval_protocol,
     step3_eval_protocol_spec,
+)
+from odcr_core.step5_sample_plan_intent import (
+    Step5SamplePlanIntentError,
+    build_step5_sample_plan_intent,
+    cf_mix_is_low_weighted_only as _step5_cf_mix_is_low_weighted_only,
+    gold_mix_is_medium_only as _step5_gold_mix_is_medium_only,
+    selected_step5_candidate_rows as _selected_step5_candidate_rows,
 )
 from odcr_core.upstream_resolver import UpstreamResolutionError, resolve_latest, resolve_run, resolve_upstream
 
@@ -183,11 +188,6 @@ _RETIRED_ACCUM_ENV = frozenset(
 )
 
 _STEP5_RETIRED_TRAIN_FIELDS = frozenset({"adv", "eta", "train_label_max_length"})
-_STEP5_FORMAL_RATIO_ID = "STEP5_RATIO_0"
-_STEP5_FORMAL_CF_MIX_ID = "STEP5_CF_MIX_FORMAL_HIGH_MEDIUM"
-_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID = "WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1"
-_STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID = "TG_MIX_WEAK_MEDIUM_ONLY"
-_STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID = "AG_MIX_WEAK_MEDIUM_ONLY"
 _STEP5_HISTORICAL_CF_MIX_SEMANTICS: dict[tuple[str, str], dict[str, float]] = {}
 
 
@@ -262,7 +262,7 @@ def _validate_step3_profile_shape(item: Mapping[str, Any], context: str) -> None
     for block, keys in (
         ("tokenizer", {"max_length"}),
         ("evidence", {"max_evidence_length"}),
-        ("scheduler", {"name", "warmup_ratio", "min_lr_ratio", "validation_aware_lr_damping"}),
+        ("scheduler", {"name", "warmup_ratio", "min_lr_ratio"}),
         ("cross_rank_structured_gather", {"enabled", "mode"}),
         ("memory", {"activation_checkpointing", "profile_buffer_policy"}),
     ):
@@ -341,16 +341,9 @@ def _validate_step3_config_shape(cfg: Mapping[str, Any]) -> None:
             "cross_rank_structured_gather",
             "memory",
             "timing",
-            "performance_candidates",
-            "worker_profiles",
             "objective_drift",
             "recovery",
             "phase_loss_schedule",
-            "conflict_aware",
-            "loss_gradient_conflict_probe",
-            "adapter_gating",
-            "paper_candidate_selection",
-            "checkpoint_averaging",
             "train",
         },
         "step3",
@@ -892,81 +885,12 @@ def _resolve_step4_runtime_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _resolve_step4_step5_dedicated_exports_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step4.step5_dedicated_exports"), "step4.step5_dedicated_exports")
-    allowed = {
-        "enabled",
-        "output_dir_name",
-        "full_audit_format",
-        "scorer_train_format",
-        "explainer_train_format",
-        "scorer_filter",
-        "explainer_filter",
-        "write_gold_cf_subsplits",
-        "full_audit_role",
-        "atomic_write",
-        "validate_after_write",
-        "chunk_rows",
-    }
-    _reject_unknown_keys(raw, allowed, "step4.step5_dedicated_exports")
-
-    def _fmt(key: str) -> str:
-        value = str(raw.get(key) or "").strip().lower()
-        if value != "parquet":
-            raise OneControlConfigError(f"step4.step5_dedicated_exports.{key} must be parquet")
-        return value
-
-    def _filter(name: str, route_key: str) -> dict[str, Any]:
-        obj = _mapping(raw.get(name), f"step4.step5_dedicated_exports.{name}")
-        _reject_unknown_keys(
-            obj,
-            {"train_keep", route_key, "min_sample_weight_hint"},
-            f"step4.step5_dedicated_exports.{name}",
-        )
-        if _bool(obj.get("train_keep")) is not True:
-            raise OneControlConfigError(f"step4.step5_dedicated_exports.{name}.train_keep must be true")
-        if _bool(obj.get(route_key)) is not True:
-            raise OneControlConfigError(f"step4.step5_dedicated_exports.{name}.{route_key} must be true")
-        min_weight = _rcr_float(
-            obj.get("min_sample_weight_hint"),
-            f"step4.step5_dedicated_exports.{name}.min_sample_weight_hint",
-            min_value=0.0,
-        )
-        return {
-            "train_keep": True,
-            route_key: True,
-            "min_sample_weight_hint": float(min_weight),
-        }
-
-    output_dir_name = str(raw.get("output_dir_name") or "").strip()
-    if not output_dir_name or "/" in output_dir_name or output_dir_name in {".", ".."}:
-        raise OneControlConfigError("step4.step5_dedicated_exports.output_dir_name must be a simple directory name")
-    full_audit_role = str(raw.get("full_audit_role") or "").strip()
-    if full_audit_role != "audit_only":
-        raise OneControlConfigError("step4.step5_dedicated_exports.full_audit_role must be audit_only")
-    return {
-        "enabled": _bool(raw.get("enabled")),
-        "output_dir_name": output_dir_name,
-        "full_audit_format": _fmt("full_audit_format"),
-        "scorer_train_format": _fmt("scorer_train_format"),
-        "explainer_train_format": _fmt("explainer_train_format"),
-        "scorer_filter": _filter("scorer_filter", "route_scorer"),
-        "explainer_filter": _filter("explainer_filter", "route_explainer"),
-        "write_gold_cf_subsplits": _bool(raw.get("write_gold_cf_subsplits")),
-        "full_audit_role": full_audit_role,
-        "atomic_write": _bool(raw.get("atomic_write")),
-        "validate_after_write": _bool(raw.get("validate_after_write")),
-        "chunk_rows": _rcr_int(raw.get("chunk_rows", 100000), "step4.step5_dedicated_exports.chunk_rows", min_value=1),
-    }
-
-
 def _resolve_step4_step5_pool_exports_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step4.step5_pool_exports"), "step4.step5_pool_exports")
     allowed = {
         "enabled",
         "output_dir_name",
         "full_audit_role",
-        "legacy_dedicated_exports_role",
         "chunk_rows",
     }
     _reject_unknown_keys(raw, allowed, "step4.step5_pool_exports")
@@ -976,16 +900,10 @@ def _resolve_step4_step5_pool_exports_config(cfg: Mapping[str, Any]) -> dict[str
     full_audit_role = str(raw.get("full_audit_role") or "").strip()
     if full_audit_role != "audit_only":
         raise OneControlConfigError("step4.step5_pool_exports.full_audit_role must be audit_only")
-    legacy_role = str(raw.get("legacy_dedicated_exports_role") or "").strip()
-    if legacy_role != "legacy_old_filter_exports":
-        raise OneControlConfigError(
-            "step4.step5_pool_exports.legacy_dedicated_exports_role must be legacy_old_filter_exports"
-        )
     return {
         "enabled": _bool(raw.get("enabled")),
         "output_dir_name": output_dir_name,
         "full_audit_role": full_audit_role,
-        "legacy_dedicated_exports_role": legacy_role,
         "chunk_rows": _rcr_int(raw.get("chunk_rows", 100000), "step4.step5_pool_exports.chunk_rows", min_value=1),
     }
 
@@ -1168,8 +1086,6 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any], *, task_id: int | None
         "effective_epoch_enabled",
         "seed",
         "rotate_across_epochs",
-        "full_audit_default_allowed",
-        "legacy_gold_heavy_exports_allowed",
         "auto_budget",
         "explanation",
         "epochs",
@@ -1177,10 +1093,6 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any], *, task_id: int | None
     _reject_unknown_keys(raw, allowed, "step5.sampler")
     if str(raw.get("contract_source") or "") != "step4_pool_manifest":
         raise OneControlConfigError("step5.sampler.contract_source must be step4_pool_manifest")
-    if _bool(raw.get("full_audit_default_allowed")):
-        raise OneControlConfigError("step5.sampler.full_audit_default_allowed must be false")
-    if _bool(raw.get("legacy_gold_heavy_exports_allowed")):
-        raise OneControlConfigError("step5.sampler.legacy_gold_heavy_exports_allowed must be false")
 
     def _explanation(name: str = "explanation") -> dict[str, Any]:
         obj = _mapping(raw.get(name), f"step5.sampler.{name}")
@@ -1209,13 +1121,6 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any], *, task_id: int | None
         cf = _rcr_float(obj.get("cf_ratio"), f"step5.sampler.{name}.cf_ratio", min_value=0.0, max_value=1.0)
         if abs((tg + ag + cf) - 1.0) > 1e-6:
             raise OneControlConfigError(f"step5.sampler.{name} ratios must sum to 1.0")
-        for value, (lo, hi), key in zip(
-            (tg, ag, cf),
-            ((0.30, 0.45), (0.10, 0.25), (0.34, 0.50)),
-            ("target_gold_ratio", "aux_gold_ratio", "cf_ratio"),
-        ):
-            if not (lo <= value <= hi):
-                raise OneControlConfigError(f"step5.sampler.{name}.{key} must be in [{lo}, {hi}]")
         def _gold_mix(mix_name: str) -> dict[str, float]:
             mix_raw = _mapping(obj.get(mix_name), f"step5.sampler.{name}.{mix_name}")
             _reject_unknown_keys(mix_raw, {"high", "medium"}, f"step5.sampler.{name}.{mix_name}")
@@ -1299,8 +1204,6 @@ def _resolve_step5_sampler_config(cfg: Mapping[str, Any], *, task_id: int | None
         "effective_epoch_enabled": _bool(raw.get("effective_epoch_enabled")),
         "seed": _positive_int(raw.get("seed"), "step5.sampler.seed"),
         "rotate_across_epochs": _bool(raw.get("rotate_across_epochs")),
-        "full_audit_default_allowed": False,
-        "legacy_gold_heavy_exports_allowed": False,
         "auto_budget": {
             "enabled": True,
             "capacity_basis": "balanced_capacity",
@@ -1366,19 +1269,6 @@ def _resolve_step5_task_decoupled_policy_config(cfg: Mapping[str, Any]) -> dict[
         },
         "rating_training": {"enabled": False, "source": RATING_SOURCE_TYPE},
     }
-
-def resolve_step4_step5_dedicated_exports_config(
-    *,
-    config_path: str | Path,
-    set_overrides: Iterable[str],
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """Resolve the Step4 dedicated-export block without planning a formal run."""
-    _reject_retired_accum_env()
-    base = load_yaml_config(config_path)
-    cfg, cli_sources = apply_cli_sets(base, set_overrides)
-    _validate_config_shape(cfg)
-    return _resolve_step4_step5_dedicated_exports_config(cfg), cli_sources
-
 
 def resolve_step4_step5_pool_exports_config(
     *,
@@ -1788,6 +1678,15 @@ def _alloc_run(repo_root: Path, task_id: int, stage: str, requested: str | None,
     return run_naming.allocate_child_dir(parent, requested=requested, kind="run")
 
 
+def _bind_existing_run(repo_root: Path, task_id: int, stage: str, requested: str, *, dry_run: bool) -> str:
+    run_name = run_naming.parse_run_id(requested)
+    if not dry_run:
+        run_root = _stage_root(repo_root, task_id, stage, run_name)
+        if not run_root.is_dir():
+            raise OneControlConfigError(f"{stage} eval-only source run is missing: {run_root}")
+    return run_name
+
+
 def _alloc_step4_run(repo_root: Path, task_id: int, step3_run: str, requested: str | None, *, dry_run: bool) -> str:
     parent = path_layout.get_stage_task_root(repo_root, "step4", task_id)
     if requested and requested not in ("", "auto"):
@@ -1871,23 +1770,6 @@ def _public_decode_snapshot(decode: Mapping[str, Any]) -> dict[str, Any]:
         out.pop("tail_temperature", None)
         out.pop("tail_top_p", None)
     return out
-
-
-def _resolve_rerank(cfg: Mapping[str, Any], name: str | None, *, need_rerank: bool) -> tuple[str, dict[str, Any]]:
-    if not need_rerank:
-        return "", {}
-    eval_cfg = _get(cfg, "eval", {})
-    rerank_cfg = eval_cfg.get("rerank", {}) if isinstance(eval_cfg, Mapping) else {}
-    if not isinstance(rerank_cfg, Mapping):
-        raise OneControlConfigError("eval.rerank must be a mapping")
-    base = rerank_cfg.get("default", {})
-    if not isinstance(base, Mapping):
-        raise OneControlConfigError("eval.rerank.default must be a mapping")
-    stem = str(name or "quality")
-    overlay = rerank_cfg.get(stem, {})
-    if stem != "default" and not isinstance(overlay, Mapping):
-        raise OneControlConfigError(f"eval.rerank.{stem} must be a mapping")
-    return stem, _merge_dicts(base, overlay if stem != "default" else {})
 
 
 def _resolve_step3_scenario_profile(
@@ -2138,124 +2020,20 @@ def _resolve_step3_scheduler_config(cfg: Mapping[str, Any], task_profile: Mappin
         task_profile.get("scheduler") if isinstance(task_profile, Mapping) else None,
     )
     name = str(raw.get("name") or "").strip().lower()
-    if name not in {"warmup_cosine", "safe_damping_v2"}:
-        raise OneControlConfigError(
-            "step3.scheduler.name must be warmup_cosine or safe_damping_v2 for Step3 V3."
-        )
+    if name != "warmup_cosine":
+        raise OneControlConfigError("step3.scheduler.name must be warmup_cosine for the clean Step3 path.")
     warmup_ratio = _rcr_float(raw.get("warmup_ratio"), "step3.scheduler.warmup_ratio", min_value=0.0)
     min_lr_ratio = _rcr_float(raw.get("min_lr_ratio"), "step3.scheduler.min_lr_ratio", min_value=0.0)
     if warmup_ratio <= 0.0 or warmup_ratio >= 1.0:
         raise OneControlConfigError("step3.scheduler.warmup_ratio must be in (0,1)")
     if min_lr_ratio < 0.0 or min_lr_ratio >= 1.0:
         raise OneControlConfigError("step3.scheduler.min_lr_ratio must be in [0,1)")
-    damping_raw = _mapping(raw.get("validation_aware_lr_damping"), "step3.scheduler.validation_aware_lr_damping")
-    damping_enabled = _bool(damping_raw.get("enabled", False))
-    damping = {
-        "enabled": damping_enabled,
-        "name": str(damping_raw.get("name") or "safe_damping_v2"),
-        "base_scheduler": "warmup_cosine",
-        "formal_allowed": _bool(damping_raw.get("formal_allowed", False)),
-        "probe_only": _bool(damping_raw.get("probe_only", True)),
-        "monitor_metric": str(damping_raw.get("monitor_metric") or "valid_loss"),
-        "direction": str(damping_raw.get("direction") or "min").strip().lower(),
-        "worsen_abs_threshold": _rcr_float(
-            damping_raw.get("worsen_abs_threshold", 0.25),
-            "step3.scheduler.validation_aware_lr_damping.worsen_abs_threshold",
-            min_value=0.0,
-        ),
-        "worsen_ratio_threshold": _rcr_float(
-            damping_raw.get("worsen_ratio_threshold", 0.10),
-            "step3.scheduler.validation_aware_lr_damping.worsen_ratio_threshold",
-            min_value=0.0,
-        ),
-        "worsen_patience": _positive_int(
-            damping_raw.get("worsen_patience", 3),
-            "step3.scheduler.validation_aware_lr_damping.worsen_patience",
-        ),
-        "lr_decay_factor": _rcr_float(
-            damping_raw.get("lr_decay_factor", 0.5),
-            "step3.scheduler.validation_aware_lr_damping.lr_decay_factor",
-            min_value=0.0,
-        ),
-        "min_lr_ratio": _rcr_float(
-            damping_raw.get("min_lr_ratio", min_lr_ratio),
-            "step3.scheduler.validation_aware_lr_damping.min_lr_ratio",
-            min_value=0.0,
-        ),
-        "cooldown_epochs": _nonnegative_int(
-            damping_raw.get("cooldown_epochs", 3),
-            "step3.scheduler.validation_aware_lr_damping.cooldown_epochs",
-        ),
-        "max_damping_events": _positive_int(
-            damping_raw.get("max_damping_events", 2),
-            "step3.scheduler.validation_aware_lr_damping.max_damping_events",
-        ),
-        "start_epoch": _positive_int(
-            damping_raw.get("start_epoch", 4),
-            "step3.scheduler.validation_aware_lr_damping.start_epoch",
-        ),
-        "recent_trend_epochs": _positive_int(
-            damping_raw.get("recent_trend_epochs", 2),
-            "step3.scheduler.validation_aware_lr_damping.recent_trend_epochs",
-        ),
-        "recent_recovery_tolerance": _rcr_float(
-            damping_raw.get("recent_recovery_tolerance", 1.0e-3),
-            "step3.scheduler.validation_aware_lr_damping.recent_recovery_tolerance",
-            min_value=0.0,
-        ),
-        "effective_lr_floor_abs": _rcr_float(
-            damping_raw.get("effective_lr_floor_abs", 0.0),
-            "step3.scheduler.validation_aware_lr_damping.effective_lr_floor_abs",
-            min_value=0.0,
-        ),
-        "effective_lr_floor_ratio": _rcr_float(
-            damping_raw.get("effective_lr_floor_ratio", 0.25),
-            "step3.scheduler.validation_aware_lr_damping.effective_lr_floor_ratio",
-            min_value=0.0,
-        ),
-        "effective_min_lr_policy": str(
-            damping_raw.get("effective_min_lr_policy")
-            or "safe_floor_no_halve_to_zero"
-        ),
-        "action_on_max_events": str(damping_raw.get("action_on_max_events") or "stop_and_select_candidate"),
-        "action_on_low_lr_no_progress": str(
-            damping_raw.get("action_on_low_lr_no_progress") or "stop_and_select_candidate"
-        ),
-    }
-    if damping["monitor_metric"] != "valid_loss" or damping["direction"] != "min":
-        raise OneControlConfigError("Step3 validation-aware damping currently supports valid_loss/min only.")
-    if not (0.0 < float(damping["lr_decay_factor"]) < 1.0):
-        raise OneControlConfigError("step3.scheduler.validation_aware_lr_damping.lr_decay_factor must be in (0,1).")
-    if int(damping["worsen_patience"]) < 3:
-        raise OneControlConfigError("safe_damping_v2 requires worsen_patience >= 3.")
-    if int(damping["cooldown_epochs"]) < 3:
-        raise OneControlConfigError("safe_damping_v2 requires cooldown_epochs >= 3.")
-    if int(damping["max_damping_events"]) > 3:
-        raise OneControlConfigError("safe_damping_v2 requires max_damping_events <= 3.")
-    if float(damping["effective_lr_floor_ratio"]) < 0.25:
-        raise OneControlConfigError("safe_damping_v2 requires effective_lr_floor_ratio >= 0.25.")
-    if float(damping["min_lr_ratio"]) < float(min_lr_ratio):
-        damping["min_lr_ratio"] = float(min_lr_ratio)
-    if name == "warmup_cosine" and damping_enabled:
-        raise OneControlConfigError(
-            "hidden Step3 LR damping is forbidden: step3.scheduler.name=warmup_cosine requires "
-            "step3.scheduler.validation_aware_lr_damping.enabled=false."
-        )
-    if name == "safe_damping_v2" and not damping_enabled:
-        raise OneControlConfigError(
-            "step3.scheduler.name=safe_damping_v2 requires "
-            "step3.scheduler.validation_aware_lr_damping.enabled=true."
-        )
-    if name == "safe_damping_v2" and bool(damping["formal_allowed"]):
-        raise OneControlConfigError("safe_damping_v2 is probe-only and cannot be formal_allowed.")
     return {
         "name": name,
         "base_scheduler": "warmup_cosine",
-        "damping_enabled": bool(damping_enabled),
         "warmup_ratio": float(warmup_ratio),
         "min_lr_ratio": float(min_lr_ratio),
         "base_min_lr_ratio": float(min_lr_ratio),
-        "validation_aware_lr_damping": damping,
     }
 
 
@@ -2328,100 +2106,6 @@ def _resolve_step3_phase_loss_schedule_config(cfg: Mapping[str, Any]) -> dict[st
         "enabled": _bool(raw.get("enabled", True)),
         "transition": str(raw.get("transition") or "epoch_or_objective_drift"),
         "phases": phases,
-    }
-
-
-def _resolve_step3_conflict_aware_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.conflict_aware"), "step3.conflict_aware")
-    mode = str(raw.get("mode") or "off")
-    allowed = list(raw.get("allowed_modes") or ["off", "dynamic_weighting", "pcgrad", "gradnorm", "uncertainty_weighting"])
-    if mode not in allowed:
-        raise OneControlConfigError("step3.conflict_aware.mode must be one of step3.conflict_aware.allowed_modes.")
-    if mode in {"pcgrad", "gradnorm", "uncertainty_weighting"} and _bool(raw.get("formal_allowed", False)):
-        raise OneControlConfigError("conflict-aware optimizer modes require probe evidence before formal_allowed=true.")
-    return {
-        "enabled": _bool(raw.get("enabled", False)),
-        "mode": mode,
-        "allowed_modes": allowed,
-        "default_mode": str(raw.get("default_mode") or "off"),
-        "formal_allowed": _bool(raw.get("formal_allowed", False)),
-        "requires_gradient_probe": _bool(raw.get("requires_gradient_probe", True)),
-        "ddp_graph_safe_zero_required": _bool(raw.get("ddp_graph_safe_zero_required", True)),
-    }
-
-
-def _resolve_step3_loss_gradient_conflict_probe_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.loss_gradient_conflict_probe"), "step3.loss_gradient_conflict_probe")
-    if not _bool(raw.get("real_data_only", True)):
-        raise OneControlConfigError("step3.loss_gradient_conflict_probe.real_data_only must be true.")
-    return {
-        "enabled": _bool(raw.get("enabled", True)),
-        "real_data_only": True,
-        "synthetic_benchmark_forbidden": _bool(raw.get("synthetic_benchmark_forbidden", True)),
-        "bounded_max_batches": _positive_int(raw.get("bounded_max_batches", 4), "step3.loss_gradient_conflict_probe.bounded_max_batches"),
-        "output_dir": str(raw.get("output_dir") or "AI_analysis/01_raw_logs/step3_loss_gradient_conflict_probe"),
-        "write_formal_checkpoint": _bool(raw.get("write_formal_checkpoint", False)),
-    }
-
-
-def _resolve_step3_adapter_gating_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.adapter_gating"), "step3.adapter_gating")
-    enabled = _bool(raw.get("enabled", False))
-    formal_allowed = _bool(raw.get("formal_allowed", False))
-    if enabled and formal_allowed:
-        raise OneControlConfigError("step3.adapter_gating cannot be enabled for formal use before gradient-probe evidence.")
-    return {
-        "enabled": enabled,
-        "formal_allowed": formal_allowed,
-        "requires_gradient_probe": _bool(raw.get("requires_gradient_probe", True)),
-        "rating_adapter": str(raw.get("rating_adapter") or "off"),
-        "shared_specific_gate": str(raw.get("shared_specific_gate") or "off"),
-        "explainer_adapter": str(raw.get("explainer_adapter") or "off"),
-        "style_content_residual_gate": str(raw.get("style_content_residual_gate") or "off"),
-        "checkpoint_compatibility": str(raw.get("checkpoint_compatibility") or "disabled_no_state_change"),
-    }
-
-
-def _resolve_step3_paper_candidate_selection_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.paper_candidate_selection"), "step3.paper_candidate_selection")
-    rating_guard = _mapping(raw.get("rating_guard"), "step3.paper_candidate_selection.rating_guard")
-    diversity_guard = _mapping(raw.get("diversity_guard"), "step3.paper_candidate_selection.diversity_guard")
-    weights = _mapping(raw.get("composite_weights"), "step3.paper_candidate_selection.composite_weights")
-    outputs = _mapping(raw.get("outputs"), "step3.paper_candidate_selection.outputs")
-    return {
-        "enabled": _bool(raw.get("enabled", True)),
-        "eval_protocol": str(raw.get("eval_protocol") or "paper_target_only_eval"),
-        "bounded_eval_required": _bool(raw.get("bounded_eval_required", True)),
-        "candidate_pool": list(raw.get("candidate_pool") or []),
-        "no_paper_eval_no_selection": _bool(raw.get("no_paper_eval_no_selection", True)),
-        "scorer_explainer_split": _bool(raw.get("scorer_explainer_split", True)),
-        "rating_guard": {
-            "max_mae": _rcr_float(rating_guard.get("max_mae", 0.65), "step3.paper_candidate_selection.rating_guard.max_mae", min_value=0.0),
-            "max_rmse": _rcr_float(rating_guard.get("max_rmse", 0.95), "step3.paper_candidate_selection.rating_guard.max_rmse", min_value=0.0),
-            "max_mae_worse_abs": _rcr_float(rating_guard.get("max_mae_worse_abs", 0.02), "step3.paper_candidate_selection.rating_guard.max_mae_worse_abs", min_value=0.0),
-            "max_rmse_worse_abs": _rcr_float(rating_guard.get("max_rmse_worse_abs", 0.03), "step3.paper_candidate_selection.rating_guard.max_rmse_worse_abs", min_value=0.0),
-        },
-        "diversity_guard": {
-            "dist1_floor": _rcr_float(diversity_guard.get("dist1_floor", 0.05), "step3.paper_candidate_selection.diversity_guard.dist1_floor", min_value=0.0),
-            "dist2_floor": _rcr_float(diversity_guard.get("dist2_floor", 0.20), "step3.paper_candidate_selection.diversity_guard.dist2_floor", min_value=0.0),
-            "collapse_penalty": _rcr_float(diversity_guard.get("collapse_penalty", 100.0), "step3.paper_candidate_selection.diversity_guard.collapse_penalty", min_value=0.0),
-        },
-        "composite_weights": {str(key): _rcr_float(value, f"step3.paper_candidate_selection.composite_weights.{key}", min_value=0.0) for key, value in weights.items()},
-        "outputs": {
-            "paper_candidate_selection": str(outputs.get("paper_candidate_selection") or "paper_candidate_selection.json"),
-            "candidate_eval_registry": str(outputs.get("candidate_eval_registry") or "candidate_eval_registry.jsonl"),
-        },
-    }
-
-
-def _resolve_step3_checkpoint_averaging_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.checkpoint_averaging"), "step3.checkpoint_averaging")
-    return {
-        "enabled": _bool(raw.get("enabled", False)),
-        "candidate_only": _bool(raw.get("candidate_only", True)),
-        "never_overwrite_best_observed": _bool(raw.get("never_overwrite_best_observed", True)),
-        "requires_lineage": _bool(raw.get("requires_lineage", True)),
-        "requires_paper_eval_before_downstream": _bool(raw.get("requires_paper_eval_before_downstream", True)),
     }
 
 
@@ -2642,40 +2326,6 @@ def _resolve_step3_batch_candidate_role(
     return f"{profile_id}:{candidate}" if candidate else profile_id
 
 
-def _resolve_step3_worker_profiles_config(
-    cfg: Mapping[str, Any],
-    *,
-    ddp_world_size: int,
-    max_parallel_cpu: int,
-) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.worker_profiles"), "step3.worker_profiles")
-    out: dict[str, Any] = {}
-    reserved_cpu = 2
-    for name, item in raw.items():
-        if not isinstance(item, Mapping):
-            raise OneControlConfigError(f"step3.worker_profiles.{name} must be a mapping")
-        workers = _positive_int(
-            item.get("train_workers_per_rank"),
-            f"step3.worker_profiles.{name}.train_workers_per_rank",
-        )
-        pf = _positive_int(item.get("prefetch_factor"), f"step3.worker_profiles.{name}.prefetch_factor")
-        budget = workers * int(ddp_world_size) + reserved_cpu
-        if budget > int(max_parallel_cpu):
-            raise OneControlConfigError(
-                f"step3.worker_profiles.{name} exceeds CPU budget: "
-                f"{workers} * {ddp_world_size} + {reserved_cpu} = {budget} > {max_parallel_cpu}"
-            )
-        out[str(name)] = {
-            "train_workers_per_rank": workers,
-            "prefetch_factor": pf,
-            "reserved_cpu": reserved_cpu,
-            "cpu_budget": budget,
-            "max_parallel_cpu": int(max_parallel_cpu),
-            "role": str(item.get("role") or "performance_candidate"),
-        }
-    return out
-
-
 def _resolve_step3_prefetcher_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
     raw = _mapping(_get(cfg, "step3.prefetcher"), "step3.prefetcher")
     fallback_policy = str(raw.get("fallback_policy") or "fail_fast").strip().lower()
@@ -2883,38 +2533,6 @@ def _resolve_step3_timing_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "required_fields": sorted(required),
         "rank_timing_required": True,
     }
-
-
-def _resolve_step3_performance_candidates_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
-    raw = _mapping(_get(cfg, "step3.performance_candidates"), "step3.performance_candidates")
-    if not raw:
-        return default_a100_candidate_matrix()
-    matrix = default_a100_candidate_matrix()
-    for key, value in raw.items():
-        if key in matrix and isinstance(matrix.get(key), Mapping) and isinstance(value, Mapping):
-            matrix[key] = _merge_dicts(matrix[key], value)
-        else:
-            matrix[str(key)] = deepcopy(value)
-    batch_ladder = _mapping(matrix.get("batch_ladder"), "step3.performance_candidates.batch_ladder")
-    selected_candidate = str(matrix.get("selected_candidate") or "").strip()
-    for name, item in batch_ladder.items():
-        if not isinstance(item, Mapping):
-            raise OneControlConfigError(f"step3.performance_candidates.batch_ladder.{name} must be a mapping")
-        formal_allowed = _bool(item.get("formal_allowed", False))
-        probe_only = _bool(item.get("probe_only", True))
-        if formal_allowed and str(name) != selected_candidate:
-            raise OneControlConfigError(f"batch ladder candidate {name} must not be formal_allowed before runtime evidence.")
-        if str(name) == selected_candidate:
-            if not formal_allowed or probe_only:
-                raise OneControlConfigError(
-                    f"selected formal batch ladder candidate {name} must be formal_allowed=true and probe_only=false."
-                )
-            continue
-        if not probe_only:
-            raise OneControlConfigError(f"batch ladder candidate {name} must remain probe_only.")
-    matrix["schema_version"] = STEP3_PERFORMANCE_CANDIDATE_SCHEMA_VERSION
-    matrix["formal_default_unchanged"] = False
-    return matrix
 
 
 def _resolve_step3_cache_policy_config(cfg: Mapping[str, Any]) -> dict[str, Any]:
@@ -3308,7 +2926,6 @@ def _resolve_step5_eval_config(
             "validation_memory_policy",
             "validation_mode",
             "formal_entry_E4_validation_required",
-            "old_eval_batch_2048_retired",
             "valid_loss_components",
         },
         "step5.eval",
@@ -3345,7 +2962,6 @@ def _resolve_step5_eval_config(
         "validation_memory_policy": "microbatch_accumulate",
         "step5_validation_mode": "explanation_only",
         "formal_entry_E4_validation_required": _bool(raw.get("formal_entry_E4_validation_required")),
-        "old_eval_batch_2048_retired": _bool(raw.get("old_eval_batch_2048_retired")),
         "valid_loss_components": {"explanation": explanation_components},
         "valid_loss_components_json": json_dumps({"explanation": explanation_components}),
         "source_path": source,
@@ -3478,19 +3094,13 @@ def _resolve_step5_effective_epoch_config(cfg: Mapping[str, Any]) -> dict[str, A
             "enabled",
             "max_effective_epochs",
             "early_stopping_patience",
-            "retired_full_table_epochs",
-            "retired_full_table_policy",
         },
         "step5.effective_epoch",
     )
-    if str(raw.get("retired_full_table_policy") or "") != "fail_fast":
-        raise OneControlConfigError("step5.effective_epoch.retired_full_table_policy must be fail_fast")
     return {
         "enabled": _bool(raw.get("enabled")),
         "max_effective_epochs": _rcr_int(raw.get("max_effective_epochs"), "step5.effective_epoch.max_effective_epochs", min_value=1),
         "early_stopping_patience": _rcr_int(raw.get("early_stopping_patience"), "step5.effective_epoch.early_stopping_patience", min_value=0),
-        "retired_full_table_epochs": _rcr_int(raw.get("retired_full_table_epochs"), "step5.effective_epoch.retired_full_table_epochs", min_value=1),
-        "retired_full_table_policy": "fail_fast",
     }
 
 
@@ -3560,14 +3170,13 @@ def _resolve_step5_tuning_config(
         {
             "enabled",
             "selected_tuning_candidate",
-            "fallback_tuning_candidate",
             "effective_samples",
             "optimizer_steps",
             "batch_candidate",
-            "fallback_batch_candidate",
             "selected_budget_candidate",
             "pilot_fraction_candidates",
             "lr_candidates",
+            "selected_warmup_fraction",
             "warmup_fraction_candidates",
             "innovation_weight_candidates",
             "ratio_candidates",
@@ -3579,17 +3188,14 @@ def _resolve_step5_tuning_config(
     )
     batch_ids = {str(item.get("id")) for item in batch_candidates_config.get("candidates", []) if isinstance(item, Mapping)}
     batch_candidate = str(raw.get("batch_candidate") or "").strip()
-    fallback_batch_candidate = str(raw.get("fallback_batch_candidate") or "").strip()
-    for key, value in (("batch_candidate", batch_candidate), ("fallback_batch_candidate", fallback_batch_candidate)):
-        if value not in batch_ids:
-            raise OneControlConfigError(f"step5.tuning.{key} must name a resolved step5.batch_candidates id")
+    if batch_candidate not in batch_ids:
+        raise OneControlConfigError("step5.tuning.batch_candidate must name a resolved step5.batch_candidates id")
     selected_budget = str(raw.get("selected_budget_candidate") or "medium").strip()
     if selected_budget not in {"small", "medium", "full", "large"}:
         raise OneControlConfigError("step5.tuning.selected_budget_candidate must be small, medium, full, or large")
     selected_tuning_candidate = str(raw.get("selected_tuning_candidate") or "").strip()
-    fallback_tuning_candidate = str(raw.get("fallback_tuning_candidate") or "").strip()
-    if not selected_tuning_candidate or not fallback_tuning_candidate:
-        raise OneControlConfigError("step5.tuning selected and fallback candidates must be configured")
+    if not selected_tuning_candidate:
+        raise OneControlConfigError("step5.tuning.selected_tuning_candidate must be configured")
 
     def _single_positive_int_map(key: str) -> dict[str, int]:
         values = _mapping(raw.get(key), f"step5.tuning.{key}")
@@ -3609,9 +3215,9 @@ def _resolve_step5_tuning_config(
             if not isinstance(item, Mapping):
                 raise OneControlConfigError(f"step5.tuning.ratio_candidates.explanation.{cid} must be a mapping")
             _reject_unknown_keys(item, {"target_gold", "aux_gold", "cf"}, f"step5.tuning.ratio_candidates.explanation.{cid}")
-            tg = _rcr_float(item.get("target_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.target_gold", min_value=0.30, max_value=0.45)
-            ag = _rcr_float(item.get("aux_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.aux_gold", min_value=0.10, max_value=0.25)
-            cf = _rcr_float(item.get("cf"), f"step5.tuning.ratio_candidates.explanation.{cid}.cf", min_value=0.34, max_value=0.50)
+            tg = _rcr_float(item.get("target_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.target_gold", min_value=0.0, max_value=1.0)
+            ag = _rcr_float(item.get("aux_gold"), f"step5.tuning.ratio_candidates.explanation.{cid}.aux_gold", min_value=0.0, max_value=1.0)
+            cf = _rcr_float(item.get("cf"), f"step5.tuning.ratio_candidates.explanation.{cid}.cf", min_value=0.0, max_value=1.0)
             if abs((tg + ag + cf) - 1.0) > 1e-6:
                 raise OneControlConfigError(f"step5.tuning.ratio_candidates.explanation.{cid} ratios must sum to 1.0")
             out.append({"id": str(cid), "target_gold": tg, "aux_gold": ag, "cf": cf})
@@ -3660,22 +3266,32 @@ def _resolve_step5_tuning_config(
         })
 
     strategy = _mapping(raw.get("search_strategy"), "step5.tuning.search_strategy")
-    _reject_unknown_keys(strategy, {"stage_a_fraction", "stage_b_fraction", "extended_primary_fraction", "extended_backup_fraction"}, "step5.tuning.search_strategy")
+    _reject_unknown_keys(strategy, {"stage_a_fraction", "stage_b_fraction", "extended_primary_fraction"}, "step5.tuning.search_strategy")
     lr_values = raw.get("lr_candidates")
     if not isinstance(lr_values, list) or not lr_values:
         raise OneControlConfigError("step5.tuning.lr_candidates must be a non-empty list")
+    warmup_fraction_candidates = _fraction_list("warmup_fraction_candidates")
+    selected_warmup_fraction = _rcr_float(
+        raw.get("selected_warmup_fraction"),
+        "step5.tuning.selected_warmup_fraction",
+        min_value=0.03,
+        max_value=0.10,
+    )
+    if not any(abs(selected_warmup_fraction - float(value)) <= 1e-12 for value in warmup_fraction_candidates):
+        raise OneControlConfigError(
+            "step5.tuning.selected_warmup_fraction must be one of step5.tuning.warmup_fraction_candidates"
+        )
     return {
         "enabled": _bool(raw.get("enabled")),
         "selected_tuning_candidate": selected_tuning_candidate,
-        "fallback_tuning_candidate": fallback_tuning_candidate,
         "effective_samples": _single_positive_int_map("effective_samples"),
         "optimizer_steps": _single_positive_int_map("optimizer_steps"),
         "batch_candidate": batch_candidate,
-        "fallback_batch_candidate": fallback_batch_candidate,
         "selected_budget_candidate": selected_budget,
         "pilot_fraction_candidates": _fraction_list("pilot_fraction_candidates"),
         "lr_candidates": [_rcr_float(value, "step5.tuning.lr_candidates", min_value=0.0) for value in lr_values],
-        "warmup_fraction_candidates": _fraction_list("warmup_fraction_candidates"),
+        "selected_warmup_fraction": selected_warmup_fraction,
+        "warmup_fraction_candidates": warmup_fraction_candidates,
         "innovation_weight_candidates": innovation_out,
         "ratio_candidates": {"explanation": _ratio_candidates()},
         "cf_tier_mix_candidates": {"explanation": _mix_candidates("cf_tier_mix_candidates", {"high", "medium", "low_weighted"})},
@@ -3689,52 +3305,12 @@ def _resolve_step5_tuning_config(
             if task_tuning and "selected_tuning_candidate" in task_tuning
             else "step5.tuning.selected_tuning_candidate"
         ),
-        "fallback_tuning_candidate_source": (
-            f"step5.tasks.{int(task_id)}.tuning.fallback_tuning_candidate"
-            if task_tuning and "fallback_tuning_candidate" in task_tuning
-            else "step5.tuning.fallback_tuning_candidate"
-        ),
         "search_strategy": {
             "stage_a_fraction": _rcr_float(strategy.get("stage_a_fraction"), "step5.tuning.search_strategy.stage_a_fraction", min_value=0.0, max_value=1.0),
             "stage_b_fraction": _rcr_float(strategy.get("stage_b_fraction"), "step5.tuning.search_strategy.stage_b_fraction", min_value=0.0, max_value=1.0),
             "extended_primary_fraction": _rcr_float(strategy.get("extended_primary_fraction"), "step5.tuning.search_strategy.extended_primary_fraction", min_value=0.0, max_value=1.0),
-            "extended_backup_fraction": _rcr_float(strategy.get("extended_backup_fraction"), "step5.tuning.search_strategy.extended_backup_fraction", min_value=0.0, max_value=1.0),
         },
     }
-
-
-def _step5_candidate_tokens(candidate: str) -> dict[str, str]:
-    tokens = {str(part).strip() for part in str(candidate or "").split("+") if str(part).strip()}
-    out: dict[str, str] = {}
-    for matcher, key, label in (
-        (lambda token: token.startswith("STEP5_RATIO_"), "ratio", "STEP5_RATIO_"),
-        (
-            lambda token: token.startswith("STEP5_CF_MIX_")
-            or token == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID,
-            "cf_mix",
-            "STEP5_CF_MIX_ or WEAK_CROSS_PLATFORM_LOW_WEIGHTED_CF_V1",
-        ),
-        (lambda token: token.startswith("TG_MIX_"), "target_gold_mix", "TG_MIX_"),
-        (lambda token: token.startswith("AG_MIX_"), "aux_gold_mix", "AG_MIX_"),
-        (lambda token: token.startswith("LR_"), "lr", "LR_"),
-        (lambda token: token.startswith("W") and token[1:].isdigit(), "weight", "W<digits>"),
-    ):
-        matches = sorted(token for token in tokens if matcher(token))
-        if len(matches) != 1:
-            raise OneControlConfigError(
-                f"step5.tuning.selected_tuning_candidate must contain exactly one {label} token; got {candidate!r}"
-            )
-        out[key] = matches[0]
-    return out
-
-
-def _candidate_row_by_id(rows: Any, wanted: str, label: str) -> Mapping[str, Any]:
-    if not isinstance(rows, list):
-        raise OneControlConfigError(f"{label} must be a resolved candidate list")
-    for row in rows:
-        if isinstance(row, Mapping) and str(row.get("id")) == wanted:
-            return row
-    raise OneControlConfigError(f"selected Step5 candidate id {wanted!r} missing from {label}")
 
 
 def _assert_close_mapping(actual: Mapping[str, Any], expected: Mapping[str, Any], *, fields: tuple[str, ...], label: str) -> None:
@@ -3743,6 +3319,37 @@ def _assert_close_mapping(actual: Mapping[str, Any], expected: Mapping[str, Any]
         e = _rcr_float(expected.get(field), f"{label}.selected.{field}", min_value=0.0)
         if abs(a - e) > 1e-6:
             raise OneControlConfigError(f"{label}.{field}={a} does not match selected Step5 tuning candidate value {e}")
+
+
+def _step5_selected_rows_with_task_gate(
+    *,
+    task_id: int,
+    scenario: str,
+    tuning_config: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any] | dict[str, str]]:
+    try:
+        selected_rows = _selected_step5_candidate_rows(tuning_config)
+    except Step5SamplePlanIntentError as exc:
+        raise OneControlConfigError(str(exc)) from exc
+    tokens = dict(selected_rows["tokens"])
+    weak_task_allowed = str(scenario) == "weak_cross_platform" and int(task_id) in {7, 8}
+    cf_mix_row = _mapping(selected_rows["cf_mix"], "step5.tuning.cf_tier_mix_candidates.selected")
+    if _step5_cf_mix_is_low_weighted_only(cf_mix_row):
+        if not weak_task_allowed:
+            raise OneControlConfigError(
+                f"low-weighted-only Step5 CF mix {tokens.get('cf_mix')} is only allowed for task7/task8 weak_cross_platform Step5."
+            )
+        target_row = _mapping(selected_rows["target_gold_mix"], "step5.tuning.gold_tier_mix_candidates.target_gold.selected")
+        aux_row = _mapping(selected_rows["aux_gold_mix"], "step5.tuning.gold_tier_mix_candidates.aux_gold.selected")
+        if not _step5_gold_mix_is_medium_only(target_row):
+            raise OneControlConfigError(
+                f"low-weighted-only Step5 CF mix {tokens.get('cf_mix')} requires a medium-only target_gold tier mix."
+            )
+        if not _step5_gold_mix_is_medium_only(aux_row):
+            raise OneControlConfigError(
+                f"low-weighted-only Step5 CF mix {tokens.get('cf_mix')} requires a medium-only aux_gold tier mix."
+            )
+    return selected_rows
 
 
 def _assert_step5_selected_candidate_consistency(
@@ -3754,31 +3361,15 @@ def _assert_step5_selected_candidate_consistency(
     tuning_config: Mapping[str, Any],
     innovation_config: Mapping[str, Any],
 ) -> None:
-    tokens = _step5_candidate_tokens(str(tuning_config.get("selected_tuning_candidate") or ""))
-    if tokens.get("ratio") != _STEP5_FORMAL_RATIO_ID:
-        raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_RATIO_ID}")
-    weak_task_allowed = str(scenario) == "weak_cross_platform" and int(task_id) in {7, 8}
-    if tokens.get("cf_mix") == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID:
-        if not weak_task_allowed:
-            raise OneControlConfigError(
-                f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} is only allowed for task7/task8 weak_cross_platform Step5."
-            )
-        if tokens.get("target_gold_mix") != _STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID:
-            raise OneControlConfigError(
-                f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} requires {_STEP5_WEAK_CROSS_PLATFORM_TARGET_GOLD_MIX_ID}."
-            )
-        if tokens.get("aux_gold_mix") != _STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID:
-            raise OneControlConfigError(
-                f"{_STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID} requires {_STEP5_WEAK_CROSS_PLATFORM_AUX_GOLD_MIX_ID}."
-            )
-    elif tokens.get("cf_mix") != _STEP5_FORMAL_CF_MIX_ID:
-        raise OneControlConfigError(f"Step5 explanation formal mainline requires {_STEP5_FORMAL_CF_MIX_ID}")
-    explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
-    ratio = _candidate_row_by_id(
-        (tuning_config.get("ratio_candidates") or {}).get("explanation"),
-        tokens["ratio"],
-        "step5.tuning.ratio_candidates.explanation",
+    selected_rows = _step5_selected_rows_with_task_gate(
+        task_id=task_id,
+        scenario=scenario,
+        tuning_config=tuning_config,
     )
+    tokens = dict(selected_rows["tokens"])
+    cf_mix_row = _mapping(selected_rows["cf_mix"], "step5.tuning.cf_tier_mix_candidates.selected")
+    explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
+    ratio = _mapping(selected_rows["ratio"], "step5.tuning.ratio_candidates.selected")
     _assert_close_mapping(
         {
             "target_gold": explanation_cfg.get("target_gold_ratio"),
@@ -3789,43 +3380,28 @@ def _assert_step5_selected_candidate_consistency(
         fields=("target_gold", "aux_gold", "cf"),
         label="step5.sampler.explanation",
     )
-    cf_mix = _candidate_row_by_id(
-        (tuning_config.get("cf_tier_mix_candidates") or {}).get("explanation"),
-        tokens["cf_mix"],
-        "step5.tuning.cf_tier_mix_candidates.explanation",
-    )
     _assert_close_mapping(
         _mapping(explanation_cfg.get("cf_tier_mix"), "step5.sampler.explanation.cf_tier_mix"),
-        cf_mix,
+        cf_mix_row,
         fields=("high", "medium", "low_weighted"),
         label="step5.sampler.explanation.cf_tier_mix",
     )
-    target_gold_mix = _candidate_row_by_id(
-        (tuning_config.get("gold_tier_mix_candidates") or {}).get("target_gold"),
-        tokens["target_gold_mix"],
-        "step5.tuning.gold_tier_mix_candidates.target_gold",
-    )
     _assert_close_mapping(
         _mapping(explanation_cfg.get("target_gold_tier_mix"), "step5.sampler.explanation.target_gold_tier_mix"),
-        target_gold_mix,
+        _mapping(selected_rows["target_gold_mix"], "step5.tuning.gold_tier_mix_candidates.target_gold.selected"),
         fields=("high", "medium"),
         label="step5.sampler.explanation.target_gold_tier_mix",
     )
-    aux_gold_mix = _candidate_row_by_id(
-        (tuning_config.get("gold_tier_mix_candidates") or {}).get("aux_gold"),
-        tokens["aux_gold_mix"],
-        "step5.tuning.gold_tier_mix_candidates.aux_gold",
-    )
     _assert_close_mapping(
         _mapping(explanation_cfg.get("aux_gold_tier_mix"), "step5.sampler.explanation.aux_gold_tier_mix"),
-        aux_gold_mix,
+        _mapping(selected_rows["aux_gold_mix"], "step5.tuning.gold_tier_mix_candidates.aux_gold.selected"),
         fields=("high", "medium"),
         label="step5.sampler.explanation.aux_gold_tier_mix",
     )
     selected_lr = float(str(tokens["lr"])[len("LR_") :])
     if abs(float(row.get("lr")) - selected_lr) > 1e-12:
         raise OneControlConfigError(f"step5.train.lr={row.get('lr')} does not match selected candidate {tokens['lr']}")
-    weights = _candidate_row_by_id(tuning_config.get("innovation_weight_candidates"), tokens["weight"], "step5.tuning.innovation_weight_candidates")
+    weights = _mapping(selected_rows["weights"], "step5.tuning.innovation_weight_candidates.selected")
     fca = _mapping(innovation_config.get("fca"), "step5.fca")
     ccv = _mapping(innovation_config.get("ccv"), "step5.ccv")
     checks = (
@@ -3842,22 +3418,26 @@ def _step5_formal_active_candidate_payload(
     *,
     sampler_config: Mapping[str, Any],
     tuning_config: Mapping[str, Any],
+    batch_candidates_config: Mapping[str, Any],
     row: Mapping[str, Any],
 ) -> dict[str, Any]:
-    tokens = _step5_candidate_tokens(str(tuning_config.get("selected_tuning_candidate") or ""))
-    explanation_cfg = _mapping(sampler_config.get("explanation"), "step5.sampler.explanation")
-    explanation_mix = dict(_mapping(explanation_cfg.get("cf_tier_mix"), "step5.sampler.explanation.cf_tier_mix"))
+    try:
+        intent = build_step5_sample_plan_intent(
+            sampler_config=sampler_config,
+            tuning_config=tuning_config,
+            batch_candidates_config=batch_candidates_config,
+            task_head="explanation",
+        )
+    except Step5SamplePlanIntentError as exc:
+        raise OneControlConfigError(str(exc)) from exc
+    tokens = dict(intent["candidate_parts"])
+    explanation_mix = dict(intent["cf_tier_mix"])
     low_weighted_disabled = float(explanation_mix.get("low_weighted") or 0.0) == 0.0
-    sampler_protocol = (
-        _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
-        if tokens["cf_mix"] == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID
-        else "STEP5_FORMAL_HIGH_MEDIUM_MAINLINE"
-    )
     return {
-        "schema_version": "odcr_step5_formal_active_candidate/2",
+        "schema_version": "odcr_step5_formal_active_candidate/3",
         "mode": "explanation_only",
-        "sampler_protocol": sampler_protocol,
-        "weak_cross_platform_protocol": tokens["cf_mix"] == _STEP5_WEAK_CROSS_PLATFORM_CF_MIX_ID,
+        "sampler_protocol": str(intent["sampler_protocol"]),
+        "weak_cross_platform_protocol": bool(intent.get("weak_cross_platform_protocol")),
         "selected_tuning_candidate": str(tuning_config.get("selected_tuning_candidate") or ""),
         "candidate_parts": {
             "ratio_id": tokens["ratio"],
@@ -3867,29 +3447,26 @@ def _step5_formal_active_candidate_payload(
             "lr_id": tokens["lr"],
             "weights_id": tokens["weight"],
         },
+        "sample_plan_intent_hash": str(intent["sample_plan_intent_hash"]),
+        "sample_plan_intent": dict(intent),
+        "component_ratios": dict(intent["component_ratios"]),
         "explanation_cf_mix_id": tokens["cf_mix"],
         "explanation_cf_mix": explanation_mix,
         "target_gold_tier_mix_id": tokens["target_gold_mix"],
-        "target_gold_tier_mix": dict(
-            _mapping(explanation_cfg.get("target_gold_tier_mix"), "step5.sampler.explanation.target_gold_tier_mix")
-        ),
+        "target_gold_tier_mix": dict(intent["target_gold_tier_mix"]),
         "aux_gold_tier_mix_id": tokens["aux_gold_mix"],
-        "aux_gold_tier_mix": dict(
-            _mapping(explanation_cfg.get("aux_gold_tier_mix"), "step5.sampler.explanation.aux_gold_tier_mix")
-        ),
+        "aux_gold_tier_mix": dict(intent["aux_gold_tier_mix"]),
         "lr": float(row.get("lr") or 0.0),
+        "warmup_fraction": float(tuning_config.get("selected_warmup_fraction") or 0.0),
+        "warmup_fraction_candidates": list(tuning_config.get("warmup_fraction_candidates") or []),
         "weights_id": tokens["weight"],
         "batch_candidate": str(tuning_config.get("batch_candidate") or ""),
         "effective_samples": dict(tuning_config.get("effective_samples") or {}),
         "optimizer_steps": dict(tuning_config.get("optimizer_steps") or {}),
         "low_weighted_policy": "disabled_for_mainline" if low_weighted_disabled else "active",
-        "full_audit_default_forbidden": bool(sampler_config.get("full_audit_default_allowed") is False),
-        "old_dedicated_default_forbidden": bool(sampler_config.get("legacy_gold_heavy_exports_allowed") is False),
+        "full_audit_default_forbidden": True,
         "step4_sampling_contract_role": "pool_lineage_only",
-        "active_sampler_source": (
-            f"{sampler_config.get('task_override_source') or 'step5.sampler'} + "
-            f"{tuning_config.get('selected_tuning_candidate_source') or 'step5.tuning.selected_tuning_candidate'}"
-        ),
+        "active_sampler_source": str(intent["active_sampler_source"]),
         "ai_analysis_runtime_config_source": "evidence_only_not_runtime_config",
     }
 
@@ -4103,7 +3680,6 @@ def resolve_config(
     step3_task_profile_config: dict[str, Any] = {}
     step3_backup_profiles_config: dict[str, Any] = {}
     step3_exploration_profiles_config: dict[str, Any] = {}
-    step3_worker_profiles_config: dict[str, Any] = {}
     step3_prefetcher_config: dict[str, Any] = {}
     step3_checkpoint_policy_config: dict[str, Any] = {}
     step3_quality_gate_config: dict[str, Any] = {}
@@ -4112,16 +3688,10 @@ def resolve_config(
     step3_cross_rank_gather_config: dict[str, Any] = {}
     step3_memory_config: dict[str, Any] = {}
     step3_timing_config: dict[str, Any] = {}
-    step3_performance_candidates_config: dict[str, Any] = {}
     step3_cache_policy_config: dict[str, Any] = {}
     step3_objective_drift_config: dict[str, Any] = {}
     step3_recovery_config: dict[str, Any] = {}
     step3_phase_loss_schedule_config: dict[str, Any] = {}
-    step3_conflict_aware_config: dict[str, Any] = {}
-    step3_loss_gradient_conflict_probe_config: dict[str, Any] = {}
-    step3_adapter_gating_config: dict[str, Any] = {}
-    step3_paper_candidate_selection_config: dict[str, Any] = {}
-    step3_checkpoint_averaging_config: dict[str, Any] = {}
     step3_batch_candidate_role = ""
     if stage_for_train == "step3":
         step3_optimizer_config = _resolve_step3_optimizer_config(cfg, step3_task_profile_raw)
@@ -4132,11 +3702,6 @@ def resolve_config(
         )
         step3_scheduler_config = _resolve_step3_scheduler_config(cfg, step3_task_profile_raw)
         step3_eval_config = _resolve_step3_eval_config(train, stage_cfg, ddp_world_size)
-        step3_worker_profiles_config = _resolve_step3_worker_profiles_config(
-            cfg,
-            ddp_world_size=ddp_world_size,
-            max_parallel_cpu=_positive_int(hw.get("max_parallel_cpu", 1), "hardware.max_parallel_cpu"),
-        )
         step3_prefetcher_config = _resolve_step3_prefetcher_config(cfg)
         step3_checkpoint_policy_config = _resolve_step3_checkpoint_policy_config(cfg)
         step3_quality_gate_config = _resolve_step3_quality_gate_config(cfg)
@@ -4147,16 +3712,10 @@ def resolve_config(
         step3_backup_profiles_config = _resolve_step3_backup_profiles_config(cfg, ddp_world_size)
         step3_exploration_profiles_config = _resolve_step3_exploration_profiles_config(cfg, ddp_world_size)
         step3_timing_config = _resolve_step3_timing_config(cfg)
-        step3_performance_candidates_config = _resolve_step3_performance_candidates_config(cfg)
         step3_cache_policy_config = _resolve_step3_cache_policy_config(cfg)
         step3_objective_drift_config = _resolve_step3_objective_drift_config(cfg)
         step3_recovery_config = _resolve_step3_recovery_config(cfg)
         step3_phase_loss_schedule_config = _resolve_step3_phase_loss_schedule_config(cfg)
-        step3_conflict_aware_config = _resolve_step3_conflict_aware_config(cfg)
-        step3_loss_gradient_conflict_probe_config = _resolve_step3_loss_gradient_conflict_probe_config(cfg)
-        step3_adapter_gating_config = _resolve_step3_adapter_gating_config(cfg)
-        step3_paper_candidate_selection_config = _resolve_step3_paper_candidate_selection_config(cfg)
-        step3_checkpoint_averaging_config = _resolve_step3_checkpoint_averaging_config(cfg)
         step3_task_profile_config = _resolve_step3_task_profile_config(
             key=step3_task_profile_key,
             raw=step3_task_profile_raw,
@@ -4190,9 +3749,6 @@ def resolve_config(
     decode_snapshot = decode
     if stage_for_train == "step5" and not need_decode and decode_name:
         _snapshot_decode_id, decode_snapshot = _resolve_decode(cfg, decode_name, need_decode=True)
-    need_rerank = command == "eval" and bool(eval_profile_obj.get("rerank"))
-    rerank_name = str(eval_profile_obj.get("rerank")) if eval_profile_obj.get("rerank") else None
-    rerank_id, rerank = _resolve_rerank(cfg, rerank_name, need_rerank=need_rerank)
     if stage_for_train == "step5" and command == "eval":
         if eval_profile_name != "paper_greedy_25":
             raise OneControlConfigError(
@@ -4203,14 +3759,21 @@ def resolve_config(
             raise OneControlConfigError("eval.profiles.paper_greedy_25 must declare official: true")
         if str(decode_id) != "paper_greedy_25":
             raise OneControlConfigError("Step5 official eval requires eval.decode.paper_greedy_25")
-        if bool(eval_profile_obj.get("rerank")):
-            raise OneControlConfigError("Step5 official paper_greedy_25 eval forbids rerank")
         if str(decode.get("decode_strategy", "")).strip().lower() != "greedy":
             raise OneControlConfigError("Step5 official paper_greedy_25 decode_strategy must be greedy")
         if int(decode.get("max_explanation_length", 0)) != 25 or int(decode.get("hard_max_len", 0)) != 25:
             raise OneControlConfigError("Step5 official paper_greedy_25 max/hard length must be 25")
-        if abs(float(decode.get("repetition_penalty", 1.0)) - 1.0) > 1e-12:
-            raise OneControlConfigError("Step5 official paper_greedy_25 repetition_penalty must be 1.0")
+            if abs(float(decode.get("repetition_penalty", 1.0)) - 1.0) > 1e-12:
+                raise OneControlConfigError("Step5 official paper_greedy_25 repetition_penalty must be 1.0")
+
+    if command == "step5":
+        early_step5_batch_candidates = _resolve_step5_batch_candidates_config(cfg)
+        early_step5_tuning = _resolve_step5_tuning_config(cfg, early_step5_batch_candidates, task_id=tid)
+        _step5_selected_rows_with_task_gate(
+            task_id=tid,
+            scenario=scenario,
+            tuning_config=early_step5_tuning,
+        )
 
     iteration_id = "v1"
     run_name: str | None = None
@@ -4224,7 +3787,15 @@ def resolve_config(
     active_stage_status_payload: dict[str, Any] = {}
 
     if command == "step3":
-        run_name = _alloc_run(repo_root, tid, "step3", run_id or "auto", dry_run=dry_run)
+        explicit_eval_only_run = (
+            str(mode or "").strip().lower() == "eval_only"
+            and run_id is not None
+            and str(run_id).strip() not in {"", "auto"}
+        )
+        if explicit_eval_only_run:
+            run_name = _bind_existing_run(repo_root, tid, "step3", str(run_id), dry_run=dry_run)
+        else:
+            run_name = _alloc_run(repo_root, tid, "step3", run_id or "auto", dry_run=dry_run)
         run_root = _stage_root(repo_root, tid, "step3", run_name)
         try:
             active_stage_status_payload = resolve_latest(
@@ -4356,12 +3927,7 @@ def resolve_config(
         from_run = run_naming.parse_run_id(upstream_from_step3) if upstream_from_step3 else inferred_from_run
         step4_run = run_naming.parse_run_id(upstream_from_step4) if upstream_from_step4 else inferred_step4
         run_root = _stage_root(repo_root, tid, "step5", step5_run)
-        if need_rerank:
-            eval_stage = "rerank"
-            eval_run_id = _alloc_run(repo_root, tid, eval_stage, run_id or "auto", dry_run=dry_run)
-            eval_run_dir = str(_stage_root(repo_root, tid, eval_stage, eval_run_id))
-        else:
-            eval_run_dir = str((run_root / "post_train_eval" / eval_split).resolve())
+        eval_run_dir = str((run_root / "post_train_eval" / eval_split).resolve())
     else:
         raise OneControlConfigError(f"unsupported command for resolver: {command}")
 
@@ -4375,7 +3941,6 @@ def resolve_config(
 
     step4_rcr_config = _resolve_step4_rcr_config(cfg)
     step4_runtime_config = _resolve_step4_runtime_config(cfg)
-    step4_step5_dedicated_exports_config = _resolve_step4_step5_dedicated_exports_config(cfg)
     step4_step5_pool_exports_config = _resolve_step4_step5_pool_exports_config(cfg)
     step4_gold_quality_config = _resolve_step4_gold_quality_config(cfg)
     step4_cf_tiers_config = _resolve_step4_cf_tiers_config(cfg)
@@ -4451,18 +4016,6 @@ def resolve_config(
     )
     step5_valid_loss_config = _resolve_step5_valid_loss_config(cfg) if stage_for_train == "step5" else {}
     step5_final_eval_config = _resolve_step5_final_eval_config(cfg) if stage_for_train == "step5" else {}
-    if (
-        stage_for_train == "step5"
-        and command == "eval"
-        and step5_eval_config
-        and bool(step5_eval_config.get("old_eval_batch_2048_retired"))
-    ):
-        eval_batch_size, eval_per_gpu = _step5_official_eval_batch_layout(
-            step5_eval_config,
-            eval_split=eval_split,
-            ddp_world_size=ddp_world_size,
-        )
-        row["eval_batch_size"] = int(eval_batch_size)
     train_precision, train_precision_source = _resolve_train_precision(stage_for_train, train, row)
     row["train_precision"] = train_precision
     row.setdefault("tokenizer_max_length", int(step3_tokenizer_config["max_length"]))
@@ -4495,25 +4048,13 @@ def resolve_config(
                 "evidence_max_length": int(step3_evidence_config["max_evidence_length"]),
                 "lr_scheduler": str(step3_scheduler_config["name"]),
                 "lr_base_scheduler": str(step3_scheduler_config.get("base_scheduler", "warmup_cosine")),
-                "lr_damping_enabled": bool(step3_scheduler_config.get("damping_enabled", False)),
                 "warmup_ratio": float(step3_scheduler_config["warmup_ratio"]),
                 "min_lr_ratio": float(step3_scheduler_config["min_lr_ratio"]),
-                "effective_min_lr_policy": str(
-                    step3_scheduler_config.get("validation_aware_lr_damping", {}).get(
-                        "effective_min_lr_policy",
-                        "base_floor",
-                    )
-                ),
-                "validation_aware_lr_damping": bool(
-                    step3_scheduler_config.get("validation_aware_lr_damping", {}).get("enabled", False)
-                ),
+                "effective_min_lr_policy": "base_floor",
                 "step3_objective_drift_enabled": bool(step3_objective_drift_config.get("enabled", False)),
                 "step3_recovery_enabled": bool(step3_recovery_config.get("enabled", False)),
                 "step3_recovery_scheduler": str(step3_recovery_config.get("recovery_scheduler", "")),
                 "step3_phase_loss_schedule_enabled": bool(step3_phase_loss_schedule_config.get("enabled", False)),
-                "step3_conflict_aware_mode": str(step3_conflict_aware_config.get("mode", "off")),
-                "step3_adapter_gating_enabled": bool(step3_adapter_gating_config.get("enabled", False)),
-                "step3_paper_candidate_selection_enabled": bool(step3_paper_candidate_selection_config.get("enabled", False)),
                 "step3_eval_protocol": str(step3_eval_config.get("protocol", MINIMAL_EVAL)),
                 "step3_eval_split": str(step3_eval_config.get("split", "valid")),
                 "step3_eval_batch_candidates": list(step3_eval_config.get("batch_candidates") or []),
@@ -4609,10 +4150,12 @@ def resolve_config(
         step5_formal_active_candidate_config = _step5_formal_active_candidate_payload(
             sampler_config=step5_sampler_config,
             tuning_config=step5_tuning_config,
+            batch_candidates_config=step5_batch_candidates_config,
             row=row,
         )
         row["selected_tuning_candidate"] = str(step5_tuning_config.get("selected_tuning_candidate") or "")
-        row["fallback_tuning_candidate"] = str(step5_tuning_config.get("fallback_tuning_candidate") or "")
+        row["warmup_ratio"] = float(step5_tuning_config.get("selected_warmup_fraction") or 0.05)
+        row["warmup_epochs"] = 0.0
         row["step5_effective_samples"] = dict(step5_tuning_config.get("effective_samples") or {})
         row["step5_optimizer_steps"] = dict(step5_tuning_config.get("optimizer_steps") or {})
         row["step5_formal_active_candidate"] = dict(step5_formal_active_candidate_config)
@@ -4653,7 +4196,6 @@ def resolve_config(
         payload["step3_evidence"] = step3_evidence_config
         payload["step3_scheduler"] = step3_scheduler_config
         payload["step3_eval"] = step3_eval_config
-        payload["step3_worker_profiles"] = step3_worker_profiles_config
         payload["step3_prefetcher"] = step3_prefetcher_config
         payload["step3_checkpoint_policy"] = step3_checkpoint_policy_config
         payload["step3_quality_gate"] = step3_quality_gate_config
@@ -4662,19 +4204,12 @@ def resolve_config(
         payload["step3_cross_rank_structured_gather"] = step3_cross_rank_gather_config
         payload["step3_memory"] = step3_memory_config
         payload["step3_timing"] = step3_timing_config
-        payload["step3_performance_candidates"] = step3_performance_candidates_config
         payload["step3_cache_policy"] = step3_cache_policy_config
         payload["step3_objective_drift"] = step3_objective_drift_config
         payload["step3_recovery"] = step3_recovery_config
         payload["step3_phase_loss_schedule"] = step3_phase_loss_schedule_config
-        payload["step3_conflict_aware"] = step3_conflict_aware_config
-        payload["step3_loss_gradient_conflict_probe"] = step3_loss_gradient_conflict_probe_config
-        payload["step3_adapter_gating"] = step3_adapter_gating_config
-        payload["step3_paper_candidate_selection"] = step3_paper_candidate_selection_config
-        payload["step3_checkpoint_averaging"] = step3_checkpoint_averaging_config
     payload["step4_rcr"] = step4_rcr_config
     payload["step4_runtime"] = step4_runtime_config
-    payload["step4_step5_dedicated_exports"] = step4_step5_dedicated_exports_config
     payload["step4_step5_pool_exports"] = step4_step5_pool_exports_config
     payload["step4_gold_quality"] = step4_gold_quality_config
     payload["step4_cf_tiers"] = step4_cf_tiers_config
@@ -4691,7 +4226,7 @@ def resolve_config(
         payload["step5_head"] = "explanation"
         payload["rating_source"] = dict(rating_source_config)
         payload["selected_tuning_candidate"] = str(step5_tuning_config.get("selected_tuning_candidate") or "")
-        payload["fallback_tuning_candidate"] = str(step5_tuning_config.get("fallback_tuning_candidate") or "")
+        payload["step5_selected_warmup_fraction"] = float(step5_tuning_config.get("selected_warmup_fraction") or 0.0)
         payload["step5_effective_samples"] = dict(step5_tuning_config.get("effective_samples") or {})
         payload["step5_optimizer_steps"] = dict(step5_tuning_config.get("optimizer_steps") or {})
         payload["step5_innovation"] = step5_innovation_config
@@ -4760,10 +4295,8 @@ def resolve_config(
         "eval_profile": f"eval.profiles.{eval_profile_name}" if eval_profile_name else None,
         "eval_split": "eval.split",
         "decode": f"eval.decode.{decode_id}" if decode_id else None,
-        "rerank": f"eval.rerank.{rerank_id}" if rerank_id else None,
         "step4_rcr": "step4.rcr",
         "step4_runtime": "step4.runtime",
-        "step4_step5_dedicated_exports": "step4.step5_dedicated_exports",
         "step4_step5_pool_exports": "step4.step5_pool_exports",
         "step4_gold_quality": "step4.gold_quality",
         "step4_cf_tiers": "step4.cf_tiers",
@@ -4794,7 +4327,6 @@ def resolve_config(
             else None
         ),
         "step3_scheduler": "step3.scheduler" if stage_for_train == "step3" else None,
-        "step3_scheduler_damping": "step3.scheduler.validation_aware_lr_damping" if stage_for_train == "step3" else None,
         "step3_max_grad_norm": "step3.train.max_grad_norm" if stage_for_train == "step3" else None,
         "step3_batch_semantics": "step3.train global_batch_size/per_gpu_batch_size with hardware.ddp_world_size" if stage_for_train == "step3" else None,
         "step3_batch_candidate_role": "step3.task_profiles candidate" if stage_for_train == "step3" else None,
@@ -4813,7 +4345,6 @@ def resolve_config(
         "step3_exploration_profiles": (
             "step3.exploration_profiles" if stage_for_train == "step3" and step3_exploration_profiles_config else None
         ),
-        "step3_worker_profiles": "step3.worker_profiles" if stage_for_train == "step3" else None,
         "step3_prefetcher": "step3.prefetcher" if stage_for_train == "step3" else None,
         "step3_checkpoint_policy": "step3.checkpoint_policy" if stage_for_train == "step3" else None,
         "step3_quality_gate": "step3.quality_gate" if stage_for_train == "step3" else None,
@@ -4822,16 +4353,10 @@ def resolve_config(
         "step3_cross_rank_structured_gather": "step3.cross_rank_structured_gather" if stage_for_train == "step3" else None,
         "step3_memory": "step3.memory" if stage_for_train == "step3" else None,
         "step3_timing": "step3.timing" if stage_for_train == "step3" else None,
-        "step3_performance_candidates": "step3.performance_candidates" if stage_for_train == "step3" else None,
         "step3_cache_policy": "step3.cache" if stage_for_train == "step3" else None,
         "step3_objective_drift": "step3.objective_drift" if stage_for_train == "step3" else None,
         "step3_recovery": "step3.recovery" if stage_for_train == "step3" else None,
         "step3_phase_loss_schedule": "step3.phase_loss_schedule" if stage_for_train == "step3" else None,
-        "step3_conflict_aware": "step3.conflict_aware" if stage_for_train == "step3" else None,
-        "step3_loss_gradient_conflict_probe": "step3.loss_gradient_conflict_probe" if stage_for_train == "step3" else None,
-        "step3_adapter_gating": "step3.adapter_gating" if stage_for_train == "step3" else None,
-        "step3_paper_candidate_selection": "step3.paper_candidate_selection" if stage_for_train == "step3" else None,
-        "step3_checkpoint_averaging": "step3.checkpoint_averaging" if stage_for_train == "step3" else None,
         "step5_lci": "step5.lci",
         "step5_uci": "step5.uci",
         "step5_explainer_gate": "step5.explainer_gate",
@@ -4881,6 +4406,16 @@ def resolve_config(
             if stage_for_train == "step5"
             else None
         ),
+        "step5_formal_active_candidate.component_ratios": (
+            str(step5_sampler_config.get("task_override_source") or "step5.sampler")
+            if stage_for_train == "step5"
+            else None
+        ),
+        "step5_formal_active_candidate.sample_plan_intent_hash": (
+            "derived from resolved step5.tuning + step5.sampler + step5.batch_candidates content-affecting intent"
+            if stage_for_train == "step5"
+            else None
+        ),
         "step5_formal_active_candidate.active_sampler_source": (
             str(step5_formal_active_candidate_config.get("active_sampler_source") or "")
             if stage_for_train == "step5"
@@ -4910,6 +4445,7 @@ def resolve_config(
         "step5_valid_loss": "step5.valid_loss" if stage_for_train == "step5" else None,
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
         "train_per_gpu_batch_size": "step5.train.per_gpu_batch_size" if stage_for_train == "step5" else None,
+        "step5_validate_every_epochs": "step5.train.validate_every_epochs / step5.tasks.<task>.validate_every_epochs" if stage_for_train == "step5" else None,
         "valid_per_gpu_batch_size": f"{step5_eval_source}.valid_per_gpu_batch_size" if stage_for_train == "step5" else None,
         "valid_global_batch_size": f"{step5_eval_source}.valid_batch_size" if stage_for_train == "step5" else None,
         "valid_forward_micro_batch_size": f"{step5_eval_source}.valid_forward_micro_batch_size" if stage_for_train == "step5" else None,
@@ -4919,7 +4455,6 @@ def resolve_config(
         "formal_entry_E4_validation_required": (
             f"{step5_eval_source}.formal_entry_E4_validation_required" if stage_for_train == "step5" else None
         ),
-        "old_eval_batch_2048_retired": f"{step5_eval_source}.old_eval_batch_2048_retired" if stage_for_train == "step5" else None,
         "valid_loss_components": f"{step5_eval_source}.valid_loss_components" if stage_for_train == "step5" else None,
         "validation_flans_logits_materialized": "not_applicable_explanation_only" if stage_for_train == "step5" else None,
         "validation_e4_evidence_id": "AI_analysis formal-entry E4 with validation evidence" if stage_for_train == "step5" else None,
@@ -5013,23 +4548,7 @@ def resolve_config(
     for key in (
         "enabled",
         "output_dir_name",
-        "full_audit_format",
-        "scorer_train_format",
-        "explainer_train_format",
-        "scorer_filter",
-        "explainer_filter",
-        "write_gold_cf_subsplits",
         "full_audit_role",
-        "atomic_write",
-        "validate_after_write",
-        "chunk_rows",
-    ):
-        field_sources[f"step4_step5_dedicated_exports.{key}"] = f"step4.step5_dedicated_exports.{key}"
-    for key in (
-        "enabled",
-        "output_dir_name",
-        "full_audit_role",
-        "legacy_dedicated_exports_role",
         "chunk_rows",
     ):
         field_sources[f"step4_step5_pool_exports.{key}"] = f"step4.step5_pool_exports.{key}"
@@ -5077,8 +4596,6 @@ def resolve_config(
         "effective_epoch_enabled",
         "seed",
         "rotate_across_epochs",
-        "full_audit_default_allowed",
-        "legacy_gold_heavy_exports_allowed",
         "auto_budget",
         "explanation",
         "epochs",
@@ -5098,8 +4615,6 @@ def resolve_config(
         "enabled",
         "max_effective_epochs",
         "early_stopping_patience",
-        "retired_full_table_epochs",
-        "retired_full_table_policy",
     ):
         field_sources[f"step5_effective_epoch.{key}"] = f"step5.effective_epoch.{key}"
     for key in ("ddp_world_size", "fsdp_zero_policy", "selected_default", "candidates"):
@@ -5107,14 +4622,13 @@ def resolve_config(
     for key in (
         "enabled",
         "selected_tuning_candidate",
-        "fallback_tuning_candidate",
         "effective_samples",
         "optimizer_steps",
         "batch_candidate",
-        "fallback_batch_candidate",
         "selected_budget_candidate",
         "pilot_fraction_candidates",
         "lr_candidates",
+        "selected_warmup_fraction",
         "warmup_fraction_candidates",
         "innovation_weight_candidates",
         "ratio_candidates",
@@ -5136,7 +4650,6 @@ def resolve_config(
         "validation_memory_policy",
         "step5_validation_mode",
         "formal_entry_E4_validation_required",
-        "old_eval_batch_2048_retired",
         "valid_loss_components",
     ):
         field_sources[f"step5_eval.{key}"] = f"{step5_eval_source}.{key}"
@@ -5191,10 +4704,8 @@ def resolve_config(
         "hardware_profile": hw_name,
         "eval_profile": eval_profile_name or None,
         "decode_profile": decode_id or None,
-        "rerank_profile": rerank_id or None,
         "step4_rcr": "step4.rcr",
         "step4_runtime": "step4.runtime",
-        "step4_step5_dedicated_exports": "step4.step5_dedicated_exports",
         "step4_step5_pool_exports": "step4.step5_pool_exports",
         "rating_source": "rating_source + upstream Step3 eval_handoff" if stage_for_train == "step5" else None,
         "step5_data_pipeline": "step5.data_pipeline" if stage_for_train == "step5" else None,
@@ -5217,7 +4728,6 @@ def resolve_config(
         "step3_exploration_profiles": (
             "step3.exploration_profiles" if stage_for_train == "step3" and step3_exploration_profiles_config else None
         ),
-        "step3_worker_profiles": "step3.worker_profiles" if stage_for_train == "step3" else None,
         "step3_prefetcher": "step3.prefetcher" if stage_for_train == "step3" else None,
         "step3_checkpoint_policy": "step3.checkpoint_policy" if stage_for_train == "step3" else None,
         "step3_quality_gate": "step3.quality_gate" if stage_for_train == "step3" else None,
@@ -5226,16 +4736,10 @@ def resolve_config(
         "step3_cross_rank_structured_gather": "step3.cross_rank_structured_gather" if stage_for_train == "step3" else None,
         "step3_memory": "step3.memory" if stage_for_train == "step3" else None,
         "step3_timing": "step3.timing" if stage_for_train == "step3" else None,
-        "step3_performance_candidates": "step3.performance_candidates" if stage_for_train == "step3" else None,
         "step3_cache_policy": "step3.cache" if stage_for_train == "step3" else None,
         "step3_objective_drift": "step3.objective_drift" if stage_for_train == "step3" else None,
         "step3_recovery": "step3.recovery" if stage_for_train == "step3" else None,
         "step3_phase_loss_schedule": "step3.phase_loss_schedule" if stage_for_train == "step3" else None,
-        "step3_conflict_aware": "step3.conflict_aware" if stage_for_train == "step3" else None,
-        "step3_loss_gradient_conflict_probe": "step3.loss_gradient_conflict_probe" if stage_for_train == "step3" else None,
-        "step3_adapter_gating": "step3.adapter_gating" if stage_for_train == "step3" else None,
-        "step3_paper_candidate_selection": "step3.paper_candidate_selection" if stage_for_train == "step3" else None,
-        "step3_checkpoint_averaging": "step3.checkpoint_averaging" if stage_for_train == "step3" else None,
         "runtime_roots": {
             "data_dir": "project.data_dir",
             "merged_dir": "project.merged_dir",
@@ -5301,11 +4805,6 @@ def resolve_config(
             if stage_for_train == "step5"
             else None
         ),
-        "fallback_tuning_candidate": (
-            str(step5_tuning_config.get("fallback_tuning_candidate_source") or "step5.tuning.fallback_tuning_candidate")
-            if stage_for_train == "step5"
-            else None
-        ),
         "step5_effective_samples": (
             f"step5.tasks.{tid}.tuning.effective_samples" if stage_for_train == "step5" and "effective_samples" in _step5_task_block(cfg, tid, "tuning") else ("step5.tuning.effective_samples" if stage_for_train == "step5" else None)
         ),
@@ -5331,7 +4830,7 @@ def resolve_config(
         "step5_final_eval": "step5.final_eval" if stage_for_train == "step5" else None,
     }
     train_fp = fingerprint({"payload": payload, "hardware": hw_semantic, "ddp_world_size": ddp_world_size})
-    gen_fp = fingerprint({"decode": decode, "eval_batch_size": eval_batch_size, "rerank": rerank}) if need_decode else ""
+    gen_fp = fingerprint({"decode": decode, "eval_batch_size": eval_batch_size}) if need_decode else ""
     runtime_fp = fingerprint(runtime_diagnostics_fingerprint_source())
     field_sources = {k: v for k, v in field_sources.items() if v is not None}
     sources = [SourceRecord(k, v, field_sources.get(k, "configs/odcr.yaml")) for k, v in sorted(field_sources.items())]
@@ -5405,11 +4904,12 @@ def resolve_config(
             **(
                 {
                     "selected_tuning_candidate": str(step5_tuning_config.get("selected_tuning_candidate") or ""),
-                    "fallback_tuning_candidate": str(step5_tuning_config.get("fallback_tuning_candidate") or ""),
                     "effective_samples": dict(step5_tuning_config.get("effective_samples") or {}),
                     "optimizer_steps": dict(step5_tuning_config.get("optimizer_steps") or {}),
                     "batch_candidate": str(step5_tuning_config.get("batch_candidate") or ""),
-                    "fallback_batch_candidate": str(step5_tuning_config.get("fallback_batch_candidate") or ""),
+                    "warmup_ratio": float(row.get("warmup_ratio") or 0.0),
+                    "warmup_ratio_source": "step5.tuning.selected_warmup_fraction",
+                    "validate_every_epochs": int(row.get("validate_every_epochs", 1)),
                 }
                 if stage_for_train == "step5"
                 else {}
@@ -5457,7 +4957,6 @@ def resolve_config(
                         "formal_entry_E4_validation_required": bool(
                             step5_eval_config["formal_entry_E4_validation_required"]
                         ),
-                        "old_eval_batch_2048_retired": bool(step5_eval_config["old_eval_batch_2048_retired"]),
                     },
                     "eval_batch_size_role_for_step5_train_validation": (
                         "step5_official_eval_uses_step5_eval_batch"
@@ -5469,20 +4968,9 @@ def resolve_config(
                 else {}
             ),
             "decode": _public_decode_snapshot(decode_snapshot),
-            "rerank": rerank if rerank else None,
-            "rerank_source_table": (
-                {
-                    "eval_profile": f"eval.profiles.{eval_profile_name}.rerank",
-                    "rerank_profile": f"eval.rerank.{rerank_id}",
-                    "transport": "ResolvedConfig.rerank_profile_json + step5 eval-rerank CLI transport",
-                }
-                if rerank
-                else None
-            ),
         },
         "step4_rcr": step4_rcr_config if command == "step4" else None,
         "step4_runtime": step4_runtime_config if command == "step4" else None,
-        "step4_step5_dedicated_exports": step4_step5_dedicated_exports_config if command == "step4" else None,
         "step4_step5_pool_exports": step4_step5_pool_exports_config if command == "step4" else None,
         "step4_gold_quality": step4_gold_quality_config if command == "step4" else None,
         "step4_cf_tiers": step4_cf_tiers_config if command == "step4" else None,
@@ -5505,7 +4993,6 @@ def resolve_config(
             if stage_for_train == "step3" and step3_exploration_profiles_config
             else None
         ),
-        "step3_worker_profiles": step3_worker_profiles_config if stage_for_train == "step3" else None,
         "step3_prefetcher": step3_prefetcher_config if stage_for_train == "step3" else None,
         "step3_checkpoint_policy": step3_checkpoint_policy_config if stage_for_train == "step3" else None,
         "step3_quality_gate": step3_quality_gate_config if stage_for_train == "step3" else None,
@@ -5514,16 +5001,10 @@ def resolve_config(
         "step3_cross_rank_structured_gather": step3_cross_rank_gather_config if stage_for_train == "step3" else None,
         "step3_memory": step3_memory_config if stage_for_train == "step3" else None,
         "step3_timing": step3_timing_config if stage_for_train == "step3" else None,
-        "step3_performance_candidates": step3_performance_candidates_config if stage_for_train == "step3" else None,
         "step3_cache_policy": step3_cache_policy_config if stage_for_train == "step3" else None,
         "step3_objective_drift": step3_objective_drift_config if stage_for_train == "step3" else None,
         "step3_recovery": step3_recovery_config if stage_for_train == "step3" else None,
         "step3_phase_loss_schedule": step3_phase_loss_schedule_config if stage_for_train == "step3" else None,
-        "step3_conflict_aware": step3_conflict_aware_config if stage_for_train == "step3" else None,
-        "step3_loss_gradient_conflict_probe": step3_loss_gradient_conflict_probe_config if stage_for_train == "step3" else None,
-        "step3_adapter_gating": step3_adapter_gating_config if stage_for_train == "step3" else None,
-        "step3_paper_candidate_selection": step3_paper_candidate_selection_config if stage_for_train == "step3" else None,
-        "step3_checkpoint_averaging": step3_checkpoint_averaging_config if stage_for_train == "step3" else None,
         "step5": step5_innovation_config if stage_for_train == "step5" else None,
         "rating_source": rating_source_config if stage_for_train == "step5" else None,
         "step5_task_decoupled_policy": (
@@ -5556,9 +5037,6 @@ def resolve_config(
         ),
         "selected_tuning_candidate": (
             str(step5_tuning_config.get("selected_tuning_candidate") or "") if stage_for_train == "step5" else None
-        ),
-        "fallback_tuning_candidate": (
-            str(step5_tuning_config.get("fallback_tuning_candidate") or "") if stage_for_train == "step5" else None
         ),
         "step5_effective_samples": dict(step5_tuning_config.get("effective_samples") or {}) if stage_for_train == "step5" else None,
         "step5_optimizer_steps": dict(step5_tuning_config.get("optimizer_steps") or {}) if stage_for_train == "step5" else None,
@@ -5658,7 +5136,7 @@ def resolve_config(
             resolved_snapshot.pop(retired_empty_key, None)
 
     cfg_obj = ResolvedConfig(
-        command="eval-rerank" if command == "eval" and need_rerank else command,
+        command=command,
         repo_root=repo_root,
         code_dir=_CODE_DIR,
         task_id=tid,
@@ -5705,7 +5183,6 @@ def resolve_config(
         validation_memory_policy=str(row.get("validation_memory_policy", "")),
         step5_validation_mode=str(row.get("step5_validation_mode", "")),
         formal_entry_E4_validation_required=bool(row.get("formal_entry_E4_validation_required", False)),
-        old_eval_batch_2048_retired=bool(row.get("old_eval_batch_2048_retired", False)),
         valid_loss_components_json=json_dumps(row.get("valid_loss_components", {})),
         valid_loss_label_max_length=int(row.get("valid_loss_label_max_length", row.get("train_label_max_length", 64))),
         final_eval_prediction_max_length=int(row.get("final_eval_prediction_max_length", 25)),
@@ -5736,21 +5213,7 @@ def resolve_config(
         step5_allow_embedded_final_eval=bool(step5_allow_embedded_final_eval),
         hardware_preset_id=hw_name,
         decode_preset_id=decode_id,
-        num_return_sequences=int(eval_profile_obj.get("num_return_sequences", rerank.get("num_return_sequences", 3) if rerank else 3)),
-        rerank_method=str(rerank.get("rerank_method", "rule_v3")),
-        rerank_top_k=int(rerank.get("rerank_top_k", 1)),
-        rerank_weight_logprob=float(rerank.get("rerank_weight_logprob", 0.35)),
-        rerank_weight_length=float(rerank.get("rerank_weight_length", 0.10)),
-        rerank_weight_repeat=float(rerank.get("rerank_weight_repeat", 0.16)),
-        rerank_weight_dirty=float(rerank.get("rerank_weight_dirty", 0.20)),
-        rerank_target_len_ratio=float(rerank.get("rerank_target_len_ratio", 1.10)),
-        export_examples_mode=str(rerank.get("export_examples_mode", "head50")),
-        export_full_rerank_examples=str(rerank.get("export_examples_mode", "")).lower() == "full",
-        rerank_malformed_tail_penalty=float(rerank.get("rerank_malformed_tail_penalty", 0.15)),
-        rerank_malformed_token_penalty=float(rerank.get("rerank_malformed_token_penalty", 0.18)),
         decode_profile_json=json_dumps(decode),
-        rerank_profile_json=json_dumps(rerank),
-        rerank_preset_id=rerank_id,
         hardware_profile_json=json_dumps(hw_semantic),
         optimizer_config_json=json_dumps(step3_optimizer_config),
         precision_config_json=json_dumps(step3_backend_config),
@@ -5762,7 +5225,6 @@ def resolve_config(
         task_profile_config_json=json_dumps(step3_task_profile_config),
         backup_profiles_config_json=json_dumps(step3_backup_profiles_config),
         exploration_profiles_config_json=json_dumps(step3_exploration_profiles_config),
-        worker_profiles_config_json=json_dumps(step3_worker_profiles_config),
         prefetcher_config_json=json_dumps(step3_prefetcher_config),
         checkpoint_policy_config_json=json_dumps(step3_checkpoint_policy_config),
         quality_gate_config_json=json_dumps(step3_quality_gate_config),
@@ -5771,16 +5233,10 @@ def resolve_config(
         cross_rank_structured_gather_config_json=json_dumps(step3_cross_rank_gather_config),
         memory_config_json=json_dumps(step3_memory_config),
         timing_config_json=json_dumps(step3_timing_config),
-        performance_candidates_config_json=json_dumps(step3_performance_candidates_config),
         cache_policy_config_json=json_dumps(step3_cache_policy_config),
         objective_drift_config_json=json_dumps(step3_objective_drift_config),
         recovery_config_json=json_dumps(step3_recovery_config),
         phase_loss_schedule_config_json=json_dumps(step3_phase_loss_schedule_config),
-        conflict_aware_config_json=json_dumps(step3_conflict_aware_config),
-        loss_gradient_conflict_probe_config_json=json_dumps(step3_loss_gradient_conflict_probe_config),
-        adapter_gating_config_json=json_dumps(step3_adapter_gating_config),
-        paper_candidate_selection_config_json=json_dumps(step3_paper_candidate_selection_config),
-        checkpoint_averaging_config_json=json_dumps(step3_checkpoint_averaging_config),
         omp_num_threads=int(thread_env["OMP_NUM_THREADS"]),
         mkl_num_threads=int(thread_env["MKL_NUM_THREADS"]),
         tokenizers_parallelism=thread_env["TOKENIZERS_PARALLELISM"] == "true",
@@ -5809,7 +5265,6 @@ def resolve_config(
         upstream_resolution_json=json_dumps(upstream_resolution_payload),
         step4_rcr_config_json=json_dumps(step4_rcr_config),
         step4_runtime_config_json=json_dumps(step4_runtime_config),
-        step4_step5_dedicated_exports_config_json=json_dumps(step4_step5_dedicated_exports_config),
         step4_step5_pool_exports_config_json=json_dumps(step4_step5_pool_exports_config),
         step4_gold_quality_config_json=json_dumps(step4_gold_quality_config),
         step4_cf_tiers_config_json=json_dumps(step4_cf_tiers_config),
@@ -5828,7 +5283,6 @@ def resolve_config(
         head_specific_trainable_policy=str(row.get("head_specific_trainable_policy", "")),
         head_gated_loss_contract_json=json_dumps(row.get("head_gated_loss_contract", {})),
         step5_selected_tuning_candidate=str(step5_tuning_config.get("selected_tuning_candidate") or "") if stage_for_train == "step5" else "",
-        step5_fallback_tuning_candidate=str(step5_tuning_config.get("fallback_tuning_candidate") or "") if stage_for_train == "step5" else "",
         step5_effective_samples_json=json_dumps(step5_tuning_config.get("effective_samples") or {}),
         step5_optimizer_steps_json=json_dumps(step5_tuning_config.get("optimizer_steps") or {}),
         step5_export_loader_config_json=json_dumps(step5_export_loader_config),

@@ -315,12 +315,18 @@ does not write rating MAE/RMSE.
 
 Step5 valid/test target factual rows are not Step4 exports. When Step5 builds
 eval-only control packets for these rows, the control contract is explicitly
-`mode=factual_eval_default` with schema
-`odcr_step5_factual_eval_control/1.0`. These defaults are neutral eval controls
-for factual target rows only: they are not RCR posterior decisions, not train
-routes, and not Step4 export posterior fields. Any input path that is supposed
-to consume `odcr_routing_train.csv` must fail fast if the Step4 posterior
-route/control columns are missing.
+`mode=train_memory_controls` with schema
+`odcr_step5_clean_memory_eval_control/1.0`. These controls must be constructed
+from train-only user/item/domain memory. Current-row `review`, `explanation`,
+and gold `rating` derived controls are forbidden; the target explanation is
+only the metric reference. Any input path that is supposed to consume
+`odcr_routing_train.csv` must fail fast if the Step4 posterior route/control
+columns are missing.
+
+Task2 ODCR-CleanMemory uses the mainline 250,000-sample effective epoch plan
+with target_gold/aux_gold/CF ratios 0.50/0.15/0.35. Its active warmup ratio is
+`step5.tuning.selected_warmup_fraction`, default 0.05. Full-warmup training,
+or a warmup longer than 15% of optimizer steps, is a fail-fast Step5 error.
 
 Active Step5 controls live under:
 

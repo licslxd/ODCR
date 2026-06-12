@@ -34,8 +34,8 @@ SCOPE_REASONS: dict[str, str] = {
     "step3": "Step3 dry-run and contract tests only; no formal training",
     "step4": "Step4 entrypoint smoke, export validator, readiness and upstream contract tests only",
     "step5": "Step5 resolver dry-run, graph/loss and cache-admission tests only",
-    "eval": "eval/rerank contract checks only; no real eval or rerank run",
-    "all": "manual deep lightweight sweep across scopes; still no real training/eval/rerank",
+    "eval": "eval contract checks only; no real eval run",
+    "all": "manual deep lightweight sweep across scopes; still no real training/eval",
 }
 
 LOGGING_SCOPE_PATH_HINTS = (

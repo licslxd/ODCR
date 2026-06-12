@@ -157,18 +157,6 @@ from odcr_core.training_checkpoint import (
     state_dict_for_canonical_best_pth,
     write_checkpoint_lineage,
 )
-from odcr_core.rerank import (
-    build_rerank_weights_dict,
-    compute_lp_norm,
-    extract_rerank_features,
-    extract_rerank_features_for_v3,
-    keywords_from_source_text,
-    merge_rerank_v3_profile,
-    rouge_l_proxy,
-    score_candidates_rule_v1,
-    score_candidates_rule_v2,
-    score_candidates_rule_v3,
-)
 from odcr_eval_metrics import (
     compose_step3_rating_step5_explanation_report,
     compute_collapse_stats,
@@ -190,6 +178,20 @@ from odcr_core.rating_source import rating_metrics_from_source, validate_rating_
 from odcr_core.step5_explanation_handoff import build_step5_explanation_handoff
 from odcr_core.step5_explanation_control_projection import ExplanationControlProjection
 from odcr_core.step5_eval_summary import write_post_train_eval_metrics_log
+from odcr_core.step5_clean_memory import (
+    STEP5_CLEAN_MEMORY_AUDIT_STATUS,
+    STEP5_CLEAN_MEMORY_CONTROL_SCHEMA_VERSION,
+    STEP5_CLEAN_MEMORY_EVAL_CONTROL_SCHEMA_VERSION,
+    STEP5_CLEAN_MEMORY_EVIDENCE_SOURCE,
+    STEP5_CLEAN_MEMORY_MODE,
+    STEP5_CLEAN_MEMORY_MODEL_NAME,
+    STEP5_CLEAN_MEMORY_PROTOCOL,
+    STEP5_CLEAN_MEMORY_SOURCE,
+    STEP5_CLEAN_MEMORY_STEP3_SOURCE,
+    STEP5_CLEAN_MEMORY_STEP4_SOURCE,
+    apply_step5_clean_memory_controls,
+    require_step5_clean_memory_controls,
+)
 from odcr_core.step5_innovation import (
     STEP5_EVIDENCE_FEATURE_DIM,
     CF_RELIABILITY,
@@ -471,19 +473,20 @@ def get_step5_tokenizer() -> Any:
 
 # HuggingFace tokenize 磁盘缓存：cache_identity 只包含会改变 tokenized tensors 的字段；
 # training/generation/runtime knobs live in lineage_metadata for audit only.
-ODCR_TOKENIZE_CACHE_VERSION = "v10_step5_content_metric_ref_identity"
+ODCR_TOKENIZE_CACHE_VERSION = "v13_step5_clean_memory_no_eval_review"
 STEP5_TOKENIZE_CACHE_SCHEMA_VERSION = "odcr_step5_tokenize_cache/4"
 STEP5_TOKENIZE_CACHE_MANIFEST = "cache_manifest.json"
 STEP5_TOKENIZE_CACHE_LINEAGE = "token_cache_lineage.json"
+STEP5_DATA_AUDIT_TOKEN_LENGTH_SAMPLE_ROWS = 20_000
 STEP5_TOKENIZE_CACHE_COMPLETED = "_SUCCESS"
-STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/5"
+STEP5_TOKENIZE_CACHE_PRODUCER_CODE_VERSION = "executors.step5_engine.tokenize_cache/8"
 STEP5_TOKENIZE_SEMANTIC_SCHEMA_VERSION = "odcr_step5_tokenize_cache_identity/2"
 STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION = (
-    "odcr_step5_flan_encoder_input/2_soft_prompt_plus_content_evidence"
+    "odcr_step5_flan_encoder_input/3_clean_memory_content_evidence"
 )
-STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS = 32
-STEP5_CONTROL_TEXT_MAX_LENGTH = STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS
-STEP5_ENCODER_AUDIT_SCHEMA_VERSION = "odcr_step5_encoder_input_token_audit/legacy32"
+STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS = 32
+STEP5_CONTROL_TEXT_MAX_LENGTH = STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS
+STEP5_ENCODER_AUDIT_SCHEMA_VERSION = "odcr_step5_encoder_input_token_audit/clean_memory32"
 
 
 def _sha256_file(path: str) -> str:
@@ -576,7 +579,6 @@ def _build_step5_checkpoint_lineage(final_cfg: FinalTrainingConfig, model: nn.Mo
         "stage": "step5",
         "step5_head": normalize_step5_task_head(getattr(final_cfg, "step5_head", "explanation")),
         "selected_tuning_candidate": str(getattr(final_cfg, "step5_selected_tuning_candidate", "") or ""),
-        "fallback_tuning_candidate": str(getattr(final_cfg, "step5_fallback_tuning_candidate", "") or ""),
         "effective_samples": _parse_json_dict(getattr(final_cfg, "step5_effective_samples_json", "{}") or "{}"),
         "optimizer_steps": _parse_json_dict(getattr(final_cfg, "step5_optimizer_steps_json", "{}") or "{}"),
         "step5_lifecycle": _parse_json_dict(getattr(final_cfg, "step5_lifecycle_config_json", "{}") or "{}"),
@@ -610,7 +612,7 @@ def _build_step5_checkpoint_lineage(final_cfg: FinalTrainingConfig, model: nn.Mo
 def _current_step5_checkpoint_expectation(final_cfg: FinalTrainingConfig, model: nn.Module | None = None) -> Dict[str, Any]:
     step4_lineage = json.loads(str(final_cfg.step4_export_lineage_json or "{}"))
     if not isinstance(step4_lineage, dict) or not step4_lineage.get("lineage_hash"):
-        raise CheckpointLineageError("Eval/rerank requires current Step4 export lineage before checkpoint load.")
+        raise CheckpointLineageError("Eval requires current Step4 export lineage before checkpoint load.")
     arch = _step5_model_architecture_lineage(final_cfg, model)
     return {
         "compat_schema_version": STEP5_CHECKPOINT_COMPAT_SCHEMA_VERSION,
@@ -702,18 +704,17 @@ _STEP5_SAMPLER_TIER_IDS = {
     "low_weighted": 2,
     "reject": 3,
 }
-STEP5_FACTUAL_EVAL_CONTROL_SCHEMA_VERSION = "odcr_step5_factual_eval_control/1.0"
-STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT = "factual_eval_default"
+STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE = "train_memory_eval_controls"
 STEP5_CONTROL_MODE_RCR_POSTERIOR = "rcr_posterior"
 _STEP5_CONTROL_MODE_COLUMN = "step5_control_mode"
 _STEP5_CONTROL_SOURCE_COLUMN = "step5_control_source"
 _STEP5_CONTROL_CONTRACT_COLUMN = "step5_control_contract_version"
 
 
-def step5_factual_eval_control_contract(split_label: str | None = None) -> dict[str, Any]:
+def step5_clean_memory_eval_control_contract(split_label: str | None = None) -> dict[str, Any]:
     return {
-        "schema_version": STEP5_FACTUAL_EVAL_CONTROL_SCHEMA_VERSION,
-        "mode": STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT,
+        "schema_version": STEP5_CLEAN_MEMORY_EVAL_CONTROL_SCHEMA_VERSION,
+        "mode": STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE,
         "split": str(split_label or ""),
         "route_scorer": 1,
         "route_explainer": 1,
@@ -721,11 +722,33 @@ def step5_factual_eval_control_contract(split_label: str | None = None) -> dict[
         "is_rcr_posterior": False,
         "is_train_route": False,
         "is_step4_export_posterior": False,
+        "control_source": STEP5_CLEAN_MEMORY_SOURCE,
         "description": (
-            "Step5 valid/test target factual rows receive neutral eval controls so the "
-            "CCV/LCI packet can be built; these controls are not Step4 RCR posterior decisions."
+            "Step5 valid/test target factual rows receive train-only clean-memory controls. "
+            "Current-row review/explanation/gold rating derived controls are forbidden."
         ),
     }
+
+
+def _validate_step5_warmup_schedule(
+    *,
+    warmup_steps: int,
+    total_steps: int,
+    max_ratio: float = 0.15,
+) -> None:
+    total = max(1, int(total_steps))
+    warmup = max(0, int(warmup_steps))
+    ratio = warmup / float(total)
+    if warmup >= total:
+        raise RuntimeError(
+            "Step5 ODCR-CleanMemory forbids all-warmup training: "
+            f"warmup_steps={warmup} total_steps={total}. Use warmup_ratio in [0.03, 0.10]."
+        )
+    if ratio > float(max_ratio):
+        raise RuntimeError(
+            "Step5 ODCR-CleanMemory warmup is too long for short LLM fine-tuning: "
+            f"warmup_steps={warmup} total_steps={total} ratio={ratio:.6f} max_ratio={float(max_ratio):.6f}."
+        )
 
 
 def _require_step5_rcr_posterior_controls(df: pd.DataFrame, *, ctx: str) -> None:
@@ -734,36 +757,36 @@ def _require_step5_rcr_posterior_controls(df: pd.DataFrame, *, ctx: str) -> None
     except ValueError as exc:
         raise ValueError(
             f"{ctx} requires canonical Step4 RCR posterior/control columns. "
-            "Rerun Step4 to produce odcr_routing_train.csv; factual_eval_default controls are valid/test only."
+            "Rerun Step4 to produce odcr_routing_train.csv; train-memory eval controls are valid/test only."
         ) from exc
     if _STEP5_CONTROL_MODE_COLUMN in df.columns:
         modes = set(df[_STEP5_CONTROL_MODE_COLUMN].dropna().astype(str))
-        if STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT in modes:
+        if STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE in modes:
             raise ValueError(
-                f"{ctx} received factual_eval_default rows in the Step4 training export path; "
-                "Step5 train input must use RCR posterior controls from Step4."
+                f"{ctx} received eval/control-mode rows in the Step4 training export path; "
+                "Step5 train input must use RCR posterior controls from Step4, then apply leave-one-out clean memory."
             )
 
 
-def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label: str) -> pd.DataFrame:
+def _apply_step5_clean_memory_eval_controls(df: pd.DataFrame, *, split_label: str) -> pd.DataFrame:
     out = df.copy()
+    require_step5_clean_memory_controls(out, ctx=f"Step5 official {split_label} eval source")
     _require_content_evidence_frame(out, ctx=f"Step5 official {split_label} eval source")
-    contract = step5_factual_eval_control_contract(split_label)
-    out["sample_weight_hint"] = 1.0
-    out["route_scorer"] = int(contract["route_scorer"])
-    out["route_explainer"] = int(contract["route_explainer"])
-    out["route_reason_scorer"] = STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT
-    out["route_reason_explainer"] = STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT
-    out[_STEP5_CONTROL_MODE_COLUMN] = STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT
-    out[_STEP5_CONTROL_SOURCE_COLUMN] = "step5_valid_test_target_split"
-    out[_STEP5_CONTROL_CONTRACT_COLUMN] = STEP5_FACTUAL_EVAL_CONTROL_SCHEMA_VERSION
+    contract = step5_clean_memory_eval_control_contract(split_label)
+    if "sample_weight_hint" not in out.columns:
+        out["sample_weight_hint"] = 1.0
+    if "route_scorer" not in out.columns:
+        out["route_scorer"] = int(contract["route_scorer"])
+    if "route_explainer" not in out.columns:
+        out["route_explainer"] = int(contract["route_explainer"])
+    out["route_reason_scorer"] = STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE
+    out["route_reason_explainer"] = STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE
+    out[_STEP5_CONTROL_MODE_COLUMN] = STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE
+    out[_STEP5_CONTROL_SOURCE_COLUMN] = STEP5_CLEAN_MEMORY_SOURCE
+    out[_STEP5_CONTROL_CONTRACT_COLUMN] = STEP5_CLEAN_MEMORY_EVAL_CONTROL_SCHEMA_VERSION
     out["step5_control_is_rcr_posterior"] = False
     out["step5_control_is_train_route"] = False  # internal-only eval contract label
     out["step5_control_is_step4_export_posterior"] = False
-    out["style_evidence"] = ""
-    out["domain_style_anchor"] = "target"
-    out["local_style_residual_hint"] = ""
-    out["polarity_anchor"] = np.where(out["rating"].astype(float) >= 3.0, "positive", "negative")
     for _col, _dv in (
         ("entropy_score", 0.25),
         ("uncertainty_score", 0.25),
@@ -779,6 +802,12 @@ def _apply_step5_factual_eval_default_controls(df: pd.DataFrame, *, split_label:
     ):
         if _col not in out.columns:
             out[_col] = _dv
+    for _col in ("style_evidence", "domain_style_anchor", "local_style_residual_hint", "polarity_anchor"):
+        if _col not in out.columns:
+            raise ValueError(
+                f"Step5 official {split_label} eval source missing clean-memory field {_col!r}; "
+                "run train-only memory control construction before eval tokenization."
+            )
     registry = default_prompt_registry()
     prompts = [
         registry.render(
@@ -809,7 +838,7 @@ def _require_content_evidence_frame(df: pd.DataFrame, *, ctx: str) -> None:
     if "content_evidence" not in df.columns:
         raise ValueError(
             f"{ctx} missing required content_evidence field; official Step5_e train/eval requires "
-            "Flan encoder input contract soft_prompt_plus_content_evidence_legacy32."
+            "Flan encoder input contract clean_memory_content_evidence32."
         )
     vals = df["content_evidence"]
     missing = vals.isna() | (vals.astype(str).str.strip() == "")
@@ -926,8 +955,8 @@ def _sample_text_value(sample: Mapping[str, Any], *names: str) -> str:
     return ""
 
 
-def _legacy32_content_evidence_max_length(label_max_length: int) -> int:
-    return max(4, min(STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS, int(label_max_length)))
+def _clean_memory_content_evidence_max_length(label_max_length: int) -> int:
+    return max(4, min(STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS, int(label_max_length)))
 
 
 def _tokenizer_input_ids_untruncated(text: Any, *, add_special_tokens: bool = True) -> List[int]:
@@ -950,13 +979,13 @@ def _tokenizer_input_ids_untruncated(text: Any, *, add_special_tokens: bool = Tr
     return [int(x) for x in list(ids or [])]
 
 
-def _encode_legacy32_content_evidence(
+def _encode_clean_memory_content_evidence(
     sample: Mapping[str, Any],
     *,
     max_length: int,
     soft_prompt_len: int = 16,
 ) -> Dict[str, Any]:
-    max_len = _legacy32_content_evidence_max_length(max_length)
+    max_len = _clean_memory_content_evidence_max_length(max_length)
     text = _sample_text_value(sample, "content_evidence")
     raw_ids = _tokenizer_input_ids_untruncated(text, add_special_tokens=True)
     kept = _control_text_to_ids(text, max_length=max_len)
@@ -970,7 +999,7 @@ def _encode_legacy32_content_evidence(
         "text_token_len": kept_len,
         "content_evidence_token_len": kept_len,
         "content_evidence_raw_token_len": raw_len,
-        "legacy_max_content_tokens": int(max_len),
+        "clean_memory_max_content_tokens": int(max_len),
         "soft_prompt_len": int(soft_prompt_len),
     }
 
@@ -1099,8 +1128,8 @@ class Processor():
             ],
             dtype=torch.float32,
         )
-        control_max_len = _legacy32_content_evidence_max_length(self.max_length)
-        encoder_content = _encode_legacy32_content_evidence(
+        control_max_len = _clean_memory_content_evidence_max_length(self.max_length)
+        encoder_content = _encode_clean_memory_content_evidence(
             sample,
             max_length=self.max_length,
             soft_prompt_len=self.flan_soft_prompt_len,
@@ -1738,10 +1767,6 @@ class Model(nn.Module):
             "domain_gate_std": float(gate.detach().std(unbiased=False).item()),
             "domain_gate_min": float(gate.detach().amin().item()),
             "domain_gate_max": float(gate.detach().amax().item()),
-            "gate_user_profile_mean": float(gate[:, :, :].detach().mean().item()),
-            "gate_item_profile_mean": float(gate[:, :, :].detach().mean().item()),
-            "gate_user_emb_mean": float(gate[:, :, :].detach().mean().item()),
-            "gate_item_emb_mean": float(gate[:, :, :].detach().mean().item()),
         }
         prefix = torch.cat([domain_enhanced, domain_stack, modulated_context], dim=1)
         return prefix
@@ -1838,11 +1863,11 @@ class Model(nn.Module):
                 "content_evidence_ids batch size does not match soft prompt batch: "
                 f"{int(text_ids.shape[0])} vs {int(soft_embeds.shape[0])}"
             )
-        if int(text_ids.shape[1]) > int(STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS):
+        if int(text_ids.shape[1]) > int(STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS):
             raise RuntimeError(
-                "content_evidence_ids exceeds the legacy32 Flan encoder content budget; Processor must "
+                "content_evidence_ids exceeds the CleanMemory32 Flan encoder content budget; Processor must "
                 "tokenize content_evidence with truncation=True and max_length=max(4,min(32,label_max_length)). "
-                f"text_tokens={int(text_ids.shape[1])}, legacy_content_budget={STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS}."
+                f"text_tokens={int(text_ids.shape[1])}, clean_memory_content_budget={STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS}."
             )
         embed_getter = getattr(self.flan_explainer, "get_input_embeddings", None)
         input_embeddings = embed_getter() if callable(embed_getter) else getattr(self.flan_explainer, "shared", None)
@@ -2451,7 +2476,7 @@ class Model(nn.Module):
             "out_logits_materialized": True,
             "word_dist_returned": True,
             "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-            "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+            "clean_memory_encoder_max_content_tokens": STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
             "flan_encoder_tokens": int(encoder_embeds.shape[1]),
         }
         word_dist = logits
@@ -2681,7 +2706,7 @@ class Model(nn.Module):
         ccv_control_packet: Optional[CCVControlPacket] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        解码 + 每 token 选中类 logprob；平均得 avg_logprob（长度归一见 rerank v3 lp_norm）。
+        解码 + 每 token 选中类 logprob；平均得 avg_logprob。
         cfg_override 可为 GenerateConfig 或 dict，仅本调用有效。
         """
         if not bool(getattr(self, "step5_big_model_enabled", True)):
@@ -2864,7 +2889,6 @@ def _step5_runtime_contract_payload(
         ),
         "validation_memory_policy": str(getattr(final_cfg, "validation_memory_policy", "")),
         "valid_loss_components": head_valid_components,
-        "old_eval_batch_2048_retired": bool(getattr(final_cfg, "old_eval_batch_2048_retired", False)),
         "validation_oom_guard_status": (
             "pass"
             if int(getattr(final_cfg, "valid_per_gpu_batch_size", 0))
@@ -2975,7 +2999,6 @@ def _patch_step5_runtime_contract_artifacts(
             "validation_microbatch_accumulation",
             "validation_memory_policy",
             "valid_loss_components",
-            "old_eval_batch_2048_retired",
             "validation_oom_guard_status",
             "formal_entry_E4_evidence_id",
             "first_train_step_evidence_id",
@@ -3634,6 +3657,40 @@ def _checkpoint_composite_weights_dict(cfg: FinalTrainingConfig) -> Dict[str, fl
     }
 
 
+def _step5_train_monitor_generation_batch_size(cfg: FinalTrainingConfig) -> int:
+    """Per-rank generation batch for train-time valid monitor."""
+    for attr in ("valid_forward_micro_batch_size", "valid_per_gpu_batch_size"):
+        value = int(getattr(cfg, attr, 0) or 0)
+        if value > 0:
+            return value
+    world_size = max(1, int(getattr(cfg, "ddp_world_size", 1) or 1))
+    valid_global = int(
+        getattr(cfg, "valid_global_batch_size", getattr(cfg, "valid_batch_size", 0)) or 0
+    )
+    if valid_global > 0:
+        if valid_global % world_size != 0:
+            raise ValueError(
+                f"Step5 train monitor valid_global_batch_size={valid_global} is not divisible by "
+                f"ddp_world_size={world_size}."
+            )
+        return max(1, valid_global // world_size)
+    eval_global = int(getattr(cfg, "eval_batch_size", 0) or 0)
+    if eval_global > 0:
+        if eval_global % world_size != 0:
+            raise ValueError(
+                f"Step5 train monitor eval_batch_size={eval_global} is not divisible by "
+                f"ddp_world_size={world_size}."
+            )
+        return max(1, eval_global // world_size)
+    return 1
+
+
+def _step5_should_validate_epoch(epoch_1: int, total_epochs: int, validate_every_epochs: int) -> bool:
+    cadence = max(1, int(validate_every_epochs or 1))
+    epoch_i = int(epoch_1)
+    return bool(epoch_i % cadence == 0 or epoch_i >= int(total_epochs))
+
+
 class _StepComponentCudaTimer:
     """rank0 调试：可选 CUDA Event 计时；关闭时方法为空操作，无额外同步。"""
 
@@ -3760,9 +3817,10 @@ def trainModel_ddp(
         _ckm = str(getattr(final_cfg, "checkpoint_selection_mode", "guarded_composite")).strip().lower()
         if _lg:
             _lg.info(
-                "Train profile: lr_scheduler=%s warmup_epochs=%g checkpoint_selection_mode=%s",
+                "Train profile: lr_scheduler=%s warmup_epochs_fallback=%g warmup_ratio=%s checkpoint_selection_mode=%s",
                 lr_scheduler_type,
                 warmup_epochs,
+                warmup_ratio_env,
                 _ckm,
                 extra=log_route_extra(_lg, ROUTE_SUMMARY),
             )
@@ -3798,6 +3856,7 @@ def trainModel_ddp(
             explicit_ratio=warmup_ratio_env,
             warmup_epochs_fallback=warmup_epochs,
         )
+        _validate_step5_warmup_schedule(warmup_steps=ws_resolved, total_steps=total_steps_plan)
         lr_lambda = warmup_cosine_multiplier_lambda(ws_resolved, total_steps_plan, min_lr_ratio)
         sched = lr_sched.LambdaLR(optimizer, lr_lambda)
         if rank == 0 and _lg:
@@ -4383,131 +4442,63 @@ def trainModel_ddp(
             else:
                 rec = None
 
-            _lifecycle_phase = str(getattr(final_cfg, "step5_lifecycle_phase", "") or "").strip().lower()
-            official_train_only_candidate = (
-                str(getattr(final_cfg, "checkpoint_selection_mode", "guarded_composite")).strip().lower()
-                == "official_paper_metrics"
-                and _lifecycle_phase == "train_only"
-                and not bool(getattr(final_cfg, "step5_allow_embedded_final_eval", False))
-            )
-            if official_train_only_candidate:
+            validate_every_epochs = max(1, int(getattr(final_cfg, "validate_every_epochs", 1) or 1))
+            if not _step5_should_validate_epoch(epoch_1, int(epochs), validate_every_epochs):
                 if rank == 0:
                     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    block = format_epoch_training_block(
-                        time_str=current_time,
-                        epoch=epoch + 1,
-                        epoch_time_s=rec["epoch_time"],
-                        total_time_s=rec["total_time"],
-                        step_time_s=rec["step_time"],
-                        gpu_util=rec["gpu_util"],
-                        gpu_mem=rec["gpu_mem"],
-                        cpu_used=rec["cpu_used"],
-                        cpu_total=rec["cpu_total"],
-                        cpu_util=rec["cpu_util"],
-                        lr=lr_epoch,
-                        train_loss=avg_loss,
-                        valid_loss=float("nan"),
-                        bleu_line=None,
-                        lr_schedule_detail=None,
-                    )
-                    log_epoch_training_block(_lg, block)
+                    lr_sched_line = None
+                    if sched is not None and ws_resolved is not None:
+                        lr_sched_line = (
+                            f"scheduler_type=warmup_cosine "
+                            f"initial_lr={initial_lr:.6g} current_lr={lr_epoch:.6g} min_lr={min_lr_effective:.6g} "
+                            f"min_lr_ratio={min_lr_ratio:.6g} warmup_steps={ws_resolved} total_steps={total_steps_plan} "
+                            f"scheduler_steps_cumulative={scheduler_steps} warmup_ratio={warmup_ratio_logged:.6g}"
+                        )
+                    if rec is not None:
+                        block = format_epoch_training_block(
+                            time_str=current_time,
+                            epoch=epoch + 1,
+                            epoch_time_s=rec["epoch_time"],
+                            total_time_s=rec["total_time"],
+                            step_time_s=rec["step_time"],
+                            gpu_util=rec["gpu_util"],
+                            gpu_mem=rec["gpu_mem"],
+                            cpu_used=rec["cpu_used"],
+                            cpu_total=rec["cpu_total"],
+                            cpu_util=rec["cpu_util"],
+                            lr=lr_epoch,
+                            train_loss=avg_loss,
+                            valid_loss=None,
+                            lr_schedule_detail=lr_sched_line,
+                        )
+                        log_epoch_training_block(_lg, block)
                     _lg.info(
-                        "[OfficialPaperCheckpoint] train-only candidate saved without in-process valid_loss; "
-                        "valid official paper_greedy_25 selection must run as a separate clean eval. "
-                        "epoch=%d global_step=%d train_loss=%.6f",
+                        "[ValidationSkip] epoch=%d validate_every_epochs=%d total_epochs=%d "
+                        "reason=scheduled_non_validation_epoch",
                         int(epoch_1),
-                        int(global_step),
-                        float(avg_loss),
+                        int(validate_every_epochs),
+                        int(epochs),
                         extra=log_route_extra(_lg, ROUTE_SUMMARY),
-                    )
-                    model_to_save = state_dict_for_canonical_best_pth(
-                        ema_enabled=ema_enabled,
-                        ema_model=ema_model,
-                        ddp_module=model,
-                        underlying_model_fn=get_underlying_model,
-                    )
-                    atomic_torch_save(str(final_cfg.save_file), model_to_save)
-                    model_sha = _sha256_file(str(final_cfg.save_file))
-                    _ckpt_lineage = _build_step5_checkpoint_lineage(final_cfg, model)
-                    _ckpt_lineage["checkpoint_file"] = file_fingerprint(str(final_cfg.save_file))
-                    _ckpt_lineage_path = write_checkpoint_lineage(str(final_cfg.save_file), _ckpt_lineage)
-                    _sp = _state_paths_from_save_file(str(final_cfg.save_file))
-                    os.makedirs(_sp["state_dir"], exist_ok=True)
-                    atomic_torch_save(_sp["optimizer_pt"], optimizer.state_dict())
-                    atomic_write_json(
-                        _sp["trainer_state"],
-                        {
-                            "epoch": int(epoch_1),
-                            "global_step": int(global_step),
-                            "scheduler_steps": int(scheduler_steps),
-                        },
-                    )
-                    atomic_write_json(
-                        _sp["best_event"],
-                        {
-                            "best_version": int(best_version + 1),
-                            "epoch": int(epoch_1),
-                            "global_step": int(global_step),
-                            "valid_loss": None,
-                            "valid_loss_role": "diagnostic_skipped_train_only",
-                            "valid_official_metrics": None,
-                            "model_sha256": model_sha,
-                            "checkpoint_hash": model_sha,
-                            "checkpoint_lineage_hash": _ckpt_lineage.get("checkpoint_compatibility_hash"),
-                            "checkpoint_lineage_path": str(_ckpt_lineage_path),
-                            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "ema_enabled": bool(ema_enabled),
-                            "weight_kind": "ema" if ema_enabled else "raw",
-                            "checkpoint_selection_mode": "official_paper_metrics",
-                            "checkpoint_save_reason": "train_only_epoch_candidate_pending_valid_official_eval",
-                            "checkpoint_acceptance": "candidate_pending_valid_official_paper_metrics",
-                            "decode_policy": build_official_paper_greedy_25_override(final_cfg),
-                            "reference_policy": {
-                                "source": "raw_ref_text",
-                                "metric_builder": "base_utils.build_paper_metric_inputs",
-                                "max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
-                            },
-                            "prediction_policy": {
-                                "source": "raw_pred_text",
-                                "metric_builder": "base_utils.build_paper_metric_inputs",
-                                "max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
-                            },
-                            "token_length_policy": {
-                                "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
-                                "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
-                                "unit": "tokenizer_tokens_then_decode",
-                            },
-                            "metrics_implementation": "base_utils.official_paper_metrics",
-                            "content_evidence_used": True,
-                            "content_evidence_contract": _step5_content_evidence_contract_payload(final_cfg),
-                            "test_eligibility": "blocked_until_clean_valid_lock",
-                            "selected_params": {
-                                "best_train_label_max_length": int(getattr(final_cfg, "train_label_max_length", 128)),
-                                "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
-                                "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
-                                "best_metric_policy": "official_paper_metrics_valid_only",
-                                "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
-                            },
-                        },
                     )
                     append_train_epoch_metrics_jsonl(
                         log_file=final_cfg.log_file,
                         row={
                             "epoch": epoch + 1,
-                            "global_step": int(global_step),
                             "train_loss_total_epoch": avg_loss,
                             "train_loss_e_epoch": train_loss_e_epoch,
-                            "valid_loss_total_epoch": None,
-                            "valid_loss_e_epoch": None,
-                            "checkpoint_selection_mode": "official_paper_metrics",
-                            "checkpoint_acceptance": "candidate_pending_valid_official_paper_metrics",
-                            "train_only_valid_loss_skipped": True,
+                            "lr": lr_epoch,
+                            "validation_skipped": True,
+                            "validate_every_epochs": int(validate_every_epochs),
+                            "checkpoint_selection_mode": ckpt_mode,
+                            "loss_weight_batch_diversity": float(final_cfg.loss_weight_batch_diversity),
+                            "batch_diversity_warmup_epochs": int(final_cfg.batch_diversity_warmup_epochs),
                             "lambda_ortho_step5": float(lambda_ortho_step5),
                             "lambda_ortho_xcov": float(orth5_w_xcov),
                             "lambda_ortho_cos": float(orth5_w_cos),
                             "step5_fca_weight": float(w_fca),
                         },
                     )
+
                 if odcr_ddp_epoch_end_barrier():
                     ddp_heartbeat(_lg, "before_epoch_end_barrier", rank=rank, epoch=epoch_1)
                     dist.barrier()
@@ -4570,6 +4561,14 @@ def trainModel_ddp(
                     if ckpt_mode == "official_paper_metrics"
                     else build_full_bleu_monitor_cfg_override(final_cfg)
                 )
+                _monitor_gen_bs = _step5_train_monitor_generation_batch_size(final_cfg)
+                if rank == 0 and _lg is not None:
+                    _lg.info(
+                        "[MainlineMonitor] train-time generation batch_size_per_rank=%d "
+                        "source=step5_train_validation",
+                        int(_monitor_gen_bs),
+                        extra=log_route_extra(_lg, ROUTE_SUMMARY),
+                    )
                 mainline_composite_val, mainline_monitor_bundle = mainline_monitor_full_valid_ddp(
                     model,
                     _vd_mon,
@@ -4577,7 +4576,7 @@ def trainModel_ddp(
                     device=int(device),
                     rank=int(rank),
                     world_size=int(world_size),
-                    batch_size=int(final_cfg.eval_batch_size),
+                    batch_size=int(_monitor_gen_bs),
                     dataloader_num_workers=int(final_cfg.dataloader_num_workers_valid),
                     dataloader_prefetch_factor=final_cfg.dataloader_prefetch_factor_valid,
                     logger=_lg,
@@ -5003,8 +5002,11 @@ def trainModel_ddp(
                             "best_train_label_max_length": int(getattr(final_cfg, "train_label_max_length", 128)),
                             "best_train_batch_size": int(getattr(final_cfg, "train_batch_size", 0)),
                             "best_eval_batch_size": int(getattr(final_cfg, "eval_batch_size", 0)),
+                            "best_train_monitor_generation_batch_size": int(
+                                _step5_train_monitor_generation_batch_size(final_cfg)
+                            ),
                             "best_metric_policy": str(ckpt_mode),
-                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
+                            "best_content_evidence_policy": "clean_memory32_content_evidence_required",
                         },
                         "checkpoint_guard_valid_loss_rel_tol": float(
                             final_cfg.checkpoint_guard_valid_loss_rel_tol
@@ -5485,901 +5487,20 @@ def evalModel(
     return {"rows": rows, "timings": {"decode_time": float(decode_wall)}}
 
 
-def _load_review_by_sample_id(csv_path: str) -> Tuple[List[str], Dict[str, Any]]:
-    if not (csv_path or "").strip() or not os.path.isfile(csv_path):
-        return [], {"fast_path": "missing_path", "review_rows_count": 0}
-    try:
-        df = pd.read_csv(csv_path, usecols=["review"])
-    except Exception:
-        return [], {"fast_path": "read_failed", "review_rows_count": 0}
-    if "review" not in df.columns:
-        return [], {"fast_path": "missing_review_col", "review_rows_count": 0}
-    vals = df["review"].fillna("").astype(str).tolist()
-    return vals, {"fast_path": "loaded", "review_rows_count": int(len(vals))}
-
-
-def _count_tokens_before_eos(ids_list: List[int], eos_id: int) -> int:
-    if eos_id is not None and eos_id >= 0 and eos_id in ids_list:
-        return int(ids_list.index(eos_id))
-    return len(ids_list)
-
-
-def evalModelWithRerank(
-    model,
-    test_dataloader,
-    device,
-    *,
-    num_return_sequences: int,
-    rerank_method: str,
-    rerank_top_k: int,
-    rerank_weight_logprob: float,
-    rerank_weight_length: float,
-    rerank_weight_repeat: float,
-    rerank_weight_dirty: float,
-    rerank_target_len_ratio: float,
-    rerank_malformed_tail_penalty: float,
-    rerank_malformed_token_penalty: float,
-    cli_seed: int,
-    step5_innov_cfg,
-    non_blocking_h2d: bool | None = None,
-    review_by_sample_id: Optional[Sequence[str]] = None,
-    rerank_v3_profile: Optional[Dict[str, Any]] = None,
-):
-    """混合候选池 + rule_v1/v2/v3 rerank；最终 pred_text 与 evalModel 对齐。"""
-    import time as _time_perf
-
-    rm = (rerank_method or "").strip().lower().replace("-", "_")
-    if rm not in ("rule_v1", "rule_v2", "rule_v3"):
-        raise ValueError(
-            f"不支持的 rerank_method={rerank_method!r}（支持 rule_v1 / rule_v2 / rule_v3）"
-        )
-    v3_prof = merge_rerank_v3_profile(rerank_v3_profile)
-    _m = get_underlying_model(model).to(device)
-    _m.eval()
-    if non_blocking_h2d is None:
-        raise RuntimeError("evalModelWithRerank requires non_blocking_h2d from resolved FinalTrainingConfig.")
-    K = max(1, int(num_return_sequences))
-    strategy = str(_m.decode_strategy).lower()
-    _tok_eos = get_step5_tokenizer()
-    eos_id = int(_tok_eos.eos_token_id) if _tok_eos.eos_token_id is not None else -1
-    base_gc = _m._make_generate_config()
-    fam = str(getattr(_m, "candidate_family", "balanced")).strip().lower()
-    specs = build_candidate_generation_specs(
-        base_gc,
-        fam,
-        k_cli=K,
-        include_diverse=bool(getattr(_m, "candidate_mixed_include_diverse", True)),
-    )
-    cand_slot = 0
-    rows: List[dict] = []
-    batch_idx = 0
-    decode_wall = 0.0
-    feature_wall = 0.0
-    score_wall = 0.0
-    base_decode_seed = _m.decode_seed if _m.decode_seed is not None else int(cli_seed)
-    review_rows = list(review_by_sample_id or [])
-    with torch.no_grad():
-        for batch in test_dataloader:
-            gb = require_gathered_batch(_m.gather(batch, device, non_blocking_h2d=bool(non_blocking_h2d)))
-            user_idx = gb.user_idx
-            item_idx = gb.item_idx
-            rating = gb.rating
-            tgt_output = gb.tgt_output
-            domain_idx = gb.domain_idx
-            sample_id = gb.sample_id
-            ccv_packet = build_ccv_control_packet(gb, step5_innov_cfg)
-            raw_refs = list(gb.raw_ref_text or [])
-            ref_texts = (
-                raw_refs
-                if len(raw_refs) == int(tgt_output.shape[0])
-                else get_step5_tokenizer().batch_decode(tgt_output, skip_special_tokens=True)
-            )
-            B = int(user_idx.size(0))
-            candidates_per_row: List[List[Dict[str, Any]]] = [[] for _ in range(B)]
-            _tdecode0 = _time_perf.perf_counter()
-            with odcr_cuda_bf16_autocast():
-                for fam_tag, cfg_ov in specs:
-                    gen = None
-                    if strategy == "nucleus":
-                        gen = torch.Generator(device=device)
-                        gen.manual_seed(
-                            int(base_decode_seed) + cand_slot * 1_000_003 + batch_idx * 97
-                        )
-                    gen_ids, _, _, avg_lp = _m.generate_with_token_logprobs(
-                        user_idx,
-                        item_idx,
-                        domain_idx,
-                        generator=gen,
-                        cfg_override=cfg_ov,
-                        ccv_control_packet=ccv_packet,
-                    )
-                    pred_texts_k = get_step5_tokenizer().batch_decode(gen_ids, skip_special_tokens=True)
-                    eff_cfg = cfg_ov if cfg_ov is not None else base_gc
-                    gen_ids_cpu = gen_ids.detach().cpu()
-                    for i in range(B):
-                        ids_i = gen_ids_cpu[i].tolist()
-                        n_tok = _count_tokens_before_eos(ids_i, eos_id)
-                        alp = float(avg_lp[i].detach().item())
-                        candidates_per_row[i].append(
-                            {
-                                "text": pred_texts_k[i],
-                                "avg_logprob": alp,
-                                "lp_norm": float(compute_lp_norm(alp, n_tok)),
-                                "token_len": int(n_tok),
-                                "candidate_family": fam_tag,
-                                "effective_temperature": float(eff_cfg.temperature),
-                                "effective_top_p": float(eff_cfg.top_p),
-                            }
-                        )
-                    cand_slot += 1
-            decode_wall += _time_perf.perf_counter() - _tdecode0
-            gr = rating.detach().cpu().tolist()
-            sids = sample_id.detach().cpu().tolist()
-            _tfeat0 = _time_perf.perf_counter()
-            feat_cache: List[List[Tuple[Dict[str, Any], Dict[str, Any]]]] = [[] for _ in range(B)]
-            for i in range(B):
-                ref = ref_texts[i]
-                ref_w = max(len(ref.split()), 1)
-                ref_mean_dirty = float(ref_w)
-                sid = int(sids[i])
-                review_txt = review_rows[sid] if 0 <= sid < len(review_rows) else ""
-                review_kw = keywords_from_source_text(review_txt)
-                for rank_before, c in enumerate(candidates_per_row[i]):
-                    if rm == "rule_v3":
-                        feats = extract_rerank_features_for_v3(
-                            c["text"],
-                            avg_logprob=c["avg_logprob"],
-                            token_len=int(c["token_len"]),
-                            ref_mean_len_words=18.0,
-                        )
-                        feats_out = dict(feats)
-                        ok_hard, hard_rs, sc, bkd = score_candidates_rule_v3(
-                            c["text"],
-                            feats,
-                            review_keywords=review_kw,
-                            lp_norm=float(c["lp_norm"]),
-                            profile=v3_prof,
-                        )
-                        feats_out["rerank_score"] = round(sc, 6)
-                        feats_out["v3_hard_pass"] = bool(ok_hard)
-                        feats_out["v3_hard_filter_reasons"] = list(hard_rs)
-                        feats_out["v3_score_breakdown"] = {k: round(float(v), 6) for k, v in bkd.items()}
-                        feats_out["length_deviation_penalty"] = float(
-                            bkd.get("length_penalty_v2", 0.0) or 0.0
-                        )
-                        feats_out["malformed_tail_penalty"] = float(
-                            bkd.get("malformed_tail_penalty", 0.0) or 0.0
-                        )
-                        feats_out["malformed_token_penalty"] = float(
-                            bkd.get("malformed_token_penalty", 0.0) or 0.0
-                        )
-                        len_pen = float(feats_out["length_deviation_penalty"])
-                    else:
-                        feats = extract_rerank_features(
-                            c["text"],
-                            ref,
-                            avg_logprob=c["avg_logprob"],
-                            ref_mean_len_words=ref_mean_dirty,
-                        )
-                        feats_out = dict(feats)
-                        if rm == "rule_v2":
-                            sc, len_pen, bkd = score_candidates_rule_v2(
-                                feats,
-                                weight_logprob=rerank_weight_logprob,
-                                weight_length=rerank_weight_length,
-                                weight_repeat=rerank_weight_repeat,
-                                weight_dirty=rerank_weight_dirty,
-                                target_len_ratio=rerank_target_len_ratio,
-                                coef_malformed_tail=float(rerank_malformed_tail_penalty),
-                                coef_malformed_token=float(rerank_malformed_token_penalty),
-                            )
-                            tail_ap = (
-                                float(rerank_malformed_tail_penalty)
-                                if feats_out.get("malformed_tail_hit")
-                                else 0.0
-                            )
-                            tok_ap = (
-                                float(rerank_malformed_token_penalty)
-                                if feats_out.get("malformed_token_hit")
-                                else 0.0
-                            )
-                            feats_out["malformed_tail_penalty"] = round(tail_ap, 6)
-                            feats_out["malformed_token_penalty"] = round(tok_ap, 6)
-                            feats_out["rule_v2_score_breakdown"] = {
-                                k: round(float(v), 6) for k, v in bkd.items()
-                            }
-                        else:
-                            sc, len_pen = score_candidates_rule_v1(
-                                feats,
-                                weight_logprob=rerank_weight_logprob,
-                                weight_length=rerank_weight_length,
-                                weight_repeat=rerank_weight_repeat,
-                                weight_dirty=rerank_weight_dirty,
-                                target_len_ratio=rerank_target_len_ratio,
-                            )
-                            feats_out["malformed_tail_penalty"] = 0.0
-                            feats_out["malformed_token_penalty"] = 0.0
-                        feats_out["length_deviation_penalty"] = round(len_pen, 6)
-                        feats_out["rerank_score"] = round(sc, 6)
-                    feat_cache[i].append((dict(c), feats_out))
-            feature_wall += _time_perf.perf_counter() - _tfeat0
-            _tsc0 = _time_perf.perf_counter()
-            for i in range(B):
-                sid = int(sids[i])
-                scored: List[Tuple[int, Dict[str, Any], float, float, Dict[str, Any]]] = []
-                for rank_before, (c, feats_out) in enumerate(feat_cache[i]):
-                    _rs = feats_out.get("rerank_score", 0.0)
-                    sc = float(0.0 if _rs is None else _rs)
-                    _lp = feats_out.get("length_deviation_penalty", 0.0)
-                    len_pen = float(0.0 if _lp is None else _lp)
-                    scored.append((rank_before, feats_out, sc, len_pen, dict(c)))
-                scored.sort(key=lambda x: -x[2])
-                take_k = max(1, int(rerank_top_k))
-                top = scored[:take_k]
-                best = top[0]
-                best_lp_rank = max(
-                    range(len(candidates_per_row[i])),
-                    key=lambda j: candidates_per_row[i][j]["avg_logprob"],
-                )
-                sel_text = best[4]["text"]
-                cand_payload = []
-                selected_rank = int(best[0])
-                for rank_before, feats_out, sc, _len_pen, cdict in scored:
-                    entry = {
-                        "candidate_rank_before_rerank": rank_before,
-                        "candidate_text": cdict["text"] if os.environ.get("ODCR_RERANK_DEBUG", "0") == "1" else "",
-                        "avg_logprob": cdict["avg_logprob"],
-                        "lp_norm": cdict.get("lp_norm"),
-                        "candidate_family": cdict.get("candidate_family"),
-                        "effective_temperature": cdict.get("effective_temperature"),
-                        "effective_top_p": cdict.get("effective_top_p"),
-                        "token_len": cdict.get("token_len"),
-                        "features": feats_out,
-                        "rerank_score": feats_out["rerank_score"],
-                        "selected_as_final": rank_before == selected_rank,
-                    }
-                    if rm == "rule_v3":
-                        entry["v3_hard_pass"] = feats_out.get("v3_hard_pass")
-                        entry["v3_hard_filter_reasons"] = feats_out.get("v3_hard_filter_reasons")
-                        entry["v3_score_breakdown"] = feats_out.get("v3_score_breakdown")
-                    cand_payload.append(entry)
-                sel = best[1]
-                rows.append(
-                    {
-                        "sample_id": sid,
-                        "pred_rating": None,
-                        "gt_rating": float(gr[i]),
-                        "pred_text": sel_text,
-                        "ref_text": ref,
-                        "pred_token_ids": [],
-                        "ref_token_ids": tgt_output[i].detach().cpu().tolist(),
-                        "candidate_family": best[4].get("candidate_family"),
-                        "lp_norm": best[4].get("lp_norm"),
-                        "completion_ok": bool(
-                            (sel.get("v3_score_breakdown") or {}).get("completion_score", 0) >= 0.9
-                        )
-                        if rm == "rule_v3"
-                        else None,
-                        "_rerank": {
-                            "candidates": cand_payload,
-                            "selected_rank_before_rerank": selected_rank,
-                            "best_logprob_rank_before": int(best_lp_rank),
-                            "rerank_method_effective": rm,
-                            "selected": {
-                                "text": sel_text,
-                                "avg_logprob": candidates_per_row[i][selected_rank]["avg_logprob"],
-                                "lp_norm": candidates_per_row[i][selected_rank].get("lp_norm"),
-                                "candidate_family": candidates_per_row[i][selected_rank].get(
-                                    "candidate_family"
-                                ),
-                                "rerank_score": sel["rerank_score"],
-                                "repeat_penalty": sel.get("repeat_penalty"),
-                                "dirty_penalty_diagnostic_only": sel.get(
-                                    "dirty_penalty_diagnostic_only", sel.get("dirty_penalty")
-                                ),
-                                "length_deviation_penalty": sel.get("length_deviation_penalty"),
-                                "pred_len_ratio": sel.get("pred_len_ratio"),
-                                "malformed_tail_hit": bool(sel.get("malformed_tail_hit")),
-                                "malformed_token_hit": bool(sel.get("malformed_token_hit")),
-                                "malformed_tail_penalty": float(
-                                    sel.get("malformed_tail_penalty", 0.0) or 0.0
-                                ),
-                                "malformed_token_penalty": float(
-                                    sel.get("malformed_token_penalty", 0.0) or 0.0
-                                ),
-                                "v3_hard_pass": sel.get("v3_hard_pass"),
-                                "v3_hard_filter_reasons": sel.get("v3_hard_filter_reasons"),
-                                "v3_score_breakdown": sel.get("v3_score_breakdown"),
-                            },
-                            "best_by_logprob": {
-                                "rank_before": int(best_lp_rank),
-                                "text": candidates_per_row[i][best_lp_rank]["text"],
-                                "avg_logprob": candidates_per_row[i][best_lp_rank]["avg_logprob"],
-                            },
-                        },
-                    }
-                )
-            score_wall += _time_perf.perf_counter() - _tsc0
-            batch_idx += 1
-    return {
-        "rows": rows,
-        "timings": {
-            "decode_time": float(decode_wall),
-            "rerank_feature_time": float(feature_wall),
-            "rerank_scoring_time": float(score_wall),
-        },
-    }
-
-
-def _aggregate_rerank_summary(
-    merged: List[dict],
-    *,
-    export_examples_mode: str,
-    rerank_method: str,
-) -> Dict[str, Any]:
-    n = len(merged)
-    if n <= 0:
-        return {
-            "num_samples": 0,
-            "avg_candidate_count": 0.0,
-            "mean_best_logprob_score": float("nan"),
-            "mean_selected_rerank_score": float("nan"),
-            "selected_not_best_logprob_rate": float("nan"),
-            "mean_selected_len_ratio": float("nan"),
-            "mean_selected_repeat_penalty": float("nan"),
-            "mean_selected_dirty_penalty": float("nan"),
-            "mean_selected_avg_logprob": float("nan"),
-            "mean_selected_length_deviation_penalty": float("nan"),
-            "mean_candidate_rouge_proxy": float("nan"),
-            "mean_selected_malformed_tail_penalty": float("nan"),
-            "mean_selected_malformed_token_penalty": float("nan"),
-            "selected_malformed_tail_hit_rate": float("nan"),
-            "selected_malformed_token_hit_rate": float("nan"),
-            "export_examples_mode": export_examples_mode,
-            "rerank_method": rerank_method,
-            "completion_pass_rate": float("nan"),
-            "well_formed_pass_rate": float("nan"),
-            "source_coverage_mean": float("nan"),
-            "entity_drift_hit_rate": float("nan"),
-            "generic_template_hit_rate": float("nan"),
-            "hard_filter_drop_rate": float("nan"),
-        }
-
-    def _float_field(d: Dict[str, Any], key: str, default: float = float("nan")) -> float:
-        if key not in d:
-            return default
-        v = d[key]
-        if v is None:
-            return default
-        return float(v)
-
-    cand_counts: List[int] = []
-    best_lps: List[float] = []
-    sel_scores: List[float] = []
-    not_best_lp = 0
-    sel_lr: List[float] = []
-    sel_rep: List[float] = []
-    sel_dty: List[float] = []
-    sel_alp: List[float] = []
-    sel_ldp: List[float] = []
-    sel_mtail: List[float] = []
-    sel_mtok: List[float] = []
-    hit_mtail = 0
-    hit_mtok = 0
-    rouge_proxies: List[float] = []
-    rm_lc = (rerank_method or "").strip().lower().replace("-", "_")
-    comp_pass = 0
-    wf_pass = 0
-    src_covs: List[float] = []
-    drift_hits = 0
-    gen_tmpl_hits = 0
-    total_cands_v3 = 0
-    hard_drop_cands = 0
-    for r in merged:
-        rr = r.get("_rerank") or {}
-        cands = rr.get("candidates") or []
-        cand_counts.append(len(cands))
-        if cands:
-            best_lps.append(
-                max(
-                    float(c["avg_logprob"]) if c.get("avg_logprob") is not None else float("-inf")
-                    for c in cands
-                )
-            )
-            rx = [rouge_l_proxy(str(c.get("candidate_text", "")), str(r.get("ref_text", ""))) for c in cands]
-            rouge_proxies.append(sum(rx) / max(len(rx), 1))
-        sel = rr.get("selected") or {}
-        if sel:
-            sel_scores.append(_float_field(sel, "rerank_score"))
-            sel_lr.append(_float_field(sel, "pred_len_ratio"))
-            sel_rep.append(_float_field(sel, "repeat_penalty"))
-            dty_v = _float_field(sel, "dirty_penalty_diagnostic_only")
-            if dty_v != dty_v:
-                dty_v = _float_field(sel, "dirty_penalty")
-            sel_dty.append(dty_v)
-            sel_alp.append(_float_field(sel, "avg_logprob"))
-            sel_ldp.append(_float_field(sel, "length_deviation_penalty"))
-            mtp = float(sel.get("malformed_tail_penalty", 0.0) or 0.0)
-            mkp = float(sel.get("malformed_token_penalty", 0.0) or 0.0)
-            sel_mtail.append(mtp)
-            sel_mtok.append(mkp)
-            if bool(sel.get("malformed_tail_hit")) or mtp > 0:
-                hit_mtail += 1
-            if bool(sel.get("malformed_token_hit")) or mkp > 0:
-                hit_mtok += 1
-        br = int(rr.get("best_logprob_rank_before", -1))
-        sr = int(rr.get("selected_rank_before_rerank", -2))
-        if br >= 0 and sr >= 0 and br != sr:
-            not_best_lp += 1
-        if rm_lc == "rule_v3" and cands:
-            for c in cands:
-                total_cands_v3 += 1
-                if c.get("v3_hard_pass") is False:
-                    hard_drop_cands += 1
-        if sel and rm_lc == "rule_v3":
-            bd_sel = sel.get("v3_score_breakdown") or {}
-            if bd_sel:
-                if float(bd_sel.get("completion_score", 0) or 0) >= 0.9:
-                    comp_pass += 1
-                if float(bd_sel.get("well_formed_score", 0) or 0) >= 0.65:
-                    wf_pass += 1
-                scv = _float_field(bd_sel, "source_coverage_score")
-                if scv == scv:
-                    src_covs.append(scv)
-                if float(bd_sel.get("entity_drift_penalty", 0) or 0) >= 0.55:
-                    drift_hits += 1
-                _gt_raw = bd_sel.get("generic_template_penalty_raw", bd_sel.get("generic_template_penalty"))
-                if _gt_raw is not None and float(_gt_raw) >= 0.99:
-                    gen_tmpl_hits += 1
-
-    def _mean(xs: List[float]) -> float:
-        v = [x for x in xs if x == x]
-        return float(sum(v) / max(len(v), 1)) if v else float("nan")
-
-    return {
-        "num_samples": n,
-        "avg_candidate_count": float(sum(cand_counts) / max(n, 1)),
-        "mean_best_logprob_score": _mean(best_lps),
-        "mean_selected_rerank_score": _mean(sel_scores),
-        "selected_not_best_logprob_rate": float(not_best_lp) / float(n),
-        "mean_selected_len_ratio": _mean(sel_lr),
-        "mean_selected_repeat_penalty": _mean(sel_rep),
-        "mean_selected_dirty_penalty": _mean(sel_dty),
-        "mean_selected_avg_logprob": _mean(sel_alp),
-        "mean_selected_length_deviation_penalty": _mean(sel_ldp),
-        "mean_candidate_rouge_proxy": _mean(rouge_proxies),
-        "mean_selected_malformed_tail_penalty": _mean(sel_mtail),
-        "mean_selected_malformed_token_penalty": _mean(sel_mtok),
-        "selected_malformed_tail_hit_rate": float(hit_mtail) / float(n),
-        "selected_malformed_token_hit_rate": float(hit_mtok) / float(n),
-        "export_examples_mode": export_examples_mode,
-        "rerank_method": rerank_method,
-        "completion_pass_rate": float(comp_pass) / float(n) if rm_lc == "rule_v3" else float("nan"),
-        "well_formed_pass_rate": float(wf_pass) / float(n) if rm_lc == "rule_v3" else float("nan"),
-        "source_coverage_mean": _mean(src_covs) if rm_lc == "rule_v3" else float("nan"),
-        "entity_drift_hit_rate": float(drift_hits) / float(n) if rm_lc == "rule_v3" else float("nan"),
-        "generic_template_hit_rate": float(gen_tmpl_hits) / float(n) if rm_lc == "rule_v3" else float("nan"),
-        "hard_filter_drop_rate": float(hard_drop_cands) / float(max(total_cands_v3, 1))
-        if rm_lc == "rule_v3" and total_cands_v3 > 0
-        else float("nan"),
-    }
-
-
-def _rerank_eval_cli_resolved(args: Any) -> Dict[str, Any]:
-    """Return rerank settings transported by the One-Control resolver.
-
-    Direct/helper eval-rerank invocations used to fall back to literals here.
-    Phase 4A makes that a hard gate: every value must be injected by
-    ``code/odcr.py`` from ``configs/odcr.yaml`` and the resolved profile JSON.
-    """
-    required_attrs = (
-        "num_return_sequences",
-        "rerank_method",
-        "rerank_top_k",
-        "rerank_weight_logprob",
-        "rerank_weight_length",
-        "rerank_weight_repeat",
-        "rerank_weight_dirty",
-        "rerank_target_len_ratio",
-        "export_examples_mode",
-        "rerank_malformed_tail_penalty",
-        "rerank_malformed_token_penalty",
-    )
-    missing = [
-        name
-        for name in required_attrs
-        if getattr(args, name, None) is None or str(getattr(args, name, "")).strip() == ""
-    ]
-    raw_profile = (os.environ.get("ODCR_RERANK_PROFILE_JSON") or "").strip()
-    if missing or not raw_profile:
-        raise RuntimeError(
-            "eval-rerank requires resolver-owned One-Control rerank config; "
-            f"missing_cli_transport={missing}, has_ODCR_RERANK_PROFILE_JSON={bool(raw_profile)}. "
-            "Use `python code/odcr.py eval --profile <profile-with-rerank>`."
-        )
-    try:
-        profile_obj = json.loads(raw_profile)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"ODCR_RERANK_PROFILE_JSON must be valid JSON: {exc}") from exc
-    if not isinstance(profile_obj, dict) or not profile_obj:
-        raise RuntimeError("ODCR_RERANK_PROFILE_JSON must be a non-empty object from One-Control resolver.")
-
-    num_ret = max(1, int(getattr(args, "num_return_sequences")))
-    rm_s = str(getattr(args, "rerank_method")).strip()
-    top_k = max(1, int(getattr(args, "rerank_top_k")))
-    w_lp = float(getattr(args, "rerank_weight_logprob"))
-    w_len = float(getattr(args, "rerank_weight_length"))
-    w_rep = float(getattr(args, "rerank_weight_repeat"))
-    w_drt = float(getattr(args, "rerank_weight_dirty"))
-    tlr = float(getattr(args, "rerank_target_len_ratio"))
-    ex_mode = str(getattr(args, "export_examples_mode")).strip().lower()
-    mtail = float(getattr(args, "rerank_malformed_tail_penalty"))
-    mtok = float(getattr(args, "rerank_malformed_token_penalty"))
-    return {
-        "num_return_sequences": num_ret,
-        "rerank_method": rm_s,
-        "rerank_top_k": top_k,
-        "rerank_weight_logprob": w_lp,
-        "rerank_weight_length": w_len,
-        "rerank_weight_repeat": w_rep,
-        "rerank_weight_dirty": w_drt,
-        "rerank_target_len_ratio": tlr,
-        "export_examples_mode": ex_mode,
-        "rerank_malformed_tail_penalty": mtail,
-        "rerank_malformed_token_penalty": mtok,
-        "rerank_profile": profile_obj,
-        "rerank_source_table": {
-            "ODCR_RERANK_PROFILE_JSON": "configs/odcr.yaml: eval.profiles.*.rerank -> eval.rerank.*",
-            "cli_transport": "odcr_core.config_resolver.ResolvedConfig -> odcr_core.runners._rerank_runner_cli_args",
-        },
-    }
-
-
-def _eval_rows_local(
-    model,
-    dl,
-    device,
-    args,
-    *,
-    review_rows: Optional[Sequence[str]] = None,
-) -> Tuple[List[dict], Dict[str, float]]:
-    _st5_raw = str(getattr(args, "_odcr_step5_innovation_config_json", "") or "").strip()
-    if not _st5_raw:
-        raise RuntimeError("eval requires resolved Step5 LCI/UCI/CCV/FCA config JSON from One-Control.")
-    step5_innov_cfg = parse_step5_innovation_config_json(_st5_raw)
-    non_blocking_h2d = getattr(args, "_odcr_non_blocking_h2d", None)
-    if non_blocking_h2d is None:
-        raise RuntimeError("eval requires resolved non_blocking_h2d from One-Control FinalTrainingConfig.")
-    if str(args.command) == "eval-rerank":
-        _rr = _rerank_eval_cli_resolved(args)
-        v3p = dict(_rr.get("rerank_profile") or {})
-        out = evalModelWithRerank(
-            model,
-            dl,
-            device,
-            num_return_sequences=int(_rr["num_return_sequences"]),
-            rerank_method=str(_rr["rerank_method"]),
-            rerank_top_k=int(_rr["rerank_top_k"]),
-            rerank_weight_logprob=float(_rr["rerank_weight_logprob"]),
-            rerank_weight_length=float(_rr["rerank_weight_length"]),
-            rerank_weight_repeat=float(_rr["rerank_weight_repeat"]),
-            rerank_weight_dirty=float(_rr["rerank_weight_dirty"]),
-            rerank_target_len_ratio=float(_rr["rerank_target_len_ratio"]),
-            rerank_malformed_tail_penalty=float(_rr["rerank_malformed_tail_penalty"]),
-            rerank_malformed_token_penalty=float(_rr["rerank_malformed_token_penalty"]),
-            cli_seed=int(args.seed),
-            step5_innov_cfg=step5_innov_cfg,
-            non_blocking_h2d=bool(non_blocking_h2d),
-            review_by_sample_id=review_rows,
-            rerank_v3_profile=v3p,
-        )
-        return out["rows"], dict(out.get("timings") or {})
-    out_m = evalModel(
+def _eval_rows_local(model, eval_dataloader, device, args) -> Tuple[List[dict], Dict[str, float]]:
+    """Run local eval decode with resolver-owned Step5 controls."""
+    result = evalModel(
         model,
-        dl,
+        eval_dataloader,
         device,
-        step5_innov_cfg=step5_innov_cfg,
-        non_blocking_h2d=bool(non_blocking_h2d),
+        step5_innov_cfg=parse_step5_innovation_config_json(
+            str(getattr(args, "_odcr_step5_innovation_config_json", "{}") or "{}")
+        ),
+        non_blocking_h2d=bool(getattr(args, "_odcr_non_blocking_h2d", False)),
         eval_forward_micro_batch_size=int(getattr(args, "_odcr_eval_forward_micro_batch_size", 0) or 0) or None,
     )
-    return out_m["rows"], dict(out_m.get("timings") or {})
+    return list(result.get("rows") or []), dict(result.get("timings") or {})
 
-
-_RERANK_TOP2_GAP = 0.025
-
-
-def _rerank_compact_cand(c: Dict[str, Any], *, text_max: int = 200) -> Dict[str, Any]:
-    fe = c.get("features") or {}
-    t = str(c.get("candidate_text") or "")
-    if len(t) > text_max:
-        t = t[:text_max] + "…"
-    out: Dict[str, Any] = {
-        "candidate_rank_before_rerank": c.get("candidate_rank_before_rerank"),
-        "avg_logprob": c.get("avg_logprob"),
-        "rerank_score": c.get("rerank_score"),
-        "pred_len_ratio": fe.get("pred_len_ratio"),
-        "dirty_penalty_diagnostic_only": fe.get(
-            "dirty_penalty_diagnostic_only", fe.get("dirty_penalty")
-        ),
-        "malformed_tail_penalty": fe.get("malformed_tail_penalty", 0),
-        "malformed_token_penalty": fe.get("malformed_token_penalty", 0),
-        "text_preview": t,
-    }
-    bd = fe.get("rule_v2_score_breakdown")
-    if bd:
-        out["rule_v2_score_breakdown"] = bd
-    dr = fe.get("dirty_detail_v2")
-    if isinstance(dr, dict):
-        out["dirty_detail_v2"] = {"active_rules": dr.get("active_rules", [])}
-    return out
-
-
-def _rerank_build_changed_only_row(r: dict) -> Tuple[bool, Dict[str, Any]]:
-    rr = r.get("_rerank") or {}
-    cands = list(rr.get("candidates") or [])
-    sid = int(r["sample_id"])
-    sel = rr.get("selected") or {}
-    best_lp = rr.get("best_by_logprob") or {}
-    br = int(rr.get("best_logprob_rank_before", -1))
-    sr = int(rr.get("selected_rank_before_rerank", -2))
-    selected_not_best_lp = bool(br >= 0 and sr >= 0 and br != sr)
-
-    scores = sorted(
-        [float((c.get("rerank_score") if c.get("rerank_score") is not None else 0.0) or 0.0) for c in cands],
-        reverse=True,
-    )
-    top12_gap = (scores[0] - scores[1]) if len(scores) >= 2 else 1.0
-    tight_top2 = bool(len(scores) >= 2 and top12_gap < _RERANK_TOP2_GAP)
-
-    if cands:
-        lp_winner = max(
-            cands,
-            key=lambda x: float(x.get("avg_logprob"))
-            if x.get("avg_logprob") is not None
-            else float("-inf"),
-        )
-        lp_rank = int(lp_winner.get("candidate_rank_before_rerank", -1))
-    else:
-        lp_rank = -1
-    rerank_differs_from_lp_winner = bool(lp_rank >= 0 and sr >= 0 and lp_rank != sr)
-
-    dirty = float(sel.get("dirty_penalty_diagnostic_only", sel.get("dirty_penalty", 0.0)) or 0.0)
-    ldp = float(sel.get("length_deviation_penalty", 0.0) or 0.0)
-    mtail_ap = float(sel.get("malformed_tail_penalty", 0.0) or 0.0)
-    mtok_ap = float(sel.get("malformed_token_penalty", 0.0) or 0.0)
-    mtail_hit = bool(sel.get("malformed_tail_hit"))
-    mtok_hit = bool(sel.get("malformed_token_hit"))
-
-    veto_clean_lp = False
-    if dirty >= 0.15 and cands:
-        lp_text = str(best_lp.get("text") or "")
-        lp_c = next((c for c in cands if str(c.get("candidate_text") or "") == lp_text), None)
-        if lp_c:
-            lp_d = float(
-                (
-                    (lp_c.get("features") or {}).get(
-                        "dirty_penalty_diagnostic_only",
-                        (lp_c.get("features") or {}).get("dirty_penalty", 1.0),
-                    )
-                )
-                or 1.0
-            )
-            if lp_d < 0.05:
-                veto_clean_lp = True
-
-    flags: List[str] = []
-    if selected_not_best_lp:
-        flags.append("selected_not_best_logprob")
-    if dirty > 0:
-        flags.append("selected_dirty")
-    if mtail_ap > 0 or mtail_hit:
-        flags.append("malformed_tail")
-    if mtok_ap > 0 or mtok_hit:
-        flags.append("malformed_token")
-    if ldp > 0.30:
-        flags.append("length_dev_high")
-    if rerank_differs_from_lp_winner:
-        flags.append("rerank_not_logprob_winner")
-    if tight_top2:
-        flags.append("tight_top2_scores")
-    if veto_clean_lp:
-        flags.append("veto_dirty_selected_vs_clean_logprob")
-
-    include = bool(
-        selected_not_best_lp
-        or dirty > 0
-        or mtail_ap > 0
-        or mtok_ap > 0
-        or mtail_hit
-        or mtok_hit
-        or ldp > 0.30
-        or rerank_differs_from_lp_winner
-        or tight_top2
-        or veto_clean_lp
-    )
-    scored_c = sorted(
-        cands,
-        key=lambda x: -float(x["rerank_score"])
-        if x.get("rerank_score") is not None
-        else float("inf"),
-    )
-    top_compact = [_rerank_compact_cand(x) for x in scored_c[:3]]
-    rec: Dict[str, Any] = {
-        "sample_id": sid,
-        "reference": r.get("ref_text"),
-        "selected": {
-            "text": sel.get("text"),
-            "avg_logprob": sel.get("avg_logprob"),
-            "rerank_score": sel.get("rerank_score"),
-            "dirty_penalty_diagnostic_only": sel.get(
-                "dirty_penalty_diagnostic_only", sel.get("dirty_penalty")
-            ),
-            "malformed_tail_penalty": mtail_ap,
-            "malformed_token_penalty": mtok_ap,
-            "length_deviation_penalty": ldp,
-        },
-        "best_by_logprob": best_lp,
-        "comparison": {
-            "rerank_selected_text": sel.get("text"),
-            "logprob_winner_text": best_lp.get("text"),
-            "selected_not_best_logprob": selected_not_best_lp,
-            "top1_top2_rerank_gap": round(top12_gap, 6),
-        },
-        "top_candidates_compact": top_compact,
-        "analysis_flags": flags,
-    }
-    return include, rec
-
-
-def _rerank_head50_sort_key(rec: Dict[str, Any]) -> Tuple[Any, ...]:
-    flags = set(rec.get("analysis_flags") or [])
-    sel = rec.get("selected") or {}
-    _g = (rec.get("comparison") or {}).get("top1_top2_rerank_gap", 1.0)
-    gap = float(1.0 if _g is None else _g)
-    dirty = float(sel.get("dirty_penalty_diagnostic_only", sel.get("dirty_penalty", 0.0)) or 0.0)
-    return (
-        0 if "malformed_token" in flags else 1,
-        0 if "malformed_tail" in flags else 1,
-        0 if "selected_not_best_logprob" in flags else 1,
-        -dirty,
-        gap,
-    )
-
-
-def _write_rerank_artifacts(
-    eval_sub: str,
-    merged: List[dict],
-    *,
-    rerank_cfg: Dict[str, Any],
-    rerank_summary: Dict[str, Any],
-    export_examples_mode: str,
-    export_full_rerank_examples: bool,
-) -> None:
-    import csv as _csv
-
-    mode = (export_examples_mode or "head50").strip().lower()
-    cand_path = os.path.join(eval_sub, "rerank_candidates.csv")
-    fieldnames = [
-        "sample_id",
-        "candidate_rank_before_rerank",
-        "candidate_text",
-        "avg_logprob",
-        "pred_len_words",
-        "pred_len_ratio",
-        "repeat_penalty",
-        "dirty_penalty_diagnostic_only",
-        "length_deviation_penalty",
-        "malformed_tail_penalty",
-        "malformed_token_penalty",
-        "rerank_score",
-        "selected_as_final",
-    ]
-    full_samples: List[Dict[str, Any]] = []
-    with open(cand_path, "w", newline="", encoding="utf-8") as cf:
-        w = _csv.DictWriter(cf, fieldnames=fieldnames)
-        w.writeheader()
-        for r in merged:
-            sid = int(r["sample_id"])
-            rr = r.get("_rerank") or {}
-            for c in rr.get("candidates") or []:
-                fe = c.get("features") or {}
-                w.writerow(
-                    {
-                        "sample_id": sid,
-                        "candidate_rank_before_rerank": c.get("candidate_rank_before_rerank"),
-                        "candidate_text": c.get("candidate_text"),
-                        "avg_logprob": fe.get("avg_logprob"),
-                        "pred_len_words": fe.get("pred_len_words"),
-                        "pred_len_ratio": fe.get("pred_len_ratio"),
-                        "repeat_penalty": fe.get("repeat_penalty"),
-                        "dirty_penalty_diagnostic_only": fe.get(
-                            "dirty_penalty_diagnostic_only", fe.get("dirty_penalty")
-                        ),
-                        "length_deviation_penalty": fe.get("length_deviation_penalty"),
-                        "malformed_tail_penalty": fe.get("malformed_tail_penalty", 0),
-                        "malformed_token_penalty": fe.get("malformed_token_penalty", 0),
-                        "rerank_score": c.get("rerank_score"),
-                        "selected_as_final": c.get("selected_as_final"),
-                    }
-                )
-            full_samples.append(
-                {
-                    "sample_id": sid,
-                    "reference": r.get("ref_text"),
-                    "candidates": rr.get("candidates"),
-                    "selected": rr.get("selected"),
-                    "best_by_logprob": rr.get("best_by_logprob"),
-                    "comparison": {
-                        "rerank_selected_text": (rr.get("selected") or {}).get("text"),
-                        "logprob_winner_text": (rr.get("best_by_logprob") or {}).get("text"),
-                    },
-                }
-            )
-
-    want_light = mode in ("changed_only", "head20", "head50")
-    changed_records: List[Dict[str, Any]] = []
-    if want_light:
-        for r in merged:
-            inc, rec = _rerank_build_changed_only_row(r)
-            if inc:
-                changed_records.append(rec)
-        jlp = os.path.join(eval_sub, "rerank_examples_changed_only.jsonl")
-        with open(jlp, "w", encoding="utf-8") as jlf:
-            for rec in changed_records:
-                jlf.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-        idx_p = os.path.join(eval_sub, "rerank_examples_changed_only_index.csv")
-        with open(idx_p, "w", newline="", encoding="utf-8") as ixf:
-            iw = _csv.DictWriter(
-                ixf,
-                fieldnames=[
-                    "sample_id",
-                    "selected_not_best_logprob",
-                    "dirty_penalty_diagnostic_only",
-                    "malformed_tail_penalty",
-                    "malformed_token_penalty",
-                    "flags_summary",
-                ],
-            )
-            iw.writeheader()
-            for rec in changed_records:
-                comp = rec.get("comparison") or {}
-                sel = rec.get("selected") or {}
-                iw.writerow(
-                    {
-                        "sample_id": rec.get("sample_id"),
-                        "selected_not_best_logprob": comp.get("selected_not_best_logprob"),
-                        "dirty_penalty_diagnostic_only": sel.get(
-                            "dirty_penalty_diagnostic_only", sel.get("dirty_penalty")
-                        ),
-                        "malformed_tail_penalty": sel.get("malformed_tail_penalty"),
-                        "malformed_token_penalty": sel.get("malformed_token_penalty"),
-                        "flags_summary": ";".join(rec.get("analysis_flags") or []),
-                    }
-                )
-        _head_limits = {"head20": 20, "head50": 50}
-        if mode in _head_limits:
-            n = _head_limits[mode]
-            head = sorted(changed_records, key=_rerank_head50_sort_key)[:n]
-            with open(
-                os.path.join(eval_sub, f"rerank_examples_{mode}.json"),
-                "w",
-                encoding="utf-8",
-            ) as hf:
-                json.dump(head, hf, ensure_ascii=False, indent=2, default=str)
-
-    if export_full_rerank_examples:
-        gz_path = os.path.join(eval_sub, "rerank_examples.json.gz")
-        blob = json.dumps(
-            {
-                "rerank_cfg": rerank_cfg,
-                "rerank_summary": rerank_summary,
-                "samples": full_samples,
-            },
-            ensure_ascii=False,
-            default=str,
-        ).encode("utf-8")
-        with gzip.open(gz_path, "wb", compresslevel=6) as gzf:
-            gzf.write(blob)
 
 
 def _resolve_odcr_profile_paths(index_contract: Mapping[str, Any]) -> Dict[str, str]:
@@ -6560,7 +5681,7 @@ def load_step5_checkpoint_cpu_staged(
     for key, expected_value in expected.items():
         if lineage.get(key) != expected_value:
             raise CheckpointLineageError(
-                f"Step5 eval/rerank refused checkpoint due to compatibility mismatch for {key}: "
+                f"Step5 eval refused checkpoint due to compatibility mismatch for {key}: "
                 f"checkpoint={lineage.get(key)!r} current={expected_value!r}"
             )
     before = _cuda_memory_snapshot_for_step5_load(device_idx)
@@ -6787,7 +5908,9 @@ def _build_tokenize_cache_fingerprint(
         "max_output_length": int(max_length),
         "train_valid_split_fingerprint": semantic_source_files,
         "input_formatting_version": {
-            "processor": "executors.step5_engine.Processor/2",
+            "processor": "executors.step5_engine.Processor/3_clean_memory",
+            "clean_memory_controls": STEP5_CLEAN_MEMORY_CONTROL_SCHEMA_VERSION,
+            "control_source": STEP5_CLEAN_MEMORY_SOURCE,
             "prompt_registry_schema": prompt_manifest.get("schema_version"),
             "prompt_manifest_hash": stable_hash(prompt_manifest),
             "control_text_max_len_policy": f"max(4,min({STEP5_CONTROL_TEXT_MAX_LENGTH},max_length))",
@@ -6798,7 +5921,7 @@ def _build_tokenize_cache_fingerprint(
         "required_fields_hash": stable_hash(_STEP5_TOKENIZE_REQUIRED_FIELDS),
     }
     if eval_only and split_norm in {"valid", "test"}:
-        _eval_control_contract = step5_factual_eval_control_contract(split_label)
+        _eval_control_contract = step5_clean_memory_eval_control_contract(split_label)
         identity_payload["eval_control_contract"] = _eval_control_contract
         identity_payload["eval_control_contract_hash"] = stable_hash(_eval_control_contract)
     else:
@@ -6880,12 +6003,12 @@ def _build_tokenize_cache_fingerprint(
             "max_length": int(max_length),
             "dynamic_padding": "collate_time",
             "required_fields": list(_STEP5_TOKENIZE_REQUIRED_FIELDS),
-            "version": "Processor/2",
-            "cache_identity_contract": "Processor2/v10/legacy32",
+            "version": "Processor/3_clean_memory",
+            "cache_identity_contract": "Processor3/v13/clean_memory/no_eval_review",
             "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-            "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+            "clean_memory_encoder_max_content_tokens": STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
             "flan_soft_prompt_len": flan_soft_prompt_len,
-            "encoder_input_policy": "legacy32_content_evidence_only",
+            "encoder_input_policy": "clean_memory32_content_evidence_only",
             "encoder_input_tokenizer_kwargs": {
                 "truncation": True,
                 "max_length_policy": "max(4,min(32,max_length))",
@@ -7519,6 +6642,15 @@ def _rank0_step5_train_data_audit(
     """Console plus canonical run-meta data audit JSON/CSV."""
     n_raw = int(raw_row_count_override) if raw_row_count_override is not None else len(raw_df)
     n_filt = len(filt_df)
+    token_audit_cap = max(1, int(STEP5_DATA_AUDIT_TOKEN_LENGTH_SAMPLE_ROWS))
+    if n_filt > token_audit_cap:
+        token_audit_idx = np.linspace(0, n_filt - 1, token_audit_cap, dtype=np.int64)
+        token_audit_df = filt_df.iloc[token_audit_idx]
+        token_audit_sampled = True
+    else:
+        token_audit_df = filt_df
+        token_audit_sampled = False
+    token_audit_rows = int(len(token_audit_df))
     msg_lines = [
         f"[Step5 数据审计] 过滤后训练行数={n_filt}（过滤前={n_raw}，条件 train_keep==1 且 clean_text 非空）",
         f"  train_label_max_length={train_label_max_length}",
@@ -7583,9 +6715,15 @@ def _rank0_step5_train_data_audit(
     word_lens: List[int] = []
     # 审计需统计「未按 train_label 截断」的原始 token 数；临时放宽 tokenizer.model_max_length
     # 只用于计数，训练路径中 Processor 已 truncation=True，不会把超长序列喂进模型。
+    if token_audit_sampled:
+        msg_lines.append(
+            "  token_length_audit_sampled=1 "
+            f"sample_rows={token_audit_rows} total_rows={n_filt} "
+            "policy=deterministic_even_spacing"
+        )
     if tokenizer_free_control_probe:
-        for _, row in filt_df.iterrows():
-            ct = str(row.get("clean_text", "") or "")
+        for ct_raw in token_audit_df.get("clean_text", pd.Series(dtype=object)).tolist():
+            ct = str(ct_raw or "")
             word_lens.append(len(ct.split()))
         tok_lens = [0 for _ in word_lens]
         truncated = 0
@@ -7594,8 +6732,8 @@ def _rank0_step5_train_data_audit(
         _prev_mml = getattr(_tok_audit, "model_max_length", None)
         try:
             _tok_audit.model_max_length = 1_000_000
-            for _, row in filt_df.iterrows():
-                ct = str(row.get("clean_text", "") or "")
+            for ct_raw in token_audit_df.get("clean_text", pd.Series(dtype=object)).tolist():
+                ct = str(ct_raw or "")
                 word_lens.append(len(ct.split()))
                 ids = _tok_audit(ct, add_special_tokens=True, truncation=False)["input_ids"]
                 L = len(ids)
@@ -7681,6 +6819,13 @@ def _rank0_step5_train_data_audit(
         "noisy_tail_dropped": _nt_drop,
         "target_gold_kept_ratio": float(_tg_filt / max(_tg_raw, 1)),
         "aux_cf_kept_ratio": float(_cf_filt / max(_cf_raw, 1)),
+        "token_length_audit": {
+            "sampled": bool(token_audit_sampled),
+            "sample_rows": int(token_audit_rows),
+            "total_rows": int(n_filt),
+            "sample_cap": int(token_audit_cap),
+            "sample_policy": "deterministic_even_spacing" if token_audit_sampled else "full",
+        },
         "training_diagnostics": training_diagnostics_snapshot(
             diagnostics_scope="child",
             effective_training_payload_json=os.environ.get("ODCR_EFFECTIVE_TRAINING_PAYLOAD_JSON", ""),
@@ -8093,33 +7238,65 @@ def build_odcr_ddp_artefacts(
         _explainer_only_multiplier_for_loader = float(
             parse_step5_innovation_config_json(str(resolved.step5_innovation_config_json)).explainer_gate.explainer_only_multiplier
         )
-    try:
-        train_table = load_step5_pool_train_table(
-            train_path,
-            cache_root=_loader_cache_root,
-            cache_enabled=bool(_loader_cfg.get("cache_enabled", True)),
-            index_contract_path=_contract_path,
-            index_contract=index_contract,
-            required_columns=STEP5_TRAIN_VALIDATION_COLUMNS,
-            mode=_loader_mode,
-            sampler_config=_sampler_cfg,
-            batch_candidates_config=_batch_candidates_cfg,
-            tuning_config=_tuning_cfg,
-            task_head=_task_head,
-            validate_sample_rows=int(_loader_cfg.get("validate_sample_rows", 16)),
-            bounded_max_rows=int(_loader_cfg.get("bounded_max_rows", 1024)),
-            verify_sha256=(command == "train"),
-            stale_policy=str(_loader_cfg.get("stale_policy", "rebuild")),
-            validation_ctx={**_ictx, "csv_path": train_path},
-        )
-    except Step5ExportLoaderError as exc:
-        raise RuntimeError(str(exc)) from exc
+    train_table = None
     if command == "train":
+        try:
+            train_table = load_step5_pool_train_table(
+                train_path,
+                cache_root=_loader_cache_root,
+                cache_enabled=bool(_loader_cfg.get("cache_enabled", True)),
+                index_contract_path=_contract_path,
+                index_contract=index_contract,
+                required_columns=STEP5_TRAIN_VALIDATION_COLUMNS,
+                mode=_loader_mode,
+                sampler_config=_sampler_cfg,
+                batch_candidates_config=_batch_candidates_cfg,
+                tuning_config=_tuning_cfg,
+                task_head=_task_head,
+                validate_sample_rows=int(_loader_cfg.get("validate_sample_rows", 16)),
+                bounded_max_rows=int(_loader_cfg.get("bounded_max_rows", 1024)),
+                verify_sha256=True,
+                stale_policy=str(_loader_cfg.get("stale_policy", "rebuild")),
+                validation_ctx={**_ictx, "csv_path": train_path},
+            )
+        except Step5ExportLoaderError as exc:
+            raise RuntimeError(str(exc)) from exc
+        _resolved_candidate = _payload_for_lineage.get("step5_formal_active_candidate")
+        _resolved_intent = (
+            (_resolved_candidate or {}).get("sample_plan_intent")
+            if isinstance(_resolved_candidate, Mapping)
+            else {}
+        )
+        _expected_intent_hash = (
+            str((_resolved_intent or {}).get("sample_plan_intent_hash") or "")
+            if isinstance(_resolved_intent, Mapping)
+            else ""
+        )
+        _actual_intent_hash = str((train_table.stats or {}).get("sample_plan_intent_hash") or "")
+        if not _expected_intent_hash or _actual_intent_hash != _expected_intent_hash:
+            raise RuntimeError(
+                "Step5 sample-plan intent mismatch: runtime loader did not execute the resolved "
+                f"One-Control candidate. expected={_expected_intent_hash!r} actual={_actual_intent_hash!r}"
+            )
         train_df = train_table.train_df
         if GLOBAL_COL_USER not in train_df.columns or GLOBAL_COL_ITEM not in train_df.columns:
             raise ValueError(
                 f"训练 CSV 须含 {GLOBAL_COL_USER}/{GLOBAL_COL_ITEM}（Step4 index_contract 管线）。path={train_path}"
             )
+        train_df = apply_step5_clean_memory_controls(
+            train_df,
+            repo_root=get_odcr_root(),
+            target_domain=str(args.target),
+            auxiliary_domain=str(args.auxiliary),
+            index_contract=index_contract,
+            split_label="train",
+            leave_one_out=True,
+        )
+        require_step5_clean_memory_controls(
+            train_df,
+            ctx=f"Step5 training CSV {train_path}",
+            require_leave_one_out=True,
+        )
         _require_content_evidence_frame(train_df, ctx=f"Step5 training CSV {train_path}")
         _require_step5_rcr_posterior_controls(train_df, ctx=f"Step5 training CSV {train_path}")
         validate_split_indices(train_df, index_contract, "train", ctx={**_ictx, "csv_path": train_path})
@@ -8134,7 +7311,11 @@ def build_odcr_ddp_artefacts(
             "item_idx_global": [int(d[GLOBAL_COL_ITEM].min()), int(d[GLOBAL_COL_ITEM].max())],
         }
 
-    _mm_train_file = train_table.raw_index_min_max or _idx_mm(train_table.audit_raw_df)
+    _mm_train_file = (
+        train_table.raw_index_min_max or _idx_mm(train_table.audit_raw_df)
+        if train_table is not None
+        else None
+    )
     _mm_train_after_filter: Optional[Dict[str, Any]] = None
     _mm_eval_split: Optional[Dict[str, Any]] = None
 
@@ -8233,7 +7414,16 @@ def build_odcr_ddp_artefacts(
         ev_df = ev_df.reset_index(drop=True)
         ev_df["sample_id"] = np.arange(len(ev_df), dtype=np.int64)
         ev_df["clean_text"] = ev_df["explanation"].fillna("").astype(str)
-        ev_df = _apply_step5_factual_eval_default_controls(ev_df, split_label=split_label)
+        ev_df = apply_step5_clean_memory_controls(
+            ev_df,
+            repo_root=get_odcr_root(),
+            target_domain=str(args.target),
+            auxiliary_domain=str(args.auxiliary),
+            index_contract=index_contract,
+            split_label=split_label,
+            leave_one_out=False,
+        )
+        ev_df = _apply_step5_clean_memory_eval_controls(ev_df, split_label=split_label)
         cache_dir, cache_fp, cache_fp_payload = _build_step5_cache_dir(
             get_hf_cache_root(task_idx),
             train_path,
@@ -8304,7 +7494,16 @@ def build_odcr_ddp_artefacts(
         valid_df = valid_df.reset_index(drop=True)
         valid_df["sample_id"] = np.arange(len(valid_df), dtype=np.int64)
         valid_df["clean_text"] = valid_df["explanation"].fillna("").astype(str)
-        valid_df = _apply_step5_factual_eval_default_controls(valid_df, split_label="valid")
+        valid_df = apply_step5_clean_memory_controls(
+            valid_df,
+            repo_root=get_odcr_root(),
+            target_domain=str(args.target),
+            auxiliary_domain=str(args.auxiliary),
+            index_contract=index_contract,
+            split_label="valid",
+            leave_one_out=False,
+        )
+        valid_df = _apply_step5_clean_memory_eval_controls(valid_df, split_label="valid")
 
         train_raw = train_table.audit_raw_df
         train_df = train_df.reset_index(drop=True)
@@ -8577,7 +7776,7 @@ def _summarize_step5_encoder_input_rows(rows: Sequence[Mapping[str, Any]]) -> Di
     return {
         "schema_version": STEP5_ENCODER_AUDIT_SCHEMA_VERSION,
         "encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
-        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "clean_memory_encoder_max_content_tokens": STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
         "content_evidence_token_policy": "max(4,min(32,label_max_length))",
         "sample_count": n,
         "encoder_truncated_count": truncated_count,
@@ -8590,17 +7789,20 @@ def _summarize_step5_encoder_input_rows(rows: Sequence[Mapping[str, Any]]) -> Di
 def _step5_content_evidence_contract_payload(final_cfg: FinalTrainingConfig) -> Dict[str, Any]:
     soft_len = int(parse_step5_innovation_config_json(str(final_cfg.step5_innovation_config_json)).ccv.soft_prompt_len)
     return {
-        "schema_version": "odcr_step5_content_evidence_encoder_contract/legacy32",
+        "schema_version": "odcr_step5_content_evidence_encoder_contract/clean_memory32",
         "content_evidence_used": True,
         "content_evidence_field": "content_evidence",
-        "content_evidence_token_len": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "content_evidence_token_len": STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
         "soft_prompt_used": True,
-        "encoder_input_contract": "soft_prompt_plus_content_evidence_legacy32",
+        "encoder_input_contract": "clean_memory32_content_evidence",
         "flan_encoder_input_contract": STEP5_FLAN_ENCODER_INPUT_CONTRACT_VERSION,
         "flan_soft_prompt_len": soft_len,
-        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+        "clean_memory_encoder_max_content_tokens": STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
         "tokenizer_kwargs": {"truncation": True, "max_length_policy": "max(4,min(32,label_max_length))"},
         "soft_prompt_only_allowed": False,
+        "allow_current_row_review": False,
+        "allow_current_row_explanation": False,
+        "allow_gold_rating_in_generation": False,
     }
 
 
@@ -8619,7 +7821,6 @@ def _step5_official_eval_policy_payload(final_cfg: FinalTrainingConfig, *, split
         "repetition_penalty": float(final_cfg.repetition_penalty),
         "official_paper_metrics": "base_utils.official_paper_metrics",
         "metric_input_builder": "base_utils.build_paper_metric_inputs",
-        "rerank_allowed": False,
     }
 
 
@@ -8662,8 +7863,6 @@ def _step5_decode_artifact_payload(final_cfg: FinalTrainingConfig) -> Dict[str, 
 
 
 def _assert_step5_official_eval_contract(final_cfg: FinalTrainingConfig, *, command: str) -> None:
-    if str(command) == "eval-rerank":
-        raise RuntimeError("Step5 official paper eval forbids rerank; rerank profiles are diagnostic_only.")
     if str(final_cfg.decode_strategy).strip().lower() != "greedy":
         raise RuntimeError("Step5 official paper eval requires decode_strategy=greedy (paper_greedy_25).")
     if int(final_cfg.max_explanation_length) != 25:
@@ -8704,7 +7903,7 @@ def _is_clean_official_step5_test_metrics_payload(metrics: Mapping[str, Any], *,
         and int(token_policy.get("prediction_max_length") or 0) == 25
         and int(token_policy.get("reference_max_length") or 0) == 25
         and content_contract.get("content_evidence_used") is True
-        and str(content_contract.get("encoder_input_contract") or "") == "soft_prompt_plus_content_evidence_legacy32"
+        and str(content_contract.get("encoder_input_contract") or "") == "clean_memory32_content_evidence"
     )
 
 
@@ -9142,19 +8341,11 @@ def _run_ddp(args):
             _eval_global_bs = int(final_cfg.eval_batch_size)
             _eval_nw = int(final_cfg.dataloader_num_workers_valid)
             _eval_pf = final_cfg.dataloader_prefetch_factor_valid
-            _review_rows: List[str] = []
-            _review_meta: Dict[str, Any] = {"fast_path": "not_used", "review_rows_count": 0}
-            _review_t0 = time.perf_counter()
-            if str(args.command) == "eval-rerank":
-                if rank == 0:
-                    _review_rows, _review_meta = _load_review_by_sample_id(
-                        str(getattr(args, "_odcr_eval_data_path", "") or "")
-                    )
-                gathered_review: List[Any] = [_review_rows, _review_meta]
-                dist.broadcast_object_list(gathered_review, src=0)
-                _review_rows = list(gathered_review[0] or [])
-                _review_meta = dict(gathered_review[1] or {})
-            _review_load_time = float(time.perf_counter() - _review_t0)
+            _eval_current_row_review_policy = {
+                "source": "disabled",
+                "reason": "ODCR-CleanMemory forbids current split review in generation.",
+                "allow_current_row_review": False,
+            }
             single_safe = bool(getattr(args, "eval_single_process_safe", False)) and world_size > 1
             sanity_cmp = bool(getattr(args, "sanity_compare_ddp_single", False)) and world_size > 1
             if (not single_safe) and world_size > 1 and (_eval_global_bs % world_size != 0):
@@ -9187,7 +8378,7 @@ def _run_ddp(args):
                 _ed = (os.environ.get("ODCR_EVAL_RUN_DIR") or "").strip()
                 if not _ed:
                     raise RuntimeError(
-                        "ODCR_EVAL_RUN_DIR 未设置。请使用: python code/odcr.py eval|eval-rerank …"
+                        "ODCR_EVAL_RUN_DIR 未设置。请使用: python code/odcr.py eval …"
                     )
                 _ed = os.path.abspath(_ed)
                 os.makedirs(_ed, exist_ok=True)
@@ -9211,12 +8402,11 @@ def _run_ddp(args):
                         generate_temperature=float(final_cfg.generate_temperature),
                         generate_top_p=float(final_cfg.generate_top_p),
                     )
-                _is_rerank = str(args.command) == "eval-rerank"
                 eval_sub = ed
                 os.makedirs(eval_sub, exist_ok=True)
                 metrics_output_path = os.path.join(
                     os.path.abspath(eval_sub),
-                    path_layout.eval_metrics_filename(rerank=_is_rerank),
+                    path_layout.eval_metrics_filename(),
                 )
                 existing_check_paths = (
                     metrics_output_path,
@@ -9234,7 +8424,7 @@ def _run_ddp(args):
                     expected_schema = STEP5_EVAL_OUTPUT_SCHEMA_VERSION
                     if not isinstance(existing_metrics, dict) or existing_metrics.get("metrics_schema_version") != expected_schema:
                         raise RuntimeError(
-                            "eval/rerank refused old output schema at "
+                            "eval refused old output schema at "
                             f"{existing_path}: stored={getattr(existing_metrics, 'get', lambda _k, _d=None: None)('metrics_schema_version')!r} "
                             f"expected={expected_schema!r}. Use a new eval run id."
                         )
@@ -9263,7 +8453,7 @@ def _run_ddp(args):
                         continue
                     raise RuntimeError(
                         f"Refusing to overwrite existing eval metrics output: {existing_path}. "
-                        "Use a new eval/rerank run id."
+                        "Use a new eval run id."
                     )
                 checkpoint_lineage = read_checkpoint_lineage(final_cfg.save_file, expected_stage="step5")
                 _sp_eval = _state_paths_from_save_file(str(final_cfg.save_file))
@@ -9284,11 +8474,10 @@ def _run_ddp(args):
                 if _ebn:
                     train_logger.info(
                         "[eval_profile_orchestrator] name=%s hardware_preset=%s decode_preset_stem=%s "
-                        "rerank_preset_stem=%s global_eval_batch_size=%s ddp_world_size=%s",
+                        "global_eval_batch_size=%s ddp_world_size=%s",
                         _ebn,
                         (os.environ.get("ODCR_HARDWARE_PRESET") or "").strip(),
                         (os.environ.get("ODCR_DECODE_PRESET_STEM") or "").strip(),
-                        (os.environ.get("ODCR_RERANK_PRESET_STEM") or "").strip() or "-",
                         int(final_cfg.eval_batch_size),
                         int(getattr(final_cfg, "ddp_world_size", 1) or 1),
                         extra=log_route_extra(train_logger, ROUTE_SUMMARY),
@@ -9297,16 +8486,6 @@ def _run_ddp(args):
                 generation_semantic_resolved, _ = build_generation_semantic_resolved_and_fingerprint(
                     _decode_cfg
                 )
-                if _is_rerank:
-                    _cfp_raw = json.dumps(_decode_cfg, ensure_ascii=False, sort_keys=True, default=str)
-                    train_logger.info(
-                        "[CheckpointSemantics] eval_rerank candidate_decode_fingerprint_sha1=%s "
-                        "decode_strategy=%s num_return_sequences=%s",
-                        hashlib.sha1(_cfp_raw.encode("utf-8")).hexdigest()[:16],
-                        str(final_cfg.decode_strategy),
-                        int(getattr(args, "num_return_sequences", 4) or 4),
-                        extra=log_route_extra(train_logger, ROUTE_SUMMARY),
-                    )
                 collapse_stats = final.get("collapse_stats") or {}
                 rating_source_ref: dict[str, Any] = {}
                 try:
@@ -9331,7 +8510,7 @@ def _run_ddp(args):
                     final["step5_rating_metrics_written"] = False
                 except Exception as exc:
                     raise RuntimeError(f"Step5 official eval requires valid Step3 rating_source: {exc}") from exc
-                _eval_control_contract = step5_factual_eval_control_contract(_split_lab)
+                _eval_control_contract = step5_clean_memory_eval_control_contract(_split_lab)
                 content_evidence_contract = _step5_content_evidence_contract_payload(final_cfg)
                 official_eval_policy = _step5_official_eval_policy_payload(
                     final_cfg,
@@ -9339,12 +8518,28 @@ def _run_ddp(args):
                     command=str(args.command),
                 )
                 encoder_input_audit = final.get("encoder_input_token_audit") or _summarize_step5_encoder_input_rows(merged)
+                clean_memory_runtime_contract = {
+                    "model_name": STEP5_CLEAN_MEMORY_MODEL_NAME,
+                    "clean_protocol": STEP5_CLEAN_MEMORY_PROTOCOL,
+                    "control_source": STEP5_CLEAN_MEMORY_SOURCE,
+                    "evidence_source": STEP5_CLEAN_MEMORY_EVIDENCE_SOURCE,
+                    "profile_source": "preprocess_train_only_content_style_profiles",
+                    "step3_source": STEP5_CLEAN_MEMORY_STEP3_SOURCE,
+                    "step4_source": STEP5_CLEAN_MEMORY_STEP4_SOURCE,
+                    "leakage_audit_status": STEP5_CLEAN_MEMORY_AUDIT_STATUS,
+                    "leakage_audit_gate": "code/tools/odcr_clean_memory_gate.py",
+                    "allow_current_row_review": False,
+                    "allow_current_row_explanation": False,
+                    "allow_gold_rating_in_generation": False,
+                    "leave_one_out_train_memory": True,
+                }
                 metrics_payload = {
                     "metrics_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
                     "eval_output_schema_version": STEP5_EVAL_OUTPUT_SCHEMA_VERSION,
+                    **clean_memory_runtime_contract,
                     "eval_control_contract": _eval_control_contract,
                     "eval_control_contract_hash": stable_hash(_eval_control_contract),
-                    "eval_control_mode": STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT,
+                    "eval_control_mode": STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE,
                     "official_eval_profile": "paper_greedy_25",
                     "official_eval_policy": official_eval_policy,
                     "content_evidence_contract": content_evidence_contract,
@@ -9353,7 +8548,6 @@ def _run_ddp(args):
                     "encoder_truncated_rate": float(encoder_input_audit.get("encoder_truncated_rate", 0.0) or 0.0),
                     "auto_selected_params": auto_selected_params or None,
                     "target_only": True,
-                    "rerank_touched": bool(_is_rerank),
                     "checkpoint_compat_schema_version": STEP5_CHECKPOINT_COMPAT_SCHEMA_VERSION,
                     "step5_train_schema_version": STEP5_TRAIN_SCHEMA_VERSION,
                     "step5_checkpoint_lineage_hash": checkpoint_lineage.get("lineage_hash"),
@@ -9372,9 +8566,7 @@ def _run_ddp(args):
                     "task_idx": int(final_cfg.task_idx),
                     "split": _split_lab,
                     "split_csv": getattr(args, "_odcr_eval_data_path", ""),
-                    "review_path": getattr(args, "_odcr_eval_data_path", ""),
-                    "review_rows_count": int(_review_meta.get("review_rows_count", 0) or 0),
-                    "review_load_fast_path": str(_review_meta.get("fast_path", "not_used")),
+                    "current_row_review_policy": _eval_current_row_review_policy,
                     "seed": int(args.seed),
                     "world_size": world_size,
                     "eval_mode": "single_process_safe" if single_safe else "ddp_sharded",
@@ -9385,7 +8577,7 @@ def _run_ddp(args):
                     "token_length_policy": {
                         "prediction_max_length": int(getattr(final_cfg, "final_eval_prediction_max_length", 25)),
                         "reference_max_length": int(getattr(final_cfg, "final_eval_reference_max_length", 25)),
-                        "legacy_encoder_max_content_tokens": STEP5_LEGACY32_ENCODER_MAX_CONTENT_TOKENS,
+                        "clean_memory_encoder_max_content_tokens": STEP5_CLEAN_MEMORY_ENCODER_MAX_CONTENT_TOKENS,
                         "builder": "base_utils.build_paper_metric_inputs",
                     },
                     "collapse_stats": collapse_stats,
@@ -9405,80 +8597,6 @@ def _run_ddp(args):
                 except Exception:
                     pass
                 merged_for_pred: List[dict] = merged
-                if _is_rerank:
-                    _rrm = _rerank_eval_cli_resolved(args)
-                    _ex_mode = str(_rrm["export_examples_mode"]).strip().lower()
-                    _rm = str(_rrm["rerank_method"])
-                    rs = _aggregate_rerank_summary(
-                        merged,
-                        export_examples_mode=_ex_mode,
-                        rerank_method=_rm,
-                    )
-                    rw = build_rerank_weights_dict(
-                        weight_logprob=float(_rrm["rerank_weight_logprob"]),
-                        weight_length=float(_rrm["rerank_weight_length"]),
-                        weight_repeat=float(_rrm["rerank_weight_repeat"]),
-                        weight_dirty=float(_rrm["rerank_weight_dirty"]),
-                    )
-                    _mtail_c = float(_rrm["rerank_malformed_tail_penalty"])
-                    _mtok_c = float(_rrm["rerank_malformed_token_penalty"])
-                    rs["rerank_weights"] = rw
-                    rs["rerank_malformed_tail_coef"] = _mtail_c
-                    rs["rerank_malformed_token_coef"] = _mtok_c
-                    metrics_payload["rerank_enabled"] = True
-                    metrics_payload["rerank_method"] = _rm
-                    metrics_payload["num_return_sequences"] = int(_rrm["num_return_sequences"])
-                    metrics_payload["rerank_top_k"] = int(_rrm["rerank_top_k"])
-                    metrics_payload["rerank_weights"] = rw
-                    metrics_payload["rerank_target_len_ratio"] = float(_rrm["rerank_target_len_ratio"])
-                    metrics_payload["rerank_malformed_tail_penalty"] = _mtail_c
-                    metrics_payload["rerank_malformed_token_penalty"] = _mtok_c
-                    metrics_payload["rerank_source_table"] = dict(_rrm.get("rerank_source_table") or {})
-                    metrics_payload["rerank_profile_effective"] = dict(_rrm.get("rerank_profile") or {})
-                    metrics_payload["export_examples_mode"] = _ex_mode
-                    metrics_payload["export_full_rerank_examples"] = bool(
-                        getattr(args, "export_full_rerank_examples", False)
-                    )
-                    metrics_payload["rerank_logprob_source"] = (
-                        "per_token_log_softmax_at_chosen_id; same logits/preprocessing as generate "
-                        "(nucleus: tempered softmax; greedy: argmax on same logits)"
-                    )
-                    metrics_payload["rerank_summary"] = rs
-                    if "v3" in _rm.replace("_", ""):
-                        metrics_payload["rerank_v3_summary"] = dict(rs)
-                        _rrpj = (os.environ.get("ODCR_RERANK_PROFILE_JSON") or "").strip()
-                        if _rrpj:
-                            try:
-                                metrics_payload["rerank_v3_profile_effective"] = json.loads(_rrpj)
-                            except Exception:
-                                metrics_payload["rerank_v3_profile_effective"] = {}
-                    merged_for_pred = [{k: v for k, v in r.items() if k != "_rerank"} for r in merged]
-                    _export_full = bool(
-                        getattr(args, "export_full_rerank_examples", False)
-                    ) or (_ex_mode == "full")
-                    _rr0 = time.perf_counter()
-                    _write_rerank_artifacts(
-                        eval_sub,
-                        merged,
-                        rerank_cfg={
-                            "rerank_method": metrics_payload["rerank_method"],
-                            "num_return_sequences": metrics_payload["num_return_sequences"],
-                            "rerank_top_k": metrics_payload["rerank_top_k"],
-                            "rerank_weights": rw,
-                            "rerank_target_len_ratio": metrics_payload["rerank_target_len_ratio"],
-                            "rerank_source_table": metrics_payload["rerank_source_table"],
-                            "rerank_profile_effective": metrics_payload["rerank_profile_effective"],
-                            "export_examples_mode": _ex_mode,
-                            "export_full_rerank_examples": _export_full,
-                            "rerank_malformed_tail_penalty": _mtail_c,
-                            "rerank_malformed_token_penalty": _mtok_c,
-                        },
-                        rerank_summary=rs,
-                        export_examples_mode=_ex_mode,
-                        export_full_rerank_examples=_export_full,
-                    )
-                    if eval_perf is not None:
-                        eval_perf["rerank_artifacts_write_time"] = float(time.perf_counter() - _rr0)
                 if eval_model is not None:
                     _um = get_underlying_model(eval_model)
                     metrics_payload["generate_kwargs_effective"] = _um.get_generate_kwargs_effective()
@@ -9498,6 +8616,10 @@ def _run_ddp(args):
                     "checkpoint": _ckpt_abs,
                     "eval_export_tag": _eval_tag,
                     "eval_run_dir": os.path.abspath(eval_sub),
+                    "model_name": STEP5_CLEAN_MEMORY_MODEL_NAME,
+                    "clean_protocol": STEP5_CLEAN_MEMORY_PROTOCOL,
+                    "control_source": STEP5_CLEAN_MEMORY_SOURCE,
+                    "leakage_audit_status": STEP5_CLEAN_MEMORY_AUDIT_STATUS,
                     "decode": _decode_cfg,
                     "recommendation": final.get("recommendation"),
                     "bleu4": final.get("explanation", {}).get("bleu", {}).get("4"),
@@ -9529,8 +8651,6 @@ def _run_ddp(args):
                 ]
                 pred_csv = os.path.join(eval_sub, "predictions.csv")
                 pred_jsonl = os.path.join(eval_sub, "predictions.jsonl")
-                if _is_rerank:
-                    csv_fields.extend(["candidate_family", "lp_norm", "completion_ok"])
                 _pw0 = time.perf_counter()
                 write_predictions_csv(pred_csv, merged_for_pred, csv_fields)
                 write_predictions_jsonl(pred_jsonl, merged_for_pred)
@@ -9539,19 +8659,22 @@ def _run_ddp(args):
                 _perf = dict(eval_perf) if eval_perf is not None else {}
                 _perf["total_eval_time"] = float(time.perf_counter() - _eval_t0)
                 _summary_keys = (
-                    "review_load_time",
                     "tokenize_cache_time",
                     "eval_dataset_build_time",
                     "eval_dataloader_build_time",
                     "decode_time",
-                    "rerank_feature_time",
                     "gather_time",
                     "metrics_time",
                     "predictions_write_time",
-                    "rerank_scoring_time",
-                    "rerank_artifacts_write_time",
                     "total_eval_time",
                 )
+                _perf_summary: Dict[str, float] = {}
+                for _perf_key in _summary_keys:
+                    if _perf_key not in _perf:
+                        continue
+                    _perf_value = _perf[_perf_key]
+                    if isinstance(_perf_value, (int, float)) and not isinstance(_perf_value, bool):
+                        _perf_summary[_perf_key] = float(_perf_value)
                 _rt_eval_snap = runtime_env_dict_for_config_resolved()
                 metrics_payload["eval_performance"] = {
                     "global_eval_batch_size": int(_eval_global_bs),
@@ -9564,7 +8687,7 @@ def _run_ddp(args):
                     "dataloader_prefetch_factor_valid": _eval_pf,
                     "hardware_preset": (os.environ.get("ODCR_HARDWARE_PRESET") or "").strip() or None,
                     "runtime_env": _rt_eval_snap,
-                    "summary": {k: float(_perf[k]) for k in _summary_keys if k in _perf},
+                    "summary": _perf_summary,
                     "detail": _perf,
                 }
                 with open(metrics_output_path, "w", encoding="utf-8") as f:
@@ -9586,10 +8709,14 @@ def _run_ddp(args):
                     ccv_fca_report={
                         "fca_enabled": True,
                         "control_projection_module": "explanation_control_projection",
+                        "model_name": STEP5_CLEAN_MEMORY_MODEL_NAME,
+                        "clean_protocol": STEP5_CLEAN_MEMORY_PROTOCOL,
+                        "control_source": STEP5_CLEAN_MEMORY_SOURCE,
                     },
                     route_explainer_stats={
                         "split": str(_split_lab),
-                        "eval_control_mode": STEP5_CONTROL_MODE_FACTUAL_EVAL_DEFAULT,
+                        "eval_control_mode": STEP5_CLEAN_MEMORY_EVAL_CONTROL_MODE,
+                        "control_source": STEP5_CLEAN_MEMORY_SOURCE,
                     },
                 )
                 official_report = {
@@ -9597,6 +8724,10 @@ def _run_ddp(args):
                     "stage": "step5",
                     "task_id": int(final_cfg.task_idx),
                     "split": str(_split_lab),
+                    "model_name": STEP5_CLEAN_MEMORY_MODEL_NAME,
+                    "clean_protocol": STEP5_CLEAN_MEMORY_PROTOCOL,
+                    "control_source": STEP5_CLEAN_MEMORY_SOURCE,
+                    "leakage_audit_status": STEP5_CLEAN_MEMORY_AUDIT_STATUS,
                     "checkpoint": os.path.abspath(str(final_cfg.save_file)),
                     "metrics_path": os.path.abspath(metrics_output_path),
                     "rating_metrics_source": "step3_eval_handoff",
@@ -9643,7 +8774,7 @@ def _run_ddp(args):
                         "encoder_input_token_audit": encoder_input_audit,
                         "selected_params": {
                             "best_metric_policy": "official_paper_metrics_valid_only",
-                            "best_content_evidence_policy": "soft_prompt_plus_content_evidence_legacy32_required",
+                            "best_content_evidence_policy": "clean_memory32_content_evidence_required",
                             "best_cache_policy": "token_cache_identity_content_affecting_only",
                         },
                         "candidates": [
@@ -9734,21 +8865,6 @@ def _run_ddp(args):
                     extra=log_route_extra(train_logger, ROUTE_SUMMARY),
                 )
                 log_sample_id_alignment_snippet(merged_for_pred, k=20, logger=train_logger)
-                if _is_rerank:
-                    _rs = metrics_payload.get("rerank_summary") or {}
-                    train_logger.info(
-                        "[rerank_effective] K=%s method=%s selected_not_best_logprob_rate=%.6g mean_selected_rerank_score=%s",
-                        metrics_payload.get("num_return_sequences"),
-                        metrics_payload.get("rerank_method"),
-                        float(_rs.get("selected_not_best_logprob_rate", float("nan"))),
-                        _rs.get("mean_selected_rerank_score"),
-                        extra=log_route_extra(train_logger, ROUTE_SUMMARY),
-                    )
-                    train_logger.info(
-                        "[rerank_summary] %s",
-                        json.dumps(_rs, ensure_ascii=False, default=str),
-                        extra=log_route_extra(train_logger, ROUTE_SUMMARY),
-                    )
                 _cw = collapse_stats.get("collapse_warnings") or []
                 if _cw:
                     train_logger.warning(
@@ -9833,7 +8949,6 @@ def _run_ddp(args):
                         collate_fn=step5_collate_fn,
                     )
                     _eval_perf: Dict[str, Any] = {
-                        "review_load_time": _review_load_time,
                         "tokenize_cache_time": float(
                             getattr(args, "_odcr_eval_tokenize_cache_wall_s", 0.0) or 0.0
                         ),
@@ -9843,11 +8958,9 @@ def _run_ddp(args):
                         "eval_dataloader_build_time": float(time.perf_counter() - _dl_c0),
                     }
                     rows_local, _t_loc = _eval_rows_local(
-                        eval_model, eval_dataloader, local_rank, args, review_rows=_review_rows
+                        eval_model, eval_dataloader, local_rank, args
                     )
                     _eval_perf["decode_time"] = float(_t_loc.get("decode_time", 0.0))
-                    _eval_perf["rerank_feature_time"] = float(_t_loc.get("rerank_feature_time", 0.0))
-                    _eval_perf["rerank_scoring_time"] = float(_t_loc.get("rerank_scoring_time", 0.0))
                     _eval_perf["gather_time"] = 0.0
                     _mt0 = time.perf_counter()
                     merged = merge_eval_rows_by_sample_id([rows_local], _real_n)
@@ -9912,7 +9025,7 @@ def _run_ddp(args):
                 )
                 _eval_perf_ddp: Dict[str, Any] = {}
                 if rank == 0:
-                    _eval_perf_ddp["review_load_time"] = _review_load_time
+                    _eval_perf_ddp["current_row_review_policy"] = _eval_current_row_review_policy
                     _eval_perf_ddp["tokenize_cache_time"] = float(
                         getattr(args, "_odcr_eval_tokenize_cache_wall_s", 0.0) or 0.0
                     )
@@ -9921,7 +9034,7 @@ def _run_ddp(args):
                     )
                     _eval_perf_ddp["eval_dataloader_build_time"] = float(time.perf_counter() - _dl_c1)
                 rows_local, _t_loc_ddp = _eval_rows_local(
-                    eval_model, eval_dataloader, local_rank, args, review_rows=_review_rows
+                    eval_model, eval_dataloader, local_rank, args
                 )
                 gathered_rows: List[Any] = [None] * world_size
                 if rank == 0:
@@ -9930,10 +9043,6 @@ def _run_ddp(args):
                 if rank == 0:
                     _eval_perf_ddp["gather_time"] = float(time.perf_counter() - _ga0)
                     _eval_perf_ddp["decode_time"] = float(_t_loc_ddp.get("decode_time", 0.0))
-                    _eval_perf_ddp["rerank_feature_time"] = float(
-                        _t_loc_ddp.get("rerank_feature_time", 0.0)
-                    )
-                    _eval_perf_ddp["rerank_scoring_time"] = float(_t_loc_ddp.get("rerank_scoring_time", 0.0))
                     _mm0 = time.perf_counter()
                     merged = merge_eval_rows_by_sample_id(gathered_rows, _real_n)
                     final, _, _ = _metrics_final_dict_from_rows(

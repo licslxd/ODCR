@@ -291,7 +291,7 @@ def validate_resolved_config(cfg: ResolvedConfig) -> None:
     不替代 YAML/任务表解析错误（仍由 config_resolver 抛出）。
     """
     cmd = cfg.command
-    if cmd in ("step3", "step5", "eval", "eval-rerank"):
+    if cmd in ("step3", "step5", "eval"):
         if not (getattr(cfg, "effective_training_payload_json", "") or "").strip():
             raise RuntimeError(
                 f"内部错误: command={cmd!r} 缺少 effective_training_payload_json（父进程须生成训练 payload）。"
@@ -364,7 +364,7 @@ def validate_resolved_config(cfg: ResolvedConfig) -> None:
                     f"评测日志: {cfg.log_dir}/full.log\n"
                     + _hint_tail()
                 )
-    elif cmd in ("eval", "eval-rerank"):
+    elif cmd == "eval":
         if cfg.global_eval_batch_size is None:
             raise RuntimeError("内部错误: eval 系命令缺少 global_eval_batch_size。")
         if int(cfg.global_eval_batch_size) % int(cfg.ddp_world_size) != 0:
@@ -372,7 +372,7 @@ def validate_resolved_config(cfg: ResolvedConfig) -> None:
                 f"eval_batch_size={int(cfg.global_eval_batch_size)} 与 world_size={int(cfg.ddp_world_size)} 不整除。"
                 "请修改 configs/odcr.yaml 中 eval.profiles.*.eval_batch_size，或调整 hardware.profiles.*.ddp_world_size。"
             )
-        stage = "rerank" if cmd == "eval-rerank" else "eval"
+        stage = "eval"
         if cfg.model_path:
             mp = Path(cfg.model_path)
             if not mp.is_file():

@@ -166,6 +166,19 @@ GPU pane 选择优先级：
 6. historical hint 只能作参考；
 7. default /tmp fallback 最后，且不能覆盖更好的 live CUDA target。
 
+### stale handoff / 多 pane 恢复判定
+
+当 `current_gpu_pane.json` stale、live discovery 发现多个候选，或显式
+`--socket/--target` 指向的 pane 不能在 timeout 内写出 fresh handshake 时：
+
+- 可以对候选逐个执行 explicit `validate-only` / `cuda-probe`；
+- 只有 fresh handshake 同时满足 hostname 非 `admin`、`CUDA_VISIBLE_DEVICES`
+  非空、`nvidia-smi` 可用、`torch.cuda.is_available=True` 时，才能派发 GPU 工作；
+- discovery 中显示的 `pane_command` / `command_class` 只能作为线索，不能替代 handshake；
+- 如果 probe 结果显示 hostname=`admin`、CUDA 不可见，或 handoff stale 且无法 fresh validate，
+  ODCR-main 任务必须停在 GPU 前置条件，提示用户在同一个 tmux 中手动执行
+  `odcr-enter-gpu <JOBID>` 后再继续。
+
 ## 8. 证据等级
 
 E3：

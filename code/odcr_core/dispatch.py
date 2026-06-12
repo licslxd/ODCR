@@ -21,12 +21,6 @@ def print_dispatch_routing(command: str) -> None:
         print("[Dispatch] eval -> step5 runner eval (torchrun)", flush=True)
     elif command == "eval-matrix":
         print("[Dispatch] eval-matrix -> 多次 step5 runner eval (torchrun)", flush=True)
-    elif command == "eval-rerank":
-        print("[Dispatch] eval-rerank -> step5 runner eval-rerank (torchrun)", flush=True)
-    elif command == "eval-rerank-matrix":
-        print("[Dispatch] eval-rerank-matrix -> 多次 step5 runner eval-rerank (torchrun)", flush=True)
-    elif command == "rerank-summary":
-        print("[Dispatch] rerank-summary -> 扫描 rerank_summary.json 写 phase2_rerank_summary（无 torchrun）", flush=True)
     elif command == "eval-summary":
         print("[Dispatch] eval-summary -> 离线扫描 eval_metrics.json（无 torchrun）", flush=True)
     elif command == "pipeline":
@@ -45,7 +39,7 @@ def print_dispatch_script_detail(command: str) -> None:
         print(f"[Dispatch][detail] torchrun script={TORCHRUN_STEP3_SCRIPT}", flush=True)
     elif command == "step4":
         print(f"[Dispatch][detail] torchrun script={TORCHRUN_STEP4_SCRIPT}", flush=True)
-    elif command in ("step5", "eval", "eval-matrix", "eval-rerank", "eval-rerank-matrix"):
+    elif command in ("step5", "eval", "eval-matrix"):
         print(f"[Dispatch][detail] torchrun script={TORCHRUN_STEP5_SCRIPT}", flush=True)
     elif command == "pipeline":
         print(

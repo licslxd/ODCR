@@ -117,10 +117,17 @@ class Step3UpstreamGateTests(unittest.TestCase):
             self._write_json(
                 latest_path,
                 {
+                    "schema_version": "odcr_latest_pointer/active_stage_status/1",
+                    "active_run_id": "1",
                     "latest_run_id": "1",
                     "latest_run_dir": str(run_dir.relative_to(root)),
                     "latest_summary_path": str(summary_path.relative_to(root)),
-                    "latest_status": "ok",
+                    "latest_stage_status_path": str(status_path.relative_to(root)),
+                    "stage": f"preprocess_{unit}",
+                    "run_dir": str(run_dir.relative_to(root)),
+                    "run_summary": str(summary_path.relative_to(root)),
+                    "stage_status": str(status_path.relative_to(root)),
+                    "status_claim_source": "stage_status_strict_verifier",
                 },
             )
             self._write_json(resolved_config_path, {"unit": unit, "embed_dim": EMBED_DIM})
@@ -268,6 +275,7 @@ class Step3UpstreamGateTests(unittest.TestCase):
     @pytest.mark.artifact
     @pytest.mark.slow
     def test_current_preprocess_latest_artifacts_pass_gate(self) -> None:
+        latest = json.loads((REPO_ROOT / "runs" / "preprocess" / "a" / "latest.json").read_text(encoding="utf-8"))
         summary = validate_step3_preprocess_upstream_gate(
             repo_root=REPO_ROOT,
             task_id=TASK_ID,
@@ -279,7 +287,7 @@ class Step3UpstreamGateTests(unittest.TestCase):
             embed_dim=1024,
         )
         self.assertEqual(summary["status"], "ok")
-        self.assertEqual(summary["preprocess"]["a"]["run_id"], "1")
+        self.assertEqual(summary["preprocess"]["a"]["run_id"], str(latest["latest_run_id"]))
         self.assertEqual(summary["env"]["embed_dim"], 1024)
         self.assertIn(AUX, summary["profile_artifact_fingerprints"])
         self.assertIn(TARGET, summary["domain_artifact_fingerprints"])
@@ -289,6 +297,11 @@ class Step3UpstreamGateTests(unittest.TestCase):
             summary = self._validate_fixture(Path(tmp))
         self.assertEqual(summary["status"], "ok")
         self.assertEqual(summary["preprocess"]["b"]["run_id"], "1")
+        self.assertEqual(summary["preprocess"]["b"]["stage_status"], "ok")
+        self.assertEqual(
+            summary["preprocess"]["b"]["latest_pointer_schema_version"],
+            "odcr_latest_pointer/active_stage_status/1",
+        )
         self.assertEqual(summary["domain_artifacts"][AUX]["domain_content"]["shape"], [EMBED_DIM])
 
     def _expect_failure_after_mutation(self, mutate, pattern: str) -> None:
@@ -321,9 +334,19 @@ class Step3UpstreamGateTests(unittest.TestCase):
             payload["latest_run_id"] = "999"
             payload["latest_run_dir"] = "runs/preprocess/b/999"
             payload["latest_summary_path"] = "runs/preprocess/b/999/meta/run_summary.json"
+            payload["latest_stage_status_path"] = "runs/preprocess/b/999/meta/stage_status.json"
             self._write_json(latest, payload)
 
         self._expect_failure_after_mutation(mutate, "run_summary.json.*missing")
+
+    def test_missing_latest_stage_status_pointer_fails(self) -> None:
+        def mutate(root: Path, paths: dict[str, Path]) -> None:
+            latest = paths["runs"] / "preprocess" / "b" / "latest.json"
+            payload = json.loads(latest.read_text(encoding="utf-8"))
+            payload.pop("latest_stage_status_path", None)
+            self._write_json(latest, payload)
+
+        self._expect_failure_after_mutation(mutate, "latest_stage_status_path is required")
 
     def test_run_summary_status_inconsistent_fails(self) -> None:
         def mutate(root: Path, paths: dict[str, Path]) -> None:

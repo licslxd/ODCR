@@ -17,7 +17,11 @@ from executors.decode_controller import (  # noqa: E402
     coerce_generate_cfg_override,
     merge_generate_config_with_override,
 )
-from odcr_core.bleu_runtime import build_explanation_bleu_rows_for_indices  # noqa: E402
+from executors.step5_engine import (  # noqa: E402
+    _step5_should_validate_epoch,
+    _step5_train_monitor_generation_batch_size,
+)
+from odcr_core.bleu_runtime import build_explanation_bleu_rows_for_indices, mainline_monitor_full_valid_ddp  # noqa: E402
 from odcr_core.gather_schema import GatheredBatch  # noqa: E402
 from odcr_core.step5_innovation import for_test_default_step5_innovation_config  # noqa: E402
 
@@ -55,9 +59,8 @@ def _minimal_final_cfg(*, full_bleu_decode_strategy: str = "greedy") -> FinalTra
         test_forward_micro_batch_size=8,
         validation_microbatch_accumulation=False,
         validation_memory_policy="single_forward",
-        step5_validation_mode="legacy32",
+        step5_validation_mode="clean_memory32",
         formal_entry_E4_validation_required=False,
-        old_eval_batch_2048_retired=True,
         valid_loss_components_json="{}",
         train_batch_size=8,
         global_batch_size=8,
@@ -96,7 +99,6 @@ def _minimal_final_cfg(*, full_bleu_decode_strategy: str = "greedy") -> FinalTra
         task_profile_config_json="{}",
         backup_profiles_config_json="{}",
         exploration_profiles_config_json="{}",
-        worker_profiles_config_json="{}",
         prefetcher_config_json="{}",
         checkpoint_policy_config_json="{}",
         quality_gate_config_json="{}",
@@ -105,16 +107,10 @@ def _minimal_final_cfg(*, full_bleu_decode_strategy: str = "greedy") -> FinalTra
         cross_rank_structured_gather_config_json="{}",
         memory_config_json="{}",
         timing_config_json="{}",
-        performance_candidates_config_json="{}",
         cache_policy_config_json="{}",
         objective_drift_config_json="{}",
         recovery_config_json="{}",
         phase_loss_schedule_config_json="{}",
-        conflict_aware_config_json="{}",
-        loss_gradient_conflict_probe_config_json="{}",
-        adapter_gating_config_json="{}",
-        paper_candidate_selection_config_json="{}",
-        checkpoint_averaging_config_json="{}",
         eval_batch_size=8,
         min_epochs=1,
         train_min_epochs=1,
@@ -211,6 +207,37 @@ class _Tok:
 
 
 class TestFullBleuMonitorDecode(unittest.TestCase):
+    def test_step5_validation_cadence_keeps_final_epoch(self) -> None:
+        self.assertFalse(_step5_should_validate_epoch(1, 20, 5))
+        self.assertTrue(_step5_should_validate_epoch(5, 20, 5))
+        self.assertFalse(_step5_should_validate_epoch(19, 20, 5))
+        self.assertTrue(_step5_should_validate_epoch(20, 20, 5))
+        self.assertTrue(_step5_should_validate_epoch(3, 3, 20))
+        self.assertTrue(_step5_should_validate_epoch(1, 3, 0))
+
+    def test_train_monitor_uses_train_validation_generation_batch(self) -> None:
+        cfg = replace(
+            _minimal_final_cfg(),
+            ddp_world_size=2,
+            eval_batch_size=2048,
+            valid_global_batch_size=64,
+            valid_batch_size=64,
+            valid_per_gpu_batch_size=32,
+            valid_forward_micro_batch_size=16,
+        )
+
+        self.assertEqual(_step5_train_monitor_generation_batch_size(cfg), 16)
+        self.assertEqual(
+            _step5_train_monitor_generation_batch_size(replace(cfg, valid_forward_micro_batch_size=0)),
+            32,
+        )
+        self.assertEqual(
+            _step5_train_monitor_generation_batch_size(
+                replace(cfg, valid_forward_micro_batch_size=0, valid_per_gpu_batch_size=0)
+            ),
+            32,
+        )
+
     def test_build_full_bleu_monitor_override_greedy(self) -> None:
         cfg = _minimal_final_cfg(full_bleu_decode_strategy="greedy")
         ov = build_full_bleu_monitor_cfg_override(cfg)
@@ -289,6 +316,32 @@ class TestFullBleuMonitorDecode(unittest.TestCase):
             non_blocking_h2d=False,
         )
         self.assertIsNone(m2.last_cfg_override)
+
+    def test_mainline_monitor_does_not_require_retired_recommend(self) -> None:
+        m = _RecordingModel()
+        ds = _OneRowDs()
+        tok = _Tok()
+        step5_innov_cfg = for_test_default_step5_innovation_config()
+
+        score, bundle = mainline_monitor_full_valid_ddp(
+            m,
+            ds,
+            tokenizer=tok,
+            device=torch.device("cpu"),
+            rank=0,
+            world_size=1,
+            batch_size=1,
+            dataloader_num_workers=0,
+            dataloader_prefetch_factor=None,
+            cfg_override={"strategy": "greedy"},
+            step5_innov_cfg=step5_innov_cfg,
+            non_blocking_h2d=False,
+        )
+
+        self.assertIsInstance(score, float)
+        self.assertIsNotNone(bundle)
+        self.assertEqual(bundle.get("rmse_rating"), 0.0)
+        self.assertEqual(bundle.get("mae_rating"), 0.0)
 
     def test_generation_fingerprint_chunk_excludes_monitor_decode_key(self) -> None:
         """generation_semantic_fingerprint 的 _fp_gen 构造段不得包含 full_bleu_decode_strategy。"""

@@ -28,7 +28,7 @@ Tokenizer cache writes are atomic:
 
 Failed or partial caches are never reusable. A failed build writes `failed.marker` in the partial directory, and the next run may clean stale partials only as an explicit rebuild event.
 
-Downstream handoff must reject failed latest pointers. `from_step3=latest` and other upstream latest selectors require `latest_status` and `run_summary.status` to be one of `ok`, `completed`, or `success`; failed, running, partial, or interrupted runs are records only. Step3 and Step5 latest handoffs also require the canonical checkpoint, checkpoint sidecar, schema, and checkpoint file hash before downstream resolution succeeds.
+Downstream handoff must reject failed latest pointers. `from_step3=latest` and other upstream latest selectors treat `latest.json` as a pointer only: it must target the matching `run_summary.json` and `stage_status.json`, and formal status comes from the verified status artifact plus `run_summary.status`. Failed, running, partial, or interrupted runs are records only. Step3 and Step5 latest handoffs also require the canonical checkpoint, checkpoint sidecar, schema, and checkpoint file hash before downstream resolution succeeds.
 
 `training_runtime_config.json` must exist before tokenization/cache starts. A failed run summary must not point to a missing required runtime config with a null hash; missing startup artifacts are recorded under `optional_artifacts` with a reason. Failed summaries carry a compact root signature with phase, fatal signature, cache key/dir/status, training-loop status, checkpoint status, and NCCL fields when present.
 
